@@ -510,6 +510,14 @@ def test_credential_field_type_annotations_are_allowed(tmp_path):
     assert audit_repository(repo, vault=None, include_history=False) == []
 
 
+def test_python_string_fixture_containing_type_annotation_is_allowed(tmp_path):
+    annotation = "client_" + "secret: SecretStr\\n"
+    fixture_source = 'annotation = "' + annotation + '"\n'
+    repo = git_repo(tmp_path, {"fixture.py": fixture_source})
+
+    assert audit_repository(repo, vault=None, include_history=False) == []
+
+
 def test_control_characters_in_finding_path_cannot_spoof_output(tmp_path):
     assignment = "access_" + "token='synthetic-value-123'\n"
     repo = git_repo(tmp_path, {"safe\nspoof.py": assignment})

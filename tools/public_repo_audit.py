@@ -390,9 +390,21 @@ def credential_in_text(text: str) -> bool:
 
 
 def python_credential_annotation(relative_path: str, line: str) -> bool:
-    return relative_path.endswith((".py", ".pyi")) and bool(
-        PYTHON_CREDENTIAL_ANNOTATION_RE.fullmatch(line)
-    )
+    if not relative_path.endswith((".py", ".pyi")):
+        return False
+    if PYTHON_CREDENTIAL_ANNOTATION_RE.fullmatch(line):
+        return True
+    for quote in ('"', "'"):
+        start = line.find(quote)
+        end = line.rfind(quote)
+        if start < 0 or end <= start:
+            continue
+        fixture = line[start + 1 : end]
+        if fixture.endswith(r"\n"):
+            fixture = fixture[:-2]
+        if PYTHON_CREDENTIAL_ANNOTATION_RE.fullmatch(fixture):
+            return True
+    return False
 
 
 def instance_identifier_in_line(term: str, line: str) -> bool:
