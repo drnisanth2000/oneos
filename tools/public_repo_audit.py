@@ -62,6 +62,34 @@ BINARY_SIGNATURES = (
     b"\x89PNG\r\n\x1a\n",
     b"\xff\xd8\xff",
 )
+TEXT_SUFFIXES = frozenset(
+    {
+        ".cfg",
+        ".css",
+        ".csv",
+        ".html",
+        ".ini",
+        ".jinja",
+        ".jinja2",
+        ".js",
+        ".json",
+        ".lock",
+        ".md",
+        ".py",
+        ".sh",
+        ".sql",
+        ".svg",
+        ".toml",
+        ".tsv",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
+TEXT_BASENAMES = frozenset(
+    {".cursorrules", ".gitattributes", ".gitignore", "Dockerfile", "LICENSE"}
+)
 
 
 @dataclass(frozen=True)
@@ -190,7 +218,7 @@ def scan_revision(repo: Path, revision: str, terms: set[str]) -> list[Finding]:
             )
             continue
         blob = git_bytes(repo, "show", f"{revision}:{relative_path}")
-        if blob_is_binary(blob):
+        if blob_is_binary(relative_path, blob):
             if binary_is_allowlisted(relative_path, blob):
                 continue
             findings.append(
@@ -211,7 +239,10 @@ def binary_is_allowlisted(relative_path: str, blob: bytes) -> bool:
     return expected is not None and hashlib.sha256(blob).hexdigest() == expected
 
 
-def blob_is_binary(blob: bytes) -> bool:
+def blob_is_binary(relative_path: str, blob: bytes) -> bool:
+    path = Path(relative_path)
+    if path.name not in TEXT_BASENAMES and path.suffix.lower() not in TEXT_SUFFIXES:
+        return True
     if blob.startswith(BINARY_SIGNATURES):
         return True
     try:
@@ -293,7 +324,8 @@ def instance_term_in_line(term: str, line: str) -> bool:
     # free prose such as ordinary two-letter words remains usable.
     return bool(
         re.search(
-            rf"(?i:^\s*[\"']?(?:entity|product|member)(?:[_-]?id)?[\"']?"
+            rf"(?i:(?:^\s*(?:-\s*)?|(?:\{{|\[|,)\s*)[\"']?"
+            rf"(?:entity|product|member)(?:[_-]?id)?[\"']?"
             rf"\s*[:=]\s*[\"']?){re.escape(term)}(?![A-Za-z0-9])",
             line,
         )
@@ -315,17 +347,36 @@ def load_instance_terms(vault: Path) -> set[str]:
     products = load_yaml(system / "products.yaml").get("products", {})
     members = load_yaml(system / "members.yaml").get("members", {})
     terms = set(entities)
+    for entity_record in entities.values():
+        terms.update(registry_record_vocabulary(entity_record))
     for entity_products in products.values():
         if isinstance(entity_products, dict):
             terms.update(entity_products)
+            for product_record in entity_products.values():
+                terms.update(registry_record_vocabulary(product_record))
     for entity_members in members.values():
         if isinstance(entity_members, list):
-            terms.update(
-                member["id"]
-                for member in entity_members
-                if isinstance(member, dict) and isinstance(member.get("id"), str)
-            )
+            for member in entity_members:
+                if not isinstance(member, dict):
+                    continue
+                if isinstance(member.get("id"), str):
+                    terms.add(member["id"])
+                terms.update(registry_record_vocabulary(member))
     return {term for term in terms if isinstance(term, str) and term}
+
+
+def registry_record_vocabulary(record: object) -> set[str]:
+    if not isinstance(record, dict):
+        return set()
+    vocabulary = {
+        record[key]
+        for key in ("label", "name", "display_name", "email")
+        if isinstance(record.get(key), str)
+    }
+    aliases = record.get("aliases", [])
+    if isinstance(aliases, list):
+        vocabulary.update(alias for alias in aliases if isinstance(alias, str))
+    return vocabulary
 
 
 def load_yaml(path: Path) -> dict:

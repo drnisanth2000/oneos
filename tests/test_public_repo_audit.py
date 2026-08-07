@@ -42,16 +42,29 @@ def commit_bytes(repo: Path, files: dict[str, bytes], message: str) -> None:
 
 
 def synthetic_vault(
-    path: Path, entity: str, product: str | None = None, member: str | None = None
+    path: Path,
+    entity: str,
+    product: str | None = None,
+    member: str | None = None,
+    entity_label: str = "Synthetic",
+    product_label: str | None = None,
+    member_label: str | None = None,
 ) -> Path:
     system = path / "_system"
     system.mkdir(parents=True)
     (system / "entities.yaml").write_text(
-        yaml.safe_dump({"entities": {entity: {"label": "Synthetic"}}}),
+        yaml.safe_dump({"entities": {entity: {"label": entity_label}}}),
         encoding="utf-8",
     )
-    products = {entity: {product: {}}} if product else {}
-    members = {entity: [{"id": member}]} if member else {}
+    products = (
+        {entity: {product: {"label": product_label} if product_label else {}}}
+        if product
+        else {}
+    )
+    member_record = {"id": member} if member else None
+    if member_record is not None and member_label:
+        member_record["label"] = member_label
+    members = {entity: [member_record]} if member_record else {}
     (system / "products.yaml").write_text(
         yaml.safe_dump({"products": products}), encoding="utf-8"
     )
@@ -332,11 +345,51 @@ def test_short_product_and_member_ids_are_rejected_in_structured_text(tmp_path):
     assert all(member not in item.message for item in findings)
 
 
+def test_registry_labels_from_all_private_sources_are_rejected(tmp_path):
+    labels = ["Private Entity Name", "Private Product Name", "Private Member Name"]
+    repo = git_repo(tmp_path / "repo", {"note.md": "\n".join(labels) + "\n"})
+    vault = synthetic_vault(
+        tmp_path / "vault",
+        entity="customer-zeta",
+        product="product-zeta",
+        member="member-zeta",
+        entity_label=labels[0],
+        product_label=labels[1],
+        member_label=labels[2],
+    )
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert [item.category for item in findings] == [
+        "instance-value",
+        "instance-value",
+        "instance-value",
+    ]
+    assert all(label not in item.message for label in labels for item in findings)
+
+
 def test_short_registry_identifier_is_allowed_in_ordinary_prose(tmp_path):
     repo = git_repo(tmp_path / "repo", {"note.md": "it remains generic prose\n"})
     vault = synthetic_vault(tmp_path / "vault", entity="it")
 
     assert audit_repository(repo, vault=vault, include_history=False) == []
+
+
+def test_short_registry_identifier_matches_inline_structured_boundaries(tmp_path):
+    private_identifier = "xy"
+    structured = (
+        f'{{"entity": "{private_identifier}"}}\n'
+        f"- member_id: {private_identifier}\n"
+    )
+    repo = git_repo(tmp_path / "repo", {"note.yaml": structured})
+    vault = synthetic_vault(tmp_path / "vault", entity=private_identifier)
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert [item.category for item in findings] == [
+        "instance-value",
+        "instance-value",
+    ]
 
 
 def test_printable_binary_signature_still_fails_closed(tmp_path):
@@ -346,6 +399,15 @@ def test_printable_binary_signature_still_fails_closed(tmp_path):
         {"assets/printable.pdf": b"%PDF-1.7\nprintable but still binary\n"},
         "binary",
     )
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["unapproved-binary"]
+
+
+def test_printable_binary_with_unknown_extension_fails_closed(tmp_path):
+    repo = git_repo(tmp_path, {"app.py": "title = 'OneOS'\n"})
+    commit_bytes(repo, {"assets/image.ppm": b"P6\n1 1\n255\nABC"}, "binary")
 
     findings = audit_repository(repo, vault=None, include_history=False)
 
