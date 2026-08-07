@@ -30,6 +30,9 @@ Gates govern expansion, not usage. Phase 2 is not scoped until all five pass.
 
 ## Findings / decisions this session
 
+- **Private GitHub agent workflow** — private GitHub CI is active. Codex cloud
+  tasks use synthetic fixtures only; private-vault integration remains a local
+  merge gate.
 - **Ingest write target** — redacted items are written directly to
   `<entity>/00-inbox/active/` with `sub: triage` (the sanctioned intake feed).
   The raw original never enters git; it is referenced by `source_ref` + `sha256`
