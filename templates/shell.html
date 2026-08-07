@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneOS</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <!-- Vendored, never CDN (spec §6). defer preserves order: htmx, Alpine
+       plugins, the htmx alpine-morph extension, then Alpine core LAST so the
+       plugins are registered before Alpine boots. -->
+  <script defer src="/static/vendor/htmx.min.js"></script>
+  <script defer src="/static/vendor/alpine-morph.min.js"></script>
+  <script defer src="/static/vendor/alpine-persist.min.js"></script>
+  <script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
+  <script defer src="/static/vendor/alpine.min.js"></script>
+</head>
+<!-- alpine-morph extension is what makes hx-swap="morph" preserve Alpine
+     state across an auto-refresh; mandatory, not optional (spec §6). -->
+<body hx-ext="alpine-morph">
+  {% include "_sidebar.html" %}
+
+  <main class="main">
+    <!-- Self-contained #pulse block: it auto-refreshes with hx-swap="morph" and
+         carries its own polling attributes, so the morph preserves both the
+         trigger and the Alpine drawer state across every swap (spec step 1). -->
+    {% include "blocks/pulse.html" %}
+  </main>
+</body>
+</html>

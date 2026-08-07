@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneOS · Registry</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script defer src="/static/vendor/htmx.min.js"></script>
+  <script defer src="/static/vendor/alpine-morph.min.js"></script>
+  <script defer src="/static/vendor/alpine-persist.min.js"></script>
+  <script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
+  <script defer src="/static/vendor/alpine.min.js"></script>
+</head>
+<body hx-ext="alpine-morph">
+  {% include "_sidebar.html" %}
+  <main class="main">
+    <h1 class="triage-h">Registry · products · {{ entity }}</h1>
+    <p class="muted">Add and edit are direct. Delete runs a reference count first
+      and is refused while anything still points at the value.</p>
+
+    {% if not products %}
+    <p class="muted">No products registered for this entity.</p>
+    {% endif %}
+    <ul class="triage-list">
+      {% for slug in products %}
+      <li class="triage-item">
+        <div class="ti-head"><span class="ti-title">{{ slug }}</span></div>
+        <div class="prop-actions">
+          <button class="reject"
+                  hx-post="/registry/{{ entity }}/product/delete-preview"
+                  hx-vals='{"slug": "{{ slug }}"}'
+                  hx-target="#impact-{{ loop.index0 }}" hx-swap="innerHTML">Delete…</button>
+        </div>
+        <div id="impact-{{ loop.index0 }}"></div>
+      </li>
+      {% endfor %}
+    </ul>
+  </main>
+</body>
+</html>

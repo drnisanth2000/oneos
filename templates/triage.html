@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OneOS · Triage</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script defer src="/static/vendor/htmx.min.js"></script>
+  <script defer src="/static/vendor/alpine-morph.min.js"></script>
+  <script defer src="/static/vendor/alpine-persist.min.js"></script>
+  <script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
+  <script defer src="/static/vendor/alpine.min.js"></script>
+</head>
+<body hx-ext="alpine-morph">
+  {% include "_sidebar.html" %}
+
+  <main class="main">
+    <div x-data="triage({{ rows|length }})" @keydown.window="onkey($event)">
+      <h1 class="triage-h">Triage · {{ entity }}</h1>
+      <p class="muted">
+        {{ rows|length }} unsorted ·
+        <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>a</kbd> accept (writes a proposal) ·
+        <a href="/outbox/{{ entity }}">outbox →</a>
+      </p>
+
+      <!-- Gate-1 timing instrument (spec §11.1). Client-only: only the screen
+           cares about the stopwatch, so Alpine owns it. Counts accept actions
+           (each accepted item = one triaged item) between Start and Stop. -->
+      <div class="timing-bar" x-data>
+        <template x-if="!$store.timer.running && !$store.timer.done">
+          <button class="time-btn" @click="$store.timer.start()">⏱ Start timing</button>
+        </template>
+        <template x-if="$store.timer.running">
+          <span>
+            ⏱ <strong x-text="$store.timer.elapsed.toFixed(1)"></strong>s ·
+            triaged <strong x-text="$store.timer.accepted"></strong>
+            <button class="time-btn" @click="$store.timer.stop()">Stop</button>
+          </span>
+        </template>
+        <template x-if="$store.timer.done">
+          <span>
+            Triaged <strong x-text="$store.timer.accepted"></strong> item(s) in
+            <strong x-text="$store.timer.elapsed.toFixed(1)"></strong>s
+            (<span x-text="$store.timer.perItem()"></span>s/item)
+            <button class="time-btn" @click="$store.timer.start()">Reset</button>
+          </span>
+        </template>
+      </div>
+
+      {% if not rows %}
+      <p class="muted">Nothing waiting. Drop a file into <code>_dropbox/</code>.</p>
+      {% endif %}
+
+      <ul class="triage-list">
+        {% for it, c in rows %}
+        <li class="triage-item" :class="{ sel: i === {{ loop.index0 }} }"
+            @click="i = {{ loop.index0 }}">
+          <div class="ti-head">
+            <span class="ti-title">{{ it.title }}</span>
+            {% if it.source %}<span class="ti-source">{{ it.source }}</span>{% endif %}
+            {% if it.fm.get('pii_quarantined') %}<span class="unsure">PII quarantined</span>{% endif %}
+          </div>
+          {% if it.summary %}<div class="ti-sum">{{ it.summary[:180] }}</div>{% endif %}
+          <div class="ti-prop">
+            → <span class="mod-name">{{ c.module }}</span> /
+            <span class="mod-name">{{ c.sub }}</span>
+            <span class="block-tag">{{ c.block }}</span>
+            {% if c.confident %}
+              <span class="conf" title="matched rule {{ c.rule_id }}">rule: {{ c.rule_id }}</span>
+            {% else %}
+              <span class="unsure">unclassified — needs a call</span>
+            {% endif %}
+          </div>
+          {% if c.confident %}
+          <div class="ti-actions">
+            <button class="accept"
+                    hx-post="/triage/{{ entity }}/propose"
+                    hx-vals='{"filename": "{{ it.path.name }}", "module": "{{ c.module }}", "sub": "{{ c.sub }}", "block": "{{ c.block }}", "rule_id": "{{ c.rule_id or '' }}"}'
+                    hx-target="#diff-{{ loop.index0 }}" hx-swap="innerHTML">
+              Accept → write proposal
+            </button>
+          </div>
+          {% endif %}
+          <div class="diff-slot" id="diff-{{ loop.index0 }}"></div>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+  </main>
+
+  <script>
+    function triage(n) {
+      return {
+        i: 0, n: n,
+        onkey(e) {
+          if (e.key === 'j') { this.i = Math.min(this.i + 1, this.n - 1); }
+          else if (e.key === 'k') { this.i = Math.max(this.i - 1, 0); }
+          else if (e.key === 'a') {
+            const item = document.querySelectorAll('.triage-item')[this.i];
+            const btn = item && item.querySelector('.accept');
+            if (btn) btn.click();
+          }
+        },
+      };
+    }
+
+    // Gate-1 stopwatch, as an Alpine store so any element can read it.
+    document.addEventListener('alpine:init', () => {
+      Alpine.store('timer', {
+        running: false, done: false, accepted: 0, startMs: 0, elapsed: 0, _iv: null,
+        start() {
+          this.running = true; this.done = false; this.accepted = 0;
+          this.startMs = performance.now(); this.elapsed = 0;
+          this._iv = setInterval(() => {
+            this.elapsed = (performance.now() - this.startMs) / 1000;
+          }, 100);
+        },
+        stop() { this.running = false; this.done = true; clearInterval(this._iv); },
+        accept() { if (this.running) this.accepted += 1; },
+        perItem() { return this.accepted ? (this.elapsed / this.accepted).toFixed(1) : '0.0'; },
+      });
+    });
+
+    // Count each successful accept (a triaged item) while the clock runs.
+    document.addEventListener('htmx:afterRequest', (e) => {
+      const elt = e.detail && e.detail.elt;
+      if (e.detail.successful && elt && elt.classList.contains('accept')
+          && window.Alpine) {
+        Alpine.store('timer').accept();
+      }
+    });
+  </script>
+</body>
+</html>

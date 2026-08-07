@@ -1,0 +1,39 @@
+<nav class="sidebar" aria-label="Entity bundles"
+     x-data="{ open: $persist({}).as('oneos.sidebar.open') }">
+  <div class="brand"><a href="/" class="brandlink">OneOS</a> <small>· read &amp; approve</small></div>
+
+  {% for b in bundles %}
+  <div class="bundle" data-slug="{{ b.slug }}">
+    <div class="bundle-head" role="button" tabindex="0"
+         @click="open['{{ b.slug }}'] = !open['{{ b.slug }}']"
+         @keydown.enter.prevent="open['{{ b.slug }}'] = !open['{{ b.slug }}']">
+      <span class="chev" :class="{ open: open['{{ b.slug }}'] }">&#9654;</span>
+      <span class="label">{{ b.label }}</span>
+      <span class="flags">{{ b.flags | join(' ') }}</span>
+    </div>
+
+    {% if not b.on_disk %}
+      <div class="bundle-absent">listed in entities.yaml, not yet on disk</div>
+    {% endif %}
+    {% if b.errors %}
+      <div class="bundle-warn">
+        {{ b.errors | length }} module(s) required by flags, missing on disk
+      </div>
+    {% endif %}
+
+    <ul class="modules" x-show="open['{{ b.slug }}']" x-cloak>
+      {% for m in b.modules %}
+      <li class="{{ 'missing' if m.missing else '' }}"
+          {% if m.missing %}title="required by flags but absent on disk (E4)"{% endif %}>
+        {% if m.name == '00-inbox' %}
+          <a class="mod-name" href="/triage/{{ b.slug }}">{{ m.name }}</a>
+        {% else %}
+          <span class="mod-name">{{ m.name }}</span>
+        {% endif %}
+        <span class="block-tag">{{ m.block }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endfor %}
+</nav>

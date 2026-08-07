@@ -1,0 +1,61 @@
+name: Agent task
+description: Define a bounded, reviewable task for a cloud or local agent.
+title: "agent: "
+labels: [agent-task]
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: Describe the intended user-facing result.
+    validations:
+      required: true
+  - type: textarea
+    id: in_scope_files
+    attributes:
+      label: In-scope files
+      description: List the files or directories the agent may change.
+    validations:
+      required: true
+  - type: textarea
+    id: out_of_scope_changes
+    attributes:
+      label: Out-of-scope changes
+      description: List changes the agent must not make.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_tests
+    attributes:
+      label: Acceptance tests
+      description: State the commands or observations that prove the outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: private_gate
+    attributes:
+      label: Private-gate requirement
+      description: State whether the trusted local integration gate is required and who runs it.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: List required prior work, services, approvals, or state.
+    validations:
+      required: true
+  - type: textarea
+    id: stop_conditions
+    attributes:
+      label: Stop conditions
+      description: Stop and request direction if any condition applies.
+      value: |
+        - New dependency is needed
+        - Convention or schema change is needed
+        - Security boundary changes
+        - Destructive action is required
+        - Deployment is required
+        - Product choice remains unresolved
+    validations:
+      required: true

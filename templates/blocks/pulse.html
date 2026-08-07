@@ -1,0 +1,22 @@
+<!-- The hx-* attributes live on this root element, and the server returns this
+     same #pulse element on every refresh. Morph then updates #pulse in place
+     (clock text changes) while KEEPING its own id + polling attributes and the
+     Alpine drawer state. If the wrapper lived only in shell.html, the first
+     morph would rewrite #pulse to match the inner node and strip the trigger. -->
+<div id="pulse" class="block" x-data="{ drawer: false }"
+     hx-get="/blocks/pulse" hx-trigger="every 3s"
+     hx-swap="morph" hx-target="#pulse">
+  <h2>Wiring check</h2>
+  <p class="muted">Server time, refreshed every 3s via <code>hx-swap="morph"</code>.</p>
+  <div class="pulse-clock">{{ now }}</div>
+
+  <button @click="drawer = !drawer" x-text="drawer ? 'Hide detail' : 'Show detail'">
+    Show detail
+  </button>
+
+  <div class="drawer" x-show="drawer" x-cloak>
+    Open this drawer, then wait for the clock to tick. If it stays open, the
+    morph swap preserved Alpine state — the whole point of
+    <code>alpine-morph</code>. A default swap would slam it shut every 3s.
+  </div>
+</div>

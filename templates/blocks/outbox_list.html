@@ -1,0 +1,24 @@
+<div id="outbox-list">
+  {% if not props %}
+  <p class="muted">No pending proposals. Approve or reject clears them from here.</p>
+  {% endif %}
+  {% for p, diff in props %}
+  <div class="proposal">
+    <div class="prop-head">
+      <code class="prop-id">{{ p.id }}</code>
+      <span class="prop-route">{{ p.module }} / {{ p.sub }} <span class="block-tag">{{ p.block }}</span></span>
+    </div>
+    <pre class="diff-body">{{ diff }}</pre>
+    <div class="prop-actions">
+      <button class="approve"
+              hx-post="/outbox/{{ entity }}/approve"
+              hx-vals='{"id": "{{ p.id }}"}'
+              hx-target="#outbox-list" hx-swap="outerHTML">Approve → move + commit</button>
+      <button class="reject"
+              hx-post="/outbox/{{ entity }}/reject"
+              hx-vals='{"id": "{{ p.id }}"}'
+              hx-target="#outbox-list" hx-swap="outerHTML">Reject</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>

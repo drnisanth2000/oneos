@@ -1,0 +1,17 @@
+<div class="delete-impact">
+  {% if report.total %}
+  <div class="diff-head"><span class="unsure">Deleting '{{ slug }}' would orphan {{ report.total }} reference(s):</span></div>
+  <ul class="impact-list">
+    {% for k, v in report.sources.items() %}{% if v %}<li>{{ k }}: {{ v }}</li>{% endif %}{% endfor %}
+  </ul>
+  <p class="muted">Delete is refused until these are cleared.</p>
+  {% else %}
+  <div class="diff-head">No references — safe to delete.</div>
+  {% endif %}
+  <div class="prop-actions">
+    <button class="reject"
+            hx-post="/registry/{{ entity }}/product/delete-execute"
+            hx-vals='{"id": "{{ prop.id }}", "slug": "{{ slug }}"}'
+            hx-target="closest .delete-impact" hx-swap="innerHTML">Approve delete</button>
+  </div>
+</div>

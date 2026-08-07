@@ -1,0 +1,94 @@
+"""Synthetic vault fixtures.
+
+Committed tests must stay instance-agnostic: no real slug, path, or module
+count from the actual vault ever appears in this repo (AGENTS.md, "the one
+rule"). Every test builds its own throwaway vault with invented slugs, so the
+same code that drives the real system drives these.
+"""
+from pathlib import Path
+import subprocess
+import textwrap
+
+import pytest
+
+# A minimal but faithful archetypes.yaml: one module gated behind a flag
+# (`zz-extra` needs `special`), the rest unconditional — mirroring how the real
+# registry gates only `15-self` behind `personal`.
+ARCHETYPES = textwrap.dedent(
+    """
+    version: "2.0"
+    flags:
+      special: "Activates the extra module"
+      other:   "Some other capability"
+    modules:
+      00-intake:  { block: system, core: true }
+      01-core:    { block: govern, core: true }
+      02-work:    { block: build }
+      zz-extra:   { block: self, core: true, requires_flag: special }
+    submodules:
+      00-intake:
+        triage: { name: "Triage" }
+    archetypes:
+      plain:   { }
+      special: { special: true }
+    """
+).strip()
+
+
+def write_vault(root: Path, entities_yaml: str, archetypes_yaml: str = ARCHETYPES) -> Path:
+    system = root / "_system"
+    system.mkdir(parents=True, exist_ok=True)
+    (system / "archetypes.yaml").write_text(archetypes_yaml, encoding="utf-8")
+    (system / "entities.yaml").write_text(entities_yaml, encoding="utf-8")
+    return root
+
+
+def scaffold_modules(root: Path, slug: str, modules: list[str]) -> None:
+    """Create the given module directories on disk under a bundle."""
+    for m in modules:
+        (root / slug / m).mkdir(parents=True, exist_ok=True)
+
+
+@pytest.fixture
+def make_vault(tmp_path):
+    def _make(entities_yaml: str, archetypes_yaml: str = ARCHETYPES) -> Path:
+        return write_vault(tmp_path, entities_yaml, archetypes_yaml)
+    return _make
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=root, check=True, capture_output=True, text=True
+    ).stdout
+
+
+def write_tree(root: Path, files: dict[str, str]) -> None:
+    """Write a {relative_path: content} tree, creating parents."""
+    for rel, content in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+
+def git_vault(root: Path, files: dict[str, str]) -> Path:
+    """Create a committed git repo at `root` from a file tree — a throwaway
+    vault for rename tests. Never the real vault."""
+    write_tree(root, files)
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "test")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "init")
+    return root
+
+
+def git_head_message(root: Path) -> str:
+    return _git(root, "log", "-1", "--pretty=%s").strip()
+
+
+def git_is_clean(root: Path) -> bool:
+    return _git(root, "status", "--short").strip() == ""
+
+
+def git_count_commits(root: Path) -> int:
+    return int(_git(root, "rev-list", "--count", "HEAD").strip())
