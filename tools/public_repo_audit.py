@@ -15,6 +15,7 @@ import yaml
 POSIX_ABSOLUTE_HOME_RE = re.compile(
     r"(?:^|[\s\"'=`(\[,])"
     r"(?:/(?:Users|home)/[^\s\"'`]+|/root(?:/[^\s\"'`]+)?)"
+    r"(?=$|[\s\"'`),\]:;])"
 )
 WINDOWS_ABSOLUTE_HOME_RE = re.compile(
     r"(?:^|[\s\"'=`(\[,])[A-Za-z]:[\\/]+Users[\\/]+[^\s\"'`]+",
@@ -23,6 +24,11 @@ WINDOWS_ABSOLUTE_HOME_RE = re.compile(
 CREDENTIAL_RE = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|password|client[_-]?secret)\b"
     r"\s*[:=]\s*(?:[\"'][^\"']{8,}[\"']|[A-Za-z0-9_./+=-]{8,})"
+)
+PYTHON_CREDENTIAL_ANNOTATION_RE = re.compile(
+    r"^\s*(?i:api[_-]?key|access[_-]?token|password|client[_-]?secret)\s*:\s*"
+    r"(?:[A-Z][A-Za-z0-9_.]*(?:\[[^\]]+\])?|str|bytes)"
+    r"(?:\s*\|\s*None)?(?:\s*=\s*(?:None|\.\.\.))?\s*(?:#.*)?$"
 )
 URL_CREDENTIAL_RE = re.compile(r"https?://[^/\s:@]+:[^@\s/]+@")
 PRIVATE_MARKER_RE = re.compile(
@@ -43,6 +49,11 @@ GITHUB_NOREPLY_RE = re.compile(
 GITHUB_MERGE_SUBJECT_RE = re.compile(
     r"\AMerge pull request #[0-9]+ from "
     r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/[^\r\n]+"
+)
+GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/",
+    re.IGNORECASE,
 )
 # This repository needs one generic PDF fixture for ingestion tests. Its digest
 # is the SHA-256 of the tracked fixture bytes (`shasum -a 256`); path and digest
@@ -99,17 +110,25 @@ class Finding:
     message: str
 
 
+@dataclass(frozen=True)
+class InstanceTerms:
+    identifiers: frozenset[str] = frozenset()
+    vocabulary: frozenset[str] = frozenset()
+
+
 def audit_repository(
     repo: Path,
     vault: Path | None = None,
     include_history: bool = False,
 ) -> list[Finding]:
-    terms = load_instance_terms(vault) if vault else set()
+    terms = load_instance_terms(vault) if vault else InstanceTerms()
     selected = revisions(repo) if include_history else ["HEAD"]
     findings = []
     for revision in selected:
         findings.extend(scan_revision(repo, revision, terms))
         findings.extend(scan_commit_metadata(repo, revision, terms))
+    if include_history:
+        findings.extend(scan_tag_metadata(repo, terms))
     return sorted(set(findings), key=lambda item: (item.location, item.category))
 
 
@@ -117,18 +136,41 @@ def revisions(repo: Path) -> list[str]:
     return git_output(repo, "rev-list", "--all").splitlines()
 
 
-def scan_commit_metadata(repo: Path, revision: str, terms: set[str]) -> list[Finding]:
+def scan_tag_metadata(repo: Path, terms: InstanceTerms) -> list[Finding]:
+    refs = git_output(
+        repo,
+        "for-each-ref",
+        "--format=%(objecttype)%00%(objectname)%00%(refname:strip=2)",
+        "refs/tags",
+    )
+    findings: list[Finding] = []
+    for ref in refs.splitlines():
+        object_type, object_id, tag_name = ref.split("\0", maxsplit=2)
+        findings.extend(scan_text(object_id, "<tag-metadata>", tag_name, terms))
+        if object_type != "tag":
+            continue
+        tag = git_bytes(repo, "cat-file", "tag", object_id).decode(
+            "utf-8", errors="replace"
+        )
+        findings.extend(scan_text(object_id, "<tag-metadata>", tag, terms))
+    return findings
+
+
+def scan_commit_metadata(
+    repo: Path, revision: str, terms: InstanceTerms
+) -> list[Finding]:
     raw_metadata = git_output(
         repo, "show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", revision
     )
     author_name, author_email, committer_name, committer_email, message = (
         raw_metadata.split("\0", maxsplit=4)
     )
+    authenticated_owner = repository_github_owner(repo)
     author_name, author_email = redact_github_remote_identity(
-        author_name, author_email
+        author_name, author_email, authenticated_owner
     )
     committer_name, committer_email = redact_github_remote_identity(
-        committer_name, committer_email
+        committer_name, committer_email, authenticated_owner
     )
     parent_fields = git_output(repo, "rev-list", "--parents", "-n", "1", revision)
     github_committer = (
@@ -138,6 +180,7 @@ def scan_commit_metadata(repo: Path, revision: str, terms: set[str]) -> list[Fin
     message = redact_github_merge_owner(
         message,
         github_generated=len(parent_fields.split()) >= 3 and github_committer,
+        authenticated_owner=authenticated_owner,
     )
     metadata = "\n".join(
         [author_name, author_email, committer_name, committer_email, message]
@@ -145,9 +188,24 @@ def scan_commit_metadata(repo: Path, revision: str, terms: set[str]) -> list[Fin
     return scan_text(revision, "<commit-metadata>", metadata, terms)
 
 
-def redact_github_remote_identity(name: str, email: str) -> tuple[str, str]:
+def repository_github_owner(repo: Path) -> str | None:
+    try:
+        remote = git_output(repo, "remote", "get-url", "origin").strip()
+    except subprocess.CalledProcessError:
+        return None
+    match = GITHUB_REMOTE_RE.match(remote)
+    return match.group("owner") if match else None
+
+
+def redact_github_remote_identity(
+    name: str, email: str, authenticated_owner: str | None
+) -> tuple[str, str]:
     match = GITHUB_NOREPLY_RE.fullmatch(email)
-    if not match:
+    if (
+        not match
+        or authenticated_owner is None
+        or match.group("owner").casefold() != authenticated_owner.casefold()
+    ):
         return name, email
     owner = match.group("owner")
     redacted_name = "<github-owner>" if name.casefold() == owner.casefold() else name
@@ -156,17 +214,23 @@ def redact_github_remote_identity(name: str, email: str) -> tuple[str, str]:
     return redacted_name, redacted_email
 
 
-def redact_github_merge_owner(message: str, *, github_generated: bool) -> str:
+def redact_github_merge_owner(
+    message: str, *, github_generated: bool, authenticated_owner: str | None
+) -> str:
     if not github_generated:
         return message
     match = GITHUB_MERGE_SUBJECT_RE.match(message)
-    if not match:
+    if (
+        not match
+        or authenticated_owner is None
+        or match.group("owner").casefold() != authenticated_owner.casefold()
+    ):
         return message
     start, end = match.span("owner")
     return message[:start] + "<github-owner>" + message[end:]
 
 
-def scan_revision(repo: Path, revision: str, terms: set[str]) -> list[Finding]:
+def scan_revision(repo: Path, revision: str, terms: InstanceTerms) -> list[Finding]:
     raw_paths = git_bytes(repo, "ls-tree", "-r", "-z", "--name-only", revision)
     paths = [
         raw_path.decode("utf-8", errors="surrogateescape")
@@ -177,7 +241,11 @@ def scan_revision(repo: Path, revision: str, terms: set[str]) -> list[Finding]:
     for relative_path in paths:
         private_home_path = private_home_path_in_tracked_name(relative_path)
         private_instance_path = any(
-            instance_term_in_path(term, relative_path) for term in terms
+            instance_identifier_in_path(term, relative_path)
+            for term in terms.identifiers
+        ) or any(
+            instance_vocabulary_in_path(term, relative_path)
+            for term in terms.vocabulary
         )
         private_credential_path = credential_in_text(relative_path)
         path_is_sensitive = (
@@ -275,7 +343,7 @@ def safe_display_path(relative_path: str, path_is_sensitive: bool) -> str:
 
 
 def scan_text(
-    revision: str, relative_path: str, text: str, terms: set[str]
+    revision: str, relative_path: str, text: str, terms: InstanceTerms
 ) -> list[Finding]:
     findings: list[Finding] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
@@ -292,7 +360,9 @@ def scan_text(
                     message="absolute private path detected",
                 )
             )
-        if credential_in_text(line):
+        if credential_in_text(line) and not python_credential_annotation(
+            relative_path, line
+        ):
             findings.append(
                 Finding(
                     category="credential",
@@ -300,7 +370,11 @@ def scan_text(
                     message="credential assignment or URL detected",
                 )
             )
-        if any(instance_term_in_line(term, line) for term in terms):
+        if any(
+            instance_identifier_in_line(term, line) for term in terms.identifiers
+        ) or any(
+            instance_vocabulary_in_text(term, line) for term in terms.vocabulary
+        ):
             findings.append(
                 Finding(
                     category="instance-value",
@@ -315,7 +389,13 @@ def credential_in_text(text: str) -> bool:
     return bool(CREDENTIAL_RE.search(text) or URL_CREDENTIAL_RE.search(text))
 
 
-def instance_term_in_line(term: str, line: str) -> bool:
+def python_credential_annotation(relative_path: str, line: str) -> bool:
+    return relative_path.endswith((".py", ".pyi")) and bool(
+        PYTHON_CREDENTIAL_ANNOTATION_RE.fullmatch(line)
+    )
+
+
+def instance_identifier_in_line(term: str, line: str) -> bool:
     if len(term) >= 4:
         return bool(
             re.search(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", line)
@@ -332,37 +412,59 @@ def instance_term_in_line(term: str, line: str) -> bool:
     )
 
 
-def instance_term_in_path(term: str, relative_path: str) -> bool:
+def instance_identifier_in_path(term: str, relative_path: str) -> bool:
     if len(term) >= 4:
-        return instance_term_in_line(term, relative_path)
+        return instance_identifier_in_line(term, relative_path)
     # Short IDs are unsafe in free prose. A complete path component is a
     # structured identity boundary, so matching it does not make ordinary
     # words unusable.
     return term in re.split(r"[\\/]", relative_path)
 
 
-def load_instance_terms(vault: Path) -> set[str]:
+def instance_vocabulary_in_text(term: str, text: str) -> bool:
+    if len(term) <= 2:
+        return False
+    return bool(
+        re.search(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", text)
+    )
+
+
+def instance_vocabulary_in_path(term: str, relative_path: str) -> bool:
+    if len(term) <= 2:
+        return term in re.split(r"[\\/]", relative_path)
+    return instance_vocabulary_in_text(term, relative_path)
+
+
+def load_instance_terms(vault: Path) -> InstanceTerms:
     system = vault / "_system"
     entities = load_yaml(system / "entities.yaml").get("entities", {})
     products = load_yaml(system / "products.yaml").get("products", {})
     members = load_yaml(system / "members.yaml").get("members", {})
-    terms = set(entities)
+    identifiers = set(entities)
+    vocabulary: set[str] = set()
     for entity_record in entities.values():
-        terms.update(registry_record_vocabulary(entity_record))
+        vocabulary.update(registry_record_vocabulary(entity_record))
     for entity_products in products.values():
         if isinstance(entity_products, dict):
-            terms.update(entity_products)
+            identifiers.update(entity_products)
             for product_record in entity_products.values():
-                terms.update(registry_record_vocabulary(product_record))
+                vocabulary.update(registry_record_vocabulary(product_record))
     for entity_members in members.values():
         if isinstance(entity_members, list):
             for member in entity_members:
                 if not isinstance(member, dict):
                     continue
                 if isinstance(member.get("id"), str):
-                    terms.add(member["id"])
-                terms.update(registry_record_vocabulary(member))
-    return {term for term in terms if isinstance(term, str) and term}
+                    identifiers.add(member["id"])
+                vocabulary.update(registry_record_vocabulary(member))
+    return InstanceTerms(
+        identifiers=frozenset(
+            term for term in identifiers if isinstance(term, str) and term
+        ),
+        vocabulary=frozenset(
+            term for term in vocabulary if isinstance(term, str) and term
+        ),
+    )
 
 
 def registry_record_vocabulary(record: object) -> set[str]:

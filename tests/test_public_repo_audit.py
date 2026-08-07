@@ -235,6 +235,15 @@ def test_linux_and_windows_absolute_home_paths_in_text_are_rejected(
     assert "private-person" not in findings[0].message
 
 
+def test_root_prefix_without_path_boundary_is_allowed(tmp_path):
+    repo = git_repo(
+        tmp_path,
+        {"routes.txt": "paths = '/rooted/project', '/root-cause/example'\n"},
+    )
+
+    assert audit_repository(repo, vault=None, include_history=False) == []
+
+
 def test_registry_derived_identifier_in_tracked_name_is_rejected_and_redacted(
     tmp_path,
 ):
@@ -275,6 +284,19 @@ def test_credential_in_historical_commit_message_is_rejected_and_redacted(tmp_pa
     assert all(secret not in item.message for item in findings)
 
 
+def test_credential_in_annotated_tag_metadata_is_rejected_and_redacted(tmp_path):
+    secret = "synthetic-value-123"
+    credential_message = "release access_" + f"token={secret}"
+    repo = git_repo(tmp_path, {"app.py": "version = 1\n"})
+    run_git(repo, "tag", "-a", "release", "-m", credential_message)
+
+    findings = audit_repository(repo, vault=None, include_history=True)
+
+    assert any(item.category == "credential" for item in findings)
+    assert all(secret not in item.location for item in findings)
+    assert all(secret not in item.message for item in findings)
+
+
 def test_absolute_home_path_in_commit_identity_is_rejected_and_redacted(tmp_path):
     private_path = "/" + "/".join(["home", "private-person", "vault"])
     repo = git_repo(tmp_path, {"app.py": "version = 1\n"})
@@ -292,6 +314,7 @@ def test_github_generated_owner_metadata_is_the_only_owner_exception(tmp_path):
     owner = "synthetic-owner"
     repo = git_repo(tmp_path / "repo", {"app.py": "version = 1\n"})
     vault = synthetic_vault(tmp_path / "vault", entity=owner)
+    run_git(repo, "remote", "add", "origin", f"https://github.com/{owner}/oneos.git")
     base_branch = run_git(repo, "branch", "--show-current").strip()
     run_git(repo, "switch", "-q", "-c", "codex/topic")
     commit(repo, {"topic.py": "ready = True\n"}, "topic")
@@ -312,6 +335,26 @@ def test_github_generated_owner_metadata_is_the_only_owner_exception(tmp_path):
 
     commit(repo, {"app.py": "version = 3\n"}, f"document {owner}")
     findings = audit_repository(repo, vault=vault, include_history=False)
+    assert any(item.category == "instance-value" for item in findings)
+
+
+def test_github_noreply_identity_for_non_owner_is_not_exempt(tmp_path):
+    owner = "synthetic-owner"
+    contributor = "synthetic-contributor"
+    repo = git_repo(tmp_path / "repo", {"app.py": "version = 1\n"})
+    run_git(repo, "remote", "add", "origin", f"https://github.com/{owner}/oneos.git")
+    run_git(repo, "config", "user.name", contributor)
+    run_git(
+        repo,
+        "config",
+        "user.email",
+        f"123+{contributor}@users.noreply.github.com",
+    )
+    commit(repo, {"app.py": "version = 2\n"}, "contributor metadata")
+    vault = synthetic_vault(tmp_path / "vault", entity=contributor)
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
     assert any(item.category == "instance-value" for item in findings)
     assert all(owner not in item.location for item in findings)
     assert all(owner not in item.message for item in findings)
@@ -366,6 +409,36 @@ def test_registry_labels_from_all_private_sources_are_rejected(tmp_path):
         "instance-value",
     ]
     assert all(label not in item.message for label in labels for item in findings)
+
+
+def test_short_display_vocabulary_is_rejected_in_ordinary_prose(tmp_path):
+    private_label = "Amy"
+    repo = git_repo(tmp_path / "repo", {"note.md": f"{private_label} joined\n"})
+    vault = synthetic_vault(
+        tmp_path / "vault",
+        entity="customer-zeta",
+        entity_label=private_label,
+    )
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert [item.category for item in findings] == ["instance-value"]
+    assert private_label not in findings[0].message
+
+
+def test_two_character_display_vocabulary_is_allowed_as_ambiguous_prose(tmp_path):
+    private_label = "NN"
+    repo = git_repo(
+        tmp_path / "repo",
+        {"note.md": f"<NN-module>\nlabel: {private_label}\n"},
+    )
+    vault = synthetic_vault(
+        tmp_path / "vault",
+        entity="customer-zeta",
+        entity_label=private_label,
+    )
+
+    assert audit_repository(repo, vault=vault, include_history=False) == []
 
 
 def test_short_registry_identifier_is_allowed_in_ordinary_prose(tmp_path):
@@ -424,6 +497,17 @@ def test_credential_shaped_value_in_tracked_name_is_rejected_and_redacted(tmp_pa
     assert [item.category for item in findings] == ["credential"]
     assert secret not in findings[0].location
     assert secret not in findings[0].message
+
+
+def test_credential_field_type_annotations_are_allowed(tmp_path):
+    source = (
+        "client_secret: SecretStr\n"
+        "password: Optional[str] = None\n"
+        "access_token: Annotated[str, 'runtime']\n"
+    )
+    repo = git_repo(tmp_path, {"settings.py": source})
+
+    assert audit_repository(repo, vault=None, include_history=False) == []
 
 
 def test_control_characters_in_finding_path_cannot_spoof_output(tmp_path):
