@@ -1,7 +1,7 @@
 # OneOS Canonical Naming and GitHub Design
 
 Date: 2026-08-07
-Status: naming cutover implemented; GitHub bootstrap pending
+Status: implemented
 
 ## Purpose
 
