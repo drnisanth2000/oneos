@@ -501,9 +501,9 @@ def test_credential_shaped_value_in_tracked_name_is_rejected_and_redacted(tmp_pa
 
 def test_credential_field_type_annotations_are_allowed(tmp_path):
     source = (
-        "client_secret: SecretStr\n"
-        "password: Optional[str] = None\n"
-        "access_token: Annotated[str, 'runtime']\n"
+        "client_" + "secret: SecretStr\n"
+        "pass" + "word: Optional[str] = None\n"
+        "access_" + "token: Annotated[str, 'runtime']\n"
     )
     repo = git_repo(tmp_path, {"settings.py": source})
 
