@@ -2,7 +2,8 @@
 
 Living status for the code layer. Instance-specific decisions (bank/card
 parsers, external-service integrations, entity names) live in the vault's
-`decisions.md`, never here — this repo is public under AGPL.
+`decisions.md`, never here. This repository is currently private, is licensed
+under AGPL-3.0, and is intended for eventual public release.
 
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
@@ -32,7 +33,8 @@ Gates govern expansion, not usage. Phase 2 is not scoped until all five pass.
 
 - **Private GitHub agent workflow** — private GitHub CI is active. Codex cloud
   tasks use synthetic fixtures only; private-vault integration remains a local
-  merge gate.
+  merge gate. `tools/public_repo_audit.py`, the public-history CI gate, and the
+  local private-vault history gate are implemented.
 - **Ingest write target** — redacted items are written directly to
   `<entity>/00-inbox/active/` with `sub: triage` (the sanctioned intake feed).
   The raw original never enters git; it is referenced by `source_ref` + `sha256`
@@ -57,9 +59,9 @@ Gates govern expansion, not usage. Phase 2 is not scoped until all five pass.
 - **Front-matter schema** — presence-only, matching `policy_enforcer` exactly.
   Wiring the enforcer to *import* the shared model is deferred: the enforcer is
   stdlib-only by design, and editing it is a vault-side change.
-- **Public audit** — a repeatable public-checkout audit is pending the approved
-  private-GitHub workflow plan. Until it is delivered, keep public tests and
-  guidance instance-agnostic and do not restore a hardcoded grep gate.
+- **Public audit** — `tools/public_repo_audit.py` deterministically checks the
+  tracked repository and selected history. GitHub CI runs the public gate;
+  trusted local review adds private registry-derived terms before merge.
 - **Layer names and ownership** — OneOS is the complete system and the human surface;
   Command Center is the deterministic orchestration boundary;
   Grey Matter is the system of record; Hermes is an asynchronous worker, never

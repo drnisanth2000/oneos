@@ -15,7 +15,9 @@
 - The archived adoption guide remains historical research and is not implementation authority.
 - No application behavior, schema, roadmap phase, or dependency changes.
 - Do not touch unrelated user edits in the private vault.
-- Do not put any real entity, product, member, absolute vault path, credential, or GitHub owner in the public repository.
+- Do not put any real entity, product, member, absolute vault path, credential,
+  or GitHub owner in tracked source or configuration. GitHub-generated owner
+  metadata is the sole owner exception.
 - Use `$ONEOS_VAULT` for the runtime vault location and `~/code/oneos` for the canonical application checkout.
 - Internal actor, tool, caller, policy, test, and documentation renames are atomic within the private-vault commit.
 - Public and private repository changes are committed separately.

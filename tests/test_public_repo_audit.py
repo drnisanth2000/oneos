@@ -2,6 +2,7 @@ import subprocess
 from pathlib import Path
 import sys
 
+import pytest
 import yaml
 
 from tools.public_repo_audit import audit_repository
@@ -31,15 +32,32 @@ def commit(repo: Path, files: dict[str, str], message: str) -> None:
     run_git(repo, "commit", "-q", "-m", message)
 
 
-def synthetic_vault(path: Path, entity: str) -> Path:
+def commit_bytes(repo: Path, files: dict[str, bytes], message: str) -> None:
+    for relative, content in files.items():
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", message)
+
+
+def synthetic_vault(
+    path: Path, entity: str, product: str | None = None, member: str | None = None
+) -> Path:
     system = path / "_system"
     system.mkdir(parents=True)
     (system / "entities.yaml").write_text(
         yaml.safe_dump({"entities": {entity: {"label": "Synthetic"}}}),
         encoding="utf-8",
     )
-    (system / "products.yaml").write_text("products: {}\n", encoding="utf-8")
-    (system / "members.yaml").write_text("members: {}\n", encoding="utf-8")
+    products = {entity: {product: {}}} if product else {}
+    members = {entity: [{"id": member}]} if member else {}
+    (system / "products.yaml").write_text(
+        yaml.safe_dump({"products": products}), encoding="utf-8"
+    )
+    (system / "members.yaml").write_text(
+        yaml.safe_dump({"members": members}), encoding="utf-8"
+    )
     return path
 
 
@@ -105,6 +123,256 @@ def test_credential_value_is_rejected_without_echoing_it(tmp_path):
     findings = audit_repository(repo, vault=None, include_history=False)
     assert [item.category for item in findings] == ["credential"]
     assert "synthetic-value-123" not in findings[0].message
+
+
+def test_unapproved_binary_blob_is_rejected_without_echoing_bytes(tmp_path):
+    repo = git_repo(tmp_path, {"app.py": "title = 'OneOS'\n"})
+    binary = (Path(__file__).parent / "fixtures" / "sample.pdf").read_bytes()
+    commit_bytes(repo, {"assets/changed.pdf": binary + b"\0changed"}, "binary")
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["unapproved-binary"]
+    assert "changed" not in findings[0].message
+
+
+def test_known_binary_fixture_is_allowed_only_at_its_exact_path_and_hash(tmp_path):
+    repo = git_repo(tmp_path, {"app.py": "title = 'OneOS'\n"})
+    binary = (Path(__file__).parent / "fixtures" / "sample.pdf").read_bytes()
+    commit_bytes(repo, {"tests/fixtures/sample.pdf": binary}, "fixture")
+
+    assert audit_repository(repo, vault=None, include_history=False) == []
+
+
+def test_known_binary_hash_at_another_path_is_rejected(tmp_path):
+    repo = git_repo(tmp_path, {"app.py": "title = 'OneOS'\n"})
+    binary = (Path(__file__).parent / "fixtures" / "sample.pdf").read_bytes()
+    commit_bytes(repo, {"assets/sample.pdf": binary}, "fixture")
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["unapproved-binary"]
+
+
+def test_changed_binary_at_allowlisted_path_is_rejected(tmp_path):
+    repo = git_repo(tmp_path, {"app.py": "title = 'OneOS'\n"})
+    binary = (Path(__file__).parent / "fixtures" / "sample.pdf").read_bytes()
+    commit_bytes(repo, {"tests/fixtures/sample.pdf": binary + b"changed"}, "fixture")
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["unapproved-binary"]
+
+
+@pytest.mark.parametrize(
+    "artifact", ["books.db", "records.db", "records.sqlite", "records.sqlite3"]
+)
+def test_database_artifact_in_any_selected_tree_is_rejected_and_redacted(
+    tmp_path, artifact
+):
+    repo = git_repo(tmp_path, {f"data/{artifact}": "synthetic data\n"})
+    run_git(repo, "rm", "-q", f"data/{artifact}")
+    run_git(repo, "commit", "-q", "-m", "remove artifact")
+
+    assert audit_repository(repo, vault=None, include_history=False) == []
+    findings = audit_repository(repo, vault=None, include_history=True)
+
+    assert [item.category for item in findings] == ["forbidden-artifact"]
+    assert artifact not in findings[0].location
+    assert artifact not in findings[0].message
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    [
+        "/".join(["leak", "Users", "private-person", "note.md"]),
+        "/".join(["leak", "home", "private-person", "note.md"]),
+        "/".join(["leak", "root", "private-vault", "note.md"]),
+        "leak/C:\\" + "Users\\private-person\\note.md",
+    ],
+)
+def test_absolute_home_path_in_tracked_name_is_rejected_and_redacted(
+    tmp_path, private_path
+):
+    repo = git_repo(tmp_path, {private_path: "synthetic\n"})
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["absolute-private-path"]
+    assert "private-person" not in findings[0].location
+    assert "private-person" not in findings[0].message
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    [
+        "/" + "/".join(["home", "private-person", "vault"]),
+        "/" + "/".join(["root", "private-vault"]),
+        "C:\\" + "Users\\private-person\\vault",
+    ],
+)
+def test_linux_and_windows_absolute_home_paths_in_text_are_rejected(
+    tmp_path, private_path
+):
+    repo = git_repo(tmp_path, {"config.txt": f"root = {private_path!r}\n"})
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["absolute-private-path"]
+    assert "private-person" not in findings[0].message
+
+
+def test_registry_derived_identifier_in_tracked_name_is_rejected_and_redacted(
+    tmp_path,
+):
+    private_identifier = "customer-zeta"
+    repo = git_repo(tmp_path / "repo", {f"docs/{private_identifier}/note.md": "ok\n"})
+    vault = synthetic_vault(tmp_path / "vault", entity=private_identifier)
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert [item.category for item in findings] == ["instance-value"]
+    assert private_identifier not in findings[0].location
+    assert private_identifier not in findings[0].message
+
+
+def test_short_registry_identifier_is_rejected_as_exact_path_component(tmp_path):
+    private_identifier = "xy"
+    repo = git_repo(tmp_path / "repo", {f"docs/{private_identifier}/note.md": "ok\n"})
+    vault = synthetic_vault(tmp_path / "vault", entity=private_identifier)
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert [item.category for item in findings] == ["instance-value"]
+    assert private_identifier not in findings[0].location
+
+
+def test_credential_in_historical_commit_message_is_rejected_and_redacted(tmp_path):
+    secret = "synthetic-value-123"
+    credential_message = "rotate access_" + f"token={secret}"
+    repo = git_repo(tmp_path, {"app.py": "version = 1\n"})
+    commit(repo, {"app.py": "version = 2\n"}, credential_message)
+    commit(repo, {"app.py": "version = 3\n"}, "sanitize message")
+
+    assert audit_repository(repo, vault=None, include_history=False) == []
+    findings = audit_repository(repo, vault=None, include_history=True)
+
+    assert any(item.category == "credential" for item in findings)
+    assert all(secret not in item.location for item in findings)
+    assert all(secret not in item.message for item in findings)
+
+
+def test_absolute_home_path_in_commit_identity_is_rejected_and_redacted(tmp_path):
+    private_path = "/" + "/".join(["home", "private-person", "vault"])
+    repo = git_repo(tmp_path, {"app.py": "version = 1\n"})
+    run_git(repo, "config", "user.name", private_path)
+    commit(repo, {"app.py": "version = 2\n"}, "identity metadata")
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert any(item.category == "absolute-private-path" for item in findings)
+    assert all("private-person" not in item.location for item in findings)
+    assert all("private-person" not in item.message for item in findings)
+
+
+def test_github_generated_owner_metadata_is_the_only_owner_exception(tmp_path):
+    owner = "synthetic-owner"
+    repo = git_repo(tmp_path / "repo", {"app.py": "version = 1\n"})
+    vault = synthetic_vault(tmp_path / "vault", entity=owner)
+    base_branch = run_git(repo, "branch", "--show-current").strip()
+    run_git(repo, "switch", "-q", "-c", "codex/topic")
+    commit(repo, {"topic.py": "ready = True\n"}, "topic")
+    run_git(repo, "switch", "-q", base_branch)
+    run_git(repo, "config", "user.name", owner)
+    run_git(repo, "config", "user.email", f"123+{owner}@users.noreply.github.com")
+    run_git(
+        repo,
+        "merge",
+        "-q",
+        "--no-ff",
+        "codex/topic",
+        "-m",
+        f"Merge pull request #7 from {owner}/codex/topic",
+    )
+
+    assert audit_repository(repo, vault=vault, include_history=False) == []
+
+    commit(repo, {"app.py": "version = 3\n"}, f"document {owner}")
+    findings = audit_repository(repo, vault=vault, include_history=False)
+    assert any(item.category == "instance-value" for item in findings)
+    assert all(owner not in item.location for item in findings)
+    assert all(owner not in item.message for item in findings)
+
+    commit(
+        repo,
+        {"app.py": "version = 4\n"},
+        f"Merge pull request #8 from {owner}/codex/not-a-merge",
+    )
+    findings = audit_repository(repo, vault=vault, include_history=False)
+    assert any(item.category == "instance-value" for item in findings)
+
+
+def test_short_product_and_member_ids_are_rejected_in_structured_text(tmp_path):
+    entity = "customer-zeta"
+    product = "pq"
+    member = "mn"
+    repo = git_repo(tmp_path / "repo", {"note.md": f"product: {product}\n"})
+    commit(repo, {"app.py": "version = 2\n"}, f"member: {member}")
+    vault = synthetic_vault(
+        tmp_path / "vault", entity=entity, product=product, member=member
+    )
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert [item.category for item in findings] == [
+        "instance-value",
+        "instance-value",
+    ]
+    assert all(product not in item.message for item in findings)
+    assert all(member not in item.message for item in findings)
+
+
+def test_short_registry_identifier_is_allowed_in_ordinary_prose(tmp_path):
+    repo = git_repo(tmp_path / "repo", {"note.md": "it remains generic prose\n"})
+    vault = synthetic_vault(tmp_path / "vault", entity="it")
+
+    assert audit_repository(repo, vault=vault, include_history=False) == []
+
+
+def test_printable_binary_signature_still_fails_closed(tmp_path):
+    repo = git_repo(tmp_path, {"app.py": "title = 'OneOS'\n"})
+    commit_bytes(
+        repo,
+        {"assets/printable.pdf": b"%PDF-1.7\nprintable but still binary\n"},
+        "binary",
+    )
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["unapproved-binary"]
+
+
+def test_credential_shaped_value_in_tracked_name_is_rejected_and_redacted(tmp_path):
+    secret = "synthetic-value-123"
+    private_path = "leak/access_" + f"token={secret}/note.md"
+    repo = git_repo(tmp_path, {private_path: "synthetic\n"})
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["credential"]
+    assert secret not in findings[0].location
+    assert secret not in findings[0].message
+
+
+def test_control_characters_in_finding_path_cannot_spoof_output(tmp_path):
+    assignment = "access_" + "token='synthetic-value-123'\n"
+    repo = git_repo(tmp_path, {"safe\nspoof.py": assignment})
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert [item.category for item in findings] == ["credential"]
+    assert "\n" not in findings[0].location
+    assert findings[0].location.endswith(":<redacted-path>:1")
 
 
 def test_cli_prints_clean_and_exits_zero(tmp_path):

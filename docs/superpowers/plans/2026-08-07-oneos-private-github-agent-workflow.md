@@ -13,7 +13,12 @@
 - Run this plan only after the canonical naming cutover plan passes.
 - The remote repository is private and named `oneos`.
 - Never upload the old application Git history, Grey Matter, live registries, database files, private paths, credentials, or instance values.
-- The GitHub owner is supplied interactively and never written into the repository.
+- The GitHub owner is supplied interactively and never written into tracked
+  source or configuration. GitHub-generated merge subjects and remote identity
+  metadata are the sole owner exception and do not justify a hardcoded value.
+- Preserve the established canonical Git history after bootstrap; do not
+  rewrite history or recreate the repository to remove GitHub-generated owner
+  metadata.
 - The existing checkout remains the local pre-public history archive.
 - The new canonical checkout is `~/code/oneos`.
 - CI uses only synthetic fixtures and no `ONEOS_VAULT` secret.

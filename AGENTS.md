@@ -52,11 +52,25 @@ Product direction and naming are frozen in `PRODUCT-THESIS.md`.
 
 ## Cloud and pull-request boundary
 
-Cloud agents use this repository and synthetic fixtures only. They never receive
-the live Grey Matter vault, its registries, databases, paths, or Git history.
-Every write task uses a `codex/` branch and a pull request. CI is necessary but
-not sufficient: changes that read or interpret vault structure also require the
-local private integration gate in `BUILD.md` before merge.
+Cloud work may proceed only from a complete, sanitized public task contract:
+outcome, in-scope files, out-of-scope changes, acceptance tests, private-gate
+requirement, dependencies, and stop conditions must all be explicit. Cloud
+agents use this repository and synthetic fixtures only. They never receive the
+live Grey Matter vault, its registries, databases, paths, Git history, or
+private decision authority. If work requires any private authority or material,
+the cloud agent stops and returns the task to the trusted local boundary.
+
+The following six conditions are binding stops for cloud agents: dependency
+changes, convention or schema changes, security-boundary changes, destructive
+actions, deployment, and unresolved product decisions. Every write task uses a
+`codex/` branch and a pull request. CI is necessary but not sufficient: changes
+that read or interpret vault structure also require the local private
+integration gate in `BUILD.md` before merge.
+
+The authenticated GitHub owner is never written into tracked source or
+configuration. GitHub-generated Git metadata may include it in merge subjects
+or remote identities; that is the sole owner exception and does not relax the
+tracked-content rule.
 
 ## The one rule
 
@@ -85,7 +99,8 @@ its absence as a fault.
 **Test:** swap in a different `entities.yaml` and you get a different system with
 no code change. If that is not true, it is wrong.
 
-This repo goes public under AGPL-3.0. The vault never does.
+This repo is AGPL-3.0 licensed and intended for eventual public release. The
+vault is never public.
 
 ## Invariants — do not violate
 

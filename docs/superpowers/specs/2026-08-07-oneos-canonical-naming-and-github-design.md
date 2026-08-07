@@ -81,8 +81,12 @@ not a supported product alias.
 
 ## GitHub model
 
-Create a private GitHub repository named `oneos`. The GitHub owner is supplied
-at setup time and must not be embedded in source files.
+Create a private GitHub repository named `oneos`. The authenticated GitHub owner
+is supplied at setup time and is never written into tracked source or
+configuration. GitHub-generated Git metadata may carry that owner in merge
+subjects or remote identities; this is the sole owner exception and requires no
+hardcoded owner value. Preserve the established canonical history; do not
+rewrite it or recreate the repository to remove that generated metadata.
 
 The application repository is the only repository connected to GitHub. Grey
 Matter, its Git history, live registries, database files, entity names, and
