@@ -81,6 +81,16 @@ def test_wrapper_rejects_wrong_version(fake_gitleaks, repo: Path):
     assert not report_record.exists()
 
 
+def test_wrapper_rejects_version_with_required_substring(fake_gitleaks, repo: Path):
+    binary, calls, report_record = fake_gitleaks(version="8.30.10")
+
+    result = run_wrapper(repo, binary, calls, report_record)
+
+    assert result.returncode == 2
+    assert "required Gitleaks version is 8.30.1" in result.stderr
+    assert not calls.exists()
+
+
 def test_wrapper_runs_redacted_git_history_scan(fake_gitleaks, repo: Path):
     binary, calls, report_record = fake_gitleaks(version="8.30.1")
 

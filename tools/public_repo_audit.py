@@ -19,9 +19,12 @@ TEXT_FIELDS = frozenset(
     {"entity", "product", "member", "workspace", "owner", "id", "slug"}
 )
 DATABASE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
-HOME_PATTERNS = (
+PRIVATE_PATH_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9:/])/(?:Users|home)/[^/\s]+/"),
     re.compile(r"(?i)(?<![A-Za-z0-9:/\\])[A-Z]:\\[^\\\s]+\\"),
+    re.compile(
+        r"(?:^|[\s\"'=(\[,]|:(?=/[^/]))/(?:[^\s\"']*/)?\.sensitive(?:/|$)"
+    ),
 )
 ALLOWLIST_RE = re.compile(r"^([0-9a-f]{64})  (\S(?:.*\S)?)$")
 
@@ -52,6 +55,7 @@ def audit_repository(
     allowlist_text = binary_allowlist_text(repo, head)
     allowlist = parse_binary_allowlist(allowlist_text)
     findings = scan_refs(repo, long_terms, short_terms)
+    findings.extend(scan_annotated_tags(repo, long_terms))
     findings.extend(invalid_allowlist_findings(head, allowlist_text))
     for revision in selected:
         findings.extend(
@@ -87,6 +91,30 @@ def scan_refs(repo: Path, long_terms: set[str], short_terms: set[str]) -> list[F
     for ref in refs:
         if contains_long_term(ref, long_terms) or path_has_short_term(ref, short_terms):
             findings.append(finding("instance-value", ref_location(ref)))
+    return findings
+
+
+def scan_annotated_tags(repo: Path, long_terms: set[str]) -> list[Finding]:
+    if not long_terms:
+        return []
+    findings: list[Finding] = []
+    records = git_output(
+        repo,
+        "for-each-ref",
+        "--format=%(objecttype) %(objectname)",
+        "refs/tags",
+    ).splitlines()
+    for record in records:
+        object_type, object_id = record.split(" ", 1)
+        if object_type != "tag":
+            continue
+        metadata = git_bytes(repo, "cat-file", "tag", object_id).decode(
+            "utf-8", "replace"
+        )
+        if contains_long_term(metadata, long_terms):
+            findings.append(
+                finding("instance-value", f"{object_id[:12]}:tag-metadata")
+            )
     return findings
 
 
@@ -163,7 +191,7 @@ def scan_text(
     findings: list[Finding] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         location = safe_location(revision, relative_path, line_number)
-        if any(pattern.search(line) for pattern in HOME_PATTERNS):
+        if any(pattern.search(line) for pattern in PRIVATE_PATH_PATTERNS):
             findings.append(finding("absolute-private-path", location))
         if contains_long_term(line, long_terms):
             findings.append(finding("instance-value", location))
@@ -297,6 +325,12 @@ def load_instance_terms(vault: Path) -> tuple[set[str], set[str]]:
     workspaces = load_yaml(system / "workspaces.yaml").get("workspaces", {})
     if isinstance(workspaces, dict):
         terms.update(key for key in workspaces if isinstance(key, str))
+    elif isinstance(workspaces, list):
+        terms.update(
+            workspace["id"]
+            for workspace in workspaces
+            if isinstance(workspace, dict) and isinstance(workspace.get("id"), str)
+        )
 
     normalized = {term for term in terms if term}
     return (

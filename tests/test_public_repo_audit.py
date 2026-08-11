@@ -147,6 +147,22 @@ def test_relative_and_url_paths_are_allowed(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "/" + "srv/grey-matter/.sensitive/record.md",
+        "root:" + "/." + "sensitive/record.md",
+    ],
+)
+def test_absolute_sensitive_paths_are_redacted(tmp_path: Path, value: str):
+    repo = git_repo(tmp_path, {"note.txt": value + "\n"})
+
+    findings = audit_repository(repo, None, False)
+
+    assert [item.category for item in findings] == ["absolute-private-path"]
+    assert value not in repr(findings)
+
+
+@pytest.mark.parametrize(
     "relative", ["books.db", "data/a.db", "a.sqlite", "a.sqlite3"]
 )
 def test_database_artifacts_are_forbidden_even_if_allowlisted(
@@ -265,7 +281,8 @@ def test_registry_terms_include_products_members_and_workspaces(tmp_path: Path):
         "members:\n  entity-safe:\n    - id: member-private\n", encoding="utf-8"
     )
     (system / "workspaces.yaml").write_text(
-        "workspaces:\n  workspace-private: {}\n", encoding="utf-8"
+        "workspaces:\n  - {id: workspace-private, label: Private}\n",
+        encoding="utf-8",
     )
     repo = git_repo(
         tmp_path / "repo",
@@ -281,6 +298,17 @@ def test_registry_terms_include_products_members_and_workspaces(tmp_path: Path):
         "instance-value",
         "instance-value",
     ]
+
+
+def test_annotated_tag_metadata_is_scanned(tmp_path: Path):
+    vault = synthetic_vault(tmp_path / "vault", entity="customer-zeta")
+    repo = git_repo(tmp_path / "repo", {"note.md": "clean\n"})
+    run_git(repo, "tag", "-a", "release", "-m", "customer-zeta")
+
+    findings = audit_repository(repo, vault, True)
+
+    assert [item.category for item in findings] == ["instance-value"]
+    assert "customer-zeta" not in repr(findings)
 
 
 def test_history_flag_finds_removed_oneos_violation(tmp_path: Path):

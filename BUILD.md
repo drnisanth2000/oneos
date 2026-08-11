@@ -97,6 +97,7 @@ curl --fail --location --silent --show-error \
   --output /private/tmp/gitleaks_8.30.1_darwin_arm64.tar.gz
 echo "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5  /private/tmp/gitleaks_8.30.1_darwin_arm64.tar.gz" | shasum -a 256 -c -
 tar -xzf /private/tmp/gitleaks_8.30.1_darwin_arm64.tar.gz -C /private/tmp gitleaks
+mkdir -p "$HOME/.local/bin"
 install -m 0755 /private/tmp/gitleaks "$HOME/.local/bin/gitleaks"
 export PATH="$HOME/.local/bin:$PATH"
 ```
