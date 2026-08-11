@@ -1,0 +1,4 @@
+# Exact exceptions for non-text tracked blobs.
+# Format: <lowercase SHA-256><two spaces><repository-relative path>
+# Database artifacts (*.db, *.sqlite, *.sqlite3, and books.db) cannot be allowed.
+522d88772affe7c5b08039d4cc541c4adeb0c06fee457330852989335718ed2c  tests/fixtures/sample.pdf
