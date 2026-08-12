@@ -87,14 +87,34 @@ and start the step again.
 
 ### Public and private repository audits
 
+Install the exact Gitleaks release locally on Apple Silicon after verifying its
+published SHA-256. The release asset is a developer tool, not a project
+dependency:
+
 ```bash
+curl --fail --location --silent --show-error \
+  https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_darwin_arm64.tar.gz \
+  --output /private/tmp/gitleaks_8.30.1_darwin_arm64.tar.gz
+echo "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5  /private/tmp/gitleaks_8.30.1_darwin_arm64.tar.gz" | shasum -a 256 -c -
+tar -xzf /private/tmp/gitleaks_8.30.1_darwin_arm64.tar.gz -C /private/tmp gitleaks
+mkdir -p "$HOME/.local/bin"
+install -m 0755 /private/tmp/gitleaks "$HOME/.local/bin/gitleaks"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Run the general secret/history gate first, then the finite OneOS audit. The
+trusted local integration agent alone adds live registry-derived terms:
+
+```bash
+tools/run_gitleaks.sh .
 uv run python -m tools.public_repo_audit --repo . --history
 uv run python -m tools.public_repo_audit --repo . --vault "$ONEOS_VAULT" --history
 ```
 
-GitHub CI runs the first command against the public repository only. The trusted
-local integration agent runs the second command with the live vault registry
-terms before merge when a change reads or interprets vault structure.
+GitHub CI runs Gitleaks and the vault-free OneOS command against synthetic
+repository state only. It receives no vault path, registry, database, or
+credential. The trusted local integration agent runs the final command before
+merge when a change reads or interprets vault structure.
 
 ### Standing regression — E4 visibility
 

@@ -1,0 +1,2 @@
+# Synthetic private-key-shaped PII fixture in the immutable sanitized baseline.
+177a49c1971ac3603e8479ba3f21b2916fe27415:tests/test_pii.py:private-key:101
