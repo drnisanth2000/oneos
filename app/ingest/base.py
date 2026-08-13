@@ -135,14 +135,6 @@ def prepare_inbox_item(
     return note_path, env, render_note(env, entity)
 
 
-def write_inbox_item(scope: Scope, entity: str, **kwargs) -> tuple[Path, Envelope]:
-    path, env, rendered = prepare_inbox_item(scope, entity, **kwargs)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
-    note_path = path
-    return note_path, env
-
-
 def _git(scope: Scope, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args], cwd=scope.root, check=check,

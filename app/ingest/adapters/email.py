@@ -1,7 +1,7 @@
 """email.py — IMAP email ingest adapter (spec §8.1 2nd source, step 10).
 
-Normalises an email into text + metadata and hands it to the ONE shared write
-path (base.write_inbox_item): same Envelope, same PII filter, no second code
+Normalises an email into text + metadata and hands it to the ONE shared commit
+path (base.commit_inbox_item): same Envelope, same PII filter, no second code
 path. The full body stays in the mail server (§8.3) — the vault gets the
 redacted summary plus a `body_ref` pointing back at the message.
 """
@@ -10,10 +10,11 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime
 from email.message import Message
+from email.policy import SMTP
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from ..base import write_inbox_item
+from ..base import IngestResult, commit_inbox_item
 from ...scope import Scope
 
 
@@ -51,7 +52,7 @@ def process_email(
     *,
     scope: Scope | None = None,
     now: datetime | None = None,
-) -> Path:
+) -> IngestResult:
     """Ingest one email into the inbox via the shared write path."""
     scope = scope or Scope(Path(vault))
     now = now or datetime.now()
@@ -69,17 +70,17 @@ def process_email(
         received_at = now.isoformat(timespec="seconds")
 
     text = body_text(msg)
-    digest = hashlib.sha256((msgid or subject).encode("utf-8")).hexdigest()
-    source_ref = f"imap:{msgid}" if msgid else f"imap:{digest[:16]}"
+    digest = hashlib.sha256(msg.as_bytes(policy=SMTP)).hexdigest()
+    source_id = msgid or digest[:16]
+    source_ref = f"imap:{msgid}" if msgid else f"imap:{source_id}"
 
-    note_path, _ = write_inbox_item(
+    return commit_inbox_item(
         scope, entity,
-        text=text, title=subject, source="email", source_id=(msgid or digest[:16]),
+        text=text, title=subject, source="email", source_id=source_id,
         received_at=received_at, sender=sender, thread_id=thread_id,
         source_ref=source_ref, body_ref=source_ref, sha256=digest,
         attachments=attachments(msg), slug_seed=digest,
     )
-    return note_path
 
 
 def poll(  # pragma: no cover - IMAP I/O glue over process_email

@@ -1,7 +1,7 @@
 """folder.py — folder-drop ingest adapter (spec §8.1, first adapter).
 
 A file dropped into `_dropbox/` is hashed, its text extracted, run through the
-ADR-008 PII filter, and written as a redacted item into `<entity>/00-inbox/
+ADR-008 PII filter, and committed as a redacted item into `<entity>/00-inbox/
 active/` with `sub: triage`. The order is load → filter → write: only redacted
 text is ever written, so PII never reaches git (the one irreversible mistake in
 this design). The raw original is moved out of the vault to a raw archive and
