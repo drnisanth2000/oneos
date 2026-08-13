@@ -87,7 +87,7 @@ def git_vault(root: Path, files: dict[str, str]) -> Path:
     vault for rename tests. Never the real vault."""
     write_tree(root, files)
     _git(root, "init", "-q")
-    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.email", "test@example.invalid")
     _git(root, "config", "user.name", "test")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "init")

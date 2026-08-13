@@ -105,7 +105,8 @@ def load_proposals(scope: Scope, entity: str) -> list[Proposal]:
     if not outbox.is_dir():
         return []
     props = []
-    for p in sorted(outbox.glob("*.yaml")):
+    for discovered in sorted(outbox.glob("*.yaml")):
+        p = scope.resolve_stored(scope.vault_relative(discovered))
         record = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         if record.get("action") == "classify":
             props.append(_to_proposal(p, record))

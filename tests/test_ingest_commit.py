@@ -12,8 +12,10 @@ from app.ingest.base import (
     IngestResult,
     commit_inbox_item,
     prepare_inbox_item,
+    render_note,
 )
-from app.scope import Scope
+from app.ingest.envelope import Envelope
+from app.scope import CrossScopeError, Scope
 from tests.conftest import (
     git_changed_paths,
     git_count_commits,
@@ -233,3 +235,35 @@ def test_staged_deletion_at_destination_is_a_collision_and_is_preserved(tmp_path
     assert git_head(vault) == head_before
     assert git_index_paths(vault) == [rel]
     assert not result.path.exists()
+
+
+def test_tracked_receipt_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
+    vault = git_entity_vault(
+        tmp_path,
+        ("synthetic", "other"),
+        {
+            "synthetic/00-inbox/active/.gitkeep": "",
+            "other/00-inbox/active/receipt.md": render_note(
+                Envelope(
+                    source="folder",
+                    source_id="0123456789abcdef",
+                    received_at="2026-08-12T10:00:00",
+                    title="Other receipt",
+                    summary="other body",
+                    source_ref="raw:other.txt",
+                    body_ref="raw:other.txt",
+                    sha256="0123456789abcdef" * 4,
+                    mime="text/plain",
+                    size=10,
+                ),
+                "other",
+            ),
+        },
+    )
+    linked = vault / "synthetic/00-inbox/active/linked.md"
+    linked.symlink_to(vault / "other/00-inbox/active/receipt.md")
+    subprocess.run(["git", "add", "synthetic/00-inbox/active/linked.md"], cwd=vault, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fixture: linked receipt"], cwd=vault, check=True)
+
+    with pytest.raises(CrossScopeError):
+        commit_inbox_item(Scope(vault, "synthetic"), "synthetic", **_kwargs())

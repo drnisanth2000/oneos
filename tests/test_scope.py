@@ -36,6 +36,37 @@ def test_catalog_rejects_missing_manifest_without_exposing_vault_path(tmp_path):
     assert str(caught.value) == "entities manifest is missing"
 
 
+@pytest.mark.parametrize("entity_spec", ['""', "[]", "0", "false"])
+def test_catalog_rejects_falsey_non_mapping_entity_specs(tmp_path, entity_spec):
+    manifest = f'version: "1.0"\nentities:\n  alpha: {entity_spec}\n'
+    write_vault(tmp_path, manifest)
+    with pytest.raises(EntityManifestError, match="must be a mapping"):
+        EntityCatalog.load(tmp_path)
+
+
+@pytest.mark.parametrize("flags", ['""', "{}", "0", "false"])
+def test_catalog_rejects_falsey_non_list_flags(tmp_path, flags):
+    manifest = f'version: "1.0"\nentities:\n  alpha:\n    flags: {flags}\n'
+    write_vault(tmp_path, manifest)
+    with pytest.raises(EntityManifestError, match="flags must be a list of strings"):
+        EntityCatalog.load(tmp_path)
+
+
+@pytest.mark.parametrize("label", ["[]", "{}", "0", "false"])
+def test_catalog_rejects_non_string_labels(tmp_path, label):
+    manifest = f'version: "1.0"\nentities:\n  alpha:\n    label: {label}\n    flags: []\n'
+    write_vault(tmp_path, manifest)
+    with pytest.raises(EntityManifestError, match="label must be a string"):
+        EntityCatalog.load(tmp_path)
+
+
+def test_catalog_defaults_null_entity_fields(tmp_path):
+    write_vault(tmp_path, 'version: "1.0"\nentities:\n  alpha: null\n')
+    assert EntityCatalog.load(tmp_path).entities == (
+        EntityDefinition(slug="alpha", label="alpha", flags=()),
+    )
+
+
 def test_scope_accepts_only_registered_entity(tmp_path):
     write_vault(tmp_path, entities_yaml("alpha"))
     scope = Scope(tmp_path, "alpha")
@@ -103,3 +134,16 @@ def test_system_path_does_not_grant_another_entity_path(tmp_path):
     assert scope.system_path("entities.yaml") == tmp_path / "_system/entities.yaml"
     with pytest.raises(CrossScopeError):
         scope.resolve("..", "beta", "00-inbox")
+
+
+def test_entity_root_symlink_cannot_redirect_bound_scope(tmp_path):
+    write_vault(tmp_path, entities_yaml("alpha", "beta"))
+    beta = tmp_path / "beta"
+    beta.mkdir()
+    (beta / "private.md").write_text("beta-private\n", encoding="utf-8")
+    (tmp_path / "alpha").symlink_to(beta, target_is_directory=True)
+
+    scope = Scope(tmp_path, "alpha")
+    assert scope.current_entity() == "alpha"
+    with pytest.raises(CrossScopeError):
+        scope.resolve("private.md")

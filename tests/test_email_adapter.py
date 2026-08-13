@@ -24,8 +24,8 @@ def _valid_aadhaar() -> str:
 def _msg(body: str) -> EmailMessage:
     m = EmailMessage()
     m["Subject"] = "Vendor invoice Q3"
-    m["From"] = "Accounts <accounts@vendor.example>"
-    m["Message-ID"] = "<abc123@vendor.example>"
+    m["From"] = "Accounts <accounts@vendor.example.invalid>"
+    m["Message-ID"] = "<abc123@vendor.example.invalid>"
     m["Date"] = "Wed, 06 Aug 2026 10:00:00 +0000"
     m.set_content(body)
     return m
@@ -44,9 +44,9 @@ def test_email_lands_in_inbox_with_envelope_and_pii_stripped(tmp_path):
 
     assert fm["source"] == "email"
     assert fm["sub"] == "triage"
-    assert "accounts@vendor.example" in fm["sender"]
+    assert "accounts@vendor.example.invalid" in fm["sender"]
     assert str(fm["received_at"]).startswith("2026-08-06")  # YAML parses it to datetime
-    assert fm["body_ref"] == "imap:abc123@vendor.example"
+    assert fm["body_ref"] == "imap:abc123@vendor.example.invalid"
     assert fm["pii_quarantined"] is True
 
     assert "[PAN]" in body and "[AADHAAR]" in body
@@ -84,8 +84,8 @@ def test_same_filter_and_envelope_as_folder_no_second_path(tmp_path):
 def test_multipart_prefers_text_plain(tmp_path):
     m = EmailMessage()
     m["Subject"] = "Mixed"
-    m["From"] = "a@b.example"
-    m["Message-ID"] = "<m1@b.example>"
+    m["From"] = "a@b.example.invalid"
+    m["Message-ID"] = "<m1@b.example.invalid>"
     m.set_content("Plain body with PAN ABCDE1234F.")
     m.add_alternative("<p>HTML body with PAN ABCDE1234F.</p>", subtype="html")
 

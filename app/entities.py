@@ -48,13 +48,18 @@ class EntityCatalog:
         for slug, raw in records.items():
             if not isinstance(slug, str) or not _ENTITY_SLUG.fullmatch(slug):
                 raise EntityManifestError("entities manifest contains an invalid slug")
-            spec = raw or {}
+            spec = {} if raw is None else raw
             if not isinstance(spec, dict):
                 raise EntityManifestError(f"entity {slug!r} must be a mapping")
-            flags = spec.get("flags") or []
+            raw_flags = spec.get("flags")
+            flags = [] if raw_flags is None else raw_flags
             if not isinstance(flags, list) or not all(isinstance(flag, str) for flag in flags):
                 raise EntityManifestError(f"entity {slug!r} flags must be a list of strings")
-            parsed.append(EntityDefinition(slug, str(spec.get("label", slug)), tuple(flags)))
+            raw_label = spec.get("label")
+            label = slug if raw_label is None else raw_label
+            if not isinstance(label, str):
+                raise EntityManifestError(f"entity {slug!r} label must be a string")
+            parsed.append(EntityDefinition(slug, label, tuple(flags)))
         return cls(root_path, tuple(parsed))
 
     def require(self, slug: str) -> EntityDefinition:

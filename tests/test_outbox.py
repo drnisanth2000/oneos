@@ -8,7 +8,9 @@ Temp git vaults only; the real vault is never touched.
 """
 import textwrap
 
-from app.scope import Scope
+import pytest
+
+from app.scope import CrossScopeError, Scope
 from app.outbox import (
     approve,
     load_proposals,
@@ -160,3 +162,29 @@ def test_reject_discards_proposal_without_moving(tmp_path):
     assert not prop.path.exists()
     assert scope.resolve("00-inbox", "active", "note.md").exists()
     assert load_proposals(scope, "demo") == []
+
+
+def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
+    record = textwrap.dedent(
+        """\
+        id: hidden
+        action: classify
+        entity: beta
+        src: beta/00-inbox/active/note.md
+        dst: beta/11-knowledge/active/note.md
+        module: 11-knowledge
+        sub: kb
+        """
+    )
+    vault = git_entity_vault(
+        tmp_path,
+        ("alpha", "beta"),
+        {
+            "alpha/outbox/.gitkeep": "",
+            "beta/outbox/hidden.yaml": record,
+        },
+    )
+    (vault / "alpha/outbox/linked.yaml").symlink_to(vault / "beta/outbox/hidden.yaml")
+
+    with pytest.raises(CrossScopeError):
+        load_proposals(Scope(vault, "alpha"), "alpha")

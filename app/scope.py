@@ -35,7 +35,10 @@ class Scope:
         return self._entity
 
     def resolve(self, *parts: str | Path) -> Path:
-        base = (self._root / self._entity).resolve()
+        anchor = self._root / self._entity
+        base = anchor.resolve()
+        if base != anchor:
+            raise CrossScopeError("entity root redirects outside the selected scope")
         candidate = base.joinpath(*map(Path, parts)).resolve()
         if not candidate.is_relative_to(base):
             raise CrossScopeError("entity path leaves the selected scope")

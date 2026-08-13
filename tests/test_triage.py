@@ -6,8 +6,10 @@ agnostic: synthetic vault + invented slugs.
 """
 import textwrap
 
+import pytest
+
 from app.entities import EntityCatalog
-from app.scope import Scope
+from app.scope import CrossScopeError, Scope
 from app.vault import Vault
 from app.classifier import Classifier
 from app.inbox import read_inbox
@@ -111,3 +113,18 @@ def test_read_inbox_returns_triage_items_with_proposals(tmp_path):
     items = read_inbox(Scope(root, "acme"), "acme")
     assert {i.title for i in items} == {"March invoice", "random musing"}
     assert all(i.fm.get("sub") == "triage" for i in items)
+
+
+def test_read_inbox_rejects_cross_scope_leaf_symlink(tmp_path):
+    root = _vault(tmp_path)
+    outside = root / "outside.md"
+    outside.write_text(
+        "---\ntype: inbox-item\ntitle: outside marker\nsub: triage\n---\noutside body\n",
+        encoding="utf-8",
+    )
+    inbox = root / "acme/00-inbox/active"
+    inbox.mkdir(parents=True)
+    (inbox / "linked.md").symlink_to(outside)
+
+    with pytest.raises(CrossScopeError):
+        read_inbox(Scope(root, "acme"), "acme")

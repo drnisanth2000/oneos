@@ -199,7 +199,8 @@ def _tracked_markdown_paths(scope: Scope, entity: str) -> list[Path]:
             continue
         if ".sensitive" in parts or "outbox" in parts or "staging" in parts:
             continue
-        path = scope.root / candidate
+        discovered = scope.root / candidate
+        path = scope.resolve_stored(scope.vault_relative(discovered))
         if path.is_file():
             paths.append(path)
     return paths
