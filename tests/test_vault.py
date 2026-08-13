@@ -8,7 +8,9 @@ The three rules under test (AGENTS.md, task brief):
 """
 import textwrap
 
-from app.entities import EntityCatalog
+import pytest
+
+from app.entities import EntityCatalog, EntityManifestError
 from app.vault import Vault
 from tests.conftest import scaffold_modules
 
@@ -38,6 +40,42 @@ def test_discovers_every_bundle_from_entities_yaml(make_vault):
     bundles = Vault(EntityCatalog.load(root)).bundles()
     assert [b.slug for b in bundles] == ["alpha", "beta"]
     assert {b.slug: b.label for b in bundles} == {"alpha": "Alpha", "beta": "Beta"}
+
+
+def test_vault_rejects_registry_leaf_redirected_outside_system(make_vault, tmp_path):
+    root = make_vault(
+        """
+        version: "1.0"
+        entities:
+          alpha: { label: Alpha, flags: [] }
+        """
+    )
+    vault = Vault(EntityCatalog.load(root))
+    registry = root / "_system/archetypes.yaml"
+    external = tmp_path / "external-archetypes.yaml"
+    external.write_bytes(registry.read_bytes())
+    registry.unlink()
+    registry.symlink_to(external)
+
+    with pytest.raises(EntityManifestError):
+        vault.bundles()
+
+
+def test_vault_allows_shared_registry_leaf_within_real_system(make_vault):
+    root = make_vault(
+        """
+        version: "1.0"
+        entities:
+          alpha: { label: Alpha, flags: [] }
+        """
+    )
+    registry = root / "_system/archetypes.yaml"
+    shared = root / "_system/shared-archetypes.yaml"
+    shared.write_bytes(registry.read_bytes())
+    registry.unlink()
+    registry.symlink_to(shared)
+
+    assert Vault(EntityCatalog.load(root)).bundles()[0].slug == "alpha"
 
 
 def test_flag_activates_gated_module(make_vault):

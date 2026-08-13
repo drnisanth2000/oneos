@@ -14,12 +14,35 @@ class EntityManifestError(RuntimeError):
     pass
 
 
+class SystemRegistryPathError(EntityManifestError):
+    pass
+
+
 class RecipientConfigurationError(EntityManifestError):
     pass
 
 
 class EntitySelectionError(ValueError):
     pass
+
+
+def resolve_system_registry(root: Path | str, *parts: str | Path) -> Path:
+    """Resolve a registry beneath the vault's lexical ``_system`` boundary."""
+    root_path = Path(root).resolve()
+    lexical_system = root_path / "_system"
+    try:
+        resolved_system = lexical_system.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise SystemRegistryPathError("system registry root is unsafe") from exc
+    if resolved_system != lexical_system:
+        raise SystemRegistryPathError("system registry root is redirected")
+    try:
+        candidate = lexical_system.joinpath(*map(Path, parts)).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise SystemRegistryPathError("system registry path is unsafe") from exc
+    if not candidate.is_relative_to(lexical_system):
+        raise SystemRegistryPathError("system registry path leaves the registry root")
+    return candidate
 
 
 def normalize_email_address(value: object) -> str:
@@ -52,7 +75,7 @@ class EntityCatalog:
     @classmethod
     def load(cls, root: Path | str) -> "EntityCatalog":
         root_path = Path(root).resolve()
-        path = root_path / "_system/entities.yaml"
+        path = resolve_system_registry(root_path, "entities.yaml")
         if not path.is_file():
             raise EntityManifestError("entities manifest is missing")
         try:

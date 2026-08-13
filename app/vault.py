@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from .entities import EntityCatalog
+from .entities import EntityCatalog, resolve_system_registry
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,7 @@ class Vault:
         return self._catalog.root
 
     def system_path(self, *parts: str) -> Path:
-        return self.root.joinpath("_system", *parts)
+        return resolve_system_registry(self.root, *parts)
 
     # --- registry loading ---------------------------------------------------
 

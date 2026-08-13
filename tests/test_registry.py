@@ -275,6 +275,57 @@ def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
     assert "widgetx:" in (vault / "_system/products.yaml").read_text()
 
 
+def test_propose_delete_keeps_untrusted_slug_out_of_proposal_filename(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    target = scope.resolve("13-analytics", "kpis.yaml")
+    target.parent.mkdir(parents=True)
+    original = b"version: '1.0'\nkpis: unchanged\n"
+    target.write_bytes(original)
+    slug = "../../../13-analytics/kpis"
+
+    proposal = propose_delete(scope, "product", slug)
+
+    assert proposal.path.parent == scope.resolve("outbox")
+    assert yaml.safe_load(proposal.path.read_text())["slug"] == slug
+    assert target.read_bytes() == original
+
+
+def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    target = scope.resolve("13-analytics", "kpis.yaml")
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        textwrap.dedent(
+            """\
+            id: ../13-analytics/kpis
+            action: delete
+            entity: demo
+            kind: product
+            slug: widgetx
+            status: pending
+            total_references: 0
+            impact: {}
+            """
+        ),
+        encoding="utf-8",
+    )
+    target_before = target.read_bytes()
+    registry = scope.system_path("products.yaml")
+    registry_before = registry.read_bytes()
+    head_before = git_head(vault)
+
+    with pytest.raises(RegistryError):
+        get_delete_proposal(scope, "../13-analytics/kpis")
+    with pytest.raises(RegistryError):
+        execute_delete(scope, "../13-analytics/kpis")
+
+    assert target.read_bytes() == target_before
+    assert registry.read_bytes() == registry_before
+    assert git_head(vault) == head_before
+
+
 def test_execute_delete_refuses_while_referenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
     scope = Scope(vault, "demo")

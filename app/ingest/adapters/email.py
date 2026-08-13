@@ -152,15 +152,19 @@ def poll(  # pragma: no cover - IMAP I/O glue over process_email
 
     catalog = EntityCatalog.load(vault)
     conn = imaplib.IMAP4_SSL(host)
-    conn.login(user, password)
-    conn.select(mailbox)
-    _typ, data = conn.search(None, "UNSEEN")
     count = 0
-    for uid in data[0].split():
-        _typ, raw = conn.fetch(uid, "(RFC822)")
-        msg = _email.message_from_bytes(raw[0][1])
-        process_shared_email(catalog.root, msg)
-        count += 1
-    conn.close()
-    conn.logout()
+    try:
+        conn.login(user, password)
+        conn.select(mailbox)
+        _typ, data = conn.search(None, "UNSEEN")
+        for uid in data[0].split():
+            _typ, raw = conn.fetch(uid, "(BODY.PEEK[])")
+            msg = _email.message_from_bytes(raw[0][1])
+            process_shared_email(catalog.root, msg)
+            count += 1
+    finally:
+        try:
+            conn.close()
+        finally:
+            conn.logout()
     return count

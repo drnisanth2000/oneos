@@ -4,7 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .entities import EntityCatalog, EntitySelectionError
+from .entities import (
+    EntityCatalog,
+    EntitySelectionError,
+    SystemRegistryPathError,
+    resolve_system_registry,
+)
 
 
 class CrossScopeError(ValueError):
@@ -53,8 +58,7 @@ class Scope:
         return candidate.relative_to(self._root).as_posix()
 
     def system_path(self, *parts: str | Path) -> Path:
-        base = (self._root / "_system").resolve()
-        candidate = base.joinpath(*map(Path, parts)).resolve()
-        if not candidate.is_relative_to(base):
-            raise CrossScopeError("system path leaves the registry root")
-        return candidate
+        try:
+            return resolve_system_registry(self._root, *parts)
+        except SystemRegistryPathError as exc:
+            raise CrossScopeError(str(exc)) from exc

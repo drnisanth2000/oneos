@@ -155,6 +155,64 @@ def test_poll_rejects_duplicate_ownership_before_opening_imap(tmp_path, monkeypa
         poll(vault, "mail.example.invalid", "user", "password")
 
 
+@pytest.mark.parametrize("recipients,error", [
+    (["unknown@example.invalid"], UnmappedRecipientError),
+    (["intake-alpha@example.invalid", "intake-beta@example.invalid"], AmbiguousRecipientError),
+])
+def test_poll_routing_failure_peeks_without_mailbox_or_vault_mutation(
+    email_vault, monkeypatch, recipients, error
+):
+    class PollingIMAP:
+        def __init__(self, raw_message):
+            self.raw_message = raw_message
+            self.fetches = []
+            self.stores = []
+            self.closed = False
+            self.logged_out = False
+
+        def login(self, _user, _password):
+            return "OK", []
+
+        def select(self, _mailbox):
+            return "OK", []
+
+        def search(self, _charset, _criterion):
+            return "OK", [b"17"]
+
+        def fetch(self, uid, query):
+            self.fetches.append((uid, query))
+            return "OK", [(b"17 (BODY[] {1})", self.raw_message)]
+
+        def store(self, uid, command, flags):
+            self.stores.append((uid, command, flags))
+            return "OK", []
+
+        def close(self):
+            self.closed = True
+            return "OK", []
+
+        def logout(self):
+            self.logged_out = True
+            return "BYE", []
+
+    message = _msg("must remain unseen", to=", ".join(recipients))
+    connection = PollingIMAP(message.as_bytes())
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", lambda _host: connection)
+    head_before = git_head(email_vault)
+    paths_before = git_tracked_paths(email_vault)
+
+    with pytest.raises(error):
+        poll(email_vault, "mail.example.invalid", "user", "password")
+
+    assert connection.fetches == [(b"17", "(BODY.PEEK[])")]
+    assert connection.stores == []
+    assert connection.closed is True
+    assert connection.logged_out is True
+    assert git_head(email_vault) == head_before
+    assert git_tracked_paths(email_vault) == paths_before
+    assert not list(email_vault.glob("*/00-inbox/active/*.md"))
+
+
 def test_email_lands_in_inbox_with_envelope_and_pii_stripped(tmp_path):
     vault = git_entity_vault(tmp_path / "vault", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
     aadhaar = _valid_aadhaar()

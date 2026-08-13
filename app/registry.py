@@ -8,6 +8,7 @@ references remain.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from pathlib import Path
 import yaml
 
 from .inbox import split_front_matter
-from .scope import Scope
+from .scope import CrossScopeError, Scope
 
 # Columns in books.db that carry a product/member value.
 _DB_COLUMNS = {
@@ -25,6 +26,7 @@ _DB_COLUMNS = {
     "member": ("member", "member_id"),
 }
 _SKIP_DIRS = {".git", ".obsidian", ".sensitive", "outbox", "staging"}
+_PROPOSAL_ID = re.compile(r"^[A-Za-z0-9]+(?:[A-Za-z0-9_-]*[A-Za-z0-9])?$")
 
 
 class RegistryError(Exception):
@@ -179,11 +181,24 @@ def add_workspace(scope: Scope, entry: dict) -> None:
 
 # --- delete (via outbox) ---------------------------------------------------
 
+def _delete_proposal_path(scope: Scope, proposal_id: str) -> Path:
+    if not isinstance(proposal_id, str) or not _PROPOSAL_ID.fullmatch(proposal_id):
+        raise RegistryError("invalid delete proposal id")
+    entity_root = scope.resolve()
+    bound_outbox = entity_root / "outbox"
+    resolved_outbox = scope.resolve("outbox")
+    if resolved_outbox != bound_outbox:
+        raise CrossScopeError("outbox redirects outside the bound outbox")
+    candidate = (resolved_outbox / f"{proposal_id}.yaml").resolve()
+    if candidate.parent != resolved_outbox:
+        raise CrossScopeError("delete proposal leaves the bound outbox")
+    return candidate
+
 def propose_delete(scope: Scope, kind: str, slug: str) -> DeleteProposal:
     """Write a delete proposal carrying the reference count. Removes nothing."""
     entity = scope.current_entity()
     report = reference_count(scope, kind, slug)
-    pid = f"{datetime.now():%Y%m%dT%H%M%S}-delete-{kind}-{slug}"
+    pid = f"{datetime.now():%Y%m%dT%H%M%S}-delete"
     record = {
         "id": pid,
         "action": "delete",
@@ -195,15 +210,15 @@ def propose_delete(scope: Scope, kind: str, slug: str) -> DeleteProposal:
         "total_references": report.total,
         "impact": report.sources,
     }
-    outbox = scope.resolve("outbox")
+    outbox = _delete_proposal_path(scope, pid).parent
     outbox.mkdir(parents=True, exist_ok=True)
-    path = scope.resolve("outbox", f"{pid}.yaml")
+    path = _delete_proposal_path(scope, pid)
     path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
     return DeleteProposal(pid, path, entity, kind, slug, report.total, report.sources)
 
 
 def get_delete_proposal(scope: Scope, proposal_id: str) -> DeleteProposal:
-    path = scope.resolve("outbox", f"{proposal_id}.yaml")
+    path = _delete_proposal_path(scope, proposal_id)
     if not path.is_file():
         raise RegistryError(f"no delete proposal {proposal_id!r}")
     rec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

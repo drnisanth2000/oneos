@@ -44,6 +44,41 @@ def test_catalog_rejects_missing_manifest_without_exposing_vault_path(tmp_path):
     assert str(caught.value) == "entities manifest is missing"
 
 
+def test_catalog_rejects_redirected_system_root(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    external = write_vault(
+        tmp_path / "external-system-parent", entities_yaml("redirected")
+    ) / "_system"
+    (vault / "_system").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(EntityManifestError):
+        EntityCatalog.load(vault)
+
+
+def test_catalog_rejects_entities_leaf_redirected_outside_system(tmp_path):
+    vault = write_vault(tmp_path / "vault", entities_yaml("alpha"))
+    external = tmp_path / "external-entities.yaml"
+    external.write_text(entities_yaml("redirected"), encoding="utf-8")
+    manifest = vault / "_system/entities.yaml"
+    manifest.unlink()
+    manifest.symlink_to(external)
+
+    with pytest.raises(EntityManifestError):
+        EntityCatalog.load(vault)
+
+
+def test_catalog_allows_shared_entities_leaf_within_real_system(tmp_path):
+    vault = write_vault(tmp_path / "vault", entities_yaml("alpha"))
+    shared = vault / "_system/shared-entities.yaml"
+    shared.write_text(entities_yaml("shared"), encoding="utf-8")
+    manifest = vault / "_system/entities.yaml"
+    manifest.unlink()
+    manifest.symlink_to(shared)
+
+    assert EntityCatalog.load(vault).entities[0].slug == "shared"
+
+
 @pytest.mark.parametrize("entity_spec", ['""', "[]", "0", "false"])
 def test_catalog_rejects_falsey_non_mapping_entity_specs(tmp_path, entity_spec):
     manifest = f'version: "1.0"\nentities:\n  alpha: {entity_spec}\n'
@@ -213,6 +248,20 @@ def test_system_path_does_not_grant_another_entity_path(tmp_path):
     assert scope.system_path("entities.yaml") == tmp_path / "_system/entities.yaml"
     with pytest.raises(CrossScopeError):
         scope.resolve("..", "beta", "00-inbox")
+
+
+def test_scope_system_path_rejects_system_root_redirected_after_binding(tmp_path):
+    vault = write_vault(tmp_path / "vault", entities_yaml("alpha"))
+    scope = Scope(vault, "alpha")
+    original_system = vault / "_system"
+    original_system.rename(vault / "saved-system")
+    external = tmp_path / "external-system"
+    external.mkdir()
+    (external / "products.yaml").write_text("products: {}\n", encoding="utf-8")
+    original_system.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(CrossScopeError):
+        scope.system_path("products.yaml")
 
 
 def test_entity_root_symlink_cannot_redirect_bound_scope(tmp_path):
