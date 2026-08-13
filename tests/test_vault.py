@@ -8,7 +8,7 @@ The three rules under test (AGENTS.md, task brief):
 """
 import textwrap
 
-from app.scope import Scope
+from app.entities import EntityCatalog
 from app.vault import Vault
 from tests.conftest import scaffold_modules
 
@@ -35,7 +35,7 @@ def test_discovers_every_bundle_from_entities_yaml(make_vault):
             """
         )
     )
-    bundles = Vault(Scope(root)).bundles()
+    bundles = Vault(EntityCatalog.load(root)).bundles()
     assert [b.slug for b in bundles] == ["alpha", "beta"]
     assert {b.slug: b.label for b in bundles} == {"alpha": "Alpha", "beta": "Beta"}
 
@@ -51,7 +51,7 @@ def test_flag_activates_gated_module(make_vault):
     )
     scaffold_modules(root, "withflag", ALL_MODULES)
     scaffold_modules(root, "without", BASE_MODULES)
-    bundles = {b.slug: b for b in Vault(Scope(root)).bundles()}
+    bundles = {b.slug: b for b in Vault(EntityCatalog.load(root)).bundles()}
     assert counts(bundles.values()) == {"withflag": 4, "without": 3}
     assert "zz-extra" in [m.name for m in bundles["withflag"].modules]
     assert "zz-extra" not in [m.name for m in bundles["without"].modules]
@@ -71,7 +71,7 @@ def test_activation_ignores_archetype_uses_flags_only(make_vault):
             flags: [other]
         """
     )
-    (bundle,) = Vault(Scope(root)).bundles()
+    (bundle,) = Vault(EntityCatalog.load(root)).bundles()
     assert [m.name for m in bundle.modules] == BASE_MODULES
     assert bundle.flags == ("other",)
 
@@ -84,7 +84,7 @@ def test_module_carries_block_from_registry(make_vault):
           x: { label: X, flags: [special] }
         """
     )
-    (bundle,) = Vault(Scope(root)).bundles()
+    (bundle,) = Vault(EntityCatalog.load(root)).bundles()
     blocks = {m.name: m.block for m in bundle.modules}
     assert blocks == {
         "00-intake": "system",
@@ -106,7 +106,7 @@ def test_e4_module_required_by_flags_but_missing_on_disk(make_vault):
     )
     # Scaffold everything EXCEPT the gated module -> zz-extra is missing.
     scaffold_modules(root, "gap", BASE_MODULES)
-    (bundle,) = Vault(Scope(root)).bundles()
+    (bundle,) = Vault(EntityCatalog.load(root)).bundles()
     # Still listed (count unchanged), but flagged missing.
     assert len(bundle.modules) == 4
     missing = [m.name for m in bundle.modules if m.missing]
@@ -125,7 +125,7 @@ def test_present_and_absent_modules_not_flagged_missing_when_bundle_absent(make_
         """
     )
     # No directory scaffolded for `ghost` at all.
-    (bundle,) = Vault(Scope(root)).bundles()
+    (bundle,) = Vault(EntityCatalog.load(root)).bundles()
     assert bundle.on_disk is False
     assert bundle.errors == []
 
@@ -139,6 +139,6 @@ def test_no_missing_errors_when_disk_matches_flags(make_vault):
         """
     )
     scaffold_modules(root, "clean", ALL_MODULES)
-    (bundle,) = Vault(Scope(root)).bundles()
+    (bundle,) = Vault(EntityCatalog.load(root)).bundles()
     assert bundle.on_disk is True
     assert bundle.errors == []

@@ -38,7 +38,8 @@ def split_front_matter(text: str) -> tuple[dict, str]:
 
 
 def read_inbox(scope: Scope, entity: str) -> list[InboxItem]:
-    d = scope.resolve(entity, "00-inbox", "active")
+    entity = scope.require_entity(entity)
+    d = scope.resolve("00-inbox", "active")
     if not d.is_dir():
         return []
     items: list[InboxItem] = []

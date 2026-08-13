@@ -23,7 +23,7 @@ from tests.conftest import (
     git_head_message,
     git_is_clean,
     git_tracked_paths,
-    git_vault,
+    git_entity_vault,
 )
 
 
@@ -47,12 +47,12 @@ def _vault(tmp_path):
         ),
         "demo/11-knowledge/active/.gitkeep": "",
     }
-    return git_vault(tmp_path, files)
+    return git_entity_vault(tmp_path, ("demo",), files)
 
 
 def _propose(vault):
-    scope = Scope(vault)
-    src = scope.resolve("demo", "00-inbox", "active", "note.md")
+    scope = Scope(vault, "demo")
+    src = scope.resolve("00-inbox", "active", "note.md")
     return scope, propose_classification(
         scope, "demo", src, module="11-knowledge", sub="kb", block="govern",
         rule_id="research",
@@ -65,10 +65,10 @@ def test_propose_writes_proposal_and_moves_nothing(tmp_path):
 
     # proposal lives in the outbox
     assert prop.path.exists()
-    assert prop.path.parent == scope.resolve("demo", "outbox")
+    assert prop.path.parent == scope.resolve("outbox")
     # the inbox item has NOT moved
-    assert scope.resolve("demo", "00-inbox", "active", "note.md").exists()
-    assert not scope.resolve("demo", "11-knowledge", "active", "note.md").exists()
+    assert scope.resolve("00-inbox", "active", "note.md").exists()
+    assert not scope.resolve("11-knowledge", "active", "note.md").exists()
 
     assert prop.src == "demo/00-inbox/active/note.md"
     assert prop.dst == "demo/11-knowledge/active/note.md"
@@ -99,8 +99,8 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
 
     approve(scope, "demo", prop.id)
 
-    assert not scope.resolve("demo", "00-inbox", "active", "note.md").exists()
-    dst = scope.resolve("demo", "11-knowledge", "active", "note.md")
+    assert not scope.resolve("00-inbox", "active", "note.md").exists()
+    dst = scope.resolve("11-knowledge", "active", "note.md")
     assert dst.exists()
     assert "sub: kb" in dst.read_text()
     assert not prop.path.exists()
@@ -115,7 +115,7 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
 
     from app.ingest.adapters.folder import process_drop
 
-    vault = git_vault(tmp_path / "vault", {
+    vault = git_entity_vault(tmp_path / "vault", ("synthetic",), {
         "synthetic/00-inbox/active/.gitkeep": "",
         "synthetic/11-library/active/.gitkeep": "",
     })
@@ -130,7 +130,7 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
     assert git_changed_paths(vault) == [triage_rel]
     assert triage_rel in git_tracked_paths(vault)
 
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     prop = propose_classification(
         scope, "synthetic", result.path,
         module="11-library", sub="reference", block="govern",
@@ -158,5 +158,5 @@ def test_reject_discards_proposal_without_moving(tmp_path):
     scope, prop = _propose(vault)
     reject(scope, "demo", prop.id)
     assert not prop.path.exists()
-    assert scope.resolve("demo", "00-inbox", "active", "note.md").exists()
+    assert scope.resolve("00-inbox", "active", "note.md").exists()
     assert load_proposals(scope, "demo") == []

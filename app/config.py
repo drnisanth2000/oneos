@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .entities import EntityCatalog
 from .scope import Scope
 
 ENV_VAULT = "ONEOS_VAULT"
@@ -26,7 +27,9 @@ def vault_root() -> Path:
     return root
 
 
-def build_scope() -> Scope:
-    """The process-wide scope. current_entity() starts unset; a request selects
-    one later. Path resolution always goes through this object."""
-    return Scope(vault_root())
+def build_catalog() -> EntityCatalog:
+    return EntityCatalog.load(vault_root())
+
+
+def build_scope(entity: str) -> Scope:
+    return Scope(vault_root(), entity)

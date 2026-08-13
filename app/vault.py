@@ -14,10 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+from pathlib import Path
 
 import yaml
 
-from .scope import Scope
+from .entities import EntityCatalog
 
 
 @dataclass(frozen=True)
@@ -45,17 +46,20 @@ class Bundle:
 
 
 class Vault:
-    def __init__(self, scope: Scope) -> None:
-        self._scope = scope
+    def __init__(self, catalog: EntityCatalog) -> None:
+        self._catalog = catalog
 
     @property
-    def scope(self) -> Scope:
-        return self._scope
+    def root(self) -> Path:
+        return self._catalog.root
+
+    def system_path(self, *parts: str) -> Path:
+        return self.root.joinpath("_system", *parts)
 
     # --- registry loading ---------------------------------------------------
 
     def _load_yaml(self, *system_parts: str) -> dict:
-        path = self._scope.system_path(*system_parts)
+        path = self.system_path(*system_parts)
         if not path.is_file():
             raise FileNotFoundError(f"registry not found: {path}")
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -66,10 +70,6 @@ class Vault:
         if "modules" not in cfg:
             raise ValueError("archetypes.yaml has no `modules:` — v2 schema required")
         return cfg
-
-    @cached_property
-    def _entities(self) -> dict:
-        return self._load_yaml("entities.yaml").get("entities") or {}
 
     # --- flag / module resolution (faithful to oneos_wizard) ---------------
 
@@ -119,14 +119,14 @@ class Vault:
         """Every bundle in entities.yaml, each with the modules its flags
         activate. Order follows the registry."""
         result: list[Bundle] = []
-        for slug, spec in self._entities.items():
-            spec = spec or {}
-            flags = list(spec.get("flags") or [])
+        for entity in self._catalog.entities:
+            slug = entity.slug
+            flags = list(entity.flags)
             # archetype is deliberately NOT passed — flags only.
             active = self.resolve_flags(None, flags)
             names = self.active_modules(active)
 
-            bundle_dir = self._scope.bundle_path(slug)
+            bundle_dir = self.root / slug
             on_disk = bundle_dir.is_dir()
 
             modules = tuple(
@@ -141,7 +141,7 @@ class Vault:
             result.append(
                 Bundle(
                     slug=slug,
-                    label=spec.get("label", slug),
+                    label=entity.label,
                     flags=tuple(flags),
                     modules=modules,
                     on_disk=on_disk,

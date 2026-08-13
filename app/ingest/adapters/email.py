@@ -54,7 +54,8 @@ def process_email(
     now: datetime | None = None,
 ) -> IngestResult:
     """Ingest one email into the inbox via the shared write path."""
-    scope = scope or Scope(Path(vault))
+    scope = scope or Scope(Path(vault), entity)
+    entity = scope.require_entity(entity)
     now = now or datetime.now()
 
     subject = msg.get("Subject", "(no subject)")

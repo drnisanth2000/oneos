@@ -43,6 +43,18 @@ def write_vault(root: Path, entities_yaml: str, archetypes_yaml: str = ARCHETYPE
     return root
 
 
+def entities_yaml(*slugs: str, ingest: dict[str, list[str]] | None = None) -> str:
+    rows = ['version: "1.0"', "entities:"]
+    for slug in slugs:
+        rows.extend((f"  {slug}:", f"    label: {slug.title()}", "    flags: []"))
+        addresses = (ingest or {}).get(slug, [])
+        if addresses:
+            rows.append("    ingest:")
+            rows.append("      email_addresses:")
+            rows.extend(f"        - {address}" for address in addresses)
+    return "\n".join(rows) + "\n"
+
+
 def scaffold_modules(root: Path, slug: str, modules: list[str]) -> None:
     """Create the given module directories on disk under a bundle."""
     for m in modules:
@@ -80,6 +92,16 @@ def git_vault(root: Path, files: dict[str, str]) -> Path:
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "init")
     return root
+
+
+def git_entity_vault(
+    root: Path,
+    entities: tuple[str, ...],
+    files: dict[str, str],
+) -> Path:
+    tree = dict(files)
+    tree.setdefault("_system/entities.yaml", entities_yaml(*entities))
+    return git_vault(root, tree)
 
 
 def git_head_message(root: Path) -> str:

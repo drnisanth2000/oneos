@@ -13,7 +13,7 @@ from app.ingest.adapters.folder import FolderSourceRestoreError, process_drop, e
 from app.ingest.base import IngestCommitError, IngestPathCollision, IngestResult
 from app.ingest.pii import verhoeff_check_digit
 from app.schema import validate_file
-from tests.conftest import git_changed_paths, git_head, git_head_message, git_history_contains, git_vault
+from tests.conftest import git_changed_paths, git_entity_vault, git_head, git_head_message, git_history_contains
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -28,7 +28,9 @@ def _read_fm(note: Path) -> str:
 
 
 def _vault(tmp_path, name):
-    return git_vault(tmp_path / name, {"synthetic/00-inbox/active/.gitkeep": ""})
+    return git_entity_vault(
+        tmp_path / name, ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""}
+    )
 
 
 def test_drop_txt_lands_in_inbox_with_pii_stripped(tmp_path):

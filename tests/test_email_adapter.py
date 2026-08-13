@@ -13,7 +13,7 @@ from app.inbox import split_front_matter
 from app.ingest.adapters.email import process_email
 from app.ingest.adapters.folder import process_drop
 from app.ingest.pii import verhoeff_check_digit
-from tests.conftest import git_head, git_vault
+from tests.conftest import git_entity_vault, git_head
 
 
 def _valid_aadhaar() -> str:
@@ -32,7 +32,7 @@ def _msg(body: str) -> EmailMessage:
 
 
 def test_email_lands_in_inbox_with_envelope_and_pii_stripped(tmp_path):
-    vault = git_vault(tmp_path / "vault", {"synthetic/00-inbox/active/.gitkeep": ""})
+    vault = git_entity_vault(tmp_path / "vault", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
     aadhaar = _valid_aadhaar()
     result = process_email(
         vault, "synthetic",
@@ -62,7 +62,7 @@ def test_same_filter_and_envelope_as_folder_no_second_path(tmp_path):
     body = "Ref PAN ABCDE1234F and phone +91 9812345678."
 
     # via email
-    evault = git_vault(tmp_path / "ve", {"synthetic/00-inbox/active/.gitkeep": ""})
+    evault = git_entity_vault(tmp_path / "ve", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
     enote = process_email(evault, "synthetic", _msg(body)).path
     efm, ebody = split_front_matter(enote.read_text())
 
@@ -70,7 +70,7 @@ def test_same_filter_and_envelope_as_folder_no_second_path(tmp_path):
     drop = tmp_path / "dropbox" / "note.txt"
     drop.parent.mkdir(parents=True)
     drop.write_text(body)
-    fvault = git_vault(tmp_path / "vf", {"synthetic/00-inbox/active/.gitkeep": ""})
+    fvault = git_entity_vault(tmp_path / "vf", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
     fnote = process_drop(fvault, "synthetic", drop, raw_archive=tmp_path / "raw").path
     ffm, fbody = split_front_matter(fnote.read_text())
 
@@ -89,7 +89,7 @@ def test_multipart_prefers_text_plain(tmp_path):
     m.set_content("Plain body with PAN ABCDE1234F.")
     m.add_alternative("<p>HTML body with PAN ABCDE1234F.</p>", subtype="html")
 
-    vault = git_vault(tmp_path / "v", {"synthetic/00-inbox/active/.gitkeep": ""})
+    vault = git_entity_vault(tmp_path / "v", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
     note = process_email(vault, "synthetic", m).path
     _fm, body = split_front_matter(note.read_text())
     assert "[PAN]" in body
@@ -97,7 +97,7 @@ def test_multipart_prefers_text_plain(tmp_path):
 
 
 def test_email_hash_represents_deterministic_message_bytes(tmp_path):
-    vault = git_vault(tmp_path / "vault", {"synthetic/00-inbox/active/.gitkeep": ""})
+    vault = git_entity_vault(tmp_path / "vault", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
     msg = _msg("stable body\n")
     expected = hashlib.sha256(msg.as_bytes(policy=SMTP)).hexdigest()
     result = process_email(vault, "synthetic", msg)
@@ -106,7 +106,7 @@ def test_email_hash_represents_deterministic_message_bytes(tmp_path):
 
 
 def test_duplicate_email_creates_no_second_commit(tmp_path):
-    vault = git_vault(tmp_path / "vault", {"synthetic/00-inbox/active/.gitkeep": ""})
+    vault = git_entity_vault(tmp_path / "vault", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
     first = process_email(vault, "synthetic", _msg("same body\n"))
     before = git_head(vault)
     duplicate = process_email(vault, "synthetic", _msg("same body\n"))

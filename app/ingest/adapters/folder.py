@@ -89,7 +89,8 @@ def process_drop(
     vault = Path(vault)
     src = Path(src)
     raw_archive = Path(raw_archive)
-    scope = scope or Scope(vault)
+    scope = scope or Scope(vault, entity)
+    entity = scope.require_entity(entity)
     now = now or datetime.now()
 
     digest = sha256_of(src)

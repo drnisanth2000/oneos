@@ -40,7 +40,7 @@ class Proposal:
 
 
 def _rel(scope: Scope, path: Path) -> str:
-    return str(Path(path).resolve().relative_to(scope.root.resolve()))
+    return scope.vault_relative(path)
 
 
 def propose_classification(
@@ -54,6 +54,7 @@ def propose_classification(
     rule_id: str | None = None,
 ) -> Proposal:
     """Write a classify proposal. Moves nothing."""
+    entity = scope.require_entity(entity)
     item_path = Path(item_path)
     filename = item_path.name
     src_rel = _rel(scope, item_path)
@@ -74,7 +75,7 @@ def propose_classification(
         "block": block,
         "rule_id": rule_id,
     }
-    outbox = scope.resolve(entity, "outbox")
+    outbox = scope.resolve("outbox")
     outbox.mkdir(parents=True, exist_ok=True)
     path = outbox / f"{pid}.yaml"
     path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
@@ -99,7 +100,8 @@ def _to_proposal(path: Path, record: dict) -> Proposal:
 
 
 def load_proposals(scope: Scope, entity: str) -> list[Proposal]:
-    outbox = scope.resolve(entity, "outbox")
+    entity = scope.require_entity(entity)
+    outbox = scope.resolve("outbox")
     if not outbox.is_dir():
         return []
     props = []
@@ -125,7 +127,7 @@ def _apply_sub(text: str, sub: str) -> str:
 def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves."""
-    src_path = scope.root / proposal.src
+    src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
     new = _apply_sub(old, proposal.sub)
     diff = difflib.unified_diff(
@@ -147,6 +149,7 @@ class OutboxError(Exception):
 
 
 def get_proposal(scope: Scope, entity: str, proposal_id: str) -> Proposal:
+    entity = scope.require_entity(entity)
     for p in load_proposals(scope, entity):
         if p.id == proposal_id:
             return p
@@ -157,10 +160,11 @@ def approve(scope: Scope, entity: str, proposal_id: str) -> Proposal:
     """Perform the proposed move and commit it — exactly one revertible commit.
     The proposal file is untracked, so it never enters git; deleting it leaves a
     clean tree after the commit."""
+    entity = scope.require_entity(entity)
     prop = get_proposal(scope, entity, proposal_id)
     vault = scope.root
-    src = vault / prop.src
-    dst = vault / prop.dst
+    src = scope.resolve_stored(prop.src)
+    dst = scope.resolve_stored(prop.dst)
     if not src.exists():
         raise OutboxError(f"source no longer exists: {prop.src}")
 
@@ -178,6 +182,7 @@ def approve(scope: Scope, entity: str, proposal_id: str) -> Proposal:
 def reject(scope: Scope, entity: str, proposal_id: str) -> Proposal:
     """Discard the proposal. No move, no commit — the proposal was never
     tracked."""
+    entity = scope.require_entity(entity)
     prop = get_proposal(scope, entity, proposal_id)
     prop.path.unlink(missing_ok=True)
     return prop

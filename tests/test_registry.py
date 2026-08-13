@@ -15,7 +15,7 @@ from app.registry import (
     propose_delete,
     reference_count,
 )
-from tests.conftest import git_vault, git_count_commits, git_head_message, git_is_clean
+from tests.conftest import git_entity_vault, git_count_commits, git_head_message, git_is_clean
 
 
 def _products_vault(tmp_path, referenced=True):
@@ -47,7 +47,7 @@ def _products_vault(tmp_path, referenced=True):
         files["_system/workspaces.yaml"] += (
             "  - {id: widgetx, label: Widgetx, kind: product, entity: demo, product: widgetx, default_view: blocks}\n"
         )
-    vault = git_vault(tmp_path, files)
+    vault = git_entity_vault(tmp_path, ("demo",), files)
     if referenced:
         db = tmp_path / "demo" / "books.db"
         conn = sqlite3.connect(db)
@@ -65,7 +65,7 @@ def _products_vault(tmp_path, referenced=True):
 
 def test_reference_count_finds_every_reference(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    r = reference_count(Scope(vault), "product", "widgetx")
+    r = reference_count(Scope(vault, "demo"), "product", "widgetx")
     assert r.sources.get("front-matter") == 1
     assert r.sources.get("workspaces") == 1
     assert r.sources.get("books.db") == 2      # products.tag + invoices.product
@@ -74,13 +74,13 @@ def test_reference_count_finds_every_reference(tmp_path):
 
 def test_reference_count_zero_when_unused(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    r = reference_count(Scope(vault), "product", "widgetx")
+    r = reference_count(Scope(vault, "demo"), "product", "widgetx")
     assert r.total == 0
 
 
 def test_add_workspace_is_direct_and_commits(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault)
+    scope = Scope(vault, "demo")
     before = git_count_commits(vault)
     add_workspace(scope, {"id": "rti", "label": "RTI", "kind": "matter", "entity": "demo"})
     ws = (vault / "_system/workspaces.yaml").read_text()
@@ -92,7 +92,7 @@ def test_add_workspace_is_direct_and_commits(tmp_path):
 
 def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault)
+    scope = Scope(vault, "demo")
     prop = propose_delete(scope, "demo", "product", "widgetx")
     assert prop.path.exists()
     text = prop.path.read_text()
@@ -103,7 +103,7 @@ def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
 
 def test_execute_delete_refuses_while_referenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault)
+    scope = Scope(vault, "demo")
     prop = propose_delete(scope, "demo", "product", "widgetx")
     try:
         execute_delete(scope, "demo", prop.id)
@@ -115,7 +115,7 @@ def test_execute_delete_refuses_while_referenced(tmp_path):
 
 def test_execute_delete_removes_when_unreferenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault)
+    scope = Scope(vault, "demo")
     prop = propose_delete(scope, "demo", "product", "widgetx")
     execute_delete(scope, "demo", prop.id)
     prods = (vault / "_system/products.yaml").read_text()

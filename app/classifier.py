@@ -33,7 +33,7 @@ class Classification:
 class Classifier:
     def __init__(self, vault: Vault) -> None:
         self._vault = vault
-        self._path = vault.scope.system_path("classifier", "rules.yaml")
+        self._path = vault.system_path("classifier", "rules.yaml")
         self._cfg = self._load()
 
     def _load(self) -> dict:

@@ -110,6 +110,7 @@ def prepare_inbox_item(
     attachments: list[str] | None = None,
     slug_seed: str | None = None,
 ) -> tuple[Path, Envelope, str]:
+    entity = scope.require_entity(entity)
     if not sha256:
         raise IngestRepositoryError("adapter receipt requires sha256")
     redacted, matches = redact(text)
@@ -131,7 +132,7 @@ def prepare_inbox_item(
         pii_classes=sorted({m.kind for m in matches}),
     )
     seed = (slug_seed or source_id or "item")[:8]
-    note_path = scope.resolve(entity, "00-inbox", "active", f"{_slug(title)}-{seed}.md")
+    note_path = scope.resolve("00-inbox", "active", f"{_slug(title)}-{seed}.md")
     return note_path, env, render_note(env, entity)
 
 
@@ -187,7 +188,7 @@ def _cleanup_attempt(
 
 
 def _tracked_markdown_paths(scope: Scope, entity: str) -> list[Path]:
-    scope.bundle_path(entity)
+    entity = scope.require_entity(entity)
     prefix = f"{entity}/"
     output = _git(scope, "ls-files", "--", prefix).stdout
     paths: list[Path] = []
@@ -205,6 +206,7 @@ def _tracked_markdown_paths(scope: Scope, entity: str) -> list[Path]:
 
 
 def find_tracked_receipt(scope: Scope, entity: str, envelope: Envelope) -> Path | None:
+    entity = scope.require_entity(entity)
     _require_git_head(scope)
     exact: Path | None = None
     for path in _tracked_markdown_paths(scope, entity):
@@ -219,6 +221,7 @@ def find_tracked_receipt(scope: Scope, entity: str, envelope: Envelope) -> Path 
 
 
 def commit_inbox_item(scope: Scope, entity: str, **kwargs) -> IngestResult:
+    entity = scope.require_entity(entity)
     _require_git_head(scope)
     path, env, rendered = prepare_inbox_item(scope, entity, **kwargs)
     existing = find_tracked_receipt(scope, entity, env)

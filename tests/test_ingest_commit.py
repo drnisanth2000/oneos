@@ -23,12 +23,16 @@ from tests.conftest import (
     git_index_paths,
     git_is_clean,
     git_tracked_paths,
-    git_vault,
+    git_entity_vault,
+    entities_yaml,
+    write_vault,
 )
 
 
 def _vault(tmp_path: Path) -> Path:
-    return git_vault(tmp_path, {"synthetic/00-inbox/active/.gitkeep": ""})
+    return git_entity_vault(
+        tmp_path, ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""}
+    )
 
 
 def _kwargs() -> dict:
@@ -49,7 +53,7 @@ def _kwargs() -> dict:
 
 def test_prepare_returns_redacted_schema_ready_receipt_without_writing(tmp_path):
     vault = _vault(tmp_path)
-    path, env, rendered = prepare_inbox_item(Scope(vault), "synthetic", **_kwargs())
+    path, env, rendered = prepare_inbox_item(Scope(vault, "synthetic"), "synthetic", **_kwargs())
 
     assert path == vault / "synthetic/00-inbox/active/planning-note-01234567.md"
     assert env.sha256 == "0123456789abcdef" * 4
@@ -62,13 +66,13 @@ def test_prepare_rejects_adapter_receipt_without_source_hash(tmp_path):
     vault = _vault(tmp_path)
     kwargs = {**_kwargs(), "sha256": None}
     with pytest.raises(IngestRepositoryError, match="requires sha256"):
-        prepare_inbox_item(Scope(vault), "synthetic", **kwargs)
+        prepare_inbox_item(Scope(vault, "synthetic"), "synthetic", **kwargs)
 
 
 def test_new_intake_creates_one_receipt_only_ingest_commit(tmp_path):
     vault = _vault(tmp_path)
     before = git_count_commits(vault)
-    result = commit_inbox_item(Scope(vault), "synthetic", **_kwargs())
+    result = commit_inbox_item(Scope(vault, "synthetic"), "synthetic", **_kwargs())
     rel = "synthetic/00-inbox/active/planning-note-01234567.md"
     assert result.created is True
     assert result.path == vault / rel
@@ -83,23 +87,23 @@ def test_new_intake_creates_one_receipt_only_ingest_commit(tmp_path):
 
 def test_non_git_vault_fails_without_creating_receipt(tmp_path):
     vault = tmp_path / "not-git"
-    vault.mkdir()
+    write_vault(vault, entities_yaml("synthetic"))
     with pytest.raises(IngestRepositoryError):
-        commit_inbox_item(Scope(vault), "synthetic", **_kwargs())
+        commit_inbox_item(Scope(vault, "synthetic"), "synthetic", **_kwargs())
     assert not list(vault.rglob("*.md"))
 
 
 def test_git_repository_without_head_fails_without_creating_receipt(tmp_path):
     vault = tmp_path / "no-head"
-    vault.mkdir()
+    write_vault(vault, entities_yaml("synthetic"))
     subprocess.run(["git", "init", "-q"], cwd=vault, check=True)
     with pytest.raises(IngestRepositoryError):
-        commit_inbox_item(Scope(vault), "synthetic", **_kwargs())
+        commit_inbox_item(Scope(vault, "synthetic"), "synthetic", **_kwargs())
     assert not list(vault.rglob("*.md"))
 
 
 def test_rejecting_hook_removes_only_attempted_receipt_and_new_directories(tmp_path):
-    vault = git_vault(tmp_path, {"unrelated.txt": "base\n"})
+    vault = git_entity_vault(tmp_path, ("synthetic",), {"unrelated.txt": "base\n"})
     staged = vault / "staged.txt"
     staged.write_text("keep staged\n", encoding="utf-8")
     subprocess.run(["git", "add", "staged.txt"], cwd=vault, check=True)
@@ -110,7 +114,7 @@ def test_rejecting_hook_removes_only_attempted_receipt_and_new_directories(tmp_p
     hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     hook.chmod(0o755)
     with pytest.raises(IngestCommitError):
-        commit_inbox_item(Scope(vault), "synthetic", **_kwargs())
+        commit_inbox_item(Scope(vault, "synthetic"), "synthetic", **_kwargs())
     assert git_head(vault) == head_before
     assert git_index_paths(vault) == ["staged.txt"]
     assert unstaged.read_text(encoding="utf-8") == "keep unstaged\n"
@@ -119,7 +123,7 @@ def test_rejecting_hook_removes_only_attempted_receipt_and_new_directories(tmp_p
 
 def test_duplicate_tracked_identity_is_a_no_op_after_move(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     first = commit_inbox_item(scope, "synthetic", **_kwargs())
     moved = vault / "synthetic/11-library/active/planning-note-01234567.md"
     moved.parent.mkdir(parents=True)
@@ -137,7 +141,7 @@ def test_duplicate_tracked_identity_is_a_no_op_after_move(tmp_path):
 
 def test_same_source_identity_with_different_hash_is_rejected(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     commit_inbox_item(scope, "synthetic", **_kwargs())
     changed = {**_kwargs(), "sha256": "fedcba9876543210" * 4}
     with pytest.raises(IngestIdentityConflict):
@@ -146,7 +150,7 @@ def test_same_source_identity_with_different_hash_is_rejected(tmp_path):
 
 def test_occupied_destination_is_not_overwritten(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     path, _env, _rendered = prepare_inbox_item(scope, "synthetic", **_kwargs())
     path.write_text("unrelated existing bytes\n", encoding="utf-8")
     with pytest.raises(IngestPathCollision):
@@ -156,7 +160,7 @@ def test_occupied_destination_is_not_overwritten(tmp_path):
 
 def test_cleanup_never_deletes_receipt_bytes_changed_by_another_actor(tmp_path, monkeypatch):
     vault = _vault(tmp_path)
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     path, _env, _rendered = prepare_inbox_item(scope, "synthetic", **_kwargs())
     real_git = ingest_base._git
 
@@ -174,7 +178,7 @@ def test_cleanup_never_deletes_receipt_bytes_changed_by_another_actor(tmp_path, 
 
 def test_cleanup_never_deletes_receipt_committed_by_another_intake(tmp_path, monkeypatch):
     vault = _vault(tmp_path)
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     path, _env, rendered = prepare_inbox_item(scope, "synthetic", **_kwargs())
     real_git = ingest_base._git
 
@@ -198,7 +202,7 @@ def test_cleanup_never_deletes_receipt_committed_by_another_intake(tmp_path, mon
 
 def test_mixed_exact_and_conflicting_tracked_identity_is_rejected(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     exact = commit_inbox_item(scope, "synthetic", **_kwargs())
     conflict = vault / "synthetic/11-library/active/conflict.md"
     conflict.parent.mkdir(parents=True)
@@ -216,7 +220,7 @@ def test_mixed_exact_and_conflicting_tracked_identity_is_rejected(tmp_path):
 
 def test_staged_deletion_at_destination_is_a_collision_and_is_preserved(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault)
+    scope = Scope(vault, "synthetic")
     result = commit_inbox_item(scope, "synthetic", **_kwargs())
     rel = result.path.relative_to(vault).as_posix()
     result.path.unlink()

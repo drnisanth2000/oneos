@@ -152,6 +152,7 @@ def add_workspace(scope: Scope, entry: dict) -> None:
 
 def propose_delete(scope: Scope, entity: str, kind: str, slug: str) -> DeleteProposal:
     """Write a delete proposal carrying the reference count. Removes nothing."""
+    entity = scope.require_entity(entity)
     report = reference_count(scope, kind, slug)
     pid = f"{datetime.now():%Y%m%dT%H%M%S}-delete-{kind}-{slug}"
     record = {
@@ -165,7 +166,7 @@ def propose_delete(scope: Scope, entity: str, kind: str, slug: str) -> DeletePro
         "total_references": report.total,
         "impact": report.sources,
     }
-    outbox = scope.resolve(entity, "outbox")
+    outbox = scope.resolve("outbox")
     outbox.mkdir(parents=True, exist_ok=True)
     path = outbox / f"{pid}.yaml"
     path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
@@ -173,7 +174,8 @@ def propose_delete(scope: Scope, entity: str, kind: str, slug: str) -> DeletePro
 
 
 def get_delete_proposal(scope: Scope, entity: str, proposal_id: str) -> DeleteProposal:
-    outbox = scope.resolve(entity, "outbox")
+    entity = scope.require_entity(entity)
+    outbox = scope.resolve("outbox")
     path = outbox / f"{proposal_id}.yaml"
     if not path.is_file():
         raise RegistryError(f"no delete proposal {proposal_id!r}")
@@ -218,6 +220,7 @@ def _remove_key_block(text: str, slug: str) -> str:
 def execute_delete(scope: Scope, entity: str, proposal_id: str) -> None:
     """On approval: refuse if references remain (recomputed fresh), else remove
     the value from its registry and commit."""
+    entity = scope.require_entity(entity)
     prop = get_delete_proposal(scope, entity, proposal_id)
     report = reference_count(scope, prop.kind, prop.slug)
     if report.total:
