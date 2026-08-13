@@ -9,6 +9,7 @@ of these.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -17,6 +18,34 @@ from .envelope import Envelope
 from .pii import redact
 
 SUMMARY_CHARS = 800
+
+
+@dataclass(frozen=True)
+class IngestResult:
+    path: Path
+    envelope: Envelope
+    created: bool
+    commit_oid: str | None
+
+
+class IngestError(Exception):
+    pass
+
+
+class IngestRepositoryError(IngestError):
+    pass
+
+
+class IngestIdentityConflict(IngestError):
+    pass
+
+
+class IngestPathCollision(IngestError):
+    pass
+
+
+class IngestCommitError(IngestError):
+    pass
 
 
 def _slug(name: str) -> str:
@@ -60,7 +89,7 @@ def render_note(env: Envelope, entity: str) -> str:
     return "\n".join(lines) + "\n" + env.summary + "\n"
 
 
-def write_inbox_item(
+def prepare_inbox_item(
     scope: Scope,
     entity: str,
     *,
@@ -78,9 +107,9 @@ def write_inbox_item(
     size: int | None = None,
     attachments: list[str] | None = None,
     slug_seed: str | None = None,
-) -> tuple[Path, Envelope]:
-    """Redact, build the envelope, and write the inbox item. Every adapter ends
-    here. Returns (note_path, envelope)."""
+) -> tuple[Path, Envelope, str]:
+    if not sha256:
+        raise IngestRepositoryError("adapter receipt requires sha256")
     redacted, matches = redact(text)
     env = Envelope(
         source=source,
@@ -99,10 +128,14 @@ def write_inbox_item(
         pii_quarantined=bool(matches),
         pii_classes=sorted({m.kind for m in matches}),
     )
-    # Inbox items live in 00-inbox/active/ with sub: triage — path via Scope.
-    note_dir = scope.resolve(entity, "00-inbox", "active")
-    note_dir.mkdir(parents=True, exist_ok=True)
     seed = (slug_seed or source_id or "item")[:8]
-    note_path = note_dir / f"{_slug(title)}-{seed}.md"
-    note_path.write_text(render_note(env, entity), encoding="utf-8")
+    note_path = scope.resolve(entity, "00-inbox", "active", f"{_slug(title)}-{seed}.md")
+    return note_path, env, render_note(env, entity)
+
+
+def write_inbox_item(scope: Scope, entity: str, **kwargs) -> tuple[Path, Envelope]:
+    path, env, rendered = prepare_inbox_item(scope, entity, **kwargs)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rendered, encoding="utf-8")
+    note_path = path
     return note_path, env

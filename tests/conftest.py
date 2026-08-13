@@ -92,3 +92,33 @@ def git_is_clean(root: Path) -> bool:
 
 def git_count_commits(root: Path) -> int:
     return int(_git(root, "rev-list", "--count", "HEAD").strip())
+
+
+def git_head(root: Path) -> str:
+    return _git(root, "rev-parse", "HEAD").strip()
+
+
+def git_changed_paths(root: Path, revision: str = "HEAD") -> list[str]:
+    output = _git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", revision)
+    return sorted(line for line in output.splitlines() if line)
+
+
+def git_tracked_paths(root: Path) -> list[str]:
+    return sorted(line for line in _git(root, "ls-files").splitlines() if line)
+
+
+def git_index_paths(root: Path) -> list[str]:
+    return sorted(line for line in _git(root, "diff", "--cached", "--name-only").splitlines() if line)
+
+
+def git_history_contains(root: Path, needle: str) -> bool:
+    objects = _git(root, "rev-list", "--objects", "--all")
+    for line in objects.splitlines():
+        oid = line.split(" ", 1)[0]
+        proc = subprocess.run(
+            ["git", "cat-file", "-p", oid], cwd=root,
+            check=True, capture_output=True,
+        )
+        if needle.encode("utf-8") in proc.stdout:
+            return True
+    return False
