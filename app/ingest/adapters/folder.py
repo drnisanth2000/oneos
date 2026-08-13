@@ -14,7 +14,10 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from ..base import write_inbox_item
+from ..base import (
+    IngestError, IngestPathCollision, IngestResult, commit_inbox_item,
+    find_tracked_receipt, prepare_inbox_item,
+)
 from ...scope import Scope
 
 _MIME = {
@@ -32,6 +35,19 @@ _MIME = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 _TEXT_EXT = {".txt", ".md", ".csv", ".log", ".json", ".yaml", ".yml"}
+
+
+class FolderSourceRestoreError(IngestError):
+    pass
+
+
+def _restore_raw(archived: Path, src: Path, reason: str) -> None:
+    if src.exists():
+        raise FolderSourceRestoreError(f"{reason} and original drop path is occupied")
+    try:
+        shutil.move(str(archived), str(src))
+    except OSError as exc:
+        raise FolderSourceRestoreError(f"{reason} and raw source restoration failed") from exc
 
 
 def sha256_of(path: Path) -> str:
@@ -66,8 +82,8 @@ def process_drop(
     raw_archive: Path | str,
     scope: Scope | None = None,
     now: datetime | None = None,
-) -> Path:
-    """Ingest one dropped file. Returns the path of the written inbox note.
+) -> IngestResult:
+    """Ingest one dropped file. Returns the shared ingest result.
     The raw original is moved into `raw_archive` (outside the vault); only the
     redacted note enters the vault via the shared write path."""
     vault = Path(vault)
@@ -81,21 +97,42 @@ def process_drop(
     mime = mime_of(src)
     text = extract_text(src)
 
-    # Move the raw original out of the vault, never into git. `source_ref` uses
-    # a named root ("raw:") so it survives a move to the VPS or a 2nd machine.
-    raw_archive.mkdir(parents=True, exist_ok=True)
     archived = raw_archive / f"{digest[:16]}-{src.name}"
-    shutil.move(str(src), str(archived))
     source_ref = f"raw:{archived.name}"
+    kwargs = {
+        "text": text,
+        "title": src.name,
+        "source": "folder",
+        "source_id": digest[:16],
+        "received_at": now.isoformat(timespec="seconds"),
+        "source_ref": source_ref,
+        "body_ref": source_ref,
+        "sha256": digest,
+        "mime": mime,
+        "size": size,
+        "slug_seed": digest,
+    }
 
-    note_path, _ = write_inbox_item(
-        scope, entity,
-        text=text, title=src.name, source="folder", source_id=digest[:16],
-        received_at=now.isoformat(timespec="seconds"),
-        source_ref=source_ref, body_ref=source_ref,
-        sha256=digest, mime=mime, size=size, slug_seed=digest,
-    )
-    return note_path
+    _path, env, _rendered = prepare_inbox_item(scope, entity, **kwargs)
+    existing = find_tracked_receipt(scope, entity, env)
+    if existing is not None:
+        return IngestResult(existing, env, False, None)
+    if archived.exists():
+        raise IngestPathCollision("raw archive destination already exists")
+
+    raw_archive.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(archived))
+    try:
+        result = commit_inbox_item(scope, entity, **kwargs)
+    except IngestError as exc:
+        try:
+            _restore_raw(archived, src, "receipt commit failed")
+        except FolderSourceRestoreError as restore_exc:
+            raise restore_exc from exc
+        raise
+    if not result.created:
+        _restore_raw(archived, src, "duplicate detected after archive")
+    return result
 
 
 def watch(
