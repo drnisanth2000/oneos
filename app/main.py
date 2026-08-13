@@ -30,6 +30,7 @@ from .outbox import (
 from .registry import (
     RegistryError,
     execute_delete,
+    products_for,
     propose_delete,
     reference_count,
 )
@@ -161,43 +162,34 @@ def outbox_reject(
     return _outbox_list(request, scope)
 
 
-def _products_for(scope: Scope, entity: str) -> list[str]:
-    import yaml
-
-    entity = scope.require_entity(entity)
-    path = scope.system_path("products.yaml")
-    if not path.is_file():
-        return []
-    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return list(((cfg.get("products") or {}).get(entity) or {}).keys())
-
-
 @app.get("/registry/{entity}/products", response_class=HTMLResponse)
-def registry_products(request: Request, entity: str, scope: EntityScope) -> HTMLResponse:
+def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
+    selected = scope.current_entity()
     vault = Vault(catalog)
     return templates.TemplateResponse(
         request, "registry.html",
-        {"bundles": vault.bundles(), "entity": entity, "products": _products_for(scope, entity)},
+        {"bundles": vault.bundles(), "entity": selected, "products": products_for(scope)},
     )
 
 
 @app.post("/registry/{entity}/product/delete-preview", response_class=HTMLResponse)
 def registry_delete_preview(
-    request: Request, entity: str, scope: EntityScope, slug: str = Form(...)
+    request: Request, scope: EntityScope, slug: str = Form(...)
 ) -> HTMLResponse:
-    prop = propose_delete(scope, entity, "product", slug)
+    selected = scope.current_entity()
+    prop = propose_delete(scope, "product", slug)
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
-        {"entity": entity, "slug": slug, "prop": prop,
+        {"entity": selected, "slug": slug, "prop": prop,
          "report": reference_count(scope, "product", slug)},
     )
 
 
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
-def registry_delete_execute(request: Request, entity: str, scope: EntityScope,
+def registry_delete_execute(request: Request, scope: EntityScope,
                             id: str = Form(...), slug: str = Form(...)) -> HTMLResponse:
     try:
-        execute_delete(scope, entity, id)
+        execute_delete(scope, id)
         msg = f"Deleted product '{slug}'. One commit written."
     except RegistryError as e:
         msg = str(e).replace("\n", "<br>")
