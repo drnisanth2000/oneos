@@ -110,7 +110,7 @@ def test_read_inbox_returns_triage_items_with_proposals(tmp_path):
     root = _vault(tmp_path)
     _inbox_note(root, "a.md", "March invoice", "amount due", "folder")
     _inbox_note(root, "b.md", "random musing", "hello", "folder")
-    items = read_inbox(Scope(root, "acme"), "acme")
+    items = read_inbox(Scope(root, "acme"))
     assert {i.title for i in items} == {"March invoice", "random musing"}
     assert all(i.fm.get("sub") == "triage" for i in items)
 
@@ -127,4 +127,4 @@ def test_read_inbox_rejects_cross_scope_leaf_symlink(tmp_path):
     (inbox / "linked.md").symlink_to(outside)
 
     with pytest.raises(CrossScopeError):
-        read_inbox(Scope(root, "acme"), "acme")
+        read_inbox(Scope(root, "acme"))

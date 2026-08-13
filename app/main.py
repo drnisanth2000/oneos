@@ -81,24 +81,24 @@ def triage_default(request: Request):
 
 
 @app.get("/triage/{entity}", response_class=HTMLResponse)
-def triage(request: Request, entity: str, scope: EntityScope) -> HTMLResponse:
+def triage(request: Request, scope: EntityScope) -> HTMLResponse:
+    selected = scope.current_entity()
     vault = Vault(catalog)
     clf = Classifier(vault)
     rows = [
         (item, clf.classify(item.title, item.summary, item.source))
-        for item in read_inbox(scope, entity)
+        for item in read_inbox(scope)
     ]
     return templates.TemplateResponse(
         request,
         "triage.html",
-        {"bundles": vault.bundles(), "entity": entity, "rows": rows},
+        {"bundles": vault.bundles(), "entity": selected, "rows": rows},
     )
 
 
 @app.post("/triage/{entity}/propose", response_class=HTMLResponse)
 def propose(
     request: Request,
-    entity: str,
     scope: EntityScope,
     filename: str = Form(...),
     module: str = Form(...),
@@ -110,7 +110,7 @@ def propose(
     safe = Path(filename).name
     item_path = scope.resolve("00-inbox", "active", safe)
     prop = propose_classification(
-        scope, entity, item_path,
+        scope, item_path,
         module=module, sub=sub, block=block, rule_id=(rule_id or None),
     )
     return templates.TemplateResponse(
@@ -120,43 +120,45 @@ def propose(
     )
 
 
-def _outbox_list(request: Request, scope: Scope, entity: str) -> HTMLResponse:
-    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope, entity)]
+def _outbox_list(request: Request, scope: Scope) -> HTMLResponse:
+    selected = scope.current_entity()
+    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope)]
     return templates.TemplateResponse(
-        request, "blocks/outbox_list.html", {"entity": entity, "props": props}
+        request, "blocks/outbox_list.html", {"entity": selected, "props": props}
     )
 
 
 @app.get("/outbox/{entity}", response_class=HTMLResponse)
-def outbox_screen(request: Request, entity: str, scope: EntityScope) -> HTMLResponse:
+def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
+    selected = scope.current_entity()
     vault = Vault(catalog)
-    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope, entity)]
+    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope)]
     return templates.TemplateResponse(
         request, "outbox.html",
-        {"bundles": vault.bundles(), "entity": entity, "props": props},
+        {"bundles": vault.bundles(), "entity": selected, "props": props},
     )
 
 
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
 def outbox_approve(
-    request: Request, entity: str, scope: EntityScope, id: str = Form(...)
+    request: Request, scope: EntityScope, id: str = Form(...)
 ) -> HTMLResponse:
     try:
-        approve(scope, entity, id)
+        approve(scope, id)
     except OutboxError:
         pass
-    return _outbox_list(request, scope, entity)
+    return _outbox_list(request, scope)
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
 def outbox_reject(
-    request: Request, entity: str, scope: EntityScope, id: str = Form(...)
+    request: Request, scope: EntityScope, id: str = Form(...)
 ) -> HTMLResponse:
     try:
-        reject(scope, entity, id)
+        reject(scope, id)
     except OutboxError:
         pass
-    return _outbox_list(request, scope, entity)
+    return _outbox_list(request, scope)
 
 
 def _products_for(scope: Scope, entity: str) -> list[str]:

@@ -1,5 +1,6 @@
 """scope.Scope — the immutable, manifest-backed tenant boundary."""
 import dataclasses
+import inspect
 
 import pytest
 
@@ -103,17 +104,9 @@ def test_legacy_entity_guard_rejects_cross_scope_argument(tmp_path):
         scope.require_entity("beta")
 
 
-def test_legacy_reader_rejects_cross_scope_entity_before_disk_access(tmp_path):
+def test_inbox_interface_has_one_identity_authority(tmp_path):
     write_vault(tmp_path, entities_yaml("alpha", "beta"))
-    beta_inbox = tmp_path / "beta/00-inbox/active"
-    beta_inbox.mkdir(parents=True)
-    (beta_inbox / "marker.md").write_text(
-        "---\ntitle: beta marker\nsub: triage\n---\nbeta body\n",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(CrossScopeError):
-        read_inbox(Scope(tmp_path, "alpha"), "beta")
+    assert tuple(inspect.signature(read_inbox).parameters) == ("scope",)
 
 
 def test_stored_path_must_name_bound_entity(tmp_path):

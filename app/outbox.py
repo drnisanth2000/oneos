@@ -39,13 +39,8 @@ class Proposal:
     status: str = "pending"
 
 
-def _rel(scope: Scope, path: Path) -> str:
-    return scope.vault_relative(path)
-
-
 def propose_classification(
     scope: Scope,
-    entity: str,
     item_path: Path,
     *,
     module: str,
@@ -54,11 +49,11 @@ def propose_classification(
     rule_id: str | None = None,
 ) -> Proposal:
     """Write a classify proposal. Moves nothing."""
-    entity = scope.require_entity(entity)
+    entity = scope.current_entity()
     item_path = Path(item_path)
     filename = item_path.name
-    src_rel = _rel(scope, item_path)
-    dst_rel = str(Path(entity) / module / "active" / filename)
+    src_rel = scope.vault_relative(item_path)
+    dst_rel = (Path(entity) / module / "active" / filename).as_posix()
     created = datetime.now().isoformat(timespec="seconds")
     pid = f"{datetime.now():%Y%m%dT%H%M%S}-{item_path.stem}"
 
@@ -99,8 +94,7 @@ def _to_proposal(path: Path, record: dict) -> Proposal:
     )
 
 
-def load_proposals(scope: Scope, entity: str) -> list[Proposal]:
-    entity = scope.require_entity(entity)
+def load_proposals(scope: Scope) -> list[Proposal]:
     outbox = scope.resolve("outbox")
     if not outbox.is_dir():
         return []
@@ -109,7 +103,7 @@ def load_proposals(scope: Scope, entity: str) -> list[Proposal]:
         p = scope.resolve_stored(scope.vault_relative(discovered))
         record = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
         if record.get("action") == "classify":
-            props.append(_to_proposal(p, record))
+            props.append(_require_scope(scope, _to_proposal(p, record)))
     return props
 
 
@@ -128,6 +122,7 @@ def _apply_sub(text: str, sub: str) -> str:
 def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves."""
+    proposal = _require_scope(scope, proposal)
     src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
     new = _apply_sub(old, proposal.sub)
@@ -149,20 +144,31 @@ class OutboxError(Exception):
     pass
 
 
-def get_proposal(scope: Scope, entity: str, proposal_id: str) -> Proposal:
-    entity = scope.require_entity(entity)
-    for p in load_proposals(scope, entity):
+class OutboxScopeError(OutboxError):
+    pass
+
+
+def _require_scope(scope: Scope, proposal: Proposal) -> Proposal:
+    if proposal.entity != scope.current_entity():
+        raise OutboxScopeError("proposal belongs to another entity")
+    scope.resolve_stored(proposal.src)
+    scope.resolve_stored(proposal.dst)
+    return proposal
+
+
+def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
+    entity = scope.current_entity()
+    for p in load_proposals(scope):
         if p.id == proposal_id:
             return p
     raise OutboxError(f"no pending proposal {proposal_id!r} for {entity}")
 
 
-def approve(scope: Scope, entity: str, proposal_id: str) -> Proposal:
+def approve(scope: Scope, proposal_id: str) -> Proposal:
     """Perform the proposed move and commit it — exactly one revertible commit.
     The proposal file is untracked, so it never enters git; deleting it leaves a
     clean tree after the commit."""
-    entity = scope.require_entity(entity)
-    prop = get_proposal(scope, entity, proposal_id)
+    prop = get_proposal(scope, proposal_id)
     vault = scope.root
     src = scope.resolve_stored(prop.src)
     dst = scope.resolve_stored(prop.dst)
@@ -180,10 +186,9 @@ def approve(scope: Scope, entity: str, proposal_id: str) -> Proposal:
     return prop
 
 
-def reject(scope: Scope, entity: str, proposal_id: str) -> Proposal:
+def reject(scope: Scope, proposal_id: str) -> Proposal:
     """Discard the proposal. No move, no commit — the proposal was never
     tracked."""
-    entity = scope.require_entity(entity)
-    prop = get_proposal(scope, entity, proposal_id)
+    prop = get_proposal(scope, proposal_id)
     prop.path.unlink(missing_ok=True)
     return prop

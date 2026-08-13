@@ -37,13 +37,12 @@ def split_front_matter(text: str) -> tuple[dict, str]:
     return fm, text[end + 3:].lstrip("\n")
 
 
-def read_inbox(scope: Scope, entity: str) -> list[InboxItem]:
-    entity = scope.require_entity(entity)
-    d = scope.resolve("00-inbox", "active")
-    if not d.is_dir():
+def read_inbox(scope: Scope) -> list[InboxItem]:
+    directory = scope.resolve("00-inbox", "active")
+    if not directory.is_dir():
         return []
     items: list[InboxItem] = []
-    for discovered in sorted(d.glob("*.md")):
+    for discovered in sorted(directory.glob("*.md")):
         p = scope.resolve_stored(scope.vault_relative(discovered))
         fm, body = split_front_matter(p.read_text(encoding="utf-8"))
         if fm.get("sub") != "triage":
