@@ -17,9 +17,12 @@ from app.outbox import (
     reject,
 )
 from tests.conftest import (
+    git_changed_paths,
     git_count_commits,
+    git_head,
     git_head_message,
     git_is_clean,
+    git_tracked_paths,
     git_vault,
 )
 
@@ -107,19 +110,46 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
     assert git_is_clean(vault)
 
 
-def test_approved_action_is_cleanly_revertible(tmp_path):
-    """Invariant 2 / exit-gate 2: exactly one commit, git revert undoes it with
-    no manual cleanup."""
+def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
     import subprocess
 
-    vault = _vault(tmp_path)
-    scope, prop = _propose(vault)
-    approve(scope, "demo", prop.id)
+    from app.ingest.adapters.folder import process_drop
 
-    subprocess.run(["git", "revert", "--no-edit", "HEAD"], cwd=vault, check=True,
-                   capture_output=True)
-    assert scope.resolve("demo", "00-inbox", "active", "note.md").exists()
-    assert not scope.resolve("demo", "11-knowledge", "active", "note.md").exists()
+    vault = git_vault(tmp_path / "vault", {
+        "synthetic/00-inbox/active/.gitkeep": "",
+        "synthetic/11-library/active/.gitkeep": "",
+    })
+    source = tmp_path / "dropbox/research.txt"
+    source.parent.mkdir()
+    source.write_text("Synthetic research summary.\n", encoding="utf-8")
+    result = process_drop(vault, "synthetic", source, raw_archive=tmp_path / "raw")
+    ingest_oid = git_head(vault)
+    triage_rel = result.path.relative_to(vault).as_posix()
+
+    assert git_head_message(vault) == "ingest: add redacted receipt"
+    assert git_changed_paths(vault) == [triage_rel]
+    assert triage_rel in git_tracked_paths(vault)
+
+    scope = Scope(vault)
+    prop = propose_classification(
+        scope, "synthetic", result.path,
+        module="11-library", sub="reference", block="govern",
+        rule_id="synthetic-rule",
+    )
+    approve(scope, "synthetic", prop.id)
+    approval_oid = git_head(vault)
+
+    assert approval_oid != ingest_oid
+    assert git_head_message(vault).startswith("outbox: approve")
+    assert git_count_commits(vault) == 3
+
+    subprocess.run(
+        ["git", "revert", "--no-edit", approval_oid], cwd=vault,
+        check=True, capture_output=True,
+    )
+    assert result.path.exists()
+    assert triage_rel in git_tracked_paths(vault)
+    assert not (vault / prop.dst).exists()
     assert git_is_clean(vault)
 
 
