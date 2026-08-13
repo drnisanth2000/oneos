@@ -152,3 +152,21 @@ def test_occupied_destination_is_not_overwritten(tmp_path):
     with pytest.raises(IngestPathCollision):
         commit_inbox_item(scope, "synthetic", **_kwargs())
     assert path.read_text(encoding="utf-8") == "unrelated existing bytes\n"
+
+
+def test_cleanup_never_deletes_receipt_bytes_changed_by_another_actor(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    scope = Scope(vault)
+    path, _env, _rendered = prepare_inbox_item(scope, "synthetic", **_kwargs())
+    real_git = ingest_base._git
+
+    def failing_git(local_scope, *args, check=True):
+        if args and args[0] == "commit":
+            path.write_text("concurrent bytes\n", encoding="utf-8")
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        return real_git(local_scope, *args, check=check)
+
+    monkeypatch.setattr(ingest_base, "_git", failing_git)
+    with pytest.raises(IngestCommitError, match="cleanup failed"):
+        commit_inbox_item(scope, "synthetic", **_kwargs())
+    assert path.read_text(encoding="utf-8") == "concurrent bytes\n"
