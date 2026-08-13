@@ -158,9 +158,13 @@ def _cleanup_attempt(
     path: Path,
     rendered: str,
     created_dirs: list[Path],
+    expected_head: str,
 ) -> None:
     rel = _relative(scope, path)
     failures: list[str] = []
+    current_head = _git(scope, "rev-parse", "HEAD", check=False).stdout.strip()
+    if current_head != expected_head:
+        raise IngestCommitError("repository HEAD changed during receipt commit")
     reset = _git(scope, "reset", "-q", "HEAD", "--", rel, check=False)
     if reset.returncode:
         failures.append("could not unstage attempted receipt")
@@ -202,14 +206,16 @@ def _tracked_markdown_paths(scope: Scope, entity: str) -> list[Path]:
 
 def find_tracked_receipt(scope: Scope, entity: str, envelope: Envelope) -> Path | None:
     _require_git_head(scope)
+    exact: Path | None = None
     for path in _tracked_markdown_paths(scope, entity):
         fm, _body = split_front_matter(path.read_text(encoding="utf-8"))
         if fm.get("source") != envelope.source or str(fm.get("source_id")) != envelope.source_id:
             continue
         if str(fm.get("sha256")) == envelope.sha256:
-            return path
-        raise IngestIdentityConflict("source identity already has different content")
-    return None
+            exact = path
+        else:
+            raise IngestIdentityConflict("source identity already has different content")
+    return exact
 
 
 def commit_inbox_item(scope: Scope, entity: str, **kwargs) -> IngestResult:
@@ -218,7 +224,12 @@ def commit_inbox_item(scope: Scope, entity: str, **kwargs) -> IngestResult:
     existing = find_tracked_receipt(scope, entity, env)
     if existing is not None:
         return IngestResult(existing, env, False, None)
-    if path.exists():
+    rel = _relative(scope, path)
+    tracked_destination = (
+        _git(scope, "ls-files", "--error-unmatch", "--", rel, check=False).returncode == 0
+        or _git(scope, "cat-file", "-e", f"HEAD:{rel}", check=False).returncode == 0
+    )
+    if path.exists() or tracked_destination:
         raise IngestPathCollision("receipt destination already exists")
 
     created_dirs: list[Path] = []
@@ -227,7 +238,7 @@ def commit_inbox_item(scope: Scope, entity: str, **kwargs) -> IngestResult:
         created_dirs.append(current)
         current = current.parent
 
-    rel = _relative(scope, path)
+    expected_head = _git(scope, "rev-parse", "HEAD").stdout.strip()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(rendered, encoding="utf-8")
@@ -235,7 +246,7 @@ def commit_inbox_item(scope: Scope, entity: str, **kwargs) -> IngestResult:
         _git(scope, "commit", "--only", "-m", "ingest: add redacted receipt", "--", rel)
     except (OSError, subprocess.CalledProcessError) as exc:
         try:
-            _cleanup_attempt(scope, path, rendered, created_dirs)
+            _cleanup_attempt(scope, path, rendered, created_dirs, expected_head)
         except IngestCommitError as cleanup_exc:
             raise IngestCommitError(
                 f"receipt commit failed; cleanup failed: {cleanup_exc}"

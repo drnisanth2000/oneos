@@ -170,3 +170,62 @@ def test_cleanup_never_deletes_receipt_bytes_changed_by_another_actor(tmp_path, 
     with pytest.raises(IngestCommitError, match="cleanup failed"):
         commit_inbox_item(scope, "synthetic", **_kwargs())
     assert path.read_text(encoding="utf-8") == "concurrent bytes\n"
+
+
+def test_cleanup_never_deletes_receipt_committed_by_another_intake(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    scope = Scope(vault)
+    path, _env, rendered = prepare_inbox_item(scope, "synthetic", **_kwargs())
+    real_git = ingest_base._git
+
+    def concurrent_commit(local_scope, *args, check=True):
+        if args and args[0] == "commit":
+            subprocess.run(
+                ["git", "commit", "--only", "-m", "ingest: add redacted receipt", "--",
+                 path.relative_to(vault).as_posix()],
+                cwd=vault, check=True, capture_output=True, text=True,
+            )
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        return real_git(local_scope, *args, check=check)
+
+    monkeypatch.setattr(ingest_base, "_git", concurrent_commit)
+    with pytest.raises(IngestCommitError, match="cleanup failed"):
+        commit_inbox_item(scope, "synthetic", **_kwargs())
+    assert path.read_text(encoding="utf-8") == rendered
+    assert path.relative_to(vault).as_posix() in git_tracked_paths(vault)
+    assert git_is_clean(vault)
+
+
+def test_mixed_exact_and_conflicting_tracked_identity_is_rejected(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault)
+    exact = commit_inbox_item(scope, "synthetic", **_kwargs())
+    conflict = vault / "synthetic/11-library/active/conflict.md"
+    conflict.parent.mkdir(parents=True)
+    text = exact.path.read_text(encoding="utf-8").replace(
+        "sha256: " + "0123456789abcdef" * 4,
+        "sha256: " + "fedcba9876543210" * 4,
+    )
+    conflict.write_text(text, encoding="utf-8")
+    subprocess.run(["git", "add", "--", conflict.relative_to(vault)], cwd=vault, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fixture: mixed identity"], cwd=vault, check=True)
+
+    with pytest.raises(IngestIdentityConflict):
+        commit_inbox_item(scope, "synthetic", **_kwargs())
+
+
+def test_staged_deletion_at_destination_is_a_collision_and_is_preserved(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault)
+    result = commit_inbox_item(scope, "synthetic", **_kwargs())
+    rel = result.path.relative_to(vault).as_posix()
+    result.path.unlink()
+    subprocess.run(["git", "add", "--", rel], cwd=vault, check=True)
+    head_before = git_head(vault)
+
+    with pytest.raises(IngestPathCollision):
+        commit_inbox_item(scope, "synthetic", **_kwargs())
+
+    assert git_head(vault) == head_before
+    assert git_index_paths(vault) == [rel]
+    assert not result.path.exists()
