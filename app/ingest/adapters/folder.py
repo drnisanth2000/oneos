@@ -114,8 +114,8 @@ def process_drop(
         "slug_seed": digest,
     }
 
-    _path, env, _rendered = prepare_inbox_item(scope, entity, **kwargs)
-    existing = find_tracked_receipt(scope, entity, env)
+    _path, env, _rendered = prepare_inbox_item(scope, **kwargs)
+    existing = find_tracked_receipt(scope, env)
     if existing is not None:
         return IngestResult(existing, env, False, None)
     if archived.exists():
@@ -124,7 +124,7 @@ def process_drop(
     raw_archive.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(archived))
     try:
-        result = commit_inbox_item(scope, entity, **kwargs)
+        result = commit_inbox_item(scope, **kwargs)
     except IngestError as exc:
         try:
             _restore_raw(archived, src, "receipt commit failed")

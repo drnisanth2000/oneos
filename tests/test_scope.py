@@ -9,6 +9,7 @@ from app.entities import (
     EntityDefinition,
     EntityManifestError,
     EntitySelectionError,
+    RecipientConfigurationError,
 )
 from app.inbox import read_inbox
 from app.scope import CrossScopeError, Scope
@@ -21,13 +22,14 @@ def test_catalog_preserves_manifest_order_and_public_entity_fields(tmp_path):
     catalog = EntityCatalog.load(tmp_path)
 
     assert catalog.entities == (
-        EntityDefinition(slug="beta", label="Beta", flags=()),
-        EntityDefinition(slug="alpha", label="Alpha", flags=()),
+        EntityDefinition(slug="beta", label="Beta", flags=(), email_addresses=()),
+        EntityDefinition(slug="alpha", label="Alpha", flags=(), email_addresses=()),
     )
     assert tuple(field.name for field in dataclasses.fields(EntityDefinition)) == (
         "slug",
         "label",
         "flags",
+        "email_addresses",
     )
 
 
@@ -64,8 +66,73 @@ def test_catalog_rejects_non_string_labels(tmp_path, label):
 def test_catalog_defaults_null_entity_fields(tmp_path):
     write_vault(tmp_path, 'version: "1.0"\nentities:\n  alpha: null\n')
     assert EntityCatalog.load(tmp_path).entities == (
-        EntityDefinition(slug="alpha", label="alpha", flags=()),
+        EntityDefinition(slug="alpha", label="alpha", flags=(), email_addresses=()),
     )
+
+
+def test_manifest_normalizes_recipient_addresses_case_insensitively(tmp_path):
+    write_vault(tmp_path, entities_yaml(
+        "alpha", ingest={"alpha": [" Intake-Alpha@Example.Invalid "]}
+    ))
+    catalog = EntityCatalog.load(tmp_path)
+    assert catalog.entity_for_recipient("intake-alpha@example.invalid") == "alpha"
+    assert catalog.entities[0].email_addresses == ("intake-alpha@example.invalid",)
+
+
+@pytest.mark.parametrize("value", ["", "not-an-address", "a@", "@example.invalid"])
+def test_manifest_rejects_malformed_recipient_address(tmp_path, value):
+    write_vault(tmp_path, entities_yaml("alpha", ingest={"alpha": [value]}))
+    with pytest.raises(RecipientConfigurationError):
+        EntityCatalog.load(tmp_path)
+
+
+def test_manifest_rejects_duplicate_normalized_address_ownership(tmp_path):
+    write_vault(tmp_path, entities_yaml(
+        "alpha", "beta", ingest={
+            "alpha": ["shared@example.invalid"],
+            "beta": ["SHARED@example.invalid"],
+        },
+    ))
+    with pytest.raises(RecipientConfigurationError, match="duplicate ownership"):
+        EntityCatalog.load(tmp_path)
+
+
+def test_manifest_deduplicates_repeated_addresses_owned_by_one_entity(tmp_path):
+    write_vault(tmp_path, entities_yaml(
+        "alpha", ingest={
+            "alpha": ["shared@example.invalid", "SHARED@example.invalid"]
+        },
+    ))
+    catalog = EntityCatalog.load(tmp_path)
+    assert catalog.entities[0].email_addresses == ("shared@example.invalid",)
+    assert catalog.entity_for_recipient("shared@example.invalid") == "alpha"
+
+
+@pytest.mark.parametrize("ingest", ["[]", "false", '"email"'])
+def test_manifest_rejects_non_mapping_ingest_configuration(tmp_path, ingest):
+    manifest = f'version: "1.0"\nentities:\n  alpha:\n    flags: []\n    ingest: {ingest}\n'
+    write_vault(tmp_path, manifest)
+    with pytest.raises(RecipientConfigurationError):
+        EntityCatalog.load(tmp_path)
+
+
+@pytest.mark.parametrize("addresses", ["{}", "false", '"address@example.invalid"'])
+def test_manifest_rejects_non_list_email_addresses(tmp_path, addresses):
+    manifest = (
+        'version: "1.0"\nentities:\n  alpha:\n    flags: []\n'
+        f'    ingest:\n      email_addresses: {addresses}\n'
+    )
+    write_vault(tmp_path, manifest)
+    with pytest.raises(RecipientConfigurationError):
+        EntityCatalog.load(tmp_path)
+
+
+def test_entity_without_ingest_configuration_remains_selectable(tmp_path):
+    write_vault(tmp_path, entities_yaml("alpha"))
+    catalog = EntityCatalog.load(tmp_path)
+    assert catalog.entities[0].email_addresses == ()
+    assert catalog.entity_for_recipient("unknown@example.invalid") is None
+    assert Scope(tmp_path, "alpha").current_entity() == "alpha"
 
 
 def test_scope_accepts_only_registered_entity(tmp_path):

@@ -6,6 +6,7 @@ rule"). Every test builds its own throwaway vault with invented slugs, so the
 same code that drives the real system drives these.
 """
 from pathlib import Path
+import json
 import subprocess
 import textwrap
 
@@ -51,7 +52,7 @@ def entities_yaml(*slugs: str, ingest: dict[str, list[str]] | None = None) -> st
         if addresses:
             rows.append("    ingest:")
             rows.append("      email_addresses:")
-            rows.extend(f"        - {address}" for address in addresses)
+            rows.extend(f"        - {json.dumps(address)}" for address in addresses)
     return "\n".join(rows) + "\n"
 
 
@@ -98,9 +99,11 @@ def git_entity_vault(
     root: Path,
     entities: tuple[str, ...],
     files: dict[str, str],
+    *,
+    ingest: dict[str, list[str]] | None = None,
 ) -> Path:
     tree = dict(files)
-    tree.setdefault("_system/entities.yaml", entities_yaml(*entities))
+    tree.setdefault("_system/entities.yaml", entities_yaml(*entities, ingest=ingest))
     return git_vault(root, tree)
 
 

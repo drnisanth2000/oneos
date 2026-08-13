@@ -93,7 +93,6 @@ def render_note(env: Envelope, entity: str) -> str:
 
 def prepare_inbox_item(
     scope: Scope,
-    entity: str,
     *,
     text: str,
     title: str,
@@ -110,7 +109,7 @@ def prepare_inbox_item(
     attachments: list[str] | None = None,
     slug_seed: str | None = None,
 ) -> tuple[Path, Envelope, str]:
-    entity = scope.require_entity(entity)
+    entity = scope.current_entity()
     if not sha256:
         raise IngestRepositoryError("adapter receipt requires sha256")
     redacted, matches = redact(text)
@@ -187,9 +186,8 @@ def _cleanup_attempt(
         raise IngestCommitError("; ".join(failures))
 
 
-def _tracked_markdown_paths(scope: Scope, entity: str) -> list[Path]:
-    entity = scope.require_entity(entity)
-    prefix = f"{entity}/"
+def _tracked_markdown_paths(scope: Scope) -> list[Path]:
+    prefix = f"{scope.current_entity()}/"
     output = _git(scope, "ls-files", "--", prefix).stdout
     paths: list[Path] = []
     for rel in output.splitlines():
@@ -206,11 +204,10 @@ def _tracked_markdown_paths(scope: Scope, entity: str) -> list[Path]:
     return paths
 
 
-def find_tracked_receipt(scope: Scope, entity: str, envelope: Envelope) -> Path | None:
-    entity = scope.require_entity(entity)
+def find_tracked_receipt(scope: Scope, envelope: Envelope) -> Path | None:
     _require_git_head(scope)
     exact: Path | None = None
-    for path in _tracked_markdown_paths(scope, entity):
+    for path in _tracked_markdown_paths(scope):
         fm, _body = split_front_matter(path.read_text(encoding="utf-8"))
         if fm.get("source") != envelope.source or str(fm.get("source_id")) != envelope.source_id:
             continue
@@ -221,11 +218,10 @@ def find_tracked_receipt(scope: Scope, entity: str, envelope: Envelope) -> Path 
     return exact
 
 
-def commit_inbox_item(scope: Scope, entity: str, **kwargs) -> IngestResult:
-    entity = scope.require_entity(entity)
+def commit_inbox_item(scope: Scope, **kwargs) -> IngestResult:
     _require_git_head(scope)
-    path, env, rendered = prepare_inbox_item(scope, entity, **kwargs)
-    existing = find_tracked_receipt(scope, entity, env)
+    path, env, rendered = prepare_inbox_item(scope, **kwargs)
+    existing = find_tracked_receipt(scope, env)
     if existing is not None:
         return IngestResult(existing, env, False, None)
     rel = _relative(scope, path)
