@@ -12,6 +12,11 @@ from app.entities import (
     RecipientConfigurationError,
 )
 from app.inbox import read_inbox
+from app.ingest.adapters.email import process_email
+from app.ingest.adapters.folder import process_drop
+from app.ingest.base import commit_inbox_item, find_tracked_receipt, prepare_inbox_item
+from app.outbox import approve, load_proposals, reject
+from app.registry import execute_delete, propose_delete, reference_count
 from app.scope import CrossScopeError, Scope
 from tests.conftest import entities_yaml, write_vault
 
@@ -163,17 +168,31 @@ def test_scope_is_immutable(tmp_path):
         scope._entity = "beta"
 
 
-def test_legacy_entity_guard_rejects_cross_scope_argument(tmp_path):
-    write_vault(tmp_path, entities_yaml("alpha", "beta"))
-    scope = Scope(tmp_path, "alpha")
-    assert scope.require_entity("alpha") == "alpha"
-    with pytest.raises(CrossScopeError):
-        scope.require_entity("beta")
-
-
 def test_inbox_interface_has_one_identity_authority(tmp_path):
     write_vault(tmp_path, entities_yaml("alpha", "beta"))
     assert tuple(inspect.signature(read_inbox).parameters) == ("scope",)
+
+
+def test_entity_sensitive_interfaces_take_only_bound_scope():
+    checks = (
+        read_inbox,
+        load_proposals,
+        approve,
+        reject,
+        reference_count,
+        propose_delete,
+        execute_delete,
+        prepare_inbox_item,
+        find_tracked_receipt,
+        commit_inbox_item,
+        process_email,
+        process_drop,
+    )
+
+    for function in checks:
+        parameters = inspect.signature(function).parameters
+        assert "entity" not in parameters
+        assert "scope" in parameters
 
 
 def test_stored_path_must_name_bound_entity(tmp_path):

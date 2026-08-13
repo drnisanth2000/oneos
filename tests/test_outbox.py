@@ -191,7 +191,9 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
     source = tmp_path / "dropbox/research.txt"
     source.parent.mkdir()
     source.write_text("Synthetic research summary.\n", encoding="utf-8")
-    result = process_drop(vault, "synthetic", source, raw_archive=tmp_path / "raw")
+    result = process_drop(
+        Scope(vault, "synthetic"), source, raw_archive=tmp_path / "raw"
+    )
     ingest_oid = git_head(vault)
     triage_rel = result.path.relative_to(vault).as_posix()
 

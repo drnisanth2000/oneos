@@ -195,7 +195,9 @@ def test_same_filter_and_envelope_as_folder_no_second_path(tmp_path):
     drop.parent.mkdir(parents=True)
     drop.write_text(body)
     fvault = git_entity_vault(tmp_path / "vf", ("synthetic",), {"synthetic/00-inbox/active/.gitkeep": ""})
-    fnote = process_drop(fvault, "synthetic", drop, raw_archive=tmp_path / "raw").path
+    fnote = process_drop(
+        Scope(fvault, "synthetic"), drop, raw_archive=tmp_path / "raw"
+    ).path
     ffm, fbody = split_front_matter(fnote.read_text())
 
     assert ebody.strip() == fbody.strip()                  # identical redaction

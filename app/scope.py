@@ -29,11 +29,6 @@ class Scope:
     def current_entity(self) -> str:
         return self._entity
 
-    def require_entity(self, entity: str) -> str:
-        if entity != self._entity:
-            raise CrossScopeError("entity argument disagrees with selected scope")
-        return self._entity
-
     def resolve(self, *parts: str | Path) -> Path:
         anchor = self._root / self._entity
         base = anchor.resolve()

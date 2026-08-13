@@ -75,34 +75,29 @@ def extract_text(path: Path) -> str:
 
 
 def process_drop(
-    vault: Path | str,
-    entity: str,
-    src: Path | str,
+    scope: Scope,
+    source: Path | str,
     *,
     raw_archive: Path | str,
-    scope: Scope | None = None,
     now: datetime | None = None,
 ) -> IngestResult:
     """Ingest one dropped file. Returns the shared ingest result.
     The raw original is moved into `raw_archive` (outside the vault); only the
     redacted note enters the vault via the shared write path."""
-    vault = Path(vault)
-    src = Path(src)
-    raw_archive = Path(raw_archive)
-    scope = scope or Scope(vault, entity)
-    entity = scope.require_entity(entity)
+    source_path = Path(source)
+    archive_root = Path(raw_archive)
     now = now or datetime.now()
 
-    digest = sha256_of(src)
-    size = src.stat().st_size
-    mime = mime_of(src)
-    text = extract_text(src)
+    digest = sha256_of(source_path)
+    size = source_path.stat().st_size
+    mime = mime_of(source_path)
+    text = extract_text(source_path)
 
-    archived = raw_archive / f"{digest[:16]}-{src.name}"
+    archived = archive_root / f"{digest[:16]}-{source_path.name}"
     source_ref = f"raw:{archived.name}"
     kwargs = {
         "text": text,
-        "title": src.name,
+        "title": source_path.name,
         "source": "folder",
         "source_id": digest[:16],
         "received_at": now.isoformat(timespec="seconds"),
@@ -121,18 +116,18 @@ def process_drop(
     if archived.exists():
         raise IngestPathCollision("raw archive destination already exists")
 
-    raw_archive.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(archived))
+    archive_root.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_path), str(archived))
     try:
         result = commit_inbox_item(scope, **kwargs)
     except IngestError as exc:
         try:
-            _restore_raw(archived, src, "receipt commit failed")
+            _restore_raw(archived, source_path, "receipt commit failed")
         except FolderSourceRestoreError as restore_exc:
             raise restore_exc from exc
         raise
     if not result.created:
-        _restore_raw(archived, src, "duplicate detected after archive")
+        _restore_raw(archived, source_path, "duplicate detected after archive")
     return result
 
 
@@ -143,19 +138,21 @@ def watch(
     raw_archive: Path | str,
 ) -> None:  # pragma: no cover - I/O glue over process_drop
     """Block, processing every file that lands in `dropbox`."""
+    scope = Scope(vault, entity)
+
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
 
-    dropbox = Path(dropbox)
-    dropbox.mkdir(parents=True, exist_ok=True)
+    dropbox_path = Path(dropbox)
+    dropbox_path.mkdir(parents=True, exist_ok=True)
 
     class _Handler(FileSystemEventHandler):
         def on_created(self, event):
             if not event.is_directory:
-                process_drop(vault, entity, event.src_path, raw_archive=raw_archive)
+                process_drop(scope, event.src_path, raw_archive=raw_archive)
 
     observer = Observer()
-    observer.schedule(_Handler(), str(dropbox), recursive=False)
+    observer.schedule(_Handler(), str(dropbox_path), recursive=False)
     observer.start()
     try:
         while True:
