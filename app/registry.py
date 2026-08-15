@@ -195,7 +195,9 @@ def _delete_proposal_path(scope: Scope, proposal_id: str) -> Path:
     resolved_outbox = scope.resolve("outbox")
     if resolved_outbox != bound_outbox:
         raise CrossScopeError("outbox redirects outside the bound outbox")
-    candidate = (resolved_outbox / f"{proposal_id}.yaml").resolve()
+    candidate = resolved_outbox / f"{proposal_id}.yaml"
+    if candidate.is_symlink():
+        raise CrossScopeError("delete proposal redirects from the requested leaf")
     if candidate.parent != resolved_outbox:
         raise CrossScopeError("delete proposal leaves the bound outbox")
     return candidate

@@ -6,8 +6,10 @@ that shows what breaks before it runs, and refuses if references remain
 """
 import inspect
 import sqlite3
+import subprocess
 import textwrap
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 import yaml
@@ -35,6 +37,50 @@ class _FixedDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
         return cls(2026, 8, 15, 9, 7, 3, tzinfo=tz)
+
+
+def _vault_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
+    entries = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries.append((relative, "symlink", path.readlink().as_posix()))
+        elif path.is_dir():
+            entries.append((relative, "directory", ""))
+        else:
+            entries.append((relative, "file", path.read_bytes()))
+    return tuple(sorted(entries))
+
+
+def _registry_delete_state(vault: Path) -> dict[str, bytes | tuple]:
+    def git_bytes(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": git_bytes("rev-parse", "HEAD"),
+        "status": git_bytes("status", "--porcelain=v1", "-z"),
+        "index": git_bytes("diff", "--cached", "--binary"),
+        "worktree": git_bytes("diff", "--binary"),
+        "tree": _vault_tree(vault),
+    }
+
+
+def _same_outbox_leaf_alias(scope: Scope, monkeypatch):
+    first_id = "20260815T090703-" + "ab" * 16
+    second_id = "20260815T090703-" + "cd" * 16
+    proposal_ids = iter((first_id, second_id))
+    monkeypatch.setattr(
+        registry,
+        "proposal_id_candidates",
+        lambda created: iter((next(proposal_ids),)),
+    )
+    first = propose_delete(scope, "product", "widgetx")
+    second = propose_delete(scope, "product", "widgetx")
+    first.path.unlink()
+    first.path.symlink_to(second.path)
+    return first, second
 
 
 def _products_vault(tmp_path, referenced=True):
@@ -499,6 +545,28 @@ def test_forged_delete_proposal_cannot_be_read_or_executed(
 
     assert scope.system_path("products.yaml").read_bytes() == registry_before
     assert git_head(two_entity_registry_vault) == head_before
+
+
+def test_same_outbox_leaf_symlink_cannot_redirect_requested_delete(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    requested, target = _same_outbox_leaf_alias(scope, monkeypatch)
+    target_before = target.path.read_bytes()
+    registry_path = scope.system_path("products.yaml")
+    registry_before = registry_path.read_bytes()
+    state_before = _registry_delete_state(vault)
+
+    with pytest.raises(CrossScopeError):
+        get_delete_proposal(scope, requested.id)
+    with pytest.raises(CrossScopeError):
+        execute_delete(scope, requested.id)
+
+    assert target.path.read_bytes() == target_before
+    assert registry_path.read_bytes() == registry_before
+    assert "widgetx:" in registry_path.read_text(encoding="utf-8")
+    assert _registry_delete_state(vault) == state_before
 
 
 def test_delete_proposal_read_rejects_cross_entity_leaf_symlink(
