@@ -4,7 +4,7 @@
 
 **Status:** Approved
 
-**Base:** S3 server-owned destinations (`7545e31`), merged by PR #6, plus the separate post-merge Gitleaks baseline hotfix (`8706e1f`)
+**Base:** `origin/main` at `90b753b` (S3 plus merged S1 containment), plus the rebased local Gitleaks baseline hotfix (`24da1f6`)
 
 ## Objective
 
