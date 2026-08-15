@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-15
 
-**Status:** Approved in design discussion; awaiting written-spec review
+**Status:** Approved for implementation planning
 
 **Authority:** `BUILD.md` Safety Foundation, the private OneOS specification,
 the authoritative vault conventions, and the approved module-general decision
