@@ -7,6 +7,7 @@ that shows what breaks before it runs, and refuses if references remain
 import inspect
 import sqlite3
 import textwrap
+from datetime import datetime
 
 import pytest
 import yaml
@@ -28,6 +29,12 @@ from tests.conftest import (
     git_head_message,
     git_is_clean,
 )
+
+
+class _FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 8, 15, 9, 7, 3, tzinfo=tz)
 
 
 def _products_vault(tmp_path, referenced=True):
@@ -291,6 +298,35 @@ def test_propose_delete_keeps_untrusted_slug_out_of_proposal_filename(tmp_path):
     assert target.read_bytes() == original
 
 
+def test_same_second_delete_proposals_are_distinct_and_preserved(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    monkeypatch.setattr(registry, "datetime", _FixedDatetime)
+
+    first = propose_delete(scope, "product", "widgetx")
+    second = propose_delete(scope, "product", "widgetx")
+
+    assert first.id != second.id
+    assert first.path != second.path
+    assert first.path.exists() and second.path.exists()
+    assert first.path.stem == first.id
+    assert second.path.stem == second.id
+
+
+def test_delete_record_id_must_equal_filename(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record["id"] = "20260815T090703-" + "ab" * 16
+    prop.path.write_text(yaml.safe_dump(record), encoding="utf-8")
+
+    with pytest.raises(RegistryError):
+        get_delete_proposal(scope, prop.path.stem)
+
+
 def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
     scope = Scope(vault, "demo")
@@ -396,18 +432,19 @@ def test_delete_proposal_read_rejects_cross_entity_leaf_symlink(
     two_entity_registry_vault,
 ):
     scope = Scope(two_entity_registry_vault, "alpha")
-    foreign = two_entity_registry_vault / "beta/outbox/foreign-delete.yaml"
+    proposal_id = "20260815T090703-" + "ab" * 16
+    foreign = two_entity_registry_vault / "beta/outbox" / f"{proposal_id}.yaml"
     foreign.parent.mkdir(parents=True, exist_ok=True)
     foreign.write_text(
-        "id: foreign-delete\naction: delete\nentity: beta\nkind: product\nslug: unused\n",
+        f"id: {proposal_id}\naction: delete\nentity: beta\nkind: product\nslug: unused\n",
         encoding="utf-8",
     )
-    linked = scope.resolve("outbox") / "linked-delete.yaml"
+    linked = scope.resolve("outbox") / f"{proposal_id}.yaml"
     linked.parent.mkdir(parents=True, exist_ok=True)
     linked.symlink_to(foreign)
 
     with pytest.raises(CrossScopeError):
-        get_delete_proposal(scope, "linked-delete")
+        get_delete_proposal(scope, proposal_id)
 
 
 def test_registry_interfaces_have_one_identity_authority():
