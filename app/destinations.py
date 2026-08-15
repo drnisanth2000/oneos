@@ -84,10 +84,16 @@ def resolve_classification_destination(
     source = Path(item_path)
     leaf = source.name
     _require_markdown_leaf(leaf)
-    expected_source = scope.resolve("00-inbox", "active", leaf)
-    if source.resolve() != expected_source:
+    expected_source = scope.root / entity / "00-inbox" / "active" / leaf
+    if source != expected_source:
         raise InvalidSourceLeaf("source is not the canonical inbox receipt")
-    if require_source and (not expected_source.is_file() or expected_source.is_symlink()):
+    inbox_dir = _require_real_directory(scope, "00-inbox")
+    inbox_active_dir = _require_real_directory(scope, "00-inbox", "active")
+    if inbox_active_dir.parent != inbox_dir:
+        raise UnsafeDestinationPath("inbox lifecycle directory is redirected")
+    if expected_source.is_symlink() or (
+        require_source and not expected_source.is_file()
+    ):
         raise InvalidSourceLeaf("source receipt is missing or redirected")
 
     if not isinstance(module, str) or module != module.strip():

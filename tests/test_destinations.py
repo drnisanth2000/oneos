@@ -299,6 +299,50 @@ def test_resolver_allows_missing_canonical_source_when_not_required(destination_
     assert result.dst == "alpha/11-library/active/missing.md"
 
 
+@pytest.mark.parametrize("require_source", (True, False), ids=("required", "optional"))
+def test_resolver_rejects_redirected_source_leaf(destination_vault, require_source):
+    scope = Scope(destination_vault, "alpha")
+    source = destination_vault / "alpha" / "00-inbox" / "active" / "receipt.md"
+    source.unlink()
+    (source.parent / "target.md").write_text("redirect target\n", encoding="utf-8")
+    source.symlink_to("target.md")
+
+    _assert_rejection_is_read_only(
+        destination_vault,
+        InvalidSourceLeaf,
+        lambda: resolve_classification_destination(
+            scope,
+            source,
+            module="11-library",
+            sub="reference",
+            require_source=require_source,
+        ),
+    )
+
+
+@pytest.mark.parametrize("part", ("00-inbox", "active"))
+def test_resolver_rejects_redirected_inbox_lifecycle(destination_vault, part):
+    scope = Scope(destination_vault, "alpha")
+    inbox = destination_vault / "alpha" / "00-inbox"
+    redirected = inbox if part == "00-inbox" else inbox / "active"
+    saved = destination_vault / "alpha" / f"saved-{part}"
+    redirected.rename(saved)
+    redirected.symlink_to(saved, target_is_directory=True)
+    source = destination_vault / "alpha" / "00-inbox" / "active" / "receipt.md"
+
+    _assert_rejection_is_read_only(
+        destination_vault,
+        UnsafeDestinationPath,
+        lambda: resolve_classification_destination(
+            scope,
+            source,
+            module="11-library",
+            sub="reference",
+            require_source=False,
+        ),
+    )
+
+
 def test_resolver_rejects_malformed_source_when_not_required(destination_vault):
     scope = Scope(destination_vault, "alpha")
     _assert_rejection_is_read_only(
