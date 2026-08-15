@@ -298,6 +298,79 @@ def test_propose_delete_keeps_untrusted_slug_out_of_proposal_filename(tmp_path):
     assert target.read_bytes() == original
 
 
+def test_propose_delete_rejects_redirected_outbox_without_creating_target(
+    tmp_path,
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    redirected = vault / "demo/redirected-outbox"
+    outbox_link = vault / "demo/outbox"
+    outbox_link.parent.mkdir(parents=True)
+    outbox_link.symlink_to(redirected)
+
+    with pytest.raises(CrossScopeError):
+        propose_delete(scope, "product", "widgetx")
+
+    assert not redirected.exists()
+
+
+def test_propose_delete_preserves_collision_before_writing_later_candidate(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    first_id = "20260815T090703-" + "ab" * 16
+    second_id = "20260815T090703-" + "cd" * 16
+    first_path = scope.resolve("outbox", f"{first_id}.yaml")
+    first_path.parent.mkdir(parents=True)
+    original = b"pre-existing collision\n"
+    first_path.write_bytes(original)
+    monkeypatch.setattr(
+        registry, "proposal_id_candidates", lambda created: iter((first_id, second_id))
+    )
+
+    proposal = propose_delete(scope, "product", "widgetx")
+
+    assert first_path.read_bytes() == original
+    assert proposal.id == second_id
+    assert proposal.path == scope.resolve("outbox", f"{second_id}.yaml")
+    assert proposal.path.exists()
+
+
+def test_propose_delete_raises_after_four_collisions_without_modifying_files(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    proposal_ids = tuple(
+        f"20260815T090703-{'ab' * 15}{suffix}"
+        for suffix in ("aa", "bb", "cc", "dd")
+    )
+    outbox = scope.resolve("outbox")
+    outbox.mkdir(parents=True)
+    originals = {
+        proposal_id: f"pre-existing {proposal_id}\n".encode()
+        for proposal_id in proposal_ids
+    }
+    for proposal_id, original in originals.items():
+        (outbox / f"{proposal_id}.yaml").write_bytes(original)
+    monkeypatch.setattr(
+        registry,
+        "proposal_id_candidates",
+        lambda created: iter(proposal_ids),
+    )
+
+    with pytest.raises(
+        RegistryError, match="^unable to allocate a unique delete proposal id$"
+    ):
+        propose_delete(scope, "product", "widgetx")
+
+    assert {
+        proposal_id: (outbox / f"{proposal_id}.yaml").read_bytes()
+        for proposal_id in proposal_ids
+    } == originals
+
+
 def test_same_second_delete_proposals_are_distinct_and_preserved(
     tmp_path, monkeypatch
 ):

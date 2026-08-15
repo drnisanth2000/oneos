@@ -206,10 +206,9 @@ def propose_delete(scope: Scope, kind: str, slug: str) -> DeleteProposal:
     entity = scope.current_entity()
     report = reference_count(scope, kind, slug)
     created_at = datetime.now()
-    outbox = scope.resolve("outbox")
-    outbox.mkdir(parents=True, exist_ok=True)
     for pid in proposal_id_candidates(created_at):
         path = _delete_proposal_path(scope, pid)
+        path.parent.mkdir(parents=True, exist_ok=True)
         record = {
             "id": pid,
             "action": "delete",
