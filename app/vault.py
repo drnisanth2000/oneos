@@ -19,6 +19,11 @@ from pathlib import Path
 import yaml
 
 from .entities import EntityCatalog, resolve_system_registry
+from .scope import Scope
+
+
+class DestinationRegistryError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,52 @@ class Vault:
             if required is None or required in active_flags:
                 out.append(name)
         return sorted(out)
+
+    def _entity_flags(self, scope: Scope) -> set[str]:
+        if scope.root != self.root:
+            raise DestinationRegistryError("scope and registry roots differ")
+        entity = self._catalog.require(scope.current_entity())
+        return self.resolve_flags(None, list(entity.flags))
+
+    def active_modules_for(self, scope: Scope) -> frozenset[str]:
+        return frozenset(self.active_modules(self._entity_flags(scope)))
+
+    def active_submodules_for(self, scope: Scope, module: str) -> frozenset[str]:
+        groups = self._archetypes.get("submodules") or {}
+        if not isinstance(groups, dict):
+            raise DestinationRegistryError("submodules registry must be a mapping")
+        entries = groups.get(module)
+        if entries is None:
+            entries = {}
+        if not isinstance(entries, dict):
+            raise DestinationRegistryError("module submodules must be a mapping")
+        flags = self._entity_flags(scope)
+        active: set[str] = set()
+        for sub, raw in entries.items():
+            if not isinstance(sub, str) or not isinstance(raw, dict):
+                raise DestinationRegistryError("submodule entry is malformed")
+            required = raw.get("flag")
+            if required is not None and not isinstance(required, str):
+                raise DestinationRegistryError("submodule flag must be a string")
+            if required is None or required in flags:
+                active.add(sub)
+        return frozenset(active)
+
+    def require_block(self, module: str) -> str:
+        spec = self.module_spec(module)
+        block = spec.get("block")
+        if not isinstance(block, str) or not block:
+            raise DestinationRegistryError("destination module has no block")
+        return block
+
+    def module_spec(self, module: str) -> dict:
+        modules = self._archetypes.get("modules")
+        if not isinstance(modules, dict) or module not in modules:
+            raise DestinationRegistryError("destination module is not declared")
+        spec = modules[module]
+        if not isinstance(spec, dict):
+            raise DestinationRegistryError("module registry entry is malformed")
+        return dict(spec)
 
     def _block_of(self, module: str) -> str:
         return self.block_of(module)

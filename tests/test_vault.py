@@ -11,15 +11,88 @@ import textwrap
 import pytest
 
 from app.entities import EntityCatalog, EntityManifestError
-from app.vault import Vault
-from tests.conftest import scaffold_modules
+from app.scope import Scope
+from app.vault import DestinationRegistryError, Vault
+from tests.conftest import scaffold_modules, write_vault
 
 ALL_MODULES = ["00-intake", "01-core", "02-work", "zz-extra"]
 BASE_MODULES = ["00-intake", "01-core", "02-work"]  # everything but the gated one
 
+DESTINATION_ARCHETYPES = """
+version: "2.0"
+flags:
+  special: "Enables specialized work"
+modules:
+  02-work: {block: build}
+  zz-extra: {block: self, requires_flag: special}
+submodules:
+  02-work:
+    general: {name: General}
+    specialized: {name: Specialized, flag: special}
+"""
+
 
 def counts(bundles):
     return {b.slug: len(b.modules) for b in bundles}
+
+
+def test_destination_registry_uses_bound_entity_flags_only(tmp_path):
+    root = write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  plain: {label: Plain, flags: []}\n'
+        '  enabled: {label: Enabled, flags: [special]}\n',
+        DESTINATION_ARCHETYPES,
+    )
+    vault = Vault(EntityCatalog.load(root))
+
+    plain = Scope(root, "plain")
+    enabled = Scope(root, "enabled")
+
+    assert "zz-extra" not in vault.active_modules_for(plain)
+    assert "zz-extra" in vault.active_modules_for(enabled)
+    assert vault.active_submodules_for(plain, "02-work") == frozenset({"general"})
+    assert vault.active_submodules_for(enabled, "02-work") == frozenset(
+        {"general", "specialized"}
+    )
+
+
+def test_destination_registry_rejects_wrong_submodule_shape(tmp_path):
+    root = write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n  01-core: {block: govern}\n'
+        'submodules:\n  01-core: [not-a-mapping]\n',
+    )
+    vault = Vault(EntityCatalog.load(root))
+    with pytest.raises(DestinationRegistryError):
+        vault.active_submodules_for(Scope(root, "alpha"), "01-core")
+
+
+def test_require_block_rejects_unknown_or_empty_mapping(tmp_path):
+    root = write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n  01-core: {}\n',
+    )
+    vault = Vault(EntityCatalog.load(root))
+    with pytest.raises(DestinationRegistryError):
+        vault.require_block("01-core")
+    with pytest.raises(DestinationRegistryError):
+        vault.require_block("missing")
+
+
+def test_module_spec_returns_copy_of_strict_mapping(tmp_path):
+    root = write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n'
+        '  01-core: {block: govern, lifecycle_pattern: false}\n',
+    )
+    vault = Vault(EntityCatalog.load(root))
+    spec = vault.module_spec("01-core")
+    assert spec == {"block": "govern", "lifecycle_pattern": False}
+    spec["block"] = "changed"
+    assert vault.require_block("01-core") == "govern"
 
 
 def test_discovers_every_bundle_from_entities_yaml(make_vault):
