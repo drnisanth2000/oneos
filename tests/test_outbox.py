@@ -9,6 +9,7 @@ Temp git vaults only; the real vault is never touched.
 import hashlib
 import inspect
 import re
+import subprocess
 import textwrap
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -81,6 +82,21 @@ def _vault_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
         else:
             entries.append((relative, "file", path.read_bytes()))
     return tuple(sorted(entries))
+
+
+def _approval_state(vault: Path):
+    def git_bytes(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": git_bytes("rev-parse", "HEAD"),
+        "status": git_bytes("status", "--porcelain=v1", "-z"),
+        "index": git_bytes("diff", "--cached", "--binary"),
+        "worktree": git_bytes("diff", "--binary"),
+        "tree": _vault_tree(vault),
+    }
 
 
 def _vault(tmp_path):
@@ -858,6 +874,64 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
 
     assert git_count_commits(vault) == before + 1
     assert git_head_message(vault).startswith("outbox: approve")
+    assert git_is_clean(vault)
+
+
+def test_approval_refuses_changed_source_without_any_added_mutation(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = scope.resolve("00-inbox", "active", "note.md")
+    source.write_bytes(source.read_bytes() + b"changed-after-proposal\n")
+    proposal_bytes = prop.path.read_bytes()
+    before = _approval_state(vault)
+
+    with pytest.raises(outbox.StaleProposalSource):
+        approve(scope, prop.id)
+
+    assert _approval_state(vault) == before
+    assert prop.path.read_bytes() == proposal_bytes
+    assert source.exists()
+    assert not scope.resolve("11-knowledge", "active", "note.md").exists()
+
+
+def test_approval_refuses_missing_source_and_preserves_proposal(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = scope.resolve("00-inbox", "active", "note.md")
+    source.unlink()
+    proposal_bytes = prop.path.read_bytes()
+    before = _approval_state(vault)
+
+    with pytest.raises(outbox.MissingProposalSource):
+        approve(scope, prop.id)
+
+    assert _approval_state(vault) == before
+    assert prop.path.read_bytes() == proposal_bytes
+    assert not scope.resolve("11-knowledge", "active", "note.md").exists()
+
+
+def test_approval_commits_bytes_from_verified_snapshot(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = scope.resolve("00-inbox", "active", "note.md")
+    reviewed_marker = b"Randomised trial protocol body."
+    raced_marker = b"replacement-after-verification"
+    real_git = outbox._git
+
+    def race_before_move(root, *args):
+        if args[:1] == ("mv",):
+            source.write_bytes(
+                source.read_bytes().replace(reviewed_marker, raced_marker)
+            )
+        return real_git(root, *args)
+
+    monkeypatch.setattr(outbox, "_git", race_before_move)
+
+    approve(scope, prop.id)
+
+    destination = scope.resolve("11-knowledge", "active", "note.md")
+    assert reviewed_marker in destination.read_bytes()
+    assert raced_marker not in destination.read_bytes()
     assert git_is_clean(vault)
 
 

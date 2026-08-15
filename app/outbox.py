@@ -37,6 +37,18 @@ class OutboxError(Exception):
     pass
 
 
+class ProposalFreshnessError(OutboxError):
+    pass
+
+
+class MissingProposalSource(ProposalFreshnessError):
+    pass
+
+
+class StaleProposalSource(ProposalFreshnessError):
+    pass
+
+
 class OutboxScopeError(OutboxError):
     pass
 
@@ -309,7 +321,7 @@ def _require_destination(scope: Scope, proposal: Proposal) -> Proposal:
     proposal = _require_scope(scope, proposal)
     _require_outbox_path(scope, proposal.path, require_leaf=True)
     try:
-        source = scope.resolve_stored(proposal.src)
+        source = scope.root / proposal.src
         canonical = resolve_classification_destination(
             scope,
             source,
@@ -339,14 +351,28 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
     clean tree after the commit."""
     prop = _require_destination(scope, get_proposal(scope, proposal_id))
     vault = scope.root
-    src = scope.resolve_stored(prop.src)
+    src = scope.root / prop.src
     dst = scope.resolve_stored(prop.dst)
-    if not src.exists():
-        raise OutboxError(f"source no longer exists: {prop.src}")
+    try:
+        source_bytes = _read_no_follow_bytes(src)
+    except FileNotFoundError as exc:
+        raise MissingProposalSource("proposal source is missing") from exc
+    actual_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    if actual_sha256 != prop.source_sha256:
+        raise StaleProposalSource("proposal source has changed")
+    try:
+        approved_bytes = _apply_sub(
+            source_bytes.decode("utf-8"), prop.sub
+        ).encode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OutboxDestinationError(
+            "proposal source is not UTF-8 markdown"
+        ) from exc
 
+    _require_destination(scope, prop)
+    _require_outbox_path(scope, prop.path, require_leaf=True)
     _git(vault, "mv", prop.src, prop.dst)          # rename (original content)
-    dst.write_text(_apply_sub(dst.read_text(encoding="utf-8"), prop.sub),
-                   encoding="utf-8")               # the sub: change
+    dst.write_bytes(approved_bytes)
     _git(vault, "add", prop.dst)
     _require_outbox_path(scope, prop.path, require_leaf=True).unlink()
     _git(vault, "commit", "-q", "-m",
