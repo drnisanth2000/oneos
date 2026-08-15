@@ -425,6 +425,54 @@ def test_concurrent_outbox_requests_keep_entity_diffs_isolated(client, monkeypat
     assert "beta-diff-marker" in beta_html and "alpha-diff-marker" not in beta_html
 
 
+@pytest.mark.parametrize(
+    "precondition,expected",
+    [
+        (
+            "changed",
+            "Approval refused: source changed since this proposal was created. "
+            "Create a fresh proposal.",
+        ),
+        (
+            "missing",
+            "Approval refused: source is missing. Restore it or reject the proposal.",
+        ),
+    ],
+)
+def test_approval_route_visibly_refuses_unfresh_source(
+    client, precondition, expected
+):
+    outbox_dir = client.vault / "alpha/outbox"
+    for path in outbox_dir.glob("*.yaml"):
+        path.unlink()
+    response = client.post(
+        "/triage/alpha/propose",
+        data={"filename": "marker.md", "module": "02-work", "sub": "general"},
+    )
+    assert response.status_code == 200
+    (proposal_path,) = tuple(outbox_dir.glob("*.yaml"))
+    record = yaml.safe_load(proposal_path.read_text(encoding="utf-8"))
+    source = client.vault / "alpha/00-inbox/active/marker.md"
+    if precondition == "changed":
+        source.write_bytes(source.read_bytes() + b"changed-after-proposal\n")
+    else:
+        source.unlink()
+    head_before = git_head(client.vault)
+    proposal_before = proposal_path.read_bytes()
+
+    refusal = client.post(
+        "/outbox/alpha/approve", data={"id": record["id"]}
+    )
+
+    assert refusal.status_code == 200
+    assert 'role="alert"' in refusal.text
+    assert expected in refusal.text
+    assert record["id"] in refusal.text
+    assert proposal_path.read_bytes() == proposal_before
+    assert git_head(client.vault) == head_before
+    assert not (client.vault / "alpha/02-work/active/marker.md").exists()
+
+
 def test_unknown_route_entity_is_404_without_entity_directory_read(client, monkeypatch):
     watched = client.vault / "directory-only"
     watched.mkdir()
