@@ -11,7 +11,7 @@ from email.policy import SMTP
 import pytest
 
 from app.entities import RecipientConfigurationError
-from app.ingest.base import IngestCommitError
+from app.ingest.base import IngestCommitError, IngestError
 from app.scope import Scope
 from app.schema import validate_file
 from app.inbox import split_front_matter
@@ -35,9 +35,10 @@ from tests.conftest import (
 
 
 class PollingIMAP:
-    def __init__(self, raw_message, *, on_store=None):
+    def __init__(self, raw_message, *, on_store=None, store_response=("OK", [])):
         self.raw_message = raw_message
         self.on_store = on_store
+        self.store_response = store_response
         self.logins = []
         self.mailboxes = []
         self.searches = []
@@ -66,7 +67,7 @@ class PollingIMAP:
         if self.on_store is not None:
             self.on_store()
         self.stores.append((uid, command, flags))
-        return "OK", []
+        return self.store_response
 
     def close(self):
         self.closed = True
@@ -226,6 +227,30 @@ def test_poll_commits_receipt_before_acknowledging_seen(email_vault, monkeypatch
     assert connection.stores == [(b"17", "+FLAGS", "\\Seen")]
     assert connection.closed is True
     assert connection.logged_out is True
+
+
+def test_poll_non_ok_acknowledgement_is_not_counted_and_propagates(
+    email_vault, monkeypatch
+):
+    message = _msg("commit but reject acknowledgement", to="intake-alpha@example.invalid")
+    connection = PollingIMAP(
+        message.as_bytes(),
+        store_response=("NO", [b"mailbox is read-only"]),
+    )
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", lambda _host: connection)
+    head_before = git_head(email_vault)
+    commit_count_before = git_count_commits(email_vault)
+
+    with pytest.raises(IngestError, match="email acknowledgement failed"):
+        poll(email_vault, "mail.example.invalid", "user", "password")
+
+    assert connection.stores == [(b"17", "+FLAGS", "\\Seen")]
+    assert connection.closed is True
+    assert connection.logged_out is True
+    assert git_head(email_vault) != head_before
+    assert git_count_commits(email_vault) == commit_count_before + 1
+    assert len(list(email_vault.glob("*/00-inbox/active/*.md"))) == 1
+    assert git_is_clean(email_vault)
 
 
 def test_poll_commit_failure_does_not_acknowledge_and_cleans_up(
