@@ -11,7 +11,10 @@ block-mapping validation — so it never trips check_v2 or the module lint.
 from __future__ import annotations
 
 import difflib
+import hashlib
+import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +24,11 @@ import yaml
 
 from .inbox import split_front_matter
 from .destinations import DestinationError, resolve_classification_destination
+from .proposal_identity import (
+    ProposalIdentityError,
+    proposal_id_candidates,
+    require_proposal_identity,
+)
 from .scope import CrossScopeError, Scope
 from .vault import DestinationRegistryError
 
@@ -44,6 +52,7 @@ class Proposal:
     action: str
     entity: str
     src: str          # vault-relative source path
+    source_sha256: str
     dst: str          # vault-relative destination path
     module: str
     sub: str | None
@@ -96,6 +105,28 @@ def _require_outbox_path(
     return candidate
 
 
+def _read_no_follow_bytes(path: Path) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise CrossScopeError("source receipt is redirected or unsafe") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise CrossScopeError("source receipt is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            return stream.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def propose_classification(
     scope: Scope,
     item_path: Path,
@@ -113,16 +144,20 @@ def propose_classification(
         sub=sub,
         claimed_block=claimed_block,
     )
-    created = datetime.now().isoformat(timespec="seconds")
-    pid = f"{datetime.now():%Y%m%dT%H%M%S}-{Path(destination.src).stem}"
+    created_at = datetime.now()
+    try:
+        source_bytes = _read_no_follow_bytes(scope.resolve_stored(destination.src))
+    except FileNotFoundError as exc:
+        raise OutboxDestinationError("source receipt is missing") from exc
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
 
     record = {
-        "id": pid,
         "action": "classify",
         "entity": destination.entity,
-        "created": created,
+        "created": created_at.isoformat(timespec="seconds"),
         "status": "pending",
         "src": destination.src,
+        "source_sha256": source_sha256,
         "dst": destination.dst,
         "module": destination.module,
         "sub": destination.sub,
@@ -130,13 +165,16 @@ def propose_classification(
         "rule_id": rule_id,
     }
     outbox = _require_outbox_path(scope, create_directory=True)
-    path = _require_outbox_path(scope, outbox / f"{pid}.yaml")
-    try:
-        with path.open("x", encoding="utf-8") as stream:
-            stream.write(yaml.safe_dump(record, sort_keys=False))
-    except FileExistsError as exc:
-        raise OutboxError("proposal already exists") from exc
-    return _to_proposal(path, record)
+    for pid in proposal_id_candidates(created_at):
+        path = _require_outbox_path(scope, outbox / f"{pid}.yaml")
+        record["id"] = pid
+        try:
+            with path.open("x", encoding="utf-8") as stream:
+                stream.write(yaml.safe_dump(record, sort_keys=False))
+        except FileExistsError:
+            continue
+        return _to_proposal(path, record)
+    raise OutboxError("unable to allocate a unique classification proposal id")
 
 
 def _required_string(record: dict, key: str) -> str:
@@ -146,9 +184,23 @@ def _required_string(record: dict, key: str) -> str:
     return value
 
 
+_SOURCE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _required_source_hash(record: dict) -> str:
+    value = record.get("source_sha256")
+    if not isinstance(value, str) or _SOURCE_SHA256.fullmatch(value) is None:
+        raise OutboxDestinationError("proposal source hash is malformed")
+    return value
+
+
 def _to_proposal(path: Path, record: dict) -> Proposal:
     if not isinstance(record, dict):
         raise OutboxDestinationError("proposal record must be a mapping")
+    try:
+        require_proposal_identity(path, record.get("id"))
+    except ProposalIdentityError as exc:
+        raise OutboxDestinationError("proposal identity is invalid") from exc
     if "sub" not in record:
         raise OutboxDestinationError("proposal destination record is malformed")
     sub = record.get("sub")
@@ -162,6 +214,7 @@ def _to_proposal(path: Path, record: dict) -> Proposal:
         action=_required_string(record, "action"),
         entity=_required_string(record, "entity"),
         src=_required_string(record, "src"),
+        source_sha256=_required_source_hash(record),
         dst=_required_string(record, "dst"),
         module=_required_string(record, "module"),
         sub=sub,
@@ -195,6 +248,10 @@ def load_proposals(scope: Scope) -> list[Proposal]:
             raise OutboxDestinationError("proposal record is invalid YAML") from exc
         if not isinstance(record, dict):
             raise OutboxDestinationError("proposal record must be a mapping")
+        try:
+            require_proposal_identity(p, record.get("id"))
+        except ProposalIdentityError as exc:
+            raise OutboxDestinationError("proposal identity is invalid") from exc
         action = record.get("action")
         if not isinstance(action, str) or not action:
             raise OutboxDestinationError("proposal action is malformed")

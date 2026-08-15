@@ -5,6 +5,7 @@ The app reads its vault from ONEOS_VAULT, so the test builds a synthetic one and
 points the env at it before importing the app — no real slug or path in the repo.
 """
 import importlib
+import hashlib
 import json
 import re
 import sqlite3
@@ -141,13 +142,17 @@ workspaces:
         )
         outbox = tmp_path / entity / "outbox"
         outbox.mkdir(parents=True, exist_ok=True)
-        (outbox / f"{entity}-proposal.yaml").write_text(
+        proposal_id = "20260815T090703-" + (
+            "11" * 16 if entity == "alpha" else "22" * 16
+        )
+        (outbox / f"{proposal_id}.yaml").write_text(
             "\n".join(
                 (
-                    f"id: {entity}-proposal",
+                    f"id: {proposal_id}",
                     "action: classify",
                     f"entity: {entity}",
                     f"src: {entity}/00-inbox/active/marker.md",
+                    f"source_sha256: {hashlib.sha256(path.read_bytes()).hexdigest()}",
                     f"dst: {entity}/02-work/active/marker.md",
                     "module: 02-work",
                     "sub: general",
@@ -437,13 +442,14 @@ def test_unknown_route_entity_is_404_without_entity_directory_read(client, monke
 
 @pytest.mark.parametrize("action", ["approve", "reject"])
 def test_alpha_outbox_action_cannot_touch_beta_proposal(client, action):
-    beta_proposal = client.vault / "beta/outbox/beta-proposal.yaml"
+    beta_id = "20260815T090703-" + "22" * 16
+    beta_proposal = client.vault / "beta/outbox" / f"{beta_id}.yaml"
     beta_source = client.vault / "beta/00-inbox/active/marker.md"
     proposal_before = beta_proposal.read_bytes()
     source_before = beta_source.read_bytes()
 
     response = client.post(
-        f"/outbox/alpha/{action}", data={"id": "beta-proposal"}
+        f"/outbox/alpha/{action}", data={"id": beta_id}
     )
 
     assert response.status_code == 200
