@@ -68,6 +68,18 @@ def test_destination_registry_rejects_wrong_submodule_shape(tmp_path):
         vault.active_submodules_for(Scope(root, "alpha"), "01-core")
 
 
+def test_destination_registry_rejects_falsy_submodules_shape(tmp_path):
+    root = write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n  01-core: {block: govern}\n'
+        'submodules: []\n',
+    )
+    vault = Vault(EntityCatalog.load(root))
+    with pytest.raises(DestinationRegistryError):
+        vault.active_submodules_for(Scope(root, "alpha"), "01-core")
+
+
 def test_require_block_rejects_unknown_or_empty_mapping(tmp_path):
     root = write_vault(
         tmp_path,

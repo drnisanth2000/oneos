@@ -120,7 +120,9 @@ class Vault:
         return frozenset(self.active_modules(self._entity_flags(scope)))
 
     def active_submodules_for(self, scope: Scope, module: str) -> frozenset[str]:
-        groups = self._archetypes.get("submodules") or {}
+        groups = self._archetypes.get("submodules")
+        if groups is None:
+            groups = {}
         if not isinstance(groups, dict):
             raise DestinationRegistryError("submodules registry must be a mapping")
         entries = groups.get(module)
