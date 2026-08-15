@@ -107,6 +107,55 @@ def test_module_spec_returns_copy_of_strict_mapping(tmp_path):
     assert vault.require_block("01-core") == "govern"
 
 
+@pytest.mark.parametrize(
+    "registry",
+    (
+        'version: "2.0"\nflags: []\nmodules:\n  01-core: {block: govern}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n  nested/module: {block: govern}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n  01-core: [not-a-mapping]\n',
+        'version: "2.0"\nflags: {}\nmodules:\n  01-core: {block: nested/block}\n',
+        'version: "2.0"\nflags: {special: Special}\nmodules:\n'
+        '  01-core: {block: govern, requires_flag: [special]}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n'
+        '  01-core: {block: govern, lifecycle_pattern: "false"}\n',
+        'version: "2.0"\nflags: {}\nmodules:\n  01-core: {block: govern}\n'
+        'submodules:\n  01-core:\n    nested/sub: {name: Nested}\n',
+        'version: "2.0"\nflags: {}\nmodules: [unterminated\n',
+    ),
+)
+def test_destination_registry_rejects_malformed_ids_and_shapes(
+    tmp_path, registry
+):
+    root = write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        registry,
+    )
+    vault = Vault(EntityCatalog.load(root))
+
+    with pytest.raises(DestinationRegistryError) as raised:
+        vault.active_modules_for(Scope(root, "alpha"))
+
+    assert type(raised.value) is DestinationRegistryError
+
+
+def test_entity_flags_reject_scope_bound_to_different_registry_root(tmp_path):
+    first = write_vault(
+        tmp_path / "first",
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        DESTINATION_ARCHETYPES,
+    )
+    second = write_vault(
+        tmp_path / "second",
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        DESTINATION_ARCHETYPES,
+    )
+    vault = Vault(EntityCatalog.load(first))
+
+    with pytest.raises(DestinationRegistryError):
+        vault._entity_flags(Scope(second, "alpha"))
+
+
 def test_discovers_every_bundle_from_entities_yaml(make_vault):
     root = make_vault(
         textwrap.dedent(

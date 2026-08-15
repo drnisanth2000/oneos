@@ -13,6 +13,7 @@ from app.destinations import (
     resolve_classification_destination,
 )
 from app.scope import CrossScopeError, Scope
+from app.vault import Vault
 from tests.conftest import write_vault
 
 
@@ -136,6 +137,69 @@ def test_resolver_rejects_noncanonical_taxonomy(
             sub=sub,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "module",
+    (
+        "11/library",
+        r"11\library",
+        "11-\nlibrary",
+        " 11-library",
+        "11-library ",
+        "11_library",
+        ".",
+        "UPPER",
+    ),
+)
+def test_resolver_rejects_noncanonical_module_before_registry_membership(
+    destination_vault, monkeypatch, module
+):
+    def forbidden_membership(*args, **kwargs):
+        raise AssertionError("non-canonical module reached registry membership")
+
+    monkeypatch.setattr(Vault, "active_modules_for", forbidden_membership)
+    scope = Scope(destination_vault, "alpha")
+
+    with pytest.raises(InvalidModule):
+        resolve_classification_destination(
+            scope,
+            scope.resolve("00-inbox", "active", "receipt.md"),
+            module=module,
+            sub=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "sub",
+    (
+        "nested/reference",
+        r"nested\reference",
+        "reference\nstatus",
+        " reference",
+        "reference ",
+        "reference id",
+        "reference_id",
+        ".",
+        "UPPER",
+    ),
+)
+def test_resolver_rejects_noncanonical_sub_before_registry_membership(
+    destination_vault, monkeypatch, sub
+):
+    def forbidden_membership(*args, **kwargs):
+        raise AssertionError("non-canonical sub reached registry membership")
+
+    monkeypatch.setattr(Vault, "active_submodules_for", forbidden_membership)
+    scope = Scope(destination_vault, "alpha")
+
+    with pytest.raises(InvalidSub):
+        resolve_classification_destination(
+            scope,
+            scope.resolve("00-inbox", "active", "receipt.md"),
+            module="11-library",
+            sub=sub,
+        )
 
 
 def test_resolver_allows_flag_enabled_module_and_sub(destination_vault):

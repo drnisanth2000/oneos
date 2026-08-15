@@ -60,6 +60,20 @@ def snapshot_entity_bytes(vault: Path, entities: tuple[str, ...]) -> dict[str, b
     }
 
 
+def snapshot_entity_tree(vault: Path, entity: str):
+    entries = []
+    root = vault / entity
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries.append((relative, "symlink", path.readlink().as_posix()))
+        elif path.is_dir():
+            entries.append((relative, "directory", b""))
+        else:
+            entries.append((relative, "file", path.read_bytes()))
+    return tuple(sorted(entries))
+
+
 class HxValsParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -237,6 +251,49 @@ def test_triage_renders_accept_only_for_canonical_destination(client):
     assert "invalid-destination-marker" in html
     assert html.count('class="accept"') == 1
     assert '"block":' not in html
+
+
+@pytest.mark.parametrize("redirect", ("directory", "leaf"))
+def test_triage_rejects_same_entity_sensitive_redirect_without_read_or_render(
+    client, monkeypatch, redirect
+):
+    active = client.vault / "alpha/00-inbox/active"
+    sensitive = client.vault / "alpha/.sensitive"
+    sensitive.mkdir()
+    if redirect == "directory":
+        target = sensitive / "redirected-active"
+        active.rename(target)
+        active.symlink_to(target, target_is_directory=True)
+        watched = target / "invalid.md"
+    else:
+        watched = sensitive / "secret.md"
+        watched.write_text(
+            "---\ntitle: sensitive-render-marker\nsub: triage\n---\nsecret\n",
+            encoding="utf-8",
+        )
+        linked = active / "aaa-sensitive.md"
+        linked.symlink_to(watched)
+    real_read = Path.read_text
+    body_reads = []
+
+    def guarded(candidate, *args, **kwargs):
+        if candidate == watched:
+            body_reads.append(candidate)
+            raise AssertionError("redirected inbox body was opened")
+        return real_read(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    before_head = git_head(client.vault)
+    before_tree = snapshot_entity_tree(client.vault, "alpha")
+    route_client = TestClient(client.app, raise_server_exceptions=False)
+
+    response = route_client.get("/triage/alpha")
+
+    assert response.status_code >= 400
+    assert "sensitive-render-marker" not in response.text
+    assert body_reads == []
+    assert git_head(client.vault) == before_head
+    assert snapshot_entity_tree(client.vault, "alpha") == before_tree
 
 
 def test_triage_serializes_canonical_destination_as_one_hx_vals_mapping(client):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 from .entities import EntityCatalog
 from .scope import Scope
@@ -31,6 +32,13 @@ class BlockMismatch(DestinationError):
 
 class UnsafeDestinationPath(DestinationError):
     pass
+
+
+_REGISTRY_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _is_registry_id(value: object) -> bool:
+    return isinstance(value, str) and _REGISTRY_ID.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -96,7 +104,7 @@ def resolve_classification_destination(
     ):
         raise InvalidSourceLeaf("source receipt is missing or redirected")
 
-    if not isinstance(module, str) or module != module.strip():
+    if not _is_registry_id(module):
         raise InvalidModule("destination module is non-canonical")
     if module not in vault.active_modules_for(scope):
         raise InvalidModule("destination module is not active")
@@ -104,7 +112,7 @@ def resolve_classification_destination(
     canonical_sub: str | None
     if sub is None or sub == "":
         canonical_sub = None
-    elif not isinstance(sub, str) or sub != sub.strip():
+    elif not _is_registry_id(sub):
         raise InvalidSub("destination sub is non-canonical")
     elif sub not in vault.active_submodules_for(scope, module):
         raise InvalidSub("destination sub is not active for this module")

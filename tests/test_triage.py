@@ -5,6 +5,7 @@ persist as rules, so the next similar item arrives pre-classified. Instance-
 agnostic: synthetic vault + invented slugs.
 """
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -128,3 +129,42 @@ def test_read_inbox_rejects_cross_scope_leaf_symlink(tmp_path):
 
     with pytest.raises(CrossScopeError):
         read_inbox(Scope(root, "acme"))
+
+
+@pytest.mark.parametrize("redirect", ("directory", "leaf"))
+def test_read_inbox_rejects_same_entity_sensitive_redirect_before_body_read(
+    tmp_path, monkeypatch, redirect
+):
+    root = _vault(tmp_path)
+    _inbox_note(root, "safe.md", "Safe", "safe body")
+    scope = Scope(root, "acme")
+    active = root / "acme/00-inbox/active"
+    sensitive = root / "acme/.sensitive"
+    sensitive.mkdir()
+    if redirect == "directory":
+        target = sensitive / "redirected-active"
+        active.rename(target)
+        active.symlink_to(target, target_is_directory=True)
+        watched = target / "safe.md"
+    else:
+        watched = sensitive / "secret.md"
+        watched.write_text(
+            "---\ntitle: sensitive-render-marker\nsub: triage\n---\nsecret\n",
+            encoding="utf-8",
+        )
+        (active / "linked.md").symlink_to(watched)
+    real_read = Path.read_text
+    body_reads = []
+
+    def guarded(candidate, *args, **kwargs):
+        if candidate == watched:
+            body_reads.append(candidate)
+            raise AssertionError("redirected inbox body was opened")
+        return real_read(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+
+    with pytest.raises(CrossScopeError):
+        read_inbox(scope)
+
+    assert body_reads == []

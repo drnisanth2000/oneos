@@ -11,6 +11,7 @@ import re
 import textwrap
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -218,6 +219,21 @@ def _write_record(scope: Scope, name: str, record: str) -> Path:
     return path
 
 
+class _FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 1, 2, 3, 4, 5, tzinfo=tz)
+
+
+def _redirect_proposal_leaf(vault: Path) -> tuple[Scope, Proposal, Path]:
+    scope, proposal = _propose(vault)
+    shadow = scope.resolve("proposal-shadow", f"{proposal.id}.yaml")
+    shadow.parent.mkdir()
+    proposal.path.rename(shadow)
+    proposal.path.symlink_to(shadow)
+    return scope, proposal, shadow
+
+
 def test_propose_writes_proposal_and_moves_nothing(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
@@ -257,6 +273,97 @@ def test_proposal_interface_has_no_entity_or_trusted_block_authority():
     assert "entity" not in params
     assert "block" not in params
     assert "claimed_block" in params
+
+
+def test_proposal_creation_is_exclusive_and_preserves_existing_record(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    source = scope.resolve("00-inbox", "active", "note.md")
+    monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
+    first = propose_classification(
+        scope,
+        source,
+        module="11-knowledge",
+        sub="kb",
+        rule_id="first-rule",
+    )
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+    first_bytes = first.path.read_bytes()
+
+    with pytest.raises(outbox.OutboxError):
+        propose_classification(
+            scope,
+            source,
+            module="11-knowledge",
+            sub="kb",
+            rule_id="second-rule",
+        )
+
+    assert first.path.read_bytes() == first_bytes
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
+
+
+def test_proposal_creation_rejects_same_entity_outbox_directory_redirect(
+    tmp_path,
+):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    redirected = scope.resolve("redirected-outbox")
+    redirected.mkdir()
+    lexical_outbox = vault / "demo/outbox"
+    lexical_outbox.symlink_to(redirected, target_is_directory=True)
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    with pytest.raises(CrossScopeError):
+        propose_classification(
+            scope,
+            scope.resolve("00-inbox", "active", "note.md"),
+            module="11-knowledge",
+            sub="kb",
+        )
+
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
+
+
+def test_proposal_creation_rejects_same_entity_leaf_symlink_without_write(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
+    outbox_dir = vault / "demo/outbox"
+    outbox_dir.mkdir()
+    protected = vault / "demo/.sensitive/protected.yaml"
+    protected.parent.mkdir()
+    protected.write_text("protected-marker\n", encoding="utf-8")
+    proposal = outbox_dir / "20260102T030405-note.yaml"
+    proposal.symlink_to(protected)
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    with pytest.raises(CrossScopeError):
+        propose_classification(
+            scope,
+            scope.resolve("00-inbox", "active", "note.md"),
+            module="11-knowledge",
+            sub="kb",
+        )
+
+    assert protected.read_text(encoding="utf-8") == "protected-marker\n"
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
 
 
 @pytest.mark.parametrize(
@@ -360,6 +467,109 @@ def test_load_proposals(tmp_path):
     scope, prop = _propose(vault)
     props = load_proposals(scope)
     assert [p.id for p in props] == [prop.id]
+
+
+def test_loading_rejects_same_entity_outbox_directory_redirect_without_read(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope, proposal = _propose(vault)
+    lexical_outbox = vault / "demo/outbox"
+    redirected = vault / "demo/redirected-outbox"
+    lexical_outbox.rename(redirected)
+    lexical_outbox.symlink_to(redirected, target_is_directory=True)
+    proposal_target = redirected / proposal.path.name
+    real_read = Path.read_text
+
+    def guarded(candidate, *args, **kwargs):
+        if candidate == proposal_target:
+            raise AssertionError("redirected proposal body was opened")
+        return real_read(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    with pytest.raises(CrossScopeError):
+        load_proposals(scope)
+
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
+
+
+def test_loading_rejects_same_entity_proposal_leaf_symlink_before_target_read(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope, _, shadow = _redirect_proposal_leaf(vault)
+    real_read = Path.read_text
+
+    def guarded(candidate, *args, **kwargs):
+        if candidate == shadow:
+            raise AssertionError("redirected proposal body was opened")
+        return real_read(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    with pytest.raises(CrossScopeError):
+        load_proposals(scope)
+
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
+
+
+def test_loading_classifications_skips_valid_registry_delete_record(tmp_path):
+    vault = _vault(tmp_path)
+    scope, classification = _propose(vault)
+    _write_record(
+        scope,
+        "delete-record.yaml",
+        yaml.safe_dump(
+            {
+                "id": "delete-record",
+                "action": "delete",
+                "entity": "demo",
+                "kind": "product",
+                "slug": "invented-product",
+                "status": "pending",
+                "total_references": 0,
+                "impact": {},
+            }
+        ),
+    )
+
+    assert [proposal.id for proposal in load_proposals(scope)] == [classification.id]
+
+
+def test_loading_rejects_unknown_proposal_action(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    record = {
+        "id": "unknown-action",
+        "action": "publish",
+        "entity": "demo",
+        "src": "demo/00-inbox/active/note.md",
+        "dst": "demo/11-knowledge/active/note.md",
+        "module": "11-knowledge",
+        "sub": "kb",
+        "block": "govern",
+    }
+    _write_record(scope, "unknown-action.yaml", yaml.safe_dump(record))
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    _assert_destination_error(lambda: load_proposals(scope))
+
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
 
 
 @pytest.mark.parametrize(
@@ -578,6 +788,92 @@ def test_reject_discards_proposal_without_moving(tmp_path):
     assert not prop.path.exists()
     assert scope.resolve("00-inbox", "active", "note.md").exists()
     assert load_proposals(scope) == []
+
+
+@pytest.mark.parametrize("operation", ("preview", "approve", "reject"))
+def test_operations_reject_same_entity_proposal_leaf_symlink_without_mutation(
+    tmp_path, operation
+):
+    vault = _vault(tmp_path)
+    scope, proposal, _ = _redirect_proposal_leaf(vault)
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    if operation == "preview":
+        attempt = lambda: preview_diff(scope, proposal)
+    elif operation == "approve":
+        attempt = lambda: approve(scope, proposal.id)
+    else:
+        attempt = lambda: reject(scope, proposal.id)
+
+    with pytest.raises(CrossScopeError):
+        attempt()
+
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
+
+
+@pytest.mark.parametrize("operation", (approve, reject), ids=("approve", "reject"))
+def test_mutation_revalidates_lexical_proposal_leaf_after_lookup(
+    tmp_path, monkeypatch, operation
+):
+    vault = _vault(tmp_path)
+    scope, proposal = _propose(vault)
+    real_get = outbox.get_proposal
+    state = {}
+
+    def redirect_after_lookup(bound_scope, proposal_id):
+        loaded = real_get(bound_scope, proposal_id)
+        shadow = bound_scope.resolve("proposal-shadow", loaded.path.name)
+        shadow.parent.mkdir()
+        loaded.path.rename(shadow)
+        loaded.path.symlink_to(shadow)
+        state["head"] = git_head(vault)
+        state["paths"] = git_tracked_paths(vault)
+        state["tree"] = _vault_tree(vault)
+        return loaded
+
+    monkeypatch.setattr(outbox, "get_proposal", redirect_after_lookup)
+
+    with pytest.raises(CrossScopeError):
+        operation(scope, proposal.id)
+
+    assert git_head(vault) == state["head"]
+    assert git_tracked_paths(vault) == state["paths"]
+    assert _vault_tree(vault) == state["tree"]
+
+
+@pytest.mark.parametrize("shape", ("missing", "redirected"))
+def test_approval_never_scaffolds_destination_parent_after_validation(
+    tmp_path, monkeypatch, shape
+):
+    vault = _vault(tmp_path)
+    scope, proposal = _propose(vault)
+    real_get = outbox.get_proposal
+    state = {}
+
+    def change_parent_after_lookup(bound_scope, proposal_id):
+        loaded = real_get(bound_scope, proposal_id)
+        active = vault / "demo/11-knowledge/active"
+        saved = vault / "demo/11-knowledge/saved-active"
+        active.rename(saved)
+        if shape == "redirected":
+            active.symlink_to(saved, target_is_directory=True)
+        state["head"] = git_head(vault)
+        state["paths"] = git_tracked_paths(vault)
+        state["tree"] = _vault_tree(vault)
+        return loaded
+
+    monkeypatch.setattr(outbox, "get_proposal", change_parent_after_lookup)
+
+    _assert_destination_error(lambda: approve(scope, proposal.id))
+
+    assert git_head(vault) == state["head"]
+    assert git_tracked_paths(vault) == state["paths"]
+    assert _vault_tree(vault) == state["tree"]
+    assert scope.resolve("00-inbox", "active", "note.md").exists()
 
 
 def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
