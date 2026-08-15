@@ -146,7 +146,7 @@ def propose_classification(
     )
     created_at = datetime.now()
     try:
-        source_bytes = _read_no_follow_bytes(scope.resolve_stored(destination.src))
+        source_bytes = _read_no_follow_bytes(scope.root / destination.src)
     except FileNotFoundError as exc:
         raise OutboxDestinationError("source receipt is missing") from exc
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()

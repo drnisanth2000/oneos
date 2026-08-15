@@ -273,6 +273,34 @@ def test_proposal_hash_is_sha256_of_exact_receipt_bytes(tmp_path):
     assert prop.source_sha256 == hashlib.sha256(exact).hexdigest()
 
 
+def test_snapshot_rejects_receipt_leaf_swapped_to_in_scope_symlink(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    source = scope.resolve("00-inbox", "active", "note.md")
+    redirected = scope.resolve("redirected-receipt.md")
+    redirected.write_bytes(b"redirected receipt bytes\n")
+    redirected_bytes = redirected.read_bytes()
+    real_resolve = outbox.resolve_classification_destination
+
+    def swap_after_destination(*args, **kwargs):
+        destination = real_resolve(*args, **kwargs)
+        source.unlink()
+        source.symlink_to(redirected)
+        return destination
+
+    monkeypatch.setattr(
+        outbox, "resolve_classification_destination", swap_after_destination
+    )
+
+    with pytest.raises(CrossScopeError):
+        propose_classification(scope, source, module="11-knowledge", sub="kb")
+
+    assert redirected.read_bytes() == redirected_bytes
+    assert not scope.resolve("outbox").exists()
+
+
 def _redirect_proposal_leaf(vault: Path) -> tuple[Scope, Proposal, Path]:
     scope, proposal = _propose(vault)
     shadow = scope.resolve("proposal-shadow", f"{proposal.id}.yaml")
