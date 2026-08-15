@@ -17,9 +17,11 @@ from fastapi.templating import Jinja2Templates
 
 from .classifier import Classifier
 from .config import build_catalog, build_scope
+from .destinations import DestinationError, resolve_classification_destination
 from .entities import EntitySelectionError
 from .inbox import read_inbox
 from .outbox import (
+    OutboxDestinationError,
     OutboxError,
     approve,
     load_proposals,
@@ -35,7 +37,7 @@ from .registry import (
     reference_count,
 )
 from .scope import Scope
-from .vault import Vault
+from .vault import DestinationRegistryError, Vault
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -86,10 +88,20 @@ def triage(request: Request, scope: EntityScope) -> HTMLResponse:
     selected = scope.current_entity()
     vault = Vault(catalog)
     clf = Classifier(vault)
-    rows = [
-        (item, clf.classify(item.title, item.summary, item.source))
-        for item in read_inbox(scope)
-    ]
+    rows = []
+    for item in read_inbox(scope):
+        classification = clf.classify(item.title, item.summary, item.source)
+        try:
+            destination = resolve_classification_destination(
+                scope,
+                item.path,
+                module=classification.module,
+                sub=classification.sub,
+                claimed_block=classification.block,
+            )
+        except (DestinationError, DestinationRegistryError):
+            destination = None
+        rows.append((item, classification, destination))
     return templates.TemplateResponse(
         request,
         "triage.html",
@@ -103,16 +115,16 @@ def propose(
     scope: EntityScope,
     filename: str = Form(...),
     module: str = Form(...),
-    sub: str = Form(...),
-    block: str = Form(...),
-    rule_id: str = Form(""),
+    sub: str = Form(""),
+    block: str | None = Form(None),
+    entity_claim: str | None = Form(None, alias="entity"),
 ) -> HTMLResponse:
-    # filename is untrusted form input — take the basename, never a path.
-    safe = Path(filename).name
-    item_path = scope.resolve("00-inbox", "active", safe)
+    if entity_claim is not None:
+        raise OutboxDestinationError("entity is owned by request scope")
+    item_path = scope.resolve("00-inbox", "active") / filename
     prop = propose_classification(
         scope, item_path,
-        module=module, sub=sub, claimed_block=block, rule_id=(rule_id or None),
+        module=module, sub=sub, claimed_block=block,
     )
     return templates.TemplateResponse(
         request,

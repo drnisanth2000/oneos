@@ -7,14 +7,17 @@ points the env at it before importing the app — no real slug or path in the re
 import importlib
 import re
 import sqlite3
+import subprocess
 import threading
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import yaml
 from starlette.testclient import TestClient
 
-from tests.conftest import write_vault, scaffold_modules, ARCHETYPES
+from tests.conftest import git_head, write_vault, scaffold_modules
 
 ENTITIES = """
 version: "1.0"
@@ -23,10 +26,55 @@ entities:
   beta:  { label: Beta,  flags: [other] }
 """
 
+HTTP_ARCHETYPES = textwrap.dedent(
+    """
+    version: "2.0"
+    flags:
+      special: "Activates the extra module"
+      other:   "Some other capability"
+    modules:
+      00-intake:  { block: system, core: true }
+      01-core:    { block: govern, core: true }
+      02-work:    { block: build }
+      zz-extra:   { block: self, core: true, requires_flag: special }
+    submodules:
+      00-intake:
+        triage: { name: "Triage" }
+      02-work:
+        general: { name: "General" }
+    archetypes:
+      plain:   { }
+      special: { special: true }
+    """
+).strip()
+
+
+def snapshot_entity_bytes(vault: Path, entities: tuple[str, ...]) -> dict[str, bytes]:
+    return {
+        path.relative_to(vault).as_posix(): path.read_bytes()
+        for entity in entities
+        for path in sorted((vault / entity).rglob("*"))
+        if path.is_file()
+    }
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    write_vault(tmp_path, ENTITIES, ARCHETYPES)
+    write_vault(tmp_path, ENTITIES, HTTP_ARCHETYPES)
+    (tmp_path / "_system/classifier").mkdir()
+    (tmp_path / "_system/classifier/rules.yaml").write_text(
+        """version: "1.0"
+rules:
+  - id: invalid-destination
+    match: {any: [invalid-destination-marker]}
+    route: {module: 02-work, sub: inactive}
+  - id: valid-destination
+    match: {any: [valid-destination-marker]}
+    route: {module: 02-work, sub: general}
+default: {module: 00-inbox, sub: triage}
+""",
+        encoding="utf-8",
+    )
     (tmp_path / "_system/products.yaml").write_text(
         """version: "1.0"
 products:
@@ -55,10 +103,12 @@ workspaces:
     scaffold_modules(tmp_path, "alpha", ["00-intake", "01-core", "02-work", "zz-extra"])
     scaffold_modules(tmp_path, "beta", ["00-intake", "01-core", "02-work"])
     for entity, marker in (("alpha", "alpha-marker"), ("beta", "beta-marker")):
+        (tmp_path / entity / "02-work" / "active").mkdir(parents=True)
         path = tmp_path / entity / "00-inbox" / "active" / "marker.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            f"---\ntype: inbox-item\ntitle: {marker}\nsub: triage\n---\n{entity}-diff-marker\n",
+            f"---\ntype: inbox-item\ntitle: {marker} valid-destination-marker\n"
+            f"sub: triage\n---\n{entity}-diff-marker\n",
             encoding="utf-8",
         )
         outbox = tmp_path / entity / "outbox"
@@ -70,16 +120,22 @@ workspaces:
                     "action: classify",
                     f"entity: {entity}",
                     f"src: {entity}/00-inbox/active/marker.md",
-                    f"dst: {entity}/11-knowledge/active/marker.md",
-                    "module: 11-knowledge",
-                    "sub: kb",
-                    "block: govern",
+                    f"dst: {entity}/02-work/active/marker.md",
+                    "module: 02-work",
+                    "sub: general",
+                    "block: build",
                     "status: pending",
                     "",
                 )
             ),
             encoding="utf-8",
         )
+    invalid = tmp_path / "alpha/00-inbox/active/invalid.md"
+    invalid.write_text(
+        "---\ntype: inbox-item\ntitle: invalid-destination-marker\n"
+        "sub: triage\n---\ninvalid recommendation remains visible\n",
+        encoding="utf-8",
+    )
     for entity, relative, marker in (
         ("alpha", "07-finance/active/alpha.md", "alpha-registry-marker"),
         ("beta", "07-finance/active/beta-one.md", "beta-registry-marker-one"),
@@ -104,6 +160,20 @@ workspaces:
             )
         connection.commit()
         connection.close()
+    (tmp_path / ".gitignore").write_text("*/outbox/*.yaml\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "fixture"], cwd=tmp_path, check=True
+    )
     monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
     import app.main as main
     importlib.reload(main)
@@ -147,6 +217,14 @@ def test_triage_screen_has_gate1_timing_instrument(client):
     assert "htmx:afterRequest" in html            # accepts increment the count
 
 
+def test_triage_renders_accept_only_for_canonical_destination(client):
+    html = client.get("/triage/alpha").text
+    assert "valid-destination-marker" in html
+    assert "invalid-destination-marker" in html
+    assert html.count('class="accept"') == 1
+    assert '"block":' not in html
+
+
 def test_concurrent_triage_requests_keep_entity_rows_isolated(client, monkeypatch):
     import app.main
 
@@ -165,6 +243,74 @@ def test_concurrent_triage_requests_keep_entity_rows_isolated(client, monkeypatc
     assert "beta-marker" not in alpha.result().text
     assert "beta-marker" in beta.result().text
     assert "alpha-marker" not in beta.result().text
+
+
+def test_concurrent_proposal_requests_keep_canonical_destinations_isolated(
+    client, monkeypatch
+):
+    import app.outbox as outbox
+
+    for entity in ("alpha", "beta"):
+        for proposal in (client.vault / entity / "outbox").glob("*.yaml"):
+            proposal.unlink()
+
+    barrier = threading.Barrier(2)
+    real_resolve = outbox.resolve_classification_destination
+    destinations = []
+
+    def overlapped(scope, item_path, **claims):
+        barrier.wait(timeout=5)
+        destination = real_resolve(scope, item_path, **claims)
+        destinations.append(destination)
+        return destination
+
+    monkeypatch.setattr(outbox, "resolve_classification_destination", overlapped)
+    data = {"filename": "marker.md", "module": "02-work", "sub": "general"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        alpha = pool.submit(client.post, "/triage/alpha/propose", data=data)
+        beta = pool.submit(client.post, "/triage/beta/propose", data=data)
+
+    assert alpha.result().status_code == 200
+    assert beta.result().status_code == 200
+    records = {}
+    for entity in ("alpha", "beta"):
+        paths = list((client.vault / entity / "outbox").glob("*.yaml"))
+        assert len(paths) == 1
+        records[entity] = yaml.safe_load(paths[0].read_text(encoding="utf-8"))
+    assert records["alpha"]["entity"] == "alpha"
+    assert records["alpha"]["src"] == "alpha/00-inbox/active/marker.md"
+    assert records["alpha"]["dst"] == "alpha/02-work/active/marker.md"
+    assert records["beta"]["entity"] == "beta"
+    assert records["beta"]["src"] == "beta/00-inbox/active/marker.md"
+    assert records["beta"]["dst"] == "beta/02-work/active/marker.md"
+    assert len(destinations) == 4
+    assert len({id(destination) for destination in destinations}) == 4
+    assert [destination.entity for destination in destinations].count("alpha") == 2
+    assert [destination.entity for destination in destinations].count("beta") == 2
+
+
+@pytest.mark.parametrize("data", [
+    {"filename": "../marker.md", "module": "02-work", "sub": "general"},
+    {"filename": r"..\\marker.md", "module": "02-work", "sub": "general"},
+    {"filename": "marker.md", "module": "missing", "sub": "general"},
+    {"filename": "marker.md", "module": "02-work", "sub": "wrong-module"},
+    {"filename": "marker.md", "module": "02-work", "sub": "general", "block": "growth"},
+    {"filename": "marker.md", "module": "02-work", "sub": "general", "entity": "beta"},
+])
+def test_tampered_proposal_form_writes_nothing(client, data):
+    for proposal in (client.vault / "alpha/outbox").glob("*.yaml"):
+        proposal.unlink()
+    route_client = TestClient(client.app, raise_server_exceptions=False)
+    route_client.vault = client.vault
+    before_head = git_head(route_client.vault)
+    before = snapshot_entity_bytes(route_client.vault, ("alpha", "beta"))
+
+    response = route_client.post("/triage/alpha/propose", data=data)
+
+    assert response.status_code >= 400
+    assert git_head(route_client.vault) == before_head
+    assert snapshot_entity_bytes(route_client.vault, ("alpha", "beta")) == before
+    assert not list((route_client.vault / "alpha/outbox").glob("*.yaml"))
 
 
 def test_concurrent_outbox_requests_keep_entity_diffs_isolated(client, monkeypatch):

@@ -52,7 +52,7 @@
       {% endif %}
 
       <ul class="triage-list">
-        {% for it, c in rows %}
+        {% for it, c, destination in rows %}
         <li class="triage-item" :class="{ sel: i === {{ loop.index0 }} }"
             @click="i = {{ loop.index0 }}">
           <div class="ti-head">
@@ -62,20 +62,24 @@
           </div>
           {% if it.summary %}<div class="ti-sum">{{ it.summary[:180] }}</div>{% endif %}
           <div class="ti-prop">
-            → <span class="mod-name">{{ c.module }}</span> /
-            <span class="mod-name">{{ c.sub }}</span>
-            <span class="block-tag">{{ c.block }}</span>
+            {% if destination %}
+              → <span class="mod-name">{{ destination.module }}</span> /
+              <span class="mod-name">{{ destination.sub or '' }}</span>
+              <span class="block-tag">{{ destination.block }}</span>
+            {% else %}
+              <span class="unsure">invalid destination — needs a call</span>
+            {% endif %}
             {% if c.confident %}
               <span class="conf" title="matched rule {{ c.rule_id }}">rule: {{ c.rule_id }}</span>
             {% else %}
               <span class="unsure">unclassified — needs a call</span>
             {% endif %}
           </div>
-          {% if c.confident %}
+          {% if c.confident and destination %}
           <div class="ti-actions">
             <button class="accept"
                     hx-post="/triage/{{ entity }}/propose"
-                    hx-vals='{"filename": "{{ it.path.name }}", "module": "{{ c.module }}", "sub": "{{ c.sub }}", "block": "{{ c.block }}", "rule_id": "{{ c.rule_id or '' }}"}'
+                    hx-vals='{"filename": "{{ it.path.name }}", "module": "{{ destination.module }}", "sub": "{{ destination.sub or '' }}"}'
                     hx-target="#diff-{{ loop.index0 }}" hx-swap="innerHTML">
               Accept → write proposal
             </button>
