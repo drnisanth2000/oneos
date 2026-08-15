@@ -13,9 +13,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import yaml
 
 import app.outbox as outbox
 from app.scope import CrossScopeError, Scope
+from app.destinations import DestinationError
 from app.outbox import (
     Proposal,
     approve,
@@ -33,6 +35,35 @@ from tests.conftest import (
     git_tracked_paths,
     git_entity_vault,
 )
+
+
+OUTBOX_ARCHETYPES = textwrap.dedent(
+    """\
+    version: "2.0"
+    flags: {}
+    modules:
+      00-inbox: {block: system}
+      11-knowledge: {block: govern}
+      11-library: {block: govern}
+    submodules:
+      00-inbox:
+        triage: {name: Triage}
+      11-knowledge:
+        kb: {name: Knowledge base}
+      11-library:
+        reference: {name: Reference}
+    archetypes:
+      plain: {}
+    """
+)
+
+
+def _outbox_vault(root, entities, files):
+    return git_entity_vault(
+        root,
+        entities,
+        {"_system/archetypes.yaml": OUTBOX_ARCHETYPES, **files},
+    )
 
 
 def _vault(tmp_path):
@@ -54,15 +85,16 @@ def _vault(tmp_path):
             """
         ),
         "demo/11-knowledge/active/.gitkeep": "",
+        "demo/11-library/active/.gitkeep": "",
     }
-    return git_entity_vault(tmp_path, ("demo",), files)
+    return _outbox_vault(tmp_path, ("demo",), files)
 
 
 def _propose(vault):
     scope = Scope(vault, "demo")
     src = scope.resolve("00-inbox", "active", "note.md")
     return scope, propose_classification(
-        scope, src, module="11-knowledge", sub="kb", block="govern",
+        scope, src, module="11-knowledge", sub="kb", claimed_block="govern",
         rule_id="research",
     )
 
@@ -103,7 +135,7 @@ def two_entity_vault(tmp_path):
         "alpha/11-knowledge/active/.gitkeep": "",
         "beta/11-knowledge/active/.gitkeep": "",
     }
-    return git_entity_vault(tmp_path, ("alpha", "beta"), files)
+    return _outbox_vault(tmp_path, ("alpha", "beta"), files)
 
 
 FORGED_BETA_PROPOSAL = textwrap.dedent(
@@ -145,6 +177,91 @@ def test_propose_writes_proposal_and_moves_nothing(tmp_path):
     assert prop.status == "pending"
 
 
+def test_proposal_derives_block_and_canonical_destination(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    source = scope.resolve("00-inbox", "active", "note.md")
+
+    prop = propose_classification(
+        scope, source, module="11-library", sub="reference", claimed_block="govern"
+    )
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    assert record["entity"] == "demo"
+    assert record["module"] == "11-library"
+    assert record["sub"] == "reference"
+    assert record["block"] == "govern"
+    assert record["dst"] == "demo/11-library/active/note.md"
+
+
+def test_proposal_interface_has_no_entity_or_trusted_block_authority():
+    params = inspect.signature(propose_classification).parameters
+    assert "entity" not in params
+    assert "block" not in params
+    assert "claimed_block" in params
+
+
+@pytest.mark.parametrize(
+    ("module", "sub", "claimed_block", "item"),
+    [
+        ("missing", "kb", None, "canonical"),
+        ("11-knowledge", "missing", None, "canonical"),
+        ("11-knowledge", "kb", "forged", "canonical"),
+        ("11-knowledge", "kb", None, "noncanonical"),
+    ],
+)
+def test_invalid_classification_leaves_vault_and_outbox_unchanged(
+    tmp_path, module, sub, claimed_block, item
+):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    source = scope.resolve("00-inbox", "active", "note.md")
+    item_path = source if item == "canonical" else scope.resolve(
+        "11-knowledge", "active", "note.md"
+    )
+    destination = scope.resolve("11-knowledge", "active", "note.md")
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_bytes = {
+        source: source.read_bytes(),
+        destination: destination.read_bytes() if destination.exists() else None,
+    }
+    assert not scope.resolve("outbox").exists()
+
+    with pytest.raises(DestinationError):
+        propose_classification(
+            scope,
+            item_path,
+            module=module,
+            sub=sub,
+            claimed_block=claimed_block,
+        )
+
+    assert not scope.resolve("outbox").exists()
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert {
+        source: source.read_bytes(),
+        destination: destination.read_bytes() if destination.exists() else None,
+    } == before_bytes
+
+
+def test_module_general_proposal_stores_null_and_removes_sub(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    prop = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note.md"),
+        module="11-library",
+        sub="",
+    )
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    assert record["sub"] is None
+    diff = preview_diff(scope, prop)
+    assert "-sub: triage" in diff
+    assert "+sub:" not in diff
+
+
 def test_preview_diff_shows_move_and_sub_change(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
@@ -184,7 +301,7 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
 
     from app.ingest.adapters.folder import process_drop
 
-    vault = git_entity_vault(tmp_path / "vault", ("synthetic",), {
+    vault = _outbox_vault(tmp_path / "vault", ("synthetic",), {
         "synthetic/00-inbox/active/.gitkeep": "",
         "synthetic/11-library/active/.gitkeep": "",
     })
@@ -204,7 +321,7 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
     scope = Scope(vault, "synthetic")
     prop = propose_classification(
         scope, result.path,
-        module="11-library", sub="reference", block="govern",
+        module="11-library", sub="reference", claimed_block="govern",
         rule_id="synthetic-rule",
     )
     approve(scope, prop.id)
@@ -245,7 +362,7 @@ def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
         sub: kb
         """
     )
-    vault = git_entity_vault(
+    vault = _outbox_vault(
         tmp_path,
         ("alpha", "beta"),
         {
@@ -290,13 +407,13 @@ def test_outbox_interfaces_have_one_identity_authority():
 def test_propose_rejects_item_path_from_another_entity(two_entity_vault):
     alpha = Scope(two_entity_vault, "alpha")
     beta_item = two_entity_vault / "beta/00-inbox/active/beta.md"
-    with pytest.raises(CrossScopeError):
+    with pytest.raises(DestinationError):
         propose_classification(
             alpha,
             beta_item,
             module="11-knowledge",
             sub="kb",
-            block="govern",
+            claimed_block="govern",
         )
     assert not alpha.resolve("outbox").exists()
 
@@ -391,7 +508,7 @@ def test_concurrent_proposals_are_written_only_to_the_bound_entity(two_entity_va
             item_path,
             module="11-knowledge",
             sub="kb",
-            block="govern",
+            claimed_block="govern",
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:

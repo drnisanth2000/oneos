@@ -112,7 +112,7 @@ def propose(
     item_path = scope.resolve("00-inbox", "active", safe)
     prop = propose_classification(
         scope, item_path,
-        module=module, sub=sub, block=block, rule_id=(rule_id or None),
+        module=module, sub=sub, claimed_block=block, rule_id=(rule_id or None),
     )
     return templates.TemplateResponse(
         request,

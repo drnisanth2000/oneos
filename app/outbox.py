@@ -20,6 +20,7 @@ from pathlib import Path
 import yaml
 
 from .inbox import split_front_matter
+from .destinations import resolve_classification_destination
 from .scope import Scope
 
 
@@ -32,7 +33,7 @@ class Proposal:
     src: str          # vault-relative source path
     dst: str          # vault-relative destination path
     module: str
-    sub: str
+    sub: str | None
     block: str
     rule_id: str | None
     created: str
@@ -45,29 +46,31 @@ def propose_classification(
     *,
     module: str,
     sub: str,
-    block: str,
+    claimed_block: str | None = None,
     rule_id: str | None = None,
 ) -> Proposal:
     """Write a classify proposal. Moves nothing."""
-    entity = scope.current_entity()
-    item_path = Path(item_path)
-    filename = item_path.name
-    src_rel = scope.vault_relative(item_path)
-    dst_rel = (Path(entity) / module / "active" / filename).as_posix()
+    destination = resolve_classification_destination(
+        scope,
+        item_path,
+        module=module,
+        sub=sub,
+        claimed_block=claimed_block,
+    )
     created = datetime.now().isoformat(timespec="seconds")
-    pid = f"{datetime.now():%Y%m%dT%H%M%S}-{item_path.stem}"
+    pid = f"{datetime.now():%Y%m%dT%H%M%S}-{Path(destination.src).stem}"
 
     record = {
         "id": pid,
         "action": "classify",
-        "entity": entity,
+        "entity": destination.entity,
         "created": created,
         "status": "pending",
-        "src": src_rel,
-        "dst": dst_rel,
-        "module": module,
-        "sub": sub,
-        "block": block,
+        "src": destination.src,
+        "dst": destination.dst,
+        "module": destination.module,
+        "sub": destination.sub,
+        "block": destination.block,
         "rule_id": rule_id,
     }
     outbox = scope.resolve("outbox")
@@ -107,9 +110,11 @@ def load_proposals(scope: Scope) -> list[Proposal]:
     return props
 
 
-def _apply_sub(text: str, sub: str) -> str:
+def _apply_sub(text: str, sub: str | None) -> str:
     """The move's only content change: the `sub:` front-matter value. `block`
     is derived from the module, never written per file (conventions v2 §1)."""
+    if sub is None:
+        return re.sub(r"(?m)^sub:\s*.*\n?", "", text, count=1)
     if re.search(r"(?m)^sub:\s*.*$", text):
         return re.sub(r"(?m)^sub:\s*.*$", f"sub: {sub}", text, count=1)
     # no sub line yet — insert one just before the closing front-matter fence
