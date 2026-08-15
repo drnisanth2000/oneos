@@ -66,6 +66,19 @@ def _outbox_vault(root, entities, files):
     )
 
 
+def _vault_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
+    entries = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries.append((relative, "symlink", path.readlink().as_posix()))
+        elif path.is_dir():
+            entries.append((relative, "directory", ""))
+        else:
+            entries.append((relative, "file", path.read_bytes()))
+    return tuple(sorted(entries))
+
+
 def _vault(tmp_path):
     files = {
         "demo/00-inbox/active/note.md": textwrap.dedent(
@@ -134,6 +147,8 @@ def two_entity_vault(tmp_path):
         ),
         "alpha/11-knowledge/active/.gitkeep": "",
         "beta/11-knowledge/active/.gitkeep": "",
+        "alpha/11-library/active/.gitkeep": "",
+        "beta/11-library/active/.gitkeep": "",
     }
     return _outbox_vault(tmp_path, ("alpha", "beta"), files)
 
@@ -219,14 +234,12 @@ def test_invalid_classification_leaves_vault_and_outbox_unchanged(
     item_path = source if item == "canonical" else scope.resolve(
         "11-knowledge", "active", "note.md"
     )
-    destination = scope.resolve("11-knowledge", "active", "note.md")
+    attempted_destination = vault / "demo" / module / "active" / source.name
     before_head = git_head(vault)
     before_paths = git_tracked_paths(vault)
-    before_bytes = {
-        source: source.read_bytes(),
-        destination: destination.read_bytes() if destination.exists() else None,
-    }
+    before_tree = _vault_tree(vault)
     assert not scope.resolve("outbox").exists()
+    assert not attempted_destination.exists()
 
     with pytest.raises(DestinationError):
         propose_classification(
@@ -238,12 +251,10 @@ def test_invalid_classification_leaves_vault_and_outbox_unchanged(
         )
 
     assert not scope.resolve("outbox").exists()
+    assert not attempted_destination.exists()
     assert git_head(vault) == before_head
     assert git_tracked_paths(vault) == before_paths
-    assert {
-        source: source.read_bytes(),
-        destination: destination.read_bytes() if destination.exists() else None,
-    } == before_bytes
+    assert _vault_tree(vault) == before_tree
 
 
 def test_module_general_proposal_stores_null_and_removes_sub(tmp_path):
@@ -303,6 +314,7 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
 
     vault = _outbox_vault(tmp_path / "vault", ("synthetic",), {
         "synthetic/00-inbox/active/.gitkeep": "",
+        "synthetic/11-knowledge/active/.gitkeep": "",
         "synthetic/11-library/active/.gitkeep": "",
     })
     source = tmp_path / "dropbox/research.txt"
@@ -366,6 +378,12 @@ def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
         tmp_path,
         ("alpha", "beta"),
         {
+            "alpha/00-inbox/active/.gitkeep": "",
+            "beta/00-inbox/active/.gitkeep": "",
+            "alpha/11-knowledge/active/.gitkeep": "",
+            "beta/11-knowledge/active/.gitkeep": "",
+            "alpha/11-library/active/.gitkeep": "",
+            "beta/11-library/active/.gitkeep": "",
             "alpha/outbox/.gitkeep": "",
             "beta/outbox/hidden.yaml": record,
         },
@@ -407,6 +425,13 @@ def test_outbox_interfaces_have_one_identity_authority():
 def test_propose_rejects_item_path_from_another_entity(two_entity_vault):
     alpha = Scope(two_entity_vault, "alpha")
     beta_item = two_entity_vault / "beta/00-inbox/active/beta.md"
+    attempted_destination = alpha.resolve("11-knowledge", "active", "beta.md")
+    before_head = git_head(two_entity_vault)
+    before_paths = git_tracked_paths(two_entity_vault)
+    before_tree = _vault_tree(two_entity_vault)
+    assert not alpha.resolve("outbox").exists()
+    assert not attempted_destination.exists()
+
     with pytest.raises(DestinationError):
         propose_classification(
             alpha,
@@ -415,7 +440,12 @@ def test_propose_rejects_item_path_from_another_entity(two_entity_vault):
             sub="kb",
             claimed_block="govern",
         )
+
     assert not alpha.resolve("outbox").exists()
+    assert not attempted_destination.exists()
+    assert git_head(two_entity_vault) == before_head
+    assert git_tracked_paths(two_entity_vault) == before_paths
+    assert _vault_tree(two_entity_vault) == before_tree
 
 
 def test_preview_diff_rejects_proposal_bound_to_another_entity(two_entity_vault):
