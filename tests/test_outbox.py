@@ -560,6 +560,47 @@ def test_preview_diff_shows_move_and_sub_change(tmp_path):
     assert "-sub: triage" in diff and "+sub: kb" in diff
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", "20260815T090703-" + "22" * 16),
+        ("source_sha256", "A" * 64),
+        ("source_sha256", "not-a-sha256"),
+        ("source_sha256", _MISSING),
+    ],
+    ids=("mismatched-id", "uppercase-hash", "malformed-hash", "missing-hash"),
+)
+def test_preview_revalidates_loaded_persisted_record_before_rendering(
+    tmp_path, field, value
+):
+    vault = _vault(tmp_path)
+    scope, proposed = _propose(vault)
+    loaded = load_proposals(scope)[0]
+    record = yaml.safe_load(proposed.path.read_text(encoding="utf-8"))
+    if value is _MISSING:
+        record.pop(field)
+    else:
+        record[field] = value
+    proposed.path.write_text(yaml.safe_dump(record), encoding="utf-8")
+    proposal_before = proposed.path.read_bytes()
+    source = scope.resolve("00-inbox", "active", "note.md")
+    source_before = source.read_bytes()
+    destination = scope.root / loaded.dst
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    _assert_destination_error(lambda: preview_diff(scope, loaded))
+
+    assert proposed.path.exists()
+    assert proposed.path.read_bytes() == proposal_before
+    assert source.read_bytes() == source_before
+    assert not destination.exists()
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
+
+
 def test_load_proposals(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)

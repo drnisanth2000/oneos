@@ -293,7 +293,11 @@ def _apply_sub(text: str, sub: str | None) -> str:
 def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves."""
-    proposal = _require_destination(scope, proposal)
+    _require_outbox_path(scope, proposal.path, require_leaf=True)
+    reloaded = get_proposal(scope, proposal.id)
+    if reloaded.id != proposal.id or reloaded.path != proposal.path:
+        raise OutboxDestinationError("proposal changed since it was loaded")
+    proposal = _require_destination(scope, reloaded)
     src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
     new = _apply_sub(old, proposal.sub)
