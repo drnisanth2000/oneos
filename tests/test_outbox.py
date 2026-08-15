@@ -7,6 +7,7 @@ commits (exactly one commit, git-revertible); reject discards the proposal.
 Temp git vaults only; the real vault is never touched.
 """
 import inspect
+import re
 import textwrap
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -168,6 +169,48 @@ FORGED_BETA_PROPOSAL = textwrap.dedent(
 )
 
 
+_MISSING = object()
+
+
+def _canonical_alpha_record() -> dict:
+    return {
+        "id": "alpha-classification",
+        "action": "classify",
+        "entity": "alpha",
+        "created": "2026-01-02T03:04:05",
+        "status": "pending",
+        "src": "alpha/00-inbox/active/alpha.md",
+        "dst": "alpha/11-knowledge/active/alpha.md",
+        "module": "11-knowledge",
+        "sub": "kb",
+        "block": "govern",
+        "rule_id": "synthetic-rule",
+    }
+
+
+def _proposal_from_record(path: Path, record: dict) -> Proposal:
+    return Proposal(
+        id=record["id"],
+        path=path,
+        action=record["action"],
+        entity=record["entity"],
+        src=record["src"],
+        dst=record["dst"],
+        module=record["module"],
+        sub=record["sub"],
+        block=record["block"],
+        rule_id=record.get("rule_id"),
+        created=record.get("created", ""),
+        status=record.get("status", "pending"),
+    )
+
+
+def _assert_destination_error(operation) -> None:
+    with pytest.raises(outbox.OutboxError) as raised:
+        operation()
+    assert type(raised.value) is outbox.OutboxDestinationError
+
+
 def _write_record(scope: Scope, name: str, record: str) -> Path:
     path = scope.resolve("outbox", name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +300,11 @@ def test_invalid_classification_leaves_vault_and_outbox_unchanged(
     assert _vault_tree(vault) == before_tree
 
 
-def test_module_general_proposal_stores_null_and_removes_sub(tmp_path):
+def test_module_general_approval_removes_triage_sub_in_one_revertible_commit(
+    tmp_path,
+):
+    import subprocess
+
     vault = _vault(tmp_path)
     scope = Scope(vault, "demo")
     prop = propose_classification(
@@ -268,9 +315,35 @@ def test_module_general_proposal_stores_null_and_removes_sub(tmp_path):
     )
     record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
     assert record["sub"] is None
-    diff = preview_diff(scope, prop)
+    source = scope.resolve("00-inbox", "active", "note.md")
+    assert "sub: triage" in source.read_text(encoding="utf-8")
+    loaded = load_proposals(scope)
+    assert len(loaded) == 1
+    assert loaded[0].sub is None
+    diff = preview_diff(scope, loaded[0])
     assert "-sub: triage" in diff
     assert "+sub:" not in diff
+
+    before = git_count_commits(vault)
+    approval = approve(scope, prop.id)
+    approval_oid = git_head(vault)
+    destination = vault / approval.dst
+
+    assert git_count_commits(vault) == before + 1
+    assert not re.search(r"(?m)^sub:", destination.read_text(encoding="utf-8"))
+    assert not scope.resolve("00-inbox", "active", "note.md").exists()
+
+    subprocess.run(
+        ["git", "revert", "--no-edit", approval_oid],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+    )
+    restored = scope.resolve("00-inbox", "active", "note.md")
+    assert restored.exists()
+    assert "sub: triage" in restored.read_text(encoding="utf-8")
+    assert not destination.exists()
+    assert git_is_clean(vault)
 
 
 def test_preview_diff_shows_move_and_sub_change(tmp_path):
@@ -287,6 +360,137 @@ def test_load_proposals(tmp_path):
     scope, prop = _propose(vault)
     props = load_proposals(scope)
     assert [p.id for p in props] == [prop.id]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        *(
+            pytest.param(field, value, id=f"{field}-{kind}")
+            for field in (
+                "id",
+                "action",
+                "entity",
+                "src",
+                "dst",
+                "module",
+                "block",
+            )
+            for value, kind in (
+                (["not-a-scalar"], "list"),
+                (7, "int"),
+                (_MISSING, "missing"),
+            )
+        ),
+        pytest.param("sub", ["kb"], id="sub-list"),
+        pytest.param("sub", 7, id="sub-int"),
+        pytest.param("sub", {"id": "kb"}, id="sub-mapping"),
+        pytest.param("sub", "", id="sub-empty"),
+        pytest.param("sub", _MISSING, id="sub-missing"),
+    ],
+)
+def test_loading_rejects_malformed_destination_scalars(
+    two_entity_vault, field, value
+):
+    scope = Scope(two_entity_vault, "alpha")
+    record = _canonical_alpha_record()
+    if value is _MISSING:
+        record.pop(field)
+    else:
+        record[field] = value
+    _write_record(scope, "malformed.yaml", yaml.safe_dump(record))
+
+    _assert_destination_error(lambda: load_proposals(scope))
+
+
+def test_loading_rejects_non_mapping_proposal_record(two_entity_vault):
+    scope = Scope(two_entity_vault, "alpha")
+    _write_record(scope, "malformed.yaml", yaml.safe_dump(["not", "a", "mapping"]))
+
+    _assert_destination_error(lambda: load_proposals(scope))
+
+
+@pytest.mark.parametrize(
+    ("case", "field", "value"),
+    [
+        ("active different module", "module", "11-library"),
+        ("sub registered to another module", "sub", "reference"),
+        ("incorrect block", "block", "system"),
+        (
+            "source filename mismatch",
+            "src",
+            "alpha/00-inbox/active/different.md",
+        ),
+        (
+            "destination filename mismatch",
+            "dst",
+            "alpha/11-knowledge/active/different.md",
+        ),
+        (
+            "destination module mismatch",
+            "dst",
+            "alpha/11-library/active/alpha.md",
+        ),
+        (
+            "destination extra path segment",
+            "dst",
+            "alpha/11-knowledge/active/nested/alpha.md",
+        ),
+    ],
+)
+@pytest.mark.parametrize("operation", ["load", "preview", "approve"])
+def test_operations_reject_noncanonical_destination_without_mutation(
+    two_entity_vault, case, field, value, operation
+):
+    scope = Scope(two_entity_vault, "alpha")
+    record = _canonical_alpha_record()
+    record[field] = value
+    path = _write_record(scope, "forged.yaml", yaml.safe_dump(record))
+    before_head = git_head(two_entity_vault)
+    before_paths = git_tracked_paths(two_entity_vault)
+    before_tree = _vault_tree(two_entity_vault)
+
+    if operation == "load":
+        attempt = lambda: load_proposals(scope)
+    elif operation == "preview":
+        proposal = _proposal_from_record(path, record)
+        attempt = lambda: preview_diff(scope, proposal)
+    else:
+        attempt = lambda: approve(scope, record["id"])
+
+    _assert_destination_error(attempt)
+
+    assert git_head(two_entity_vault) == before_head
+    assert git_tracked_paths(two_entity_vault) == before_paths
+    assert _vault_tree(two_entity_vault) == before_tree
+
+
+@pytest.mark.parametrize("operation", ["load", "preview", "approve"])
+def test_noncanonical_destination_fails_before_source_body_read(
+    two_entity_vault, monkeypatch, operation
+):
+    scope = Scope(two_entity_vault, "alpha")
+    record = _canonical_alpha_record()
+    record["block"] = "system"
+    path = _write_record(scope, "forged.yaml", yaml.safe_dump(record))
+    source = scope.resolve("00-inbox", "active", "alpha.md")
+    real_read = Path.read_text
+
+    def guarded(candidate, *args, **kwargs):
+        if candidate.resolve() == source.resolve():
+            raise AssertionError("source receipt body was opened before validation")
+        return real_read(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    if operation == "load":
+        attempt = lambda: load_proposals(scope)
+    elif operation == "preview":
+        proposal = _proposal_from_record(path, record)
+        attempt = lambda: preview_diff(scope, proposal)
+    else:
+        attempt = lambda: approve(scope, record["id"])
+
+    _assert_destination_error(attempt)
 
 
 def test_approve_moves_file_and_makes_one_commit(tmp_path):
@@ -506,7 +710,9 @@ def test_mutation_rejects_foreign_record_and_leaves_both_entities_unchanged(
         ("dst", "beta/11-knowledge/active/beta.md"),
     ],
 )
-def test_loading_rejects_foreign_stored_path(two_entity_vault, field, foreign_value):
+def test_loading_wraps_foreign_stored_path_as_destination_error(
+    two_entity_vault, field, foreign_value
+):
     alpha = Scope(two_entity_vault, "alpha")
     record = {
         "id": "forged-path",
@@ -521,8 +727,22 @@ def test_loading_rejects_foreign_stored_path(two_entity_vault, field, foreign_va
     record[field] = foreign_value
     _write_record(alpha, "forged-path.yaml", __import__("yaml").safe_dump(record))
 
-    with pytest.raises(CrossScopeError):
-        load_proposals(alpha)
+    _assert_destination_error(lambda: load_proposals(alpha))
+
+
+def test_loading_wraps_destination_registry_error(two_entity_vault):
+    scope = Scope(two_entity_vault, "alpha")
+    _write_record(
+        scope,
+        "canonical.yaml",
+        yaml.safe_dump(_canonical_alpha_record()),
+    )
+    (two_entity_vault / "_system/archetypes.yaml").write_text(
+        OUTBOX_ARCHETYPES.replace("submodules:\n", "submodules: []\ninvalid:\n"),
+        encoding="utf-8",
+    )
+
+    _assert_destination_error(lambda: load_proposals(scope))
 
 
 def test_concurrent_proposals_are_written_only_to_the_bound_entity(two_entity_vault):

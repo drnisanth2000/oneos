@@ -20,8 +20,21 @@ from pathlib import Path
 import yaml
 
 from .inbox import split_front_matter
-from .destinations import resolve_classification_destination
-from .scope import Scope
+from .destinations import DestinationError, resolve_classification_destination
+from .scope import CrossScopeError, Scope
+from .vault import DestinationRegistryError
+
+
+class OutboxError(Exception):
+    pass
+
+
+class OutboxScopeError(OutboxError):
+    pass
+
+
+class OutboxDestinationError(OutboxError):
+    pass
 
 
 @dataclass
@@ -80,20 +93,44 @@ def propose_classification(
     return _to_proposal(path, record)
 
 
+def _required_string(record: dict, key: str) -> str:
+    value = record.get(key)
+    if not isinstance(value, str) or not value:
+        raise OutboxDestinationError("proposal destination record is malformed")
+    return value
+
+
 def _to_proposal(path: Path, record: dict) -> Proposal:
+    if not isinstance(record, dict):
+        raise OutboxDestinationError("proposal record must be a mapping")
+    if "sub" not in record:
+        raise OutboxDestinationError("proposal destination record is malformed")
+    sub = record.get("sub")
+    if sub is not None and (not isinstance(sub, str) or not sub):
+        raise OutboxDestinationError("proposal sub must be a string or null")
     return Proposal(
-        id=record["id"],
+        id=_required_string(record, "id"),
         path=path,
-        action=record.get("action", "classify"),
-        entity=record["entity"],
-        src=record["src"],
-        dst=record["dst"],
-        module=record["module"],
-        sub=record["sub"],
-        block=record.get("block", ""),
-        rule_id=record.get("rule_id"),
-        created=record.get("created", ""),
-        status=record.get("status", "pending"),
+        action=_required_string(record, "action"),
+        entity=_required_string(record, "entity"),
+        src=_required_string(record, "src"),
+        dst=_required_string(record, "dst"),
+        module=_required_string(record, "module"),
+        sub=sub,
+        block=_required_string(record, "block"),
+        rule_id=(
+            record.get("rule_id")
+            if isinstance(record.get("rule_id"), str)
+            else None
+        ),
+        created=(
+            record.get("created") if isinstance(record.get("created"), str) else ""
+        ),
+        status=(
+            record.get("status")
+            if isinstance(record.get("status"), str)
+            else "pending"
+        ),
     )
 
 
@@ -104,9 +141,13 @@ def load_proposals(scope: Scope) -> list[Proposal]:
     props = []
     for discovered in sorted(outbox.glob("*.yaml")):
         p = scope.resolve_stored(scope.vault_relative(discovered))
-        record = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        if record.get("action") == "classify":
-            props.append(_require_scope(scope, _to_proposal(p, record)))
+        try:
+            record = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            raise OutboxDestinationError("proposal record is invalid YAML") from exc
+        proposal = _to_proposal(p, record)
+        if proposal.action == "classify":
+            props.append(_require_destination(scope, proposal))
     return props
 
 
@@ -127,7 +168,7 @@ def _apply_sub(text: str, sub: str | None) -> str:
 def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves."""
-    proposal = _require_scope(scope, proposal)
+    proposal = _require_destination(scope, proposal)
     src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
     new = _apply_sub(old, proposal.sub)
@@ -145,19 +186,28 @@ def _git(vault: Path, *args: str) -> str:
     ).stdout
 
 
-class OutboxError(Exception):
-    pass
-
-
-class OutboxScopeError(OutboxError):
-    pass
-
-
 def _require_scope(scope: Scope, proposal: Proposal) -> Proposal:
     if proposal.entity != scope.current_entity():
         raise OutboxScopeError("proposal belongs to another entity")
-    scope.resolve_stored(proposal.src)
-    scope.resolve_stored(proposal.dst)
+    return proposal
+
+
+def _require_destination(scope: Scope, proposal: Proposal) -> Proposal:
+    proposal = _require_scope(scope, proposal)
+    try:
+        source = scope.resolve_stored(proposal.src)
+        canonical = resolve_classification_destination(
+            scope,
+            source,
+            module=proposal.module,
+            sub=proposal.sub,
+            claimed_block=proposal.block,
+            require_source=False,
+        )
+    except (DestinationError, CrossScopeError, DestinationRegistryError) as exc:
+        raise OutboxDestinationError("proposal destination is invalid") from exc
+    if proposal.src != canonical.src or proposal.dst != canonical.dst:
+        raise OutboxDestinationError("proposal destination is non-canonical")
     return proposal
 
 
