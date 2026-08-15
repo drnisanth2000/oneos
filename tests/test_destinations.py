@@ -30,6 +30,7 @@ submodules:
     triage: {name: Triage}
   11-library:
     reference: {name: Reference}
+    special-reference: {name: Special reference, flag: special}
   zz-extra:
     specialized: {name: Specialized, flag: special}
 """
@@ -151,6 +152,57 @@ def test_resolver_allows_flag_enabled_module_and_sub(destination_vault):
     assert result.module == "zz-extra"
     assert result.sub == "specialized"
     assert result.block == "growth"
+
+
+def test_resolver_rejects_on_disk_module_inactive_for_bound_entity(
+    destination_vault,
+):
+    scope = Scope(destination_vault, "alpha")
+    (destination_vault / "alpha" / "zz-extra" / "active").mkdir(parents=True)
+
+    _assert_rejection_is_read_only(
+        destination_vault,
+        InvalidModule,
+        lambda: resolve_classification_destination(
+            scope,
+            scope.resolve("00-inbox", "active", "receipt.md"),
+            module="zz-extra",
+            sub=None,
+        ),
+    )
+
+
+def test_resolver_rejects_sub_disabled_by_flag_on_active_module(
+    destination_vault,
+):
+    scope = Scope(destination_vault, "alpha")
+
+    _assert_rejection_is_read_only(
+        destination_vault,
+        InvalidSub,
+        lambda: resolve_classification_destination(
+            scope,
+            scope.resolve("00-inbox", "active", "receipt.md"),
+            module="11-library",
+            sub="special-reference",
+        ),
+    )
+
+
+def test_resolver_allows_sub_enabled_by_flag_on_active_module(destination_vault):
+    scope = Scope(destination_vault, "enabled")
+
+    result = resolve_classification_destination(
+        scope,
+        scope.resolve("00-inbox", "active", "receipt.md"),
+        module="11-library",
+        sub="special-reference",
+        claimed_block="govern",
+    )
+
+    assert result.module == "11-library"
+    assert result.sub == "special-reference"
+    assert result.block == "govern"
 
 
 @pytest.mark.parametrize(
