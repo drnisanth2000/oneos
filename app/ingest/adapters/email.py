@@ -1,7 +1,7 @@
 """email.py — IMAP email ingest adapter (spec §8.1 2nd source, step 10).
 
-Normalises an email into text + metadata and hands it to the ONE shared write
-path (base.write_inbox_item): same Envelope, same PII filter, no second code
+Normalises an email into text + metadata and hands it to the ONE shared commit
+path (base.commit_inbox_item): same Envelope, same PII filter, no second code
 path. The full body stays in the mail server (§8.3) — the vault gets the
 redacted summary plus a `body_ref` pointing back at the message.
 """
@@ -10,11 +10,31 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime
 from email.message import Message
-from email.utils import parsedate_to_datetime
+from email.policy import SMTP
+from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 
-from ..base import write_inbox_item
+from ..base import IngestError, IngestResult, commit_inbox_item
+from ...entities import (
+    EntityCatalog,
+    RecipientConfigurationError,
+    normalize_email_address,
+)
 from ...scope import Scope
+
+_RECIPIENT_HEADERS = ("Delivered-To", "X-Original-To", "Envelope-To", "To", "Cc")
+
+
+class EmailRoutingError(IngestError):
+    pass
+
+
+class UnmappedRecipientError(EmailRoutingError):
+    pass
+
+
+class AmbiguousRecipientError(EmailRoutingError):
+    pass
 
 
 def _decode(part: Message) -> str:
@@ -44,47 +64,79 @@ def attachments(msg: Message) -> list[str]:
     return [p.get_filename() for p in msg.walk() if p.get_filename()]
 
 
+def recipient_addresses(message: Message) -> frozenset[str]:
+    values = [value for name in _RECIPIENT_HEADERS for value in message.get_all(name, [])]
+    addresses: set[str] = set()
+    for _display, raw in getaddresses(values):
+        try:
+            addresses.add(normalize_email_address(raw))
+        except RecipientConfigurationError:
+            continue
+    return frozenset(addresses)
+
+
+def route_email_scope(root: Path | str, message: Message) -> Scope:
+    catalog = EntityCatalog.load(root)
+    matches = {
+        entity
+        for address in recipient_addresses(message)
+        if (entity := catalog.entity_for_recipient(address)) is not None
+    }
+    if not matches:
+        raise UnmappedRecipientError("email has no configured entity recipient")
+    if len(matches) != 1:
+        raise AmbiguousRecipientError("email recipients map to multiple entities")
+    return Scope(catalog.root, matches.pop())
+
+
 def process_email(
-    vault: Path | str,
-    entity: str,
-    msg: Message,
+    scope: Scope,
+    message: Message,
     *,
-    scope: Scope | None = None,
     now: datetime | None = None,
-) -> Path:
+) -> IngestResult:
     """Ingest one email into the inbox via the shared write path."""
-    scope = scope or Scope(Path(vault))
     now = now or datetime.now()
 
-    subject = msg.get("Subject", "(no subject)")
-    sender = msg.get("From")
-    msgid = (msg.get("Message-ID") or "").strip("<>")
-    thread_id = (msg.get("In-Reply-To") or msg.get("References") or msgid or "").strip("<>") or None
+    subject = message.get("Subject", "(no subject)")
+    sender = message.get("From")
+    msgid = (message.get("Message-ID") or "").strip("<>")
+    thread_id = (
+        message.get("In-Reply-To") or message.get("References") or msgid or ""
+    ).strip("<>") or None
 
-    date_hdr = msg.get("Date")
+    date_hdr = message.get("Date")
     try:
         received_at = parsedate_to_datetime(date_hdr).isoformat(timespec="seconds") \
             if date_hdr else now.isoformat(timespec="seconds")
     except (TypeError, ValueError):
         received_at = now.isoformat(timespec="seconds")
 
-    text = body_text(msg)
-    digest = hashlib.sha256((msgid or subject).encode("utf-8")).hexdigest()
-    source_ref = f"imap:{msgid}" if msgid else f"imap:{digest[:16]}"
+    text = body_text(message)
+    digest = hashlib.sha256(message.as_bytes(policy=SMTP)).hexdigest()
+    source_id = msgid or digest[:16]
+    source_ref = f"imap:{msgid}" if msgid else f"imap:{source_id}"
 
-    note_path, _ = write_inbox_item(
-        scope, entity,
-        text=text, title=subject, source="email", source_id=(msgid or digest[:16]),
+    return commit_inbox_item(
+        scope,
+        text=text, title=subject, source="email", source_id=source_id,
         received_at=received_at, sender=sender, thread_id=thread_id,
         source_ref=source_ref, body_ref=source_ref, sha256=digest,
-        attachments=attachments(msg), slug_seed=digest,
+        attachments=attachments(message), slug_seed=digest,
     )
-    return note_path
+
+
+def process_shared_email(
+    root: Path | str,
+    message: Message,
+    *,
+    now: datetime | None = None,
+) -> IngestResult:
+    return process_email(route_email_scope(root, message), message, now=now)
 
 
 def poll(  # pragma: no cover - IMAP I/O glue over process_email
     vault: Path | str,
-    entity: str,
     host: str,
     user: str,
     password: str,
@@ -98,16 +150,24 @@ def poll(  # pragma: no cover - IMAP I/O glue over process_email
     import email as _email
     import imaplib
 
+    catalog = EntityCatalog.load(vault)
     conn = imaplib.IMAP4_SSL(host)
-    conn.login(user, password)
-    conn.select(mailbox)
-    _typ, data = conn.search(None, "UNSEEN")
     count = 0
-    for uid in data[0].split():
-        _typ, raw = conn.fetch(uid, "(RFC822)")
-        msg = _email.message_from_bytes(raw[0][1])
-        process_email(vault, entity, msg)
-        count += 1
-    conn.close()
-    conn.logout()
+    try:
+        conn.login(user, password)
+        conn.select(mailbox)
+        _typ, data = conn.search(None, "UNSEEN")
+        for uid in data[0].split():
+            _typ, raw = conn.fetch(uid, "(BODY.PEEK[])")
+            msg = _email.message_from_bytes(raw[0][1])
+            process_shared_email(catalog.root, msg)
+            acknowledgement_status, _data = conn.store(uid, "+FLAGS", "\\Seen")
+            if acknowledgement_status != "OK":
+                raise IngestError("email acknowledgement failed")
+            count += 1
+    finally:
+        try:
+            conn.close()
+        finally:
+            conn.logout()
     return count

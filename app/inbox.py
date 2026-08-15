@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from .scope import Scope
+from .scope import CrossScopeError, Scope
 
 
 @dataclass
@@ -37,12 +37,36 @@ def split_front_matter(text: str) -> tuple[dict, str]:
     return fm, text[end + 3:].lstrip("\n")
 
 
-def read_inbox(scope: Scope, entity: str) -> list[InboxItem]:
-    d = scope.resolve(entity, "00-inbox", "active")
-    if not d.is_dir():
+def _require_real_directory(scope: Scope, *parts: str) -> Path | None:
+    lexical = scope.root / scope.current_entity() / Path(*parts)
+    if not lexical.exists() and not lexical.is_symlink():
+        return None
+    resolved = scope.resolve(*parts)
+    if lexical.is_symlink() or resolved != lexical or not lexical.is_dir():
+        raise CrossScopeError("inbox lifecycle directory is redirected")
+    return lexical
+
+
+def _require_real_receipt(directory: Path, discovered: Path) -> Path:
+    if (
+        discovered.parent != directory
+        or discovered.is_symlink()
+        or not discovered.is_file()
+        or discovered.resolve() != discovered
+    ):
+        raise CrossScopeError("inbox receipt is redirected")
+    return discovered
+
+
+def read_inbox(scope: Scope) -> list[InboxItem]:
+    if _require_real_directory(scope, "00-inbox") is None:
+        return []
+    directory = _require_real_directory(scope, "00-inbox", "active")
+    if directory is None:
         return []
     items: list[InboxItem] = []
-    for p in sorted(d.glob("*.md")):
+    for discovered in sorted(directory.glob("*.md")):
+        p = _require_real_receipt(directory, discovered)
         fm, body = split_front_matter(p.read_text(encoding="utf-8"))
         if fm.get("sub") != "triage":
             continue

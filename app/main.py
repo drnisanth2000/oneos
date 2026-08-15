@@ -8,16 +8,20 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, Form, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .classifier import Classifier
-from .config import build_scope
+from .config import build_catalog, build_scope
+from .destinations import DestinationError, resolve_classification_destination
+from .entities import EntitySelectionError
 from .inbox import read_inbox
 from .outbox import (
+    OutboxDestinationError,
     OutboxError,
     approve,
     load_proposals,
@@ -28,10 +32,12 @@ from .outbox import (
 from .registry import (
     RegistryError,
     execute_delete,
+    products_for,
     propose_delete,
     reference_count,
 )
-from .vault import Vault
+from .scope import Scope
+from .vault import DestinationRegistryError, Vault
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -39,14 +45,22 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 app = FastAPI(title="OneOS")
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 
-# One scope for the process — the tenant boundary. Every path resolution and
-# query goes through it (invariant 4).
-scope = build_scope()
+catalog = build_catalog()
+
+
+def entity_scope(entity: str) -> Scope:
+    try:
+        return build_scope(entity)
+    except EntitySelectionError as exc:
+        raise HTTPException(status_code=404) from exc
+
+
+EntityScope = Annotated[Scope, Depends(entity_scope)]
 
 
 @app.get("/", response_class=HTMLResponse)
 def shell(request: Request) -> HTMLResponse:
-    bundles = Vault(scope).bundles()
+    bundles = Vault(catalog).bundles()
     return templates.TemplateResponse(
         request,
         "shell.html",
@@ -63,46 +77,54 @@ def pulse(request: Request) -> HTMLResponse:
 
 @app.get("/triage", response_class=HTMLResponse)
 def triage_default(request: Request):
-    bundles = Vault(scope).bundles()
+    bundles = Vault(catalog).bundles()
     if not bundles:
         return HTMLResponse("<p>No entity bundles found.</p>")
     return RedirectResponse(url=f"/triage/{bundles[0].slug}", status_code=307)
 
 
 @app.get("/triage/{entity}", response_class=HTMLResponse)
-def triage(request: Request, entity: str) -> HTMLResponse:
-    # current_entity() is the tenant boundary; set it before any read.
-    scope.set_current_entity(entity)
-    vault = Vault(scope)
+def triage(request: Request, scope: EntityScope) -> HTMLResponse:
+    selected = scope.current_entity()
+    vault = Vault(catalog)
     clf = Classifier(vault)
-    rows = [
-        (item, clf.classify(item.title, item.summary, item.source))
-        for item in read_inbox(scope, entity)
-    ]
+    rows = []
+    for item in read_inbox(scope):
+        classification = clf.classify(item.title, item.summary, item.source)
+        try:
+            destination = resolve_classification_destination(
+                scope,
+                item.path,
+                module=classification.module,
+                sub=classification.sub,
+                claimed_block=classification.block,
+            )
+        except (DestinationError, DestinationRegistryError):
+            destination = None
+        rows.append((item, classification, destination))
     return templates.TemplateResponse(
         request,
         "triage.html",
-        {"bundles": vault.bundles(), "entity": entity, "rows": rows},
+        {"bundles": vault.bundles(), "entity": selected, "rows": rows},
     )
 
 
 @app.post("/triage/{entity}/propose", response_class=HTMLResponse)
 def propose(
     request: Request,
-    entity: str,
+    scope: EntityScope,
     filename: str = Form(...),
     module: str = Form(...),
-    sub: str = Form(...),
-    block: str = Form(...),
-    rule_id: str = Form(""),
+    sub: str = Form(""),
+    block: str | None = Form(None),
+    entity_claim: str | None = Form(None, alias="entity"),
 ) -> HTMLResponse:
-    scope.set_current_entity(entity)
-    # filename is untrusted form input — take the basename, never a path.
-    safe = Path(filename).name
-    item_path = scope.resolve(entity, "00-inbox", "active", safe)
+    if entity_claim is not None:
+        raise OutboxDestinationError("entity is owned by request scope")
+    item_path = scope.resolve("00-inbox", "active") / filename
     prop = propose_classification(
-        scope, entity, item_path,
-        module=module, sub=sub, block=block, rule_id=(rule_id or None),
+        scope, item_path,
+        module=module, sub=sub, claimed_block=block,
     )
     return templates.TemplateResponse(
         request,
@@ -111,81 +133,75 @@ def propose(
     )
 
 
-def _outbox_list(request: Request, entity: str) -> HTMLResponse:
-    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope, entity)]
+def _outbox_list(request: Request, scope: Scope) -> HTMLResponse:
+    selected = scope.current_entity()
+    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope)]
     return templates.TemplateResponse(
-        request, "blocks/outbox_list.html", {"entity": entity, "props": props}
+        request, "blocks/outbox_list.html", {"entity": selected, "props": props}
     )
 
 
 @app.get("/outbox/{entity}", response_class=HTMLResponse)
-def outbox_screen(request: Request, entity: str) -> HTMLResponse:
-    scope.set_current_entity(entity)
-    vault = Vault(scope)
-    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope, entity)]
+def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
+    selected = scope.current_entity()
+    vault = Vault(catalog)
+    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope)]
     return templates.TemplateResponse(
         request, "outbox.html",
-        {"bundles": vault.bundles(), "entity": entity, "props": props},
+        {"bundles": vault.bundles(), "entity": selected, "props": props},
     )
 
 
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
-def outbox_approve(request: Request, entity: str, id: str = Form(...)) -> HTMLResponse:
-    scope.set_current_entity(entity)
+def outbox_approve(
+    request: Request, scope: EntityScope, id: str = Form(...)
+) -> HTMLResponse:
     try:
-        approve(scope, entity, id)
+        approve(scope, id)
     except OutboxError:
         pass
-    return _outbox_list(request, entity)
+    return _outbox_list(request, scope)
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
-def outbox_reject(request: Request, entity: str, id: str = Form(...)) -> HTMLResponse:
-    scope.set_current_entity(entity)
+def outbox_reject(
+    request: Request, scope: EntityScope, id: str = Form(...)
+) -> HTMLResponse:
     try:
-        reject(scope, entity, id)
+        reject(scope, id)
     except OutboxError:
         pass
-    return _outbox_list(request, entity)
-
-
-def _products_for(entity: str) -> list[str]:
-    import yaml
-
-    path = scope.system_path("products.yaml")
-    if not path.is_file():
-        return []
-    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return list(((cfg.get("products") or {}).get(entity) or {}).keys())
+    return _outbox_list(request, scope)
 
 
 @app.get("/registry/{entity}/products", response_class=HTMLResponse)
-def registry_products(request: Request, entity: str) -> HTMLResponse:
-    scope.set_current_entity(entity)
-    vault = Vault(scope)
+def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
+    selected = scope.current_entity()
+    vault = Vault(catalog)
     return templates.TemplateResponse(
         request, "registry.html",
-        {"bundles": vault.bundles(), "entity": entity, "products": _products_for(entity)},
+        {"bundles": vault.bundles(), "entity": selected, "products": products_for(scope)},
     )
 
 
 @app.post("/registry/{entity}/product/delete-preview", response_class=HTMLResponse)
-def registry_delete_preview(request: Request, entity: str, slug: str = Form(...)) -> HTMLResponse:
-    scope.set_current_entity(entity)
-    prop = propose_delete(scope, entity, "product", slug)
+def registry_delete_preview(
+    request: Request, scope: EntityScope, slug: str = Form(...)
+) -> HTMLResponse:
+    selected = scope.current_entity()
+    prop = propose_delete(scope, "product", slug)
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
-        {"entity": entity, "slug": slug, "prop": prop,
+        {"entity": selected, "slug": slug, "prop": prop,
          "report": reference_count(scope, "product", slug)},
     )
 
 
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
-def registry_delete_execute(request: Request, entity: str,
+def registry_delete_execute(request: Request, scope: EntityScope,
                             id: str = Form(...), slug: str = Form(...)) -> HTMLResponse:
-    scope.set_current_entity(entity)
     try:
-        execute_delete(scope, entity, id)
+        execute_delete(scope, id)
         msg = f"Deleted product '{slug}'. One commit written."
     except RegistryError as e:
         msg = str(e).replace("\n", "<br>")

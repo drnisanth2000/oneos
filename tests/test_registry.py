@@ -4,18 +4,30 @@ Add and edit go direct; delete goes through the outbox with a reference count
 that shows what breaks before it runs, and refuses if references remain
 (ADR-006 consequence test). Temp git vaults only.
 """
+import inspect
 import sqlite3
 import textwrap
 
-from app.scope import Scope
+import pytest
+import yaml
+
+import app.registry as registry
+from app.scope import CrossScopeError, Scope
 from app.registry import (
     RegistryError,
     add_workspace,
     execute_delete,
+    get_delete_proposal,
     propose_delete,
     reference_count,
 )
-from tests.conftest import git_vault, git_count_commits, git_head_message, git_is_clean
+from tests.conftest import (
+    git_count_commits,
+    git_entity_vault,
+    git_head,
+    git_head_message,
+    git_is_clean,
+)
 
 
 def _products_vault(tmp_path, referenced=True):
@@ -47,7 +59,7 @@ def _products_vault(tmp_path, referenced=True):
         files["_system/workspaces.yaml"] += (
             "  - {id: widgetx, label: Widgetx, kind: product, entity: demo, product: widgetx, default_view: blocks}\n"
         )
-    vault = git_vault(tmp_path, files)
+    vault = git_entity_vault(tmp_path, ("demo",), files)
     if referenced:
         db = tmp_path / "demo" / "books.db"
         conn = sqlite3.connect(db)
@@ -63,9 +75,95 @@ def _products_vault(tmp_path, referenced=True):
     return vault
 
 
+@pytest.fixture
+def two_entity_registry_vault(tmp_path):
+    files = {
+        "_system/products.yaml": textwrap.dedent(
+            """\
+            version: "1.0"
+            products:
+              alpha:
+                shared:
+                  label: Alpha Shared
+                unused:
+                  label: Alpha Unused
+                alpha-only:
+                  label: Alpha Only
+              beta:
+                shared:
+                  label: Beta Registry Marker
+                unused:
+                  label: Beta Unused
+                beta-only:
+                  label: Beta Only
+            """
+        ),
+        "_system/workspaces.yaml": textwrap.dedent(
+            """\
+            version: "1.0"
+            workspaces:
+              - id: alpha-cross
+                label: Alpha Cross
+                kind: cross
+                primary_entity: alpha
+                entities: [alpha, beta]
+                product: shared
+                default_view: blocks
+            """
+        ),
+        "alpha/07-finance/active/alpha.md": (
+            "---\ntype: note\ntitle: Alpha Registry Marker\nentity: alpha\n"
+            "product: shared\nstatus: active\ncreated: 2026-01-01\n"
+            "updated: 2026-01-01\n---\nalpha-registry-marker\n"
+        ),
+        "beta/07-finance/active/beta-one.md": (
+            "---\ntype: note\ntitle: Beta Registry Marker One\nentity: beta\n"
+            "product: shared\nstatus: active\ncreated: 2026-01-01\n"
+            "updated: 2026-01-01\n---\nbeta-registry-marker-one\n"
+        ),
+        "beta/09-marketing/active/beta-two.md": (
+            "---\ntype: note\ntitle: Beta Registry Marker Two\nentity: beta\n"
+            "product: shared\nstatus: active\ncreated: 2026-01-01\n"
+            "updated: 2026-01-01\n---\nbeta-registry-marker-two\n"
+        ),
+        "alpha/.sensitive/hidden.md": (
+            "---\ntype: note\ntitle: Hidden\nentity: alpha\nproduct: shared\n---\n"
+        ),
+        "alpha/outbox/ignored.md": (
+            "---\ntype: note\ntitle: Outbox\nentity: alpha\nproduct: shared\n---\n"
+        ),
+        "alpha/staging/ignored.md": (
+            "---\ntype: note\ntitle: Staging\nentity: alpha\nproduct: shared\n---\n"
+        ),
+    }
+    vault = git_entity_vault(tmp_path, ("alpha", "beta"), files)
+    (vault / "alpha/07-finance/active/beta-link.md").symlink_to(
+        vault / "beta/07-finance/active/beta-one.md"
+    )
+    for entity, rows in (("alpha", ("product", "tag")), ("beta", ("product",))):
+        connection = sqlite3.connect(vault / entity / "books.db")
+        connection.executescript(
+            "CREATE TABLE entries (id INTEGER PRIMARY KEY, product TEXT, tag TEXT);"
+        )
+        for column in rows:
+            connection.execute(f"INSERT INTO entries ({column}) VALUES (?)", ("shared",))
+        connection.commit()
+        connection.close()
+    import subprocess
+
+    subprocess.run(["git", "add", "-A"], cwd=vault, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add registry fixtures"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+    )
+    return vault
+
+
 def test_reference_count_finds_every_reference(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    r = reference_count(Scope(vault), "product", "widgetx")
+    r = reference_count(Scope(vault, "demo"), "product", "widgetx")
     assert r.sources.get("front-matter") == 1
     assert r.sources.get("workspaces") == 1
     assert r.sources.get("books.db") == 2      # products.tag + invoices.product
@@ -74,13 +172,89 @@ def test_reference_count_finds_every_reference(tmp_path):
 
 def test_reference_count_zero_when_unused(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    r = reference_count(Scope(vault), "product", "widgetx")
+    r = reference_count(Scope(vault, "demo"), "product", "widgetx")
     assert r.total == 0
+
+
+def test_reference_count_reads_only_bound_entity(two_entity_registry_vault):
+    alpha = reference_count(
+        Scope(two_entity_registry_vault, "alpha"), "product", "shared"
+    )
+    beta = reference_count(
+        Scope(two_entity_registry_vault, "beta"), "product", "shared"
+    )
+    assert alpha.sources == {"front-matter": 1, "workspaces": 1, "books.db": 2}
+    assert beta.sources == {"front-matter": 2, "workspaces": 0, "books.db": 1}
+
+
+def test_reference_count_never_opens_another_entity_or_sensitive_paths(
+    two_entity_registry_vault, monkeypatch
+):
+    scope = Scope(two_entity_registry_vault, "alpha")
+    beta_root = (two_entity_registry_vault / "beta").resolve()
+    hidden = (two_entity_registry_vault / "alpha/.sensitive/hidden.md").resolve()
+    beta_db = (beta_root / "books.db").resolve()
+    real_read_text = registry.Path.read_text
+    real_connect = registry.sqlite3.connect
+
+    def guarded_read_text(path, *args, **kwargs):
+        resolved = path.resolve()
+        if resolved == hidden or (
+            resolved.is_relative_to(beta_root) and resolved.suffix == ".md"
+        ):
+            raise AssertionError(f"forbidden registry read: {resolved.name}")
+        return real_read_text(path, *args, **kwargs)
+
+    def guarded_connect(database, *args, **kwargs):
+        if str(beta_db) in str(database):
+            raise AssertionError("beta books.db was opened from alpha scope")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(registry.Path, "read_text", guarded_read_text)
+    monkeypatch.setattr(registry.sqlite3, "connect", guarded_connect)
+
+    report = reference_count(scope, "product", "shared")
+    assert report.sources == {"front-matter": 1, "workspaces": 1, "books.db": 2}
+
+
+def test_reference_count_does_not_follow_cross_entity_books_db_symlink(
+    two_entity_registry_vault, monkeypatch
+):
+    scope = Scope(two_entity_registry_vault, "alpha")
+    alpha_db = two_entity_registry_vault / "alpha/books.db"
+    beta_db = (two_entity_registry_vault / "beta/books.db").resolve()
+    alpha_db.rename(two_entity_registry_vault / "alpha/original-books.db")
+    alpha_db.symlink_to(beta_db)
+    real_connect = registry.sqlite3.connect
+
+    def guarded_connect(database, *args, **kwargs):
+        raw_path = str(database).removeprefix("file:").split("?", 1)[0]
+        if registry.Path(raw_path).resolve() == beta_db:
+            raise AssertionError("beta books.db was opened through an alpha symlink")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(registry.sqlite3, "connect", guarded_connect)
+
+    report = reference_count(scope, "product", "shared")
+    assert report.sources == {"front-matter": 1, "workspaces": 1, "books.db": 0}
+
+
+def test_products_for_reads_only_bound_registry_namespace(two_entity_registry_vault):
+    assert registry.products_for(Scope(two_entity_registry_vault, "alpha")) == [
+        "shared",
+        "unused",
+        "alpha-only",
+    ]
+    assert registry.products_for(Scope(two_entity_registry_vault, "beta")) == [
+        "shared",
+        "unused",
+        "beta-only",
+    ]
 
 
 def test_add_workspace_is_direct_and_commits(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault)
+    scope = Scope(vault, "demo")
     before = git_count_commits(vault)
     add_workspace(scope, {"id": "rti", "label": "RTI", "kind": "matter", "entity": "demo"})
     ws = (vault / "_system/workspaces.yaml").read_text()
@@ -92,8 +266,8 @@ def test_add_workspace_is_direct_and_commits(tmp_path):
 
 def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault)
-    prop = propose_delete(scope, "demo", "product", "widgetx")
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
     assert prop.path.exists()
     text = prop.path.read_text()
     assert "front-matter" in text and "books.db" in text     # impact recorded
@@ -101,12 +275,63 @@ def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
     assert "widgetx:" in (vault / "_system/products.yaml").read_text()
 
 
+def test_propose_delete_keeps_untrusted_slug_out_of_proposal_filename(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    target = scope.resolve("13-analytics", "kpis.yaml")
+    target.parent.mkdir(parents=True)
+    original = b"version: '1.0'\nkpis: unchanged\n"
+    target.write_bytes(original)
+    slug = "../../../13-analytics/kpis"
+
+    proposal = propose_delete(scope, "product", slug)
+
+    assert proposal.path.parent == scope.resolve("outbox")
+    assert yaml.safe_load(proposal.path.read_text())["slug"] == slug
+    assert target.read_bytes() == original
+
+
+def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    target = scope.resolve("13-analytics", "kpis.yaml")
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        textwrap.dedent(
+            """\
+            id: ../13-analytics/kpis
+            action: delete
+            entity: demo
+            kind: product
+            slug: widgetx
+            status: pending
+            total_references: 0
+            impact: {}
+            """
+        ),
+        encoding="utf-8",
+    )
+    target_before = target.read_bytes()
+    registry = scope.system_path("products.yaml")
+    registry_before = registry.read_bytes()
+    head_before = git_head(vault)
+
+    with pytest.raises(RegistryError):
+        get_delete_proposal(scope, "../13-analytics/kpis")
+    with pytest.raises(RegistryError):
+        execute_delete(scope, "../13-analytics/kpis")
+
+    assert target.read_bytes() == target_before
+    assert registry.read_bytes() == registry_before
+    assert git_head(vault) == head_before
+
+
 def test_execute_delete_refuses_while_referenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault)
-    prop = propose_delete(scope, "demo", "product", "widgetx")
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
     try:
-        execute_delete(scope, "demo", prop.id)
+        execute_delete(scope, prop.id)
         assert False, "should have refused"
     except RegistryError:
         pass
@@ -115,11 +340,98 @@ def test_execute_delete_refuses_while_referenced(tmp_path):
 
 def test_execute_delete_removes_when_unreferenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault)
-    prop = propose_delete(scope, "demo", "product", "widgetx")
-    execute_delete(scope, "demo", prop.id)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    execute_delete(scope, prop.id)
     prods = (vault / "_system/products.yaml").read_text()
     assert "widgetx:" not in prods
     assert "other:" in prods                    # sibling untouched
     assert git_head_message(vault).startswith("registry: delete product")
     assert git_is_clean(vault)
+
+
+def test_delete_removes_only_bound_registry_key(two_entity_registry_vault):
+    scope = Scope(two_entity_registry_vault, "alpha")
+    proposal = propose_delete(scope, "product", "unused")
+    execute_delete(scope, proposal.id)
+    cfg = yaml.safe_load(scope.system_path("products.yaml").read_text())
+    assert "unused" not in cfg["products"]["alpha"]
+    assert "unused" in cfg["products"]["beta"]
+
+
+def test_forged_delete_proposal_cannot_be_read_or_executed(
+    two_entity_registry_vault,
+):
+    scope = Scope(two_entity_registry_vault, "alpha")
+    proposal = scope.resolve("outbox", "forged-delete.yaml")
+    proposal.parent.mkdir(parents=True, exist_ok=True)
+    proposal.write_text(
+        textwrap.dedent(
+            """\
+            id: forged-delete
+            action: delete
+            entity: beta
+            kind: product
+            slug: unused
+            status: pending
+            total_references: 0
+            impact: {}
+            """
+        ),
+        encoding="utf-8",
+    )
+    registry_before = scope.system_path("products.yaml").read_bytes()
+    head_before = git_head(two_entity_registry_vault)
+
+    with pytest.raises(RegistryError):
+        get_delete_proposal(scope, "forged-delete")
+    with pytest.raises(RegistryError):
+        execute_delete(scope, "forged-delete")
+
+    assert scope.system_path("products.yaml").read_bytes() == registry_before
+    assert git_head(two_entity_registry_vault) == head_before
+
+
+def test_delete_proposal_read_rejects_cross_entity_leaf_symlink(
+    two_entity_registry_vault,
+):
+    scope = Scope(two_entity_registry_vault, "alpha")
+    foreign = two_entity_registry_vault / "beta/outbox/foreign-delete.yaml"
+    foreign.parent.mkdir(parents=True, exist_ok=True)
+    foreign.write_text(
+        "id: foreign-delete\naction: delete\nentity: beta\nkind: product\nslug: unused\n",
+        encoding="utf-8",
+    )
+    linked = scope.resolve("outbox") / "linked-delete.yaml"
+    linked.parent.mkdir(parents=True, exist_ok=True)
+    linked.symlink_to(foreign)
+
+    with pytest.raises(CrossScopeError):
+        get_delete_proposal(scope, "linked-delete")
+
+
+def test_registry_interfaces_have_one_identity_authority():
+    for function in (propose_delete, get_delete_proposal, execute_delete):
+        assert "entity" not in inspect.signature(function).parameters
+
+
+def test_add_workspace_rejects_another_entity_entry(two_entity_registry_vault):
+    scope = Scope(two_entity_registry_vault, "alpha")
+    path = scope.system_path("workspaces.yaml")
+    before = path.read_bytes()
+    head_before = git_head(two_entity_registry_vault)
+
+    with pytest.raises(RegistryError):
+        add_workspace(
+            scope,
+            {
+                "id": "beta-cross",
+                "label": "Beta Cross",
+                "kind": "cross",
+                "primary_entity": "beta",
+                "entities": ["alpha", "beta"],
+            },
+        )
+
+    assert path.read_bytes() == before
+    assert git_head(two_entity_registry_vault) == head_before

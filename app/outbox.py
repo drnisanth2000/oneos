@@ -20,7 +20,21 @@ from pathlib import Path
 import yaml
 
 from .inbox import split_front_matter
-from .scope import Scope
+from .destinations import DestinationError, resolve_classification_destination
+from .scope import CrossScopeError, Scope
+from .vault import DestinationRegistryError
+
+
+class OutboxError(Exception):
+    pass
+
+
+class OutboxScopeError(OutboxError):
+    pass
+
+
+class OutboxDestinationError(OutboxError):
+    pass
 
 
 @dataclass
@@ -32,87 +46,172 @@ class Proposal:
     src: str          # vault-relative source path
     dst: str          # vault-relative destination path
     module: str
-    sub: str
+    sub: str | None
     block: str
     rule_id: str | None
     created: str
     status: str = "pending"
 
 
-def _rel(scope: Scope, path: Path) -> str:
-    return str(Path(path).resolve().relative_to(scope.root.resolve()))
+def _require_outbox_path(
+    scope: Scope,
+    proposal_path: Path | None = None,
+    *,
+    create_directory: bool = False,
+    require_leaf: bool = False,
+) -> Path:
+    """Retain the lexical outbox path and reject every redirected component."""
+    lexical_outbox = scope.root / scope.current_entity() / "outbox"
+    resolved_outbox = scope.resolve("outbox")
+    if lexical_outbox.is_symlink() or resolved_outbox != lexical_outbox:
+        raise CrossScopeError("outbox directory is redirected")
+    if lexical_outbox.exists():
+        if not lexical_outbox.is_dir():
+            raise CrossScopeError("outbox path is not a real directory")
+    elif create_directory:
+        try:
+            lexical_outbox.mkdir()
+        except FileExistsError as exc:
+            raise CrossScopeError("outbox directory changed during creation") from exc
+        if lexical_outbox.is_symlink() or scope.resolve("outbox") != lexical_outbox:
+            raise CrossScopeError("outbox directory is redirected")
+
+    if proposal_path is None:
+        return lexical_outbox
+
+    candidate = Path(proposal_path)
+    if (
+        candidate.parent != lexical_outbox
+        or candidate != lexical_outbox / candidate.name
+        or candidate.suffix != ".yaml"
+    ):
+        raise CrossScopeError("proposal is outside the lexical outbox")
+    if candidate.is_symlink():
+        raise CrossScopeError("proposal leaf is redirected")
+    if candidate.exists():
+        if not candidate.is_file() or candidate.resolve() != candidate:
+            raise CrossScopeError("proposal leaf is not a real file")
+    elif require_leaf:
+        raise OutboxError("proposal leaf no longer exists")
+    return candidate
 
 
 def propose_classification(
     scope: Scope,
-    entity: str,
     item_path: Path,
     *,
     module: str,
     sub: str,
-    block: str,
+    claimed_block: str | None = None,
     rule_id: str | None = None,
 ) -> Proposal:
     """Write a classify proposal. Moves nothing."""
-    item_path = Path(item_path)
-    filename = item_path.name
-    src_rel = _rel(scope, item_path)
-    dst_rel = str(Path(entity) / module / "active" / filename)
+    destination = resolve_classification_destination(
+        scope,
+        item_path,
+        module=module,
+        sub=sub,
+        claimed_block=claimed_block,
+    )
     created = datetime.now().isoformat(timespec="seconds")
-    pid = f"{datetime.now():%Y%m%dT%H%M%S}-{item_path.stem}"
+    pid = f"{datetime.now():%Y%m%dT%H%M%S}-{Path(destination.src).stem}"
 
     record = {
         "id": pid,
         "action": "classify",
-        "entity": entity,
+        "entity": destination.entity,
         "created": created,
         "status": "pending",
-        "src": src_rel,
-        "dst": dst_rel,
-        "module": module,
-        "sub": sub,
-        "block": block,
+        "src": destination.src,
+        "dst": destination.dst,
+        "module": destination.module,
+        "sub": destination.sub,
+        "block": destination.block,
         "rule_id": rule_id,
     }
-    outbox = scope.resolve(entity, "outbox")
-    outbox.mkdir(parents=True, exist_ok=True)
-    path = outbox / f"{pid}.yaml"
-    path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+    outbox = _require_outbox_path(scope, create_directory=True)
+    path = _require_outbox_path(scope, outbox / f"{pid}.yaml")
+    try:
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(yaml.safe_dump(record, sort_keys=False))
+    except FileExistsError as exc:
+        raise OutboxError("proposal already exists") from exc
     return _to_proposal(path, record)
 
 
+def _required_string(record: dict, key: str) -> str:
+    value = record.get(key)
+    if not isinstance(value, str) or not value:
+        raise OutboxDestinationError("proposal destination record is malformed")
+    return value
+
+
 def _to_proposal(path: Path, record: dict) -> Proposal:
+    if not isinstance(record, dict):
+        raise OutboxDestinationError("proposal record must be a mapping")
+    if "sub" not in record:
+        raise OutboxDestinationError("proposal destination record is malformed")
+    sub = record.get("sub")
+    if sub is not None and (not isinstance(sub, str) or not sub):
+        raise OutboxDestinationError("proposal sub must be a string or null")
+    if record.get("action") != "classify":
+        raise OutboxDestinationError("proposal is not a classification")
     return Proposal(
-        id=record["id"],
+        id=_required_string(record, "id"),
         path=path,
-        action=record.get("action", "classify"),
-        entity=record["entity"],
-        src=record["src"],
-        dst=record["dst"],
-        module=record["module"],
-        sub=record["sub"],
-        block=record.get("block", ""),
-        rule_id=record.get("rule_id"),
-        created=record.get("created", ""),
-        status=record.get("status", "pending"),
+        action=_required_string(record, "action"),
+        entity=_required_string(record, "entity"),
+        src=_required_string(record, "src"),
+        dst=_required_string(record, "dst"),
+        module=_required_string(record, "module"),
+        sub=sub,
+        block=_required_string(record, "block"),
+        rule_id=(
+            record.get("rule_id")
+            if isinstance(record.get("rule_id"), str)
+            else None
+        ),
+        created=(
+            record.get("created") if isinstance(record.get("created"), str) else ""
+        ),
+        status=(
+            record.get("status")
+            if isinstance(record.get("status"), str)
+            else "pending"
+        ),
     )
 
 
-def load_proposals(scope: Scope, entity: str) -> list[Proposal]:
-    outbox = scope.resolve(entity, "outbox")
-    if not outbox.is_dir():
+def load_proposals(scope: Scope) -> list[Proposal]:
+    outbox = _require_outbox_path(scope)
+    if not outbox.exists():
         return []
     props = []
-    for p in sorted(outbox.glob("*.yaml")):
-        record = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        if record.get("action") == "classify":
-            props.append(_to_proposal(p, record))
+    for discovered in sorted(outbox.glob("*.yaml")):
+        p = _require_outbox_path(scope, discovered, require_leaf=True)
+        try:
+            record = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            raise OutboxDestinationError("proposal record is invalid YAML") from exc
+        if not isinstance(record, dict):
+            raise OutboxDestinationError("proposal record must be a mapping")
+        action = record.get("action")
+        if not isinstance(action, str) or not action:
+            raise OutboxDestinationError("proposal action is malformed")
+        if action == "delete":
+            continue
+        if action != "classify":
+            raise OutboxDestinationError("proposal action is unknown")
+        proposal = _to_proposal(p, record)
+        props.append(_require_destination(scope, proposal))
     return props
 
 
-def _apply_sub(text: str, sub: str) -> str:
+def _apply_sub(text: str, sub: str | None) -> str:
     """The move's only content change: the `sub:` front-matter value. `block`
     is derived from the module, never written per file (conventions v2 §1)."""
+    if sub is None:
+        return re.sub(r"(?m)^sub:\s*.*\n?", "", text, count=1)
     if re.search(r"(?m)^sub:\s*.*$", text):
         return re.sub(r"(?m)^sub:\s*.*$", f"sub: {sub}", text, count=1)
     # no sub line yet — insert one just before the closing front-matter fence
@@ -125,7 +224,8 @@ def _apply_sub(text: str, sub: str) -> str:
 def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves."""
-    src_path = scope.root / proposal.src
+    proposal = _require_destination(scope, proposal)
+    src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
     new = _apply_sub(old, proposal.sub)
     diff = difflib.unified_diff(
@@ -142,42 +242,64 @@ def _git(vault: Path, *args: str) -> str:
     ).stdout
 
 
-class OutboxError(Exception):
-    pass
+def _require_scope(scope: Scope, proposal: Proposal) -> Proposal:
+    if proposal.entity != scope.current_entity():
+        raise OutboxScopeError("proposal belongs to another entity")
+    return proposal
 
 
-def get_proposal(scope: Scope, entity: str, proposal_id: str) -> Proposal:
-    for p in load_proposals(scope, entity):
+def _require_destination(scope: Scope, proposal: Proposal) -> Proposal:
+    proposal = _require_scope(scope, proposal)
+    _require_outbox_path(scope, proposal.path, require_leaf=True)
+    try:
+        source = scope.resolve_stored(proposal.src)
+        canonical = resolve_classification_destination(
+            scope,
+            source,
+            module=proposal.module,
+            sub=proposal.sub,
+            claimed_block=proposal.block,
+            require_source=False,
+        )
+    except (DestinationError, CrossScopeError, DestinationRegistryError) as exc:
+        raise OutboxDestinationError("proposal destination is invalid") from exc
+    if proposal.src != canonical.src or proposal.dst != canonical.dst:
+        raise OutboxDestinationError("proposal destination is non-canonical")
+    return proposal
+
+
+def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
+    entity = scope.current_entity()
+    for p in load_proposals(scope):
         if p.id == proposal_id:
             return p
     raise OutboxError(f"no pending proposal {proposal_id!r} for {entity}")
 
 
-def approve(scope: Scope, entity: str, proposal_id: str) -> Proposal:
+def approve(scope: Scope, proposal_id: str) -> Proposal:
     """Perform the proposed move and commit it — exactly one revertible commit.
     The proposal file is untracked, so it never enters git; deleting it leaves a
     clean tree after the commit."""
-    prop = get_proposal(scope, entity, proposal_id)
+    prop = _require_destination(scope, get_proposal(scope, proposal_id))
     vault = scope.root
-    src = vault / prop.src
-    dst = vault / prop.dst
+    src = scope.resolve_stored(prop.src)
+    dst = scope.resolve_stored(prop.dst)
     if not src.exists():
         raise OutboxError(f"source no longer exists: {prop.src}")
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
     _git(vault, "mv", prop.src, prop.dst)          # rename (original content)
     dst.write_text(_apply_sub(dst.read_text(encoding="utf-8"), prop.sub),
                    encoding="utf-8")               # the sub: change
     _git(vault, "add", prop.dst)
-    prop.path.unlink(missing_ok=True)              # untracked proposal — just drop it
+    _require_outbox_path(scope, prop.path, require_leaf=True).unlink()
     _git(vault, "commit", "-q", "-m",
          f"outbox: approve {prop.id} ({prop.src} → {prop.dst})")
     return prop
 
 
-def reject(scope: Scope, entity: str, proposal_id: str) -> Proposal:
+def reject(scope: Scope, proposal_id: str) -> Proposal:
     """Discard the proposal. No move, no commit — the proposal was never
     tracked."""
-    prop = get_proposal(scope, entity, proposal_id)
-    prop.path.unlink(missing_ok=True)
+    prop = get_proposal(scope, proposal_id)
+    _require_outbox_path(scope, prop.path, require_leaf=True).unlink()
     return prop

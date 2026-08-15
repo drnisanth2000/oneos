@@ -1,7 +1,7 @@
 """folder.py — folder-drop ingest adapter (spec §8.1, first adapter).
 
 A file dropped into `_dropbox/` is hashed, its text extracted, run through the
-ADR-008 PII filter, and written as a redacted item into `<entity>/00-inbox/
+ADR-008 PII filter, and committed as a redacted item into `<entity>/00-inbox/
 active/` with `sub: triage`. The order is load → filter → write: only redacted
 text is ever written, so PII never reaches git (the one irreversible mistake in
 this design). The raw original is moved out of the vault to a raw archive and
@@ -14,7 +14,10 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from ..base import write_inbox_item
+from ..base import (
+    IngestError, IngestPathCollision, IngestResult, commit_inbox_item,
+    find_tracked_receipt, prepare_inbox_item,
+)
 from ...scope import Scope
 
 _MIME = {
@@ -32,6 +35,19 @@ _MIME = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 }
 _TEXT_EXT = {".txt", ".md", ".csv", ".log", ".json", ".yaml", ".yml"}
+
+
+class FolderSourceRestoreError(IngestError):
+    pass
+
+
+def _restore_raw(archived: Path, src: Path, reason: str) -> None:
+    if src.exists():
+        raise FolderSourceRestoreError(f"{reason} and original drop path is occupied")
+    try:
+        shutil.move(str(archived), str(src))
+    except OSError as exc:
+        raise FolderSourceRestoreError(f"{reason} and raw source restoration failed") from exc
 
 
 def sha256_of(path: Path) -> str:
@@ -59,43 +75,60 @@ def extract_text(path: Path) -> str:
 
 
 def process_drop(
-    vault: Path | str,
-    entity: str,
-    src: Path | str,
+    scope: Scope,
+    source: Path | str,
     *,
     raw_archive: Path | str,
-    scope: Scope | None = None,
     now: datetime | None = None,
-) -> Path:
-    """Ingest one dropped file. Returns the path of the written inbox note.
+) -> IngestResult:
+    """Ingest one dropped file. Returns the shared ingest result.
     The raw original is moved into `raw_archive` (outside the vault); only the
     redacted note enters the vault via the shared write path."""
-    vault = Path(vault)
-    src = Path(src)
-    raw_archive = Path(raw_archive)
-    scope = scope or Scope(vault)
+    source_path = Path(source)
+    archive_root = Path(raw_archive)
     now = now or datetime.now()
 
-    digest = sha256_of(src)
-    size = src.stat().st_size
-    mime = mime_of(src)
-    text = extract_text(src)
+    digest = sha256_of(source_path)
+    size = source_path.stat().st_size
+    mime = mime_of(source_path)
+    text = extract_text(source_path)
 
-    # Move the raw original out of the vault, never into git. `source_ref` uses
-    # a named root ("raw:") so it survives a move to the VPS or a 2nd machine.
-    raw_archive.mkdir(parents=True, exist_ok=True)
-    archived = raw_archive / f"{digest[:16]}-{src.name}"
-    shutil.move(str(src), str(archived))
+    archived = archive_root / f"{digest[:16]}-{source_path.name}"
     source_ref = f"raw:{archived.name}"
+    kwargs = {
+        "text": text,
+        "title": source_path.name,
+        "source": "folder",
+        "source_id": digest[:16],
+        "received_at": now.isoformat(timespec="seconds"),
+        "source_ref": source_ref,
+        "body_ref": source_ref,
+        "sha256": digest,
+        "mime": mime,
+        "size": size,
+        "slug_seed": digest,
+    }
 
-    note_path, _ = write_inbox_item(
-        scope, entity,
-        text=text, title=src.name, source="folder", source_id=digest[:16],
-        received_at=now.isoformat(timespec="seconds"),
-        source_ref=source_ref, body_ref=source_ref,
-        sha256=digest, mime=mime, size=size, slug_seed=digest,
-    )
-    return note_path
+    _path, env, _rendered = prepare_inbox_item(scope, **kwargs)
+    existing = find_tracked_receipt(scope, env)
+    if existing is not None:
+        return IngestResult(existing, env, False, None)
+    if archived.exists():
+        raise IngestPathCollision("raw archive destination already exists")
+
+    archive_root.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_path), str(archived))
+    try:
+        result = commit_inbox_item(scope, **kwargs)
+    except IngestError as exc:
+        try:
+            _restore_raw(archived, source_path, "receipt commit failed")
+        except FolderSourceRestoreError as restore_exc:
+            raise restore_exc from exc
+        raise
+    if not result.created:
+        _restore_raw(archived, source_path, "duplicate detected after archive")
+    return result
 
 
 def watch(
@@ -105,19 +138,21 @@ def watch(
     raw_archive: Path | str,
 ) -> None:  # pragma: no cover - I/O glue over process_drop
     """Block, processing every file that lands in `dropbox`."""
+    scope = Scope(vault, entity)
+
     from watchdog.events import FileSystemEventHandler
     from watchdog.observers import Observer
 
-    dropbox = Path(dropbox)
-    dropbox.mkdir(parents=True, exist_ok=True)
+    dropbox_path = Path(dropbox)
+    dropbox_path.mkdir(parents=True, exist_ok=True)
 
     class _Handler(FileSystemEventHandler):
         def on_created(self, event):
             if not event.is_directory:
-                process_drop(vault, entity, event.src_path, raw_archive=raw_archive)
+                process_drop(scope, event.src_path, raw_archive=raw_archive)
 
     observer = Observer()
-    observer.schedule(_Handler(), str(dropbox), recursive=False)
+    observer.schedule(_Handler(), str(dropbox_path), recursive=False)
     observer.start()
     try:
         while True:

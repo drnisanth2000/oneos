@@ -6,6 +6,7 @@ rule"). Every test builds its own throwaway vault with invented slugs, so the
 same code that drives the real system drives these.
 """
 from pathlib import Path
+import json
 import subprocess
 import textwrap
 
@@ -43,6 +44,18 @@ def write_vault(root: Path, entities_yaml: str, archetypes_yaml: str = ARCHETYPE
     return root
 
 
+def entities_yaml(*slugs: str, ingest: dict[str, list[str]] | None = None) -> str:
+    rows = ['version: "1.0"', "entities:"]
+    for slug in slugs:
+        rows.extend((f"  {slug}:", f"    label: {slug.title()}", "    flags: []"))
+        addresses = (ingest or {}).get(slug, [])
+        if addresses:
+            rows.append("    ingest:")
+            rows.append("      email_addresses:")
+            rows.extend(f"        - {json.dumps(address)}" for address in addresses)
+    return "\n".join(rows) + "\n"
+
+
 def scaffold_modules(root: Path, slug: str, modules: list[str]) -> None:
     """Create the given module directories on disk under a bundle."""
     for m in modules:
@@ -75,11 +88,23 @@ def git_vault(root: Path, files: dict[str, str]) -> Path:
     vault for rename tests. Never the real vault."""
     write_tree(root, files)
     _git(root, "init", "-q")
-    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.email", "test@example.invalid")
     _git(root, "config", "user.name", "test")
     _git(root, "add", "-A")
     _git(root, "commit", "-q", "-m", "init")
     return root
+
+
+def git_entity_vault(
+    root: Path,
+    entities: tuple[str, ...],
+    files: dict[str, str],
+    *,
+    ingest: dict[str, list[str]] | None = None,
+) -> Path:
+    tree = dict(files)
+    tree.setdefault("_system/entities.yaml", entities_yaml(*entities, ingest=ingest))
+    return git_vault(root, tree)
 
 
 def git_head_message(root: Path) -> str:
@@ -92,3 +117,33 @@ def git_is_clean(root: Path) -> bool:
 
 def git_count_commits(root: Path) -> int:
     return int(_git(root, "rev-list", "--count", "HEAD").strip())
+
+
+def git_head(root: Path) -> str:
+    return _git(root, "rev-parse", "HEAD").strip()
+
+
+def git_changed_paths(root: Path, revision: str = "HEAD") -> list[str]:
+    output = _git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", revision)
+    return sorted(line for line in output.splitlines() if line)
+
+
+def git_tracked_paths(root: Path) -> list[str]:
+    return sorted(line for line in _git(root, "ls-files").splitlines() if line)
+
+
+def git_index_paths(root: Path) -> list[str]:
+    return sorted(line for line in _git(root, "diff", "--cached", "--name-only").splitlines() if line)
+
+
+def git_history_contains(root: Path, needle: str) -> bool:
+    objects = _git(root, "rev-list", "--objects", "--all")
+    for line in objects.splitlines():
+        oid = line.split(" ", 1)[0]
+        proc = subprocess.run(
+            ["git", "cat-file", "-p", oid], cwd=root,
+            check=True, capture_output=True,
+        )
+        if needle.encode("utf-8") in proc.stdout:
+            return True
+    return False
