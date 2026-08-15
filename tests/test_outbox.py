@@ -410,6 +410,20 @@ def test_loading_rejects_non_mapping_proposal_record(two_entity_vault):
     _assert_destination_error(lambda: load_proposals(scope))
 
 
+def test_loading_wraps_invalid_yaml_without_mutation(two_entity_vault):
+    scope = Scope(two_entity_vault, "alpha")
+    _write_record(scope, "invalid.yaml", "action: classify\nmodule: [unterminated\n")
+    before_head = git_head(two_entity_vault)
+    before_paths = git_tracked_paths(two_entity_vault)
+    before_tree = _vault_tree(two_entity_vault)
+
+    _assert_destination_error(lambda: load_proposals(scope))
+
+    assert git_head(two_entity_vault) == before_head
+    assert git_tracked_paths(two_entity_vault) == before_paths
+    assert _vault_tree(two_entity_vault) == before_tree
+
+
 @pytest.mark.parametrize(
     ("case", "field", "value"),
     [
