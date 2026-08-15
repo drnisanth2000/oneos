@@ -5,12 +5,14 @@ The app reads its vault from ONEOS_VAULT, so the test builds a synthetic one and
 points the env at it before importing the app — no real slug or path in the repo.
 """
 import importlib
+import json
 import re
 import sqlite3
 import subprocess
 import threading
 import textwrap
 from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,18 @@ def snapshot_entity_bytes(vault: Path, entities: tuple[str, ...]) -> dict[str, b
         for path in sorted((vault / entity).rglob("*"))
         if path.is_file()
     }
+
+
+class HxValsParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.values: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "button":
+            values = dict(attrs).get("hx-vals")
+            if values is not None:
+                self.values.append(values)
 
 
 @pytest.fixture
@@ -223,6 +237,22 @@ def test_triage_renders_accept_only_for_canonical_destination(client):
     assert "invalid-destination-marker" in html
     assert html.count('class="accept"') == 1
     assert '"block":' not in html
+
+
+def test_triage_serializes_canonical_destination_as_one_hx_vals_mapping(client):
+    hostile_leaf = 'shown\'.md", "filename": "marker.md'
+    source = client.vault / "alpha/00-inbox/active/marker.md"
+    source.rename(source.with_name(hostile_leaf))
+
+    parser = HxValsParser()
+    parser.feed(client.get("/triage/alpha").text)
+
+    assert len(parser.values) == 1
+    assert json.loads(parser.values[0]) == {
+        "filename": hostile_leaf,
+        "module": "02-work",
+        "sub": "general",
+    }
 
 
 def test_concurrent_triage_requests_keep_entity_rows_isolated(client, monkeypatch):

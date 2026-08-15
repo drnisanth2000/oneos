@@ -76,10 +76,11 @@
             {% endif %}
           </div>
           {% if c.confident and destination %}
+          {% set proposal_values = {"filename": it.path.name, "module": destination.module, "sub": destination.sub or ""} %}
           <div class="ti-actions">
             <button class="accept"
                     hx-post="/triage/{{ entity }}/propose"
-                    hx-vals='{"filename": "{{ it.path.name }}", "module": "{{ destination.module }}", "sub": "{{ destination.sub or '' }}"}'
+                    hx-vals='{{ proposal_values | tojson }}'
                     hx-target="#diff-{{ loop.index0 }}" hx-swap="innerHTML">
               Accept → write proposal
             </button>
