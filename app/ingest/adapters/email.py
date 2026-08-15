@@ -161,6 +161,7 @@ def poll(  # pragma: no cover - IMAP I/O glue over process_email
             _typ, raw = conn.fetch(uid, "(BODY.PEEK[])")
             msg = _email.message_from_bytes(raw[0][1])
             process_shared_email(catalog.root, msg)
+            conn.store(uid, "+FLAGS", "\\Seen")
             count += 1
     finally:
         try:

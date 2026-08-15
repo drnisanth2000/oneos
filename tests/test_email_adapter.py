@@ -11,6 +11,7 @@ from email.policy import SMTP
 import pytest
 
 from app.entities import RecipientConfigurationError
+from app.ingest.base import IngestCommitError
 from app.scope import Scope
 from app.schema import validate_file
 from app.inbox import split_front_matter
@@ -24,7 +25,56 @@ from app.ingest.adapters.email import (
 )
 from app.ingest.adapters.folder import process_drop
 from app.ingest.pii import verhoeff_check_digit
-from tests.conftest import git_entity_vault, git_head, git_tracked_paths
+from tests.conftest import (
+    git_count_commits,
+    git_entity_vault,
+    git_head,
+    git_is_clean,
+    git_tracked_paths,
+)
+
+
+class PollingIMAP:
+    def __init__(self, raw_message, *, on_store=None):
+        self.raw_message = raw_message
+        self.on_store = on_store
+        self.logins = []
+        self.mailboxes = []
+        self.searches = []
+        self.fetches = []
+        self.stores = []
+        self.closed = False
+        self.logged_out = False
+
+    def login(self, user, password):
+        self.logins.append((user, password))
+        return "OK", []
+
+    def select(self, mailbox):
+        self.mailboxes.append(mailbox)
+        return "OK", []
+
+    def search(self, charset, criterion):
+        self.searches.append((charset, criterion))
+        return "OK", [b"17"]
+
+    def fetch(self, uid, query):
+        self.fetches.append((uid, query))
+        return "OK", [(b"17 (BODY[] {1})", self.raw_message)]
+
+    def store(self, uid, command, flags):
+        if self.on_store is not None:
+            self.on_store()
+        self.stores.append((uid, command, flags))
+        return "OK", []
+
+    def close(self):
+        self.closed = True
+        return "OK", []
+
+    def logout(self):
+        self.logged_out = True
+        return "BYE", []
 
 
 def _valid_aadhaar() -> str:
@@ -155,6 +205,54 @@ def test_poll_rejects_duplicate_ownership_before_opening_imap(tmp_path, monkeypa
         poll(vault, "mail.example.invalid", "user", "password")
 
 
+def test_poll_commits_receipt_before_acknowledging_seen(email_vault, monkeypatch):
+    message = _msg("commit then acknowledge", to="intake-alpha@example.invalid")
+    head_before = git_head(email_vault)
+    commit_count_before = git_count_commits(email_vault)
+    head_when_stored = []
+    connection = PollingIMAP(
+        message.as_bytes(),
+        on_store=lambda: head_when_stored.append(git_head(email_vault)),
+    )
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", lambda _host: connection)
+
+    assert poll(email_vault, "mail.example.invalid", "user", "password") == 1
+
+    head_after = git_head(email_vault)
+    assert head_after != head_before
+    assert git_count_commits(email_vault) == commit_count_before + 1
+    assert head_when_stored == [head_after]
+    assert connection.fetches == [(b"17", "(BODY.PEEK[])")]
+    assert connection.stores == [(b"17", "+FLAGS", "\\Seen")]
+    assert connection.closed is True
+    assert connection.logged_out is True
+
+
+def test_poll_commit_failure_does_not_acknowledge_and_cleans_up(
+    email_vault, monkeypatch
+):
+    hook = email_vault / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    message = _msg("commit must fail", to="intake-alpha@example.invalid")
+    connection = PollingIMAP(message.as_bytes())
+    monkeypatch.setattr(imaplib, "IMAP4_SSL", lambda _host: connection)
+    head_before = git_head(email_vault)
+    paths_before = git_tracked_paths(email_vault)
+
+    with pytest.raises(IngestCommitError, match="receipt commit failed"):
+        poll(email_vault, "mail.example.invalid", "user", "password")
+
+    assert connection.fetches == [(b"17", "(BODY.PEEK[])")]
+    assert connection.stores == []
+    assert connection.closed is True
+    assert connection.logged_out is True
+    assert git_head(email_vault) == head_before
+    assert git_tracked_paths(email_vault) == paths_before
+    assert git_is_clean(email_vault)
+    assert not list(email_vault.glob("*/00-inbox/active/*.md"))
+
+
 @pytest.mark.parametrize("recipients,error", [
     (["unknown@example.invalid"], UnmappedRecipientError),
     (["intake-alpha@example.invalid", "intake-beta@example.invalid"], AmbiguousRecipientError),
@@ -162,39 +260,6 @@ def test_poll_rejects_duplicate_ownership_before_opening_imap(tmp_path, monkeypa
 def test_poll_routing_failure_peeks_without_mailbox_or_vault_mutation(
     email_vault, monkeypatch, recipients, error
 ):
-    class PollingIMAP:
-        def __init__(self, raw_message):
-            self.raw_message = raw_message
-            self.fetches = []
-            self.stores = []
-            self.closed = False
-            self.logged_out = False
-
-        def login(self, _user, _password):
-            return "OK", []
-
-        def select(self, _mailbox):
-            return "OK", []
-
-        def search(self, _charset, _criterion):
-            return "OK", [b"17"]
-
-        def fetch(self, uid, query):
-            self.fetches.append((uid, query))
-            return "OK", [(b"17 (BODY[] {1})", self.raw_message)]
-
-        def store(self, uid, command, flags):
-            self.stores.append((uid, command, flags))
-            return "OK", []
-
-        def close(self):
-            self.closed = True
-            return "OK", []
-
-        def logout(self):
-            self.logged_out = True
-            return "BYE", []
-
     message = _msg("must remain unseen", to=", ".join(recipients))
     connection = PollingIMAP(message.as_bytes())
     monkeypatch.setattr(imaplib, "IMAP4_SSL", lambda _host: connection)
