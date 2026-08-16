@@ -273,6 +273,11 @@ def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult
         return _execute_locked(vault, start_head, reviewed_index, unrelated, plan)
 
 
+def _checkpoint(name: str) -> None:
+    """Provide a deterministic failure-injection seam for transaction tests."""
+    del name
+
+
 def _execute_locked(
     vault: Path,
     start_head: str,
@@ -280,32 +285,151 @@ def _execute_locked(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
 ) -> TransactionResult:
-    del reviewed_index  # Captured now for Task 3's failure recovery.
     applied_changes: list[PathChange] = []
-    for change in plan.changes + plan.owned_changes:
-        _apply_state(vault, change)
-        applied_changes.append(change)
-
-    descriptor, temporary_index = tempfile.mkstemp(prefix="oneos-index-")
-    os.close(descriptor)
-    os.unlink(temporary_index)
-    alternate_env = os.environ.copy()
-    alternate_env["GIT_INDEX_FILE"] = temporary_index
+    temporary_index: str | None = None
+    commit_oid: str | None = None
     try:
+        for change in plan.changes + plan.owned_changes:
+            _apply_state(vault, change)
+            applied_changes.append(change)
+        _checkpoint("filesystem-applied")
+
+        descriptor, temporary_index = tempfile.mkstemp(prefix="oneos-index-")
+        os.close(descriptor)
+        os.unlink(temporary_index)
+        alternate_env = os.environ.copy()
+        alternate_env["GIT_INDEX_FILE"] = temporary_index
         _git(vault, "read-tree", start_head, env=alternate_env)
+        _checkpoint("alternate-index-ready")
         _stage_in_alternate_index(vault, plan.commit_paths, alternate_env)
+        _checkpoint("reviewed-paths-staged")
         _git(vault, "commit", "-q", "-m", plan.message, env=alternate_env)
         commit_oid = _git_text(vault, "rev-parse", "HEAD").strip()
+        _checkpoint("commit-created")
         _verify_commit(
             vault, commit_oid, start_head, plan.message, plan.commit_paths
         )
+        _checkpoint("commit-verified")
         _sync_reviewed_index(vault, commit_oid, plan.commit_paths)
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
+        _checkpoint("real-index-synchronized")
         _require_unrelated_state_unchanged(vault, unrelated, plan)
         return TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
+    except Exception as exc:
+        blocked_paths = _rollback_transaction(
+            vault,
+            start_head,
+            commit_oid,
+            reviewed_index,
+            unrelated,
+            plan,
+            applied_changes,
+        )
+        if blocked_paths:
+            raise GitTransactionRecoveryError(blocked_paths) from exc
+        raise GitTransactionFailure(
+            "approval transaction failed and was rolled back"
+        ) from exc
     finally:
+        if temporary_index is not None:
+            _remove_temporary_index(temporary_index)
+
+
+def _rollback_transaction(
+    vault: Path,
+    start_head: str,
+    commit_oid: str | None,
+    reviewed_index: tuple[_IndexEntry, ...],
+    unrelated: _UnrelatedState,
+    plan: TransactionPlan,
+    applied_changes: list[PathChange],
+) -> tuple[str, ...]:
+    blocked_paths: set[str] = set()
+
+    for change in reversed(applied_changes):
         try:
-            os.unlink(temporary_index)
+            current = capture_path_state(vault, change.path)
+        except (OSError, GitTransactionError):
+            blocked_paths.add(change.path)
+            continue
+        if current != change.after:
+            blocked_paths.add(change.path)
+            continue
+        try:
+            _apply_state(vault, PathChange(change.path, change.after, change.before))
+        except (OSError, GitTransactionError):
+            blocked_paths.add(change.path)
+
+    original_entries = {entry.path: entry for entry in reviewed_index}
+    for path in plan.commit_paths:
+        try:
+            entry = original_entries.get(path)
+            if entry is None:
+                _git(vault, "update-index", "--force-remove", "--", path)
+            else:
+                _git(
+                    vault,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    entry.mode,
+                    entry.oid,
+                    path,
+                )
+        except (OSError, GitTransactionError):
+            blocked_paths.add(path)
+
+    if commit_oid is not None:
+        try:
+            updated = _git(
+                vault,
+                "update-ref",
+                "HEAD",
+                start_head,
+                commit_oid,
+                check=False,
+            )
+        except (OSError, GitTransactionError):
+            blocked_paths.add("HEAD")
+        else:
+            if updated.returncode:
+                blocked_paths.add("HEAD")
+
+    try:
+        current_unrelated = _capture_unrelated_state(vault, plan)
+    except (OSError, GitTransactionError):
+        blocked_paths.update(entry.path for entry in unrelated.index_entries)
+        blocked_paths.update(state.path for state in unrelated.dirty_paths)
+    else:
+        blocked_paths.update(_changed_unrelated_paths(unrelated, current_unrelated))
+
+    return tuple(sorted(blocked_paths))
+
+
+def _changed_unrelated_paths(
+    expected: _UnrelatedState, current: _UnrelatedState
+) -> tuple[str, ...]:
+    expected_index = {entry.path: entry for entry in expected.index_entries}
+    current_index = {entry.path: entry for entry in current.index_entries}
+    expected_dirty = {state.path: state for state in expected.dirty_paths}
+    current_dirty = {state.path: state for state in current.dirty_paths}
+    changed = {
+        path
+        for path in expected_index.keys() | current_index.keys()
+        if expected_index.get(path) != current_index.get(path)
+    }
+    changed.update(
+        path
+        for path in expected_dirty.keys() | current_dirty.keys()
+        if expected_dirty.get(path) != current_dirty.get(path)
+    )
+    return tuple(sorted(changed))
+
+
+def _remove_temporary_index(temporary_index: str) -> None:
+    for path in (temporary_index, f"{temporary_index}.lock"):
+        try:
+            os.unlink(path)
         except FileNotFoundError:
             pass
 
@@ -321,17 +445,17 @@ def _git(
             ["git", *args],
             cwd=vault,
             env=env,
-            check=False,
+            check=check,
             capture_output=True,
         )
-    except OSError as exc:
-        raise GitTransactionFailure("could not run Git transaction command") from exc
-    if check and completed.returncode:
-        detail = completed.stderr.decode("utf-8", "replace").strip()
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()
         message = "Git transaction command failed"
         if detail:
             message = f"{message}: {detail}"
-        raise GitTransactionFailure(message)
+        raise GitTransactionFailure(message) from exc
+    except OSError as exc:
+        raise GitTransactionFailure("could not run Git transaction command") from exc
     return completed
 
 

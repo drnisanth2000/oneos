@@ -87,6 +87,17 @@ def _unrelated_index_entries(vault: Path, reviewed: tuple[str, ...]) -> tuple[by
     )
 
 
+def _reviewed_index_entries(vault: Path, reviewed: tuple[str, ...]) -> tuple[bytes, ...]:
+    reviewed_bytes = {os.fsencode(path) for path in reviewed}
+    return tuple(
+        sorted(
+            record
+            for record in git_index_entries(vault).split(b"\0")
+            if record and record.split(b"\t", 1)[1] in reviewed_bytes
+        )
+    )
+
+
 def _unrelated_status(vault: Path, excluded: set[str]) -> tuple[bytes, ...]:
     return tuple(
         sorted(
@@ -95,6 +106,94 @@ def _unrelated_status(vault: Path, excluded: set[str]) -> tuple[bytes, ...]:
             if record and os.fsdecode(record[3:]) not in excluded
         )
     )
+
+
+def _direct_path_state(vault: Path, path: str) -> tuple[bytes | None, int | None]:
+    target = vault / path
+    try:
+        target_stat = os.lstat(target)
+    except FileNotFoundError:
+        return None, None
+    assert stat.S_ISREG(target_stat.st_mode)
+    return target.read_bytes(), stat.S_IMODE(target_stat.st_mode)
+
+
+def _temporary_directory_state(directory: Path) -> tuple[tuple[str, bytes], ...]:
+    return tuple(
+        sorted(
+            (path.relative_to(directory).as_posix(), path.read_bytes())
+            for path in directory.rglob("*")
+            if path.is_file()
+        )
+    )
+
+
+def _complete_state(
+    vault: Path, plan: TransactionPlan, index_directory: Path
+) -> dict[str, object]:
+    owned_paths = tuple(change.path for change in plan.changes + plan.owned_changes)
+    excluded = set(owned_paths)
+    return {
+        "head": git_head(vault),
+        "owned": tuple(
+            (path, _direct_path_state(vault, path)) for path in owned_paths
+        ),
+        "reviewed_index": _reviewed_index_entries(vault, plan.commit_paths),
+        "unrelated_index": _unrelated_index_entries(vault, plan.commit_paths),
+        "status": git_status_bytes(vault),
+        "unrelated_status": _unrelated_status(vault, excluded),
+        "worktree_diff": git_worktree_diff(vault),
+        "cached_diff": git_cached_diff(vault),
+        "temporary_indexes": _temporary_directory_state(index_directory),
+    }
+
+
+def _prepared_transaction(
+    tmp_path: Path, monkeypatch
+) -> tuple[Path, TransactionPlan, Path, dict[str, object]]:
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+
+    staged = vault / "staged.bin"
+    unstaged = vault / "unstaged.bin"
+    untracked = vault / "untracked.bin"
+    staged.write_bytes(b"staged base\n")
+    unstaged.write_bytes(b"unstaged base\n")
+    git_bytes(vault, "add", "staged.bin", "unstaged.bin")
+    git_bytes(vault, "commit", "-q", "-m", "add unrelated rollback fixtures")
+    staged.write_bytes(b"staged exact\x00\xff\n")
+    git_bytes(vault, "add", "staged.bin")
+    unstaged.write_bytes(b"unstaged exact\x00\xfe\n")
+    untracked.write_bytes(b"untracked exact\x00\xfd\n")
+
+    index_directory = tmp_path.parent / f"{tmp_path.name}-rollback-indexes"
+    index_directory.mkdir()
+    monkeypatch.setattr(transaction.tempfile, "tempdir", os.fspath(index_directory))
+    before = _complete_state(vault, plan, index_directory)
+    return vault, plan, index_directory, before
+
+
+def _assert_unrelated_state_matches(
+    current: dict[str, object], before: dict[str, object]
+) -> None:
+    for key in (
+        "unrelated_index",
+        "unrelated_status",
+        "worktree_diff",
+        "cached_diff",
+        "temporary_indexes",
+    ):
+        assert current[key] == before[key]
+
+
+def _exception_chain_contains(error: BaseException, expected: type[BaseException]) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, expected):
+            return True
+        current = current.__cause__
+    return False
 
 
 def test_path_state_requires_absence_or_exact_regular_bytes_and_mode():
@@ -419,3 +518,130 @@ def test_temporary_alternate_index_is_removed_after_success(tmp_path, monkeypatc
     transaction.execute_transaction(vault, plan)
 
     assert list(index_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    (
+        "filesystem-applied",
+        "alternate-index-ready",
+        "reviewed-paths-staged",
+        "commit-created",
+        "commit-verified",
+        "real-index-synchronized",
+    ),
+)
+def test_failure_at_every_phase_restores_owned_and_unrelated_state(
+    tmp_path, monkeypatch, checkpoint
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+
+    def fail_here(name: str) -> None:
+        if name == checkpoint:
+            raise OSError(f"injected {name}")
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_here, raising=False)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert _complete_state(vault, plan, index_directory) == before
+    assert list(index_directory.iterdir()) == []
+    with transaction._approval_lock(vault):
+        pass
+
+
+def test_rejecting_hook_restores_exact_starting_state(tmp_path, monkeypatch):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    hook = vault / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert _complete_state(vault, plan, index_directory) == before
+    assert _exception_chain_contains(raised.value, subprocess.CalledProcessError)
+    assert list(index_directory.iterdir()) == []
+    with transaction._approval_lock(vault):
+        pass
+
+
+def test_concurrent_same_path_replacement_is_preserved_during_recovery(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    destination = plan.commit_paths[1]
+
+    def replace_destination_after_commit(name: str) -> None:
+        if name == "commit-created":
+            (vault / destination).write_bytes(b"concurrent replacement\n")
+            raise OSError("injected concurrent same-path replacement")
+
+    monkeypatch.setattr(
+        transaction, "_checkpoint", replace_destination_after_commit, raising=False
+    )
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == (destination,)
+    assert (vault / destination).read_bytes() == b"concurrent replacement\n"
+    assert git_head(vault) == before["head"]
+    current = _complete_state(vault, plan, index_directory)
+    _assert_unrelated_state_matches(current, before)
+    assert current["reviewed_index"] == before["reviewed_index"]
+    assert list(index_directory.iterdir()) == []
+    with transaction._approval_lock(vault):
+        pass
+
+
+def test_head_ownership_preserves_newer_ref_during_recovery(tmp_path, monkeypatch):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    newer_head = ""
+
+    def advance_head_after_commit(name: str) -> None:
+        nonlocal newer_head
+        if name != "commit-created":
+            return
+        transaction_head = git_head(vault)
+        start_tree = git_bytes(
+            vault, "rev-parse", f"{before['head']}^{{tree}}"
+        ).decode("ascii").strip()
+        newer_head = git_bytes(
+            vault,
+            "commit-tree",
+            start_tree,
+            "-p",
+            transaction_head,
+            "-m",
+            "concurrent head",
+        ).decode("ascii").strip()
+        git_bytes(vault, "update-ref", "HEAD", newer_head, transaction_head)
+        raise OSError("injected concurrent HEAD update")
+
+    monkeypatch.setattr(
+        transaction, "_checkpoint", advance_head_after_commit, raising=False
+    )
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == ("HEAD",)
+    assert git_head(vault) == newer_head
+    current = _complete_state(vault, plan, index_directory)
+    current["head"] = before["head"]
+    assert current == before
+    assert list(index_directory.iterdir()) == []
+    with transaction._approval_lock(vault):
+        pass
