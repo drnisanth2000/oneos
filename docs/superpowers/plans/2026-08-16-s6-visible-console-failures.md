@@ -1,41 +1,34 @@
 # S6 Visible Console Failures Implementation Plan
 
-> **SUPERSEDED — DO NOT EXECUTE.** This plan was written against an earlier
-> design structure that two independent reviews rejected. It contradicts the
-> current design on at least four points: it omits the HTMX `responseHandling`
-> configuration entirely and still asserts the pre-fix premise; it renders a
-> working reject control on unreadable outbox records; it discards the per-code
-> page-status table; and its route bodies use blanket `except Exception`, which
-> is the catch-all the design forbids and would launder every programmer error
-> into a 200 fragment. It will be replaced once the rewritten design receives a
-> fresh whole-document approval.
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make every typed Command Center refusal reach the operator as a
-specific, safe, actionable message, with no route silently swallowing a failure.
+specific, safe, actionable message, with no route silently swallowing a failure
+and no refusal decision changed.
 
-**Architecture:** One frozen description table maps every application exception
-to a stable code, severity, message, retry guidance, and commit outcome.
-`describe()` resolves by MRO walk, recursing once into `__cause__` for the two
-declared transparent transaction wrappers. Two renderers share that one table,
-selected by the `HX-Request` header: fragments return 200 so HTMX 2.0.4 swaps
-them, full pages return true status.
+**Architecture:** One frozen table maps every application exception to a code,
+tier, severity, retry guidance, and commit outcome. `describe()` resolves an
+outcome across an allowlisted `__cause__` chain by precedence. Ambiguous
+exception bases are split so every raise site names a truthful subtype, enforced
+by AST tests rather than by lists in a document. A presentation projection reads
+the outbox per record, carrying capabilities rather than kinds. Two renderers
+share the one table, selected by route shape then `HX-Request`.
 
 **Tech Stack:** Python 3.12, FastAPI, Jinja2, HTMX 2.0.4, Alpine + alpine-morph,
 pytest, `uv`.
 
 **Design:** `docs/superpowers/specs/2026-08-16-s6-visible-console-failures-design.md`
-at `d81599e`.
+— **Approved**. The design is normative. Where this plan and the design differ,
+the design wins and the plan is wrong.
 
-**Branch:** `codex/s6-visible-console-failures` from `origin/main` at `3585938`.
-**Public baseline:** 603 tests. **Private baseline:** 37 tests.
+**Branch:** `codex/s6-visible-console-failures` from `origin/main` at `a42ee12`.
+**Baselines:** 603 public tests, 37 private.
 
 ---
 
 ## Preconditions
 
-- [ ] Confirm branch, base, and clean worktree
+- [ ] Confirm branch, base, clean worktree, and baseline
 
 ```bash
 git branch --show-current
@@ -44,10 +37,10 @@ git status --short
 uv run python -m pytest -q
 ```
 
-Expected: `codex/s6-visible-console-failures`, `3585938`, no tracked
-modifications, `603 passed`.
+Expected: `codex/s6-visible-console-failures`, `a42ee12`, no modifications,
+`603 passed`.
 
-- [ ] Confirm Grey Matter is untouched and record its pre-state
+- [ ] Record Grey Matter pre-state
 
 ```bash
 export ONEOS_VAULT="${ONEOS_VAULT:?set the vault path}"
@@ -67,70 +60,66 @@ stash, or normalize private state.
 
 | File | Responsibility |
 |---|---|
-| `app/console_errors.py` (create) | The description table and `describe()`. Imports nothing from the app. |
-| `app/console_render.py` (create) | Chooses fragment vs page renderer from `HX-Request`. Owns no copy. |
-| `templates/blocks/alert.html` (create) | The one inline alert fragment. |
-| `templates/error.html` (create) | The one full-page notice. |
+| `app/console_errors.py` (create) | `ConsoleError`, the class map, `describe()`. Imports domain exceptions; nothing imports it except the composition root. |
+| `app/console_render.py` (create) | Renderer selection and status. Owns no copy. |
+| `app/console_routing.py` (create) | `@console_route(catches=...)` and `@structured_reader(category=...)` declarations. |
+| `app/scope.py`, `app/outbox.py`, `app/destinations.py`, `app/git_transaction.py` (modify) | Ambiguous-base subtypes. Type refinements only. |
+| `app/outbox.py` (modify) | `_read_record`, `_validate_record`, `_render_diff`, `project_outbox`, `OutboxRow`, `OutboxListing`. |
+| `app/vault.py`, `app/registry.py` (modify) | Boundary conversions for the `registry` reader category. |
+| `app/main.py` (modify) | Every handler, the exception handlers, the global fallback. |
+| `templates/_head.html` (create) | Shared head with the `htmx-config` meta tag. |
+| `templates/blocks/alert.html`, `templates/error.html` (create) | The one alert fragment and the one page notice. |
+| `templates/` (modify) | `_head.html` include, `tojson` `hx-vals`, blocked listing, per-row errors. |
 | `static/app.css` (modify) | `.alert`, `.alert-attention`. |
-| `app/outbox.py` (modify) | Per-record degradation in `load_proposals`. |
-| `app/main.py` (modify) | Every route handler, plus the global handler. |
-| `templates/blocks/outbox_list.html` (modify) | Alert slot, placeholder rows. |
-| `templates/triage.html` (modify) | Per-row destination error. |
-| `tests/test_console_errors.py` (create) | Table totality, invariants, transparency. |
-| `tests/test_console_routes.py` (create) | Per-route visibility, state proofs, leakage. |
+| `tests/test_console_errors.py`, `test_console_invariants.py`, `test_console_routes.py`, `test_console_projection.py` (create) | Per §8 of the design. |
 
 ---
 
-## Task 1: The description table
+## Task 1: `ConsoleError` and its structural invariants
 
-**Files:**
-- Create: `app/console_errors.py`
-- Test: `tests/test_console_errors.py`
+**Files:** create `app/console_errors.py`, `tests/test_console_errors.py`
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_console_errors.py
 import pytest
-
-from app.console_errors import ConsoleError, describe
-from app.outbox import StaleProposalSource
+from app.console_errors import ConsoleError
 
 
-def test_stale_source_describes_as_recreate_refusal():
-    result = describe(StaleProposalSource("x"))
-    assert result.code == "E-STALE"
-    assert result.severity == "refusal"
-    assert result.retry == "recreate"
-    assert result.committed == "no"
-    assert "fresh proposal" in result.message
+def test_refusal_cannot_report_a_commit():
+    with pytest.raises(ValueError):
+        ConsoleError("E-X", "refusal", "refusal", "m", "retry", "yes")
+
+
+def test_committed_tier_must_stop_and_report_yes():
+    with pytest.raises(ValueError):
+        ConsoleError("E-X", "committed", "attention", "m", "retry", "yes")
+    with pytest.raises(ValueError):
+        ConsoleError("E-X", "committed", "attention", "m", "stop", "no")
+
+
+def test_recovery_tier_must_stop_and_report_unknown():
+    with pytest.raises(ValueError):
+        ConsoleError("E-X", "recovery", "attention", "m", "stop", "no")
 
 
 def test_console_error_is_frozen():
-    error = ConsoleError("E-X", "refusal", "m", "none", "no")
+    e = ConsoleError("E-X", "refusal", "refusal", "m", "none", "no")
     with pytest.raises(Exception):
-        error.code = "E-Y"
+        e.code = "E-Y"
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify it fails** — `uv run pytest tests/test_console_errors.py -q`. Expected: `ModuleNotFoundError`.
 
-Run: `uv run pytest tests/test_console_errors.py -q`
-Expected: FAIL, `ModuleNotFoundError: No module named 'app.console_errors'`
-
-- [ ] **Step 3: Write the module**
+- [ ] **Step 3: Implement**
 
 ```python
-# app/console_errors.py
-"""The Console's entire operator-facing error vocabulary.
-
-One table, one resolver. No route, template, or service writes error copy.
-This module imports nothing from the application so it cannot create a circular
-import and can be tested alone.
-"""
+"""The Console's operator-facing error vocabulary. One table, one resolver."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+TIERS = ("committed", "recovery", "integrity", "refusal", "unknown")
 SEVERITIES = frozenset({"refusal", "attention"})
 RETRIES = frozenset({"retry", "reload", "recreate", "stop", "none"})
 COMMITTED = frozenset({"no", "yes", "unknown"})
@@ -139,13 +128,15 @@ COMMITTED = frozenset({"no", "yes", "unknown"})
 @dataclass(frozen=True)
 class ConsoleError:
     code: str
+    tier: str
     severity: str
     message: str
     retry: str
     committed: str
-    transparent: bool = False
 
     def __post_init__(self) -> None:
+        if self.tier not in TIERS:
+            raise ValueError("tier is not a permitted value")
         if self.severity not in SEVERITIES:
             raise ValueError("severity is not a permitted value")
         if self.retry not in RETRIES:
@@ -154,938 +145,318 @@ class ConsoleError:
             raise ValueError("committed is not a permitted value")
         if self.severity == "refusal" and self.committed != "no":
             raise ValueError("a refusal cannot report a commit")
-
-
-UNKNOWN = ConsoleError(
-    "E-UNKNOWN", "attention",
-    "An unexpected error was not handled. Inspect vault state with git status "
-    "before continuing.",
-    "stop", "unknown",
-)
+        if self.tier == "committed" and (
+            self.committed != "yes" or self.retry != "stop"
+        ):
+            raise ValueError("a committed outcome must stop and report yes")
+        if self.tier == "recovery" and (
+            self.committed != "unknown" or self.retry != "stop"
+        ):
+            raise ValueError("a recovery outcome must stop and report unknown")
 ```
 
-Then the table, keyed by dotted class path so the module imports nothing:
-
-```python
-_TABLE: dict[str, ConsoleError] = {
-    "app.outbox.StaleProposalSource": ConsoleError(
-        "E-STALE", "refusal",
-        "Approval refused: the source changed after this proposal was created. "
-        "Create a fresh proposal.",
-        "recreate", "no",
-    ),
-}
-
-
-def _key(cls: type) -> str:
-    return f"{cls.__module__}.{cls.__qualname__}"
-
-
-def describe(exc: BaseException) -> ConsoleError:
-    for cls in type(exc).__mro__:
-        entry = _TABLE.get(_key(cls))
-        if entry is not None:
-            return entry
-    return UNKNOWN
-```
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `uv run pytest tests/test_console_errors.py -q`
-Expected: PASS, 2 tests.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/console_errors.py tests/test_console_errors.py
-git commit -m "feat: add Console error description table"
-```
+- [ ] **Step 4: Verify** — `uv run pytest tests/test_console_errors.py -q`. Expected: PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat: add ConsoleError with structural invariants"`
 
 ---
 
-## Task 2: Complete the table
+## Task 2: Ambiguous-base subtypes
 
-**Files:**
-- Modify: `app/console_errors.py`
-- Test: `tests/test_console_errors.py`
+Type refinements only. Every existing `except` clause must still catch every
+refined type, so no refusal changes. Characterize each site before converting.
 
-- [ ] **Step 1: Write the failing totality test**
+**Files:** modify `app/scope.py`, `app/outbox.py`, `app/destinations.py`,
+`app/git_transaction.py`; test `tests/test_console_invariants.py`
 
-This is the load-bearing test. It enumerates the class hierarchy and subtracts
-the table, so an exception added later without a description fails here rather
-than reaching an operator as `E-UNKNOWN`.
+- [ ] **Step 1: Characterize** — for each ambiguous base, write a test asserting
+  current behavior at each raise site: the same input is refused, with the same
+  base type caught by the same `except`. These must stay green through the
+  conversion.
 
-```python
-import importlib
-import inspect
-import pkgutil
-
-import app as app_package
-from app.console_errors import COMMITTED, RETRIES, SEVERITIES, describe
-
-
-def _application_exception_classes() -> list[type]:
-    found: list[type] = []
-    for info in pkgutil.walk_packages(app_package.__path__, prefix="app."):
-        module = importlib.import_module(info.name)
-        for _, obj in inspect.getmembers(module, inspect.isclass):
-            if issubclass(obj, Exception) and obj.__module__.startswith("app."):
-                if obj not in found:
-                    found.append(obj)
-    return found
-
-
-def test_every_application_exception_has_a_description():
-    undescribed = [
-        f"{cls.__module__}.{cls.__qualname__}"
-        for cls in _application_exception_classes()
-        if describe(cls("probe")).code == "E-UNKNOWN"
-    ]
-    assert undescribed == []
-
-
-def test_every_refusal_reports_no_commit():
-    from app.console_errors import _TABLE
-    offenders = [
-        entry.code for entry in _TABLE.values()
-        if entry.severity == "refusal" and entry.committed != "no"
-    ]
-    assert offenders == []
-
-
-def test_all_entry_fields_are_permitted_values():
-    from app.console_errors import _TABLE
-    for entry in _TABLE.values():
-        assert entry.severity in SEVERITIES
-        assert entry.retry in RETRIES
-        assert entry.committed in COMMITTED
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `uv run pytest tests/test_console_errors.py::test_every_application_exception_has_a_description -q`
-Expected: FAIL, the assertion lists every application exception except
-`StaleProposalSource`.
-
-- [ ] **Step 3: Fill in the table**
-
-Add every remaining entry to `_TABLE`, keyed by dotted path. Messages must name
-no path, slug, module, commit id, or request value.
-
-```python
-_TABLE.update({
-    "app.outbox.MissingProposalSource": ConsoleError(
-        "E-MISSING", "refusal",
-        "Approval refused: the source is missing. Restore it or reject the "
-        "proposal.", "recreate", "no"),
-    "app.outbox.OutboxError": ConsoleError(
-        "E-INVALID", "refusal",
-        "This proposal record is not valid and cannot be approved. Reject it "
-        "and create a new one.", "recreate", "no"),
-    "app.outbox.OutboxDestinationError": ConsoleError(
-        "E-INVALID", "refusal",
-        "This proposal record is not valid and cannot be approved. Reject it "
-        "and create a new one.", "recreate", "no"),
-    "app.proposal_identity.ProposalIdentityError": ConsoleError(
-        "E-INVALID", "refusal",
-        "This proposal record is not valid and cannot be approved. Reject it "
-        "and create a new one.", "recreate", "no"),
-    "app.destinations.DestinationError": ConsoleError(
-        "E-DEST", "refusal",
-        "The destination could not be resolved from the registries. "
-        "Re-classify this item.", "recreate", "no"),
-    "app.scope.CrossScopeError": ConsoleError(
-        "E-SCOPE", "refusal",
-        "Refused: the request resolved outside the selected entity.",
-        "none", "no"),
-    "app.outbox.OutboxScopeError": ConsoleError(
-        "E-SCOPE", "refusal",
-        "Refused: the request resolved outside the selected entity.",
-        "none", "no"),
-    "app.git_transaction.VaultBusyError": ConsoleError(
-        "E-BUSY", "refusal",
-        "Another approval is in progress. Nothing was changed. Try again in a "
-        "moment.", "retry", "no"),
-    "app.git_transaction.ReviewedStateConflict": ConsoleError(
-        "E-CONFLICT", "refusal",
-        "The reviewed files changed since this proposal was previewed. Reload "
-        "and review again.", "reload", "no"),
-    "app.git_transaction.GitTransactionError": ConsoleError(
-        "E-GIT", "refusal",
-        "The commit failed and was rolled back. Nothing was changed.",
-        "retry", "no"),
-    "app.git_transaction.GitTransactionRecoveryError": ConsoleError(
-        "E-RECOVER", "attention",
-        "Rollback was blocked by a concurrent change. Do not retry. Inspect "
-        "vault state with git status and resolve it before continuing.",
-        "stop", "unknown"),
-    "app.git_transaction.GitTransactionCommittedError": ConsoleError(
-        "E-COMMITTED", "attention",
-        "The commit succeeded; only cleanup afterwards failed. Do not retry — "
-        "retrying would commit this action twice. Inspect vault state with "
-        "git status.", "stop", "yes"),
-    "app.registry.RegistryError": ConsoleError(
-        "E-REGISTRY", "refusal",
-        "The registry operation was refused. Review the impact report and try "
-        "again.", "reload", "no"),
-    "app.vault.DestinationRegistryError": ConsoleError(
-        "E-CONFIG", "attention",
-        "The vault registries could not be read. The Console cannot operate on "
-        "this entity until they are valid.", "none", "no"),
-    "app.entities.EntityManifestError": ConsoleError(
-        "E-CONFIG", "attention",
-        "The vault registries could not be read. The Console cannot operate on "
-        "this entity until they are valid.", "none", "no"),
-    "app.entities.EntitySelectionError": ConsoleError(
-        "E-ENTITY", "refusal",
-        "That entity is not in the manifest.", "none", "no"),
-    "app.ingest.base.IngestError": ConsoleError(
-        "E-INGEST", "refusal",
-        "Intake failed. Nothing was written to the vault.", "none", "no"),
-    "app.rename.RenameError": ConsoleError(
-        "E-ADMIN", "refusal",
-        "The administrative operation was refused.", "none", "no"),
-})
-```
-
-`E-CONFIG` is `attention` with `committed = no`, which the `__post_init__`
-invariant permits — the constraint is one-directional, binding only refusals.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `uv run pytest tests/test_console_errors.py -q`
-Expected: PASS. If `test_every_application_exception_has_a_description` still
-fails, add the named classes rather than weakening the test.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/console_errors.py tests/test_console_errors.py
-git commit -m "feat: describe every application exception"
-```
-
----
-
-## Task 3: Transparent transaction wrappers
-
-Without this, `E-COMMITTED` and `E-RECOVER` are unreachable — `approve()` wraps
-every S5 outcome in `OutboxTransactionError` — and an operator whose commit
-succeeded would be told to retry.
-
-**Files:**
-- Modify: `app/console_errors.py`
-- Test: `tests/test_console_errors.py`
-
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 2: Write the failing subtype tests**
 
 ```python
 import pytest
-
-from app.console_errors import describe
-from app.git_transaction import (
-    GitTransactionCommittedError, GitTransactionRecoveryError,
-    ReviewedStateConflict, VaultBusyError,
-)
-from app.outbox import OutboxTransactionError
-from app.registry import RegistryTransactionError
+from app.scope import CrossScopeError, OutOfScopeError, RedirectedPathError
+from app.outbox import ProposalSourceUnavailable
 
 
-def _wrap(wrapper, cause):
+def test_every_subtype_is_still_caught_as_its_base():
+    for cls in (OutOfScopeError, RedirectedPathError, ProposalSourceUnavailable):
+        with pytest.raises(CrossScopeError):
+            raise cls("x")
+```
+
+- [ ] **Step 3: Add the subtypes** per the design's ambiguous-base table:
+  `CrossScopeError` → `RedirectedPathError`, `OutOfScopeError`,
+  `ProposalSourceUnavailable`; `ReviewedStateConflict` →
+  `ReviewedPathIntegrityError`, `ReviewedStateChanged`, `ReviewedPathUnavailable`,
+  `InvalidTransactionPath`; `UnsafeDestinationPath` → `RedirectedDestination`,
+  `MissingDestination`; `InvalidSourceLeaf` → `RedirectedSourceLeaf`,
+  `MissingSourceLeaf`, `NonCanonicalLeaf`.
+
+- [ ] **Step 4: Convert every raise site** to a subtype. Where one `except
+  OSError` covers two conditions — `_read_no_follow_bytes` and the transaction
+  site whose message is "could not be opened safely" — apply the design's
+  discrimination rule: `ELOOP`, `O_NOFOLLOW` rejection, or a non-regular
+  `fstat` is the integrity subtype; any other `OSError` is the unavailable
+  subtype.
+
+- [ ] **Step 5: Verify** — `uv run python -m pytest -q`. Expected: `603 passed`.
+  Any S1-S5 failure here means a refusal changed; stop and investigate rather
+  than adjusting the test.
+- [ ] **Step 6: Commit** — `git commit -m "refactor: split ambiguous exception bases into truthful subtypes"`
+
+---
+
+## Task 3: The class map and `describe()`
+
+**Files:** modify `app/console_errors.py`, `tests/test_console_errors.py`
+
+- [ ] **Step 1: Write the failing tests** — one per row of the design's class
+  map, asserting the exact code. Plus chain resolution:
+
+```python
+def test_committed_outcome_survives_the_domain_wrapper():
+    from app.git_transaction import GitTransactionCommittedError
+    from app.outbox import OutboxTransactionError
     try:
-        raise cause
-    except type(cause) as inner:
         try:
-            raise wrapper("boundary") from inner
-        except type(wrapper("x")) as outer:
-            return outer
-
-
-@pytest.mark.parametrize("wrapper", [OutboxTransactionError, RegistryTransactionError])
-@pytest.mark.parametrize("cause,code", [
-    (VaultBusyError("b"), "E-BUSY"),
-    (ReviewedStateConflict("c"), "E-CONFLICT"),
-    (GitTransactionRecoveryError(("p",)), "E-RECOVER"),
-])
-def test_transaction_outcomes_survive_the_wrapper(wrapper, cause, code):
-    assert describe(_wrap(wrapper, cause)).code == code
-
-
-def test_committed_outcome_never_advises_retry():
-    result = describe(_wrap(OutboxTransactionError, GitTransactionCommittedError.__new__(
-        GitTransactionCommittedError)))
+            raise GitTransactionCommittedError.__new__(GitTransactionCommittedError)
+        except Exception as inner:
+            raise OutboxTransactionError("boundary") from inner
+    except OutboxTransactionError as outer:
+        result = describe(outer)
     assert result.code == "E-COMMITTED"
     assert result.committed == "yes"
     assert result.retry == "stop"
 
 
-def test_wrapper_without_cause_resolves_to_git():
-    assert describe(OutboxTransactionError("no cause")).code == "E-GIT"
-
-
-def test_non_transparent_entry_ignores_its_cause():
+def test_context_is_never_traversed():
     from app.outbox import OutboxScopeError, StaleProposalSource
-    outer = _wrap(OutboxScopeError, StaleProposalSource("s"))
-    assert describe(outer).code == "E-SCOPE"
+    try:
+        try:
+            raise StaleProposalSource("s")
+        except StaleProposalSource:
+            raise OutboxScopeError("outer")   # implicit __context__, no `from`
+    except OutboxScopeError as exc:
+        assert describe(exc).code == "E-SCOPE"
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify it fails.**
 
-Run: `uv run pytest tests/test_console_errors.py -q -k transaction or wrapper or committed`
-Expected: FAIL — every wrapped outcome currently reports `E-GIT`.
-
-- [ ] **Step 3: Declare the wrappers transparent and walk once**
+- [ ] **Step 3: Implement the map and resolver**
 
 ```python
-_TABLE.update({
-    "app.outbox.OutboxTransactionError": ConsoleError(
-        "E-GIT", "refusal",
-        "The commit failed and was rolled back. Nothing was changed.",
-        "retry", "no", transparent=True),
-    "app.registry.RegistryTransactionError": ConsoleError(
-        "E-GIT", "refusal",
-        "The commit failed and was rolled back. Nothing was changed.",
-        "retry", "no", transparent=True),
-})
+ALLOWLIST = (
+    OutboxTransactionError, RegistryTransactionError,
+    OutboxDestinationError, GitTransactionFailure,
+    _ApprovalLockCleanupFailure, _ReviewedIndexOwnershipConflict,
+)
+CLOSED_FAMILY = GitTransactionError
+ABSTRACT_BASES = (
+    CrossScopeError, ReviewedStateConflict,
+    UnsafeDestinationPath, InvalidSourceLeaf,
+)
+MAX_DEPTH = 4
+_TIER_RANK = {t: i for i, t in enumerate(TIERS)}
 
 
 def _lookup(exc: BaseException) -> ConsoleError:
     for cls in type(exc).__mro__:
-        entry = _TABLE.get(_key(cls))
-        if entry is not None:
-            return entry
+        if cls in _EXACT:
+            return _EXACT[cls]
+        if issubclass(cls, CLOSED_FAMILY):
+            return UNKNOWN          # closed family: no MRO inheritance
+        if cls in _MRO:
+            return _MRO[cls]
     return UNKNOWN
 
 
 def describe(exc: BaseException) -> ConsoleError:
-    entry = _lookup(exc)
-    if entry.transparent and exc.__cause__ is not None:
-        return _lookup(exc.__cause__)
-    return entry
+    best, current, depth = None, exc, 0
+    while current is not None and depth < MAX_DEPTH:
+        candidate = _lookup(current)
+        if best is None or _TIER_RANK[candidate.tier] <= _TIER_RANK[best.tier]:
+            best = candidate          # <= keeps the innermost on a tie
+        if type(current) not in ALLOWLIST:
+            return best
+        current, depth = current.__cause__, depth + 1
+    if current is not None:
+        return UNKNOWN                # depth exceeded: fail closed
+    return best or UNKNOWN
 ```
 
-The walk is depth-one and declared per entry, never inferred. A non-transparent
-entry never reads a cause, so no internal failure can surface through an error
-that was not designed to carry it.
+Populate `_EXACT` and `_MRO` from the design's class map, using the exact
+messages from the design's message table. Do not paraphrase them.
 
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `uv run pytest tests/test_console_errors.py -q`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/console_errors.py tests/test_console_errors.py
-git commit -m "feat: resolve S5 outcomes through transparent wrappers"
-```
+- [ ] **Step 4: Verify** — `uv run pytest tests/test_console_errors.py -q`.
+- [ ] **Step 5: Commit** — `git commit -m "feat: resolve outcomes across allowlisted cause chains"`
 
 ---
 
-## Task 4: Alert templates and styling
+## Task 4: Invariants 1, 2, 3
 
-**Files:**
-- Create: `templates/blocks/alert.html`, `templates/error.html`
-- Modify: `static/app.css`
+**Files:** create `tests/test_console_invariants.py`
 
-- [ ] **Step 1: Write the fragment template**
+- [ ] **Step 1: Invariant 1** — walk every exception class under `app/`; assert
+  each resolves to the code named in the design's map, exempting the four
+  abstract bases.
+- [ ] **Step 2: Invariant 2** — walk `GitTransactionError.__subclasses__()`
+  transitively; assert an exact entry for each, exempting the abstract bases.
+  Add a synthetic subclass in-test and assert it resolves to `E-UNKNOWN`.
+- [ ] **Step 3: Invariant 3** — AST-walk every `raise` under `app/`; fail on any
+  whose type is one of the four abstract bases.
+- [ ] **Step 4: Run** — all three must pass; if invariant 3 fails, fix the raise
+  site rather than the test.
+- [ ] **Step 5: Commit** — `git commit -m "test: close the taxonomy with source-derived invariants"`
+
+---
+
+## Task 5: Renderer selection and templates
+
+**Files:** create `app/console_render.py`, `templates/_head.html`,
+`templates/blocks/alert.html`, `templates/error.html`; modify `static/app.css`
+and the four page templates.
+
+- [ ] **Step 1: Failing tests** — fragment status by severity (refusal → 200,
+  attention → page status); route-shape-first (the five template-less POSTs
+  always fragment); every full-page route contains the `htmx-config` meta.
+- [ ] **Step 2: Implement `console_render`** with `is_fragment(request, route)`
+  and `status_for(error, fragment)`.
+- [ ] **Step 3: Create `_head.html`** carrying the vendored script tags and:
 
 ```html
-{# templates/blocks/alert.html — the one inline alert. #}
-{% if error %}
-<p class="alert{% if error.severity == 'attention' %} alert-attention{% endif %}"
-   role="alert">
-  <code class="alert-code">{{ error.code }}</code>
-  <span class="alert-message">{{ error.message }}</span>
-</p>
-{% endif %}
+<meta name="htmx-config" content='{"responseHandling":[
+  {"code":"204","swap":false},
+  {"code":"[23]..","swap":true},
+  {"code":"[45]..","swap":true,"error":true}]}'>
 ```
 
-Jinja autoescaping renders `{{ error.message }}` escaped. No `| safe` anywhere.
+Include it from `shell.html`, `triage.html`, `outbox.html`, `registry.html`.
+Give `triage_default`'s no-bundles response a template so it can carry the tag.
 
-- [ ] **Step 2: Write the page template**
-
-```html
-{# templates/error.html — full-page notice for a screen that cannot be built. #}
-{% extends "base.html" %}
-{% block content %}
-<main class="error-page">
-  {% include "blocks/alert.html" %}
-</main>
-{% endblock %}
-```
-
-If `templates/base.html` does not exist, mirror the `<head>`/`<body
-hx-ext="alpine-morph">` shell used by `templates/outbox.html` instead of
-introducing a new base.
-
-- [ ] **Step 3: Add styling**
-
-```css
-/* static/app.css */
-.alert {
-  display: flex; gap: .6rem; align-items: baseline;
-  padding: .6rem .8rem; margin: 0 0 .8rem;
-  border-left: 3px solid currentColor;
-}
-.alert-code { font-family: ui-monospace, monospace; font-size: .82em; opacity: .8; }
-.alert-attention { font-weight: 600; }
-```
-
-- [ ] **Step 4: Verify nothing regressed**
-
-Run: `uv run python -m pytest -q`
-Expected: `603 passed`.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add templates/blocks/alert.html templates/error.html static/app.css
-git commit -m "feat: add Console alert fragment and page notice"
-```
+- [ ] **Step 4: Create `alert.html`** rendering `error.code` and `error.message`
+  with `role="alert"`, escaped, plus `.alert` / `.alert-attention` CSS.
+- [ ] **Step 5: Verify and commit** — `git commit -m "feat: add Console renderers, shared head, and alert markup"`
 
 ---
 
-## Task 5: Renderer selection
+## Task 6: Structured readers and boundary conversions
 
-**Files:**
-- Create: `app/console_render.py`
-- Test: `tests/test_console_routes.py`
+**Files:** create `app/console_routing.py`; modify `app/vault.py`,
+`app/registry.py`, `app/outbox.py`, `app/inbox.py`.
 
-- [ ] **Step 1: Write the failing test**
-
-```python
-# tests/test_console_routes.py
-from app.console_errors import describe
-from app.console_render import is_fragment_request, status_for
-
-
-class _Req:
-    def __init__(self, headers): self.headers = headers
-
-
-def test_htmx_requests_are_fragments():
-    assert is_fragment_request(_Req({"hx-request": "true"})) is True
-    assert is_fragment_request(_Req({})) is False
-
-
-def test_fragment_status_is_always_200():
-    from app.entities import EntitySelectionError
-    assert status_for(describe(EntitySelectionError("x")), fragment=True) == 200
-
-
-def test_page_status_reflects_the_error():
-    from app.entities import EntitySelectionError
-    from app.vault import DestinationRegistryError
-    assert status_for(describe(EntitySelectionError("x")), fragment=False) == 404
-    assert status_for(describe(DestinationRegistryError("x")), fragment=False) == 500
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `uv run pytest tests/test_console_routes.py -q`
-Expected: FAIL, `No module named 'app.console_render'`
-
-- [ ] **Step 3: Write the module**
-
-```python
-# app/console_render.py
-"""Chooses how a described error is returned. Owns no error copy.
-
-HTMX 2.0.4 does not swap non-2xx responses, so a fragment must return 200 or
-the operator sees an unchanged screen and no message. A full page is not being
-swapped, so it keeps its true status.
-"""
-from __future__ import annotations
-
-from .console_errors import ConsoleError
-
-_PAGE_STATUS = {"E-ENTITY": 404}
-
-
-def is_fragment_request(request) -> bool:
-    return request.headers.get("hx-request") is not None
-
-
-def status_for(error: ConsoleError, *, fragment: bool) -> int:
-    if fragment:
-        return 200
-    return _PAGE_STATUS.get(error.code, 500)
-```
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `uv run pytest tests/test_console_routes.py -q`
-Expected: PASS, 3 tests.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/console_render.py tests/test_console_routes.py
-git commit -m "feat: select Console renderer from the HX-Request header"
-```
+- [ ] **Step 1: Failing tests (invariant 4)** — AST-find every function that
+  parses YAML, opens a `system_path` result, or connects to SQLite; fail on any
+  without a `@structured_reader(category=...)` declaration.
+- [ ] **Step 2: Declare categories** — `registry`, `proposal`, `front-matter`,
+  `admin-db` per the design.
+- [ ] **Step 3: Failing conversion tests** — inject unparseable and
+  wrongly-shaped-but-valid input through each `registry` reader; assert
+  `E-CONFIG`. Assert each reader's absorbed cases still return their tolerant
+  value. Assert a `proposal`-category failure yields `E-UNREADABLE`, not
+  `E-CONFIG`.
+- [ ] **Step 4: Convert** only failures that already escape. Narrow each
+  conversion to the specific parse or access it guards.
+- [ ] **Step 5: Verify and commit** — `git commit -m "feat: classify structured readers and convert escaping registry failures"`
 
 ---
 
-## Task 6: Outbox per-record degradation
+## Task 7: The projection
 
-`load_proposals` raises on the first malformed record and abandons the whole
-listing, so one bad file hides every valid proposal — and because the alert
-renderer re-reads proposals, rendering the alert raises the same exception.
+**Files:** modify `app/outbox.py`; create `tests/test_console_projection.py`
 
-**Files:**
-- Modify: `app/outbox.py:261-287`
-- Test: `tests/test_outbox.py`
-
-- [ ] **Step 1: Write the failing test**
-
-Add to `tests/test_outbox.py`, following the existing fixture style in that
-file for building a scoped synthetic vault with one valid proposal:
-
-```python
-def test_one_bad_record_does_not_hide_valid_proposals(scoped_vault):
-    scope, valid_id = scoped_vault
-    outbox = scope.resolve("outbox")
-    (outbox / "20260816T101010-" + "f" * 32 + ".yaml").write_text(
-        "id: mismatched\naction: classify\n", encoding="utf-8")
-
-    entries = load_entries(scope)
-
-    codes = [e.error.code for e in entries if e.error is not None]
-    ids = [e.proposal.id for e in entries if e.proposal is not None]
-    assert valid_id in ids
-    assert codes == ["E-INVALID"]
-
-
-def test_reading_the_listing_never_raises_on_a_bad_record(scoped_vault):
-    scope, _ = scoped_vault
-    (scope.resolve("outbox") / "20260816T101011-" + "a" * 32 + ".yaml").write_text(
-        ": not yaml :", encoding="utf-8")
-    load_entries(scope)  # must not raise
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `uv run pytest tests/test_outbox.py -q -k bad_record or never_raises`
-Expected: FAIL, `ImportError: cannot import name 'load_entries'`
-
-- [ ] **Step 3: Add the degrading reader**
-
-Keep `load_proposals` exactly as it is — S1-S5 callers depend on its
-fail-closed behavior. Add a listing-only reader beside it:
-
-```python
-@dataclass(frozen=True)
-class OutboxEntry:
-    """One row of the outbox listing: a usable proposal or a refused record."""
-    name: str
-    proposal: Proposal | None
-    error: ConsoleError | None
-
-
-def load_entries(scope: Scope) -> list[OutboxEntry]:
-    """Read the outbox for display. Degrades per record: an unreadable file
-    becomes one refused row instead of hiding every valid proposal."""
-    outbox = _require_outbox_path(scope)
-    if not outbox.exists():
-        return []
-    entries: list[OutboxEntry] = []
-    for discovered in sorted(outbox.glob("*.yaml")):
-        try:
-            proposal = _load_one(scope, discovered)
-        except Exception as exc:  # described, never swallowed
-            entries.append(OutboxEntry(discovered.name, None, describe(exc)))
-            continue
-        if proposal is not None:
-            entries.append(OutboxEntry(discovered.name, proposal, None))
-    return entries
-```
-
-Extract the existing per-file body of `load_proposals` into `_load_one(scope,
-path) -> Proposal | None`, returning `None` for a `delete` action, and have
-`load_proposals` call it in its current fail-closed loop. The validation logic
-moves; it does not change.
-
-Import `describe` and `ConsoleError` from `.console_errors` at the top of
-`app/outbox.py`.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `uv run pytest tests/test_outbox.py -q`
-Expected: PASS, including every pre-existing outbox test unmodified.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/outbox.py tests/test_outbox.py
-git commit -m "feat: degrade the outbox listing per record"
-```
+- [ ] **Step 1: Failing tests** — per the design's projection test list: the
+  unblocked case, the blocked case, delete-skip, an outbox of only deletes, the
+  no-re-entry assertion (patch `get_proposal`, `load_proposals`, `preview_diff`
+  to raise), and the undiffable row keeping `can_reject`.
+- [ ] **Step 2: Extract** `_read_record`, `_validate_record`, `_render_diff` from
+  the strict loader's body; have `load_proposals` call them in its existing
+  fail-closed loop. Validation logic moves, it does not change.
+- [ ] **Step 3: Add `UnreadableProposalRecord`** covering every phase-1
+  condition in the design's table, including non-UTF-8 record bytes, record-read
+  `OSError`, and malformed required fields.
+- [ ] **Step 4: Implement `project_outbox`** with the three-phase rule: phase 1
+  caught per row and sets `blocked`; phase 2 propagates; phase 3 is row-local,
+  read through the same safe-read boundary as `approve`, translated per the
+  design's normative table.
+- [ ] **Step 5: Verify** — projection tests pass and `tests/test_outbox.py`
+  passes unmodified.
+- [ ] **Step 6: Commit** — `git commit -m "feat: add the outbox presentation projection"`
 
 ---
 
-## Task 7: Outbox routes
+## Task 8: Routes
 
-**Files:**
-- Modify: `app/main.py:138-193`
-- Modify: `templates/blocks/outbox_list.html`
-- Test: `tests/test_console_routes.py`
+**Files:** modify `app/main.py` and the templates it renders.
 
-- [ ] **Step 1: Write the failing test**
+Each route gets its own RED test first, asserting status, code, message, absence
+of raw exception text, and the declared swap shape.
 
-```python
-def test_approve_shows_every_transaction_outcome(client_and_scope, monkeypatch):
-    client, entity, proposal_id = client_and_scope
-    from app import main
-    from app.git_transaction import VaultBusyError
-    from app.outbox import OutboxTransactionError
-
-    def _busy(*a, **k):
-        raise OutboxTransactionError("boundary") from VaultBusyError("held")
-    monkeypatch.setattr(main, "approve", _busy)
-
-    response = client.post(f"/outbox/{entity}/approve",
-                           data={"id": proposal_id},
-                           headers={"HX-Request": "true"})
-    assert response.status_code == 200
-    assert "E-BUSY" in response.text
-    assert 'id="outbox-list"' in response.text     # the swap target is present
-    assert "boundary" not in response.text          # no raw exception text
-
-
-def test_reject_failure_is_visible(client_and_scope, monkeypatch):
-    client, entity, proposal_id = client_and_scope
-    from app import main
-    from app.outbox import OutboxError
-    monkeypatch.setattr(main, "reject",
-                        lambda *a, **k: (_ for _ in ()).throw(OutboxError("gone")))
-    response = client.post(f"/outbox/{entity}/reject",
-                           data={"id": proposal_id},
-                           headers={"HX-Request": "true"})
-    assert response.status_code == 200
-    assert "E-INVALID" in response.text
-    assert "gone" not in response.text
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `uv run pytest tests/test_console_routes.py -q -k approve or reject`
-Expected: FAIL — approve renders no code, reject renders nothing at all.
-
-- [ ] **Step 3: Rewrite the two handlers**
-
-```python
-def _outbox_list(request, scope, *, error=None):
-    return templates.TemplateResponse(
-        request, "blocks/outbox_list.html",
-        {"entity": scope.current_entity(),
-         "entries": load_entries(scope),
-         "preview": lambda p: _safe_preview(scope, p),
-         "error": error},
-    )
-
-
-@app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
-def outbox_approve(request: Request, scope: EntityScope, id: str = Form(...)):
-    error = None
-    try:
-        approve(scope, id)
-    except Exception as exc:
-        error = describe(exc)
-    return _outbox_list(request, scope, error=error)
-
-
-@app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
-def outbox_reject(request: Request, scope: EntityScope, id: str = Form(...)):
-    error = None
-    try:
-        reject(scope, id)
-    except Exception as exc:
-        error = describe(exc)
-    return _outbox_list(request, scope, error=error)
-```
-
-`_safe_preview` returns the diff or `None` when `preview_diff` raises, so a
-degraded row cannot break the render.
-
-Update `templates/blocks/outbox_list.html` to include the alert and render
-placeholder rows:
-
-```html
-<div id="outbox-list">
-  {% include "blocks/alert.html" %}
-  {% if not entries %}
-  <p class="muted">No pending proposals. Approve or reject clears them from here.</p>
-  {% endif %}
-  {% for entry in entries %}
-    {% if entry.error %}
-    <div class="proposal proposal-refused">
-      <div class="prop-head"><code class="prop-id">{{ entry.name }}</code></div>
-      <p class="alert" role="alert">
-        <code class="alert-code">{{ entry.error.code }}</code>
-        <span>{{ entry.error.message }}</span>
-      </p>
-      <div class="prop-actions">
-        <button class="reject" hx-post="/outbox/{{ entity }}/reject"
-                hx-vals='{"id": "{{ entry.name[:-5] }}"}'
-                hx-target="#outbox-list" hx-swap="outerHTML">Reject</button>
-      </div>
-    </div>
-    {% else %}
-    ... existing proposal markup, with `p` replaced by `entry.proposal` ...
-    {% endif %}
-  {% endfor %}
-</div>
-```
-
-The refused row offers reject only. Approve is absent, not disabled, so it
-cannot be re-enabled from the client.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `uv run pytest tests/test_console_routes.py tests/test_app.py -q`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/main.py templates/blocks/outbox_list.html tests/test_console_routes.py
-git commit -m "feat: surface outbox approval and rejection failures"
-```
+- [ ] **Step 1: `@console_route(catches=...)`** on every handler; reject
+  `Exception`/`BaseException` in the declaration and bare `except Exception` in
+  the body (invariant 6).
+- [ ] **Step 2: outbox routes** — render the projection; blocked listing withholds
+  every classification control and carries one described notice.
+- [ ] **Step 3: `propose`** — alert into the existing `#diff-{index}` target;
+  emit the success-only `HX-Trigger` after persistence.
+- [ ] **Step 4: `triage`** — per-row errors; extend the catch tuple with
+  `CrossScopeError`.
+- [ ] **Step 5: registry routes** — `tojson` `hx-vals` everywhere (invariant 5),
+  success copy from a pre-execute `get_delete_proposal`, both branches templated,
+  execute request stops sending `slug`.
+- [ ] **Step 6: reading routes** — `E-CONFIG` page.
+- [ ] **Step 7: `entity_scope`** — raise `EntitySelectionError`; dedicated
+  handler renders `E-ENTITY` at 404.
+- [ ] **Step 8: handlers** — `RequestValidationError` → `E-REQUEST`;
+  `StarletteHTTPException` body replacement preserving the framework's status;
+  global fallback returning the code's page status, never 200.
+- [ ] **Step 9: stopwatch** — move `triage.html` to the `HX-Trigger` event.
+- [ ] **Step 10: Verify and commit** — `git commit -m "feat: surface described failures on every Console route"`
 
 ---
 
-## Task 8: Remaining routes
-
-Apply the identical pattern to every remaining site. Each gets its own RED test
-first, asserting status, code, absence of raw exception text, and — for
-fragments — the presence of the route's `hx-target` element.
-
-**Files:** `app/main.py`, `templates/triage.html`, `templates/registry.html`,
-`templates/blocks/delete_impact.html`, `tests/test_console_routes.py`
-
-- [ ] **Step 1: `outbox_screen`** — render `load_entries` instead of
-  `load_proposals`; a bad record must not blank the screen.
-- [ ] **Step 2: `propose`** — catch and render `blocks/alert.html` into the
-  existing `#diff-{index}` target. Do not introduce a target that encloses
-  `x-data="triage(...)"`, or the triage keyboard scope is destroyed.
-- [ ] **Step 3: `triage`** — replace `destination = None` with a per-row
-  `(destination, error)` pair and render the code in the row.
-- [ ] **Step 4: `registry_products`** — catch `products_for` failures.
-- [ ] **Step 5: `registry_delete_preview`** — catch and render inline.
-- [ ] **Step 6: `registry_delete_execute`** — delete the f-string entirely:
-
-```python
-@app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
-def registry_delete_execute(request: Request, scope: EntityScope,
-                            id: str = Form(...), slug: str = Form(...)):
-    try:
-        execute_delete(scope, id)
-    except Exception as exc:
-        return templates.TemplateResponse(
-            request, "blocks/alert.html", {"error": describe(exc)})
-    return templates.TemplateResponse(
-        request, "blocks/delete_deleted.html", {})
-```
-
-  The success message must not interpolate `slug` into HTML either.
-- [ ] **Step 7: `shell` and `triage_default`** — render the `E-CONFIG` page
-  when `Vault().bundles()` raises.
-- [ ] **Step 8: `entity_scope`** — return a rendered 404 page rather than an
-  empty `HTTPException`.
-- [ ] **Step 9: Commit**
-
-```bash
-git add app/main.py templates tests/test_console_routes.py
-git commit -m "feat: surface failures on every remaining Console route"
-```
-
----
-
-## Task 9: Global handler
-
-**Files:** `app/main.py`, `tests/test_console_routes.py`
-
-- [ ] **Step 1: Write the failing test**
-
-```python
-def test_unhandled_error_renders_safely_at_500(client_and_scope, monkeypatch):
-    client, entity, _ = client_and_scope
-    from app import main
-    monkeypatch.setattr(main, "products_for",
-                        lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
-    response = client.get(f"/registry/{entity}/products")
-    assert response.status_code == 500
-    assert "E-UNKNOWN" in response.text
-    assert "boom" not in response.text
-
-
-def test_described_errors_never_reach_the_global_handler(client_and_scope, monkeypatch):
-    """A route relying on the backstop has not satisfied S6."""
-    client, entity, proposal_id = client_and_scope
-    from app import main
-    seen = []
-    original = main.console_fallback
-    def _spy(request, exc):
-        seen.append(exc)
-        return original(request, exc)
-    monkeypatch.setattr(main, "console_fallback", _spy)
-    from app.outbox import OutboxError
-    monkeypatch.setattr(main, "approve",
-                        lambda *a, **k: (_ for _ in ()).throw(OutboxError("x")))
-    client.post(f"/outbox/{entity}/approve", data={"id": proposal_id},
-                headers={"HX-Request": "true"})
-    assert seen == []
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `uv run pytest tests/test_console_routes.py -q -k unhandled or global_handler`
-Expected: FAIL — no handler exists; the first test returns a raw 500 with a
-traceback.
-
-- [ ] **Step 3: Register the handler**
-
-```python
-@app.exception_handler(Exception)
-def console_fallback(request: Request, exc: Exception):
-    error = describe(exc)
-    return templates.TemplateResponse(
-        request, "error.html", {"error": error},
-        status_code=status_for(error, fragment=False),
-    )
-```
-
-It returns 500, never 200: a programmer error must not be laundered into a
-successful-looking response. `HTTPException` keeps FastAPI's own handling.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `uv run pytest tests/test_console_routes.py -q`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/main.py tests/test_console_routes.py
-git commit -m "feat: add a safe Console fallback handler"
-```
-
----
-
-## Task 10: State proofs and disclosure
+## Task 9: Proofs
 
 **Files:** `tests/test_console_routes.py`
 
-- [ ] **Step 1: Write the state-proof test**
-
-Use the existing `conftest.py` fingerprint helpers. The assertion is selected by
-the entry's `committed` value — asserting "nothing changed" for `E-COMMITTED`
-would pass only if S5 rollback were broken.
-
-```python
-from tests.conftest import (git_cached_diff, git_head, git_index_entries,
-                            git_status_bytes, git_worktree_diff)
-
-
-def _fingerprint(root):
-    return (git_head(root), git_status_bytes(root),
-            git_index_entries(root), git_worktree_diff(root),
-            git_cached_diff(root))
-
-
-def test_refusals_leave_every_byte_unchanged(client_and_scope, monkeypatch, vault_root):
-    client, entity, proposal_id = client_and_scope
-    before = _fingerprint(vault_root)
-    client.post(f"/outbox/{entity}/approve", data={"id": "not-a-real-id"},
-                headers={"HX-Request": "true"})
-    assert _fingerprint(vault_root) == before
-```
-
-- [ ] **Step 2: Write the disclosure tests**
-
-```python
-def test_alerts_disclose_nothing_private(client_and_scope, monkeypatch, entity_slug):
-    client, entity, proposal_id = client_and_scope
-    from app import main
-    from app.scope import CrossScopeError
-    monkeypatch.setattr(main, "approve",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            CrossScopeError("/abs/path/other-entity/outbox/x.yaml")))
-    body = client.post(f"/outbox/{entity}/approve", data={"id": proposal_id},
-                       headers={"HX-Request": "true"}).text
-    assert "E-SCOPE" in body
-    assert "/" not in body.split('role="alert"')[1].split("</p>")[0]
-    assert "other-entity" not in body
-
-
-def test_error_text_is_escaped(client_and_scope, monkeypatch):
-    client, entity, proposal_id = client_and_scope
-    from app import main
-    from app.registry import RegistryError
-    monkeypatch.setattr(main, "execute_delete",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            RegistryError("<script>alert(1)</script>")))
-    body = client.post(f"/registry/{entity}/product/delete-execute",
-                       data={"id": "x", "slug": "y"}).text
-    assert "<script>" not in body
-```
-
-- [ ] **Step 3: Run**
-
-Run: `uv run pytest tests/test_console_routes.py -q`
-Expected: PASS.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add tests/test_console_routes.py
-git commit -m "test: prove Console errors mutate nothing and disclose nothing"
-```
+- [ ] **Step 1: State proofs** keyed to `committed` and to the declared
+  persistence outcome, using the `conftest.py` fingerprint helpers. `propose` and
+  `registry_delete_preview` declare `proposal-written`.
+- [ ] **Step 2: Disclosure** — no path separators, slugs, commit ids, or echoed
+  request values in any alert; markup escaped.
+- [ ] **Step 3: `hx-vals` rebinding** — a slug with quotes, braces, and a second
+  `id` yields exactly one `id`, equal to the previewed proposal.
+- [ ] **Step 4: Route-level totality** — each declared catch family injected;
+  global handler asserted not to be the responder.
+- [ ] **Step 5: Commit** — `git commit -m "test: prove state, disclosure, and binding"`
 
 ---
 
-## Task 11: Documentation
+## Task 10: Documentation
 
-**Files:** `BUILD.md`, `docs/STATUS.md`
-
-- [ ] **Step 1:** Set `| S6 | **COMPLETE** |` in the BUILD.md table.
-- [ ] **Step 2:** Update the STATUS.md step table and record the new baselines.
-- [ ] **Step 3:** Add the historical banner to this plan file:
-
-```markdown
-> **Historical execution plan:** S6 was implemented and merged through PR #NN
-> at `<sha>`. Do not create its branch, execute its tasks, or use its old test
-> counts and stop conditions as current instructions.
-```
-
-- [ ] **Step 4:** Set the design file's `**Status:**` to
-  `Implemented and merged; historical design record`.
-- [ ] **Step 5:** Run `uv run pytest tests/test_publication_docs.py -q` —
-  `test_safety_foundation_status_tracks_merged_s1_through_s5` asserts
-  `| S6 | **NEXT** |`, so it must be updated in the same commit.
-- [ ] **Step 6: Commit**
-
-```bash
-git add BUILD.md docs/STATUS.md docs/superpowers tests/test_publication_docs.py
-git commit -m "docs: record S6 as complete"
-```
+- [ ] Set `| S6 | **COMPLETE** |` in `BUILD.md` and update
+  `tests/test_publication_docs.py`, which asserts `| S6 | **NEXT** |`.
+- [ ] Update `docs/STATUS.md`: S6 complete, defect list resolved or carried, S7
+  still proposed.
+- [ ] Mark the design and this plan historical.
+- [ ] Commit — `git commit -m "docs: record S6 as complete"`
 
 ---
 
 ## Final verification
 
-- [ ] **Public gates**
-
 ```bash
 uv run pytest tests/test_app.py -q
 uv run pytest tests/test_outbox.py tests/test_registry.py tests/test_git_transaction.py -q
+uv run pytest tests/test_vault.py -q
 uv run python -m pytest -q
 git diff --check
 git diff --stat origin/main...HEAD
 ```
 
-Expected: all pass; the file list contains only the files named in this plan.
-
-- [ ] **Private gates, read-only**
+Then the private gates, read-only:
 
 ```bash
 cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover -q; cd -
@@ -1095,44 +466,45 @@ uv run python -m tools.public_repo_audit --repo . --history
 uv run python -m tools.public_repo_audit --repo . --vault "$ONEOS_VAULT" --history
 ```
 
-Expected: 37 private tests OK; `0 error(s), 0 warning(s)`; clean audits.
-
-- [ ] **Fingerprint equality**
+Then fingerprint equality:
 
 ```bash
-git -C "$ONEOS_VAULT" rev-parse HEAD > /private/tmp/s6-proof/head.after
-git -C "$ONEOS_VAULT" status --porcelain=v1 -z --untracked-files=all > /private/tmp/s6-proof/status.after
-git -C "$ONEOS_VAULT" diff --binary > /private/tmp/s6-proof/worktree.after
-git -C "$ONEOS_VAULT" diff --cached --binary > /private/tmp/s6-proof/cached.after
 for f in head status worktree cached; do
+  case $f in
+    head)     git -C "$ONEOS_VAULT" rev-parse HEAD > /private/tmp/s6-proof/head.after ;;
+    status)   git -C "$ONEOS_VAULT" status --porcelain=v1 -z --untracked-files=all > /private/tmp/s6-proof/status.after ;;
+    worktree) git -C "$ONEOS_VAULT" diff --binary > /private/tmp/s6-proof/worktree.after ;;
+    cached)   git -C "$ONEOS_VAULT" diff --cached --binary > /private/tmp/s6-proof/cached.after ;;
+  esac
   cmp "/private/tmp/s6-proof/$f.before" "/private/tmp/s6-proof/$f.after" \
     && echo "$f identical" || { echo "$f DIFFERS — stop"; exit 1; }
 done
 ```
 
-- [ ] **Whole-branch review** for safe disclosure, HTMX swap behavior, typed
-  outcome accuracy, S1-S5 preservation, instance leakage, and non-goal drift.
-- [ ] **superpowers:verification-before-completion.**
+- [ ] Whole-branch review for safe disclosure, HTMX behavior, typed outcome
+  accuracy, S1-S5 preservation, instance leakage, and non-goal drift.
+- [ ] superpowers:verification-before-completion.
 
 ---
 
 ## Stop conditions
 
-Stop and ask rather than deciding:
-
-- Any change to `$ONEOS_VAULT` content, conventions, or registries.
-- Any S1-S5 test needing modification. S6 changes no refusal decision, so a test
-  requiring a change means scope was breached, not that the test was wrong.
+- Any S1-S5 test failing that is not one of the two listed in the design's
+  regression table. S6 changes no refusal decision, so a third failure means
+  scope was breached.
+- Any change to vault content, conventions, or registries.
 - Any new dependency, route, screen, or schema.
 - Any private gate failing, or any fingerprint differing.
-- Any need to render a value the design's disclosure boundary forbids.
+- Any need to render a value the disclosure boundary forbids.
+- Any point where the honest fix adds a refusal condition — that is S7 or later,
+  not an S6 edit. This has been the recurring breach; treat "it is only bounded"
+  as the warning sign it has been every previous time.
 - Publication: the branch stays local until explicitly authorized.
 
-## Known limitations
+## Known limitations carried from the design
 
-- `E-ENTITY` distinguishes an absent entity from a present one. Accepted for a
-  single local operator whose sidebar already lists every entity; it must become
-  indistinguishable from `E-SCOPE` before the Console serves more than one.
-- Adapter and ingest failures have no Console surface. `E-INGEST` is described
-  but unreachable until the deferred upload route exists.
-- Stdlib exceptions resolve to `E-UNKNOWN` by design.
+- The review gate does not bind reviewed content (S7).
+- `catalog = build_catalog()` runs at module scope, so a manifest failure aborts
+  import before any handler exists.
+- `E-ENTITY` distinguishes an absent entity from a present one.
+- Adapter and ingest failures have no Console surface.
