@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- S4 branches from `origin/main` at `90b753b` (including merged S1 containment) plus the rebased local post-merge baseline hotfix `24da1f6`; do not add commits to PR #6 or replay old S1 branch commits.
+- S4 branches from `origin/main` at `faa3894`, which includes merged S1 containment and the standalone Gitleaks baseline hotfix; do not add commits to PR #6 or replay old S1 branch commits.
 - Proposal IDs are exactly `YYYYMMDDTHHMMSS-<32 lowercase hex>`; entropy is `secrets.token_hex(16)`.
 - The stored proposal ID must exactly equal the proposal filename stem.
 - Every classification proposal requires `source_sha256` matching `^[0-9a-f]{64}$`.
@@ -897,7 +897,7 @@ git commit -m "feat: surface proposal freshness refusals"
 ### Task 5: Complete all S4 gates and whole-branch review
 
 **Files:**
-- Review only: all changes from `24da1f6..HEAD`
+- Review only: all changes from `faa3894..HEAD`
 - Modify only if a focused S4 defect is found through a new failing test.
 
 **Interfaces:**
@@ -970,10 +970,10 @@ do not clean or alter Grey Matter.
 - [ ] **Step 7: Run public diff hygiene and inspect branch scope**
 
 ```bash
-git diff --check 24da1f6..HEAD
+git diff --check faa3894..HEAD
 git status --short
-git diff --stat 24da1f6..HEAD
-git diff 24da1f6..HEAD -- \
+git diff --stat faa3894..HEAD
+git diff faa3894..HEAD -- \
   app/proposal_identity.py app/outbox.py app/registry.py app/main.py \
   templates/blocks/outbox_list.html tests/test_proposal_identity.py \
   tests/test_outbox.py tests/test_registry.py tests/test_app.py
@@ -984,7 +984,7 @@ code, tests, spec, and plan.
 
 - [ ] **Step 8: Perform a whole-branch review**
 
-Review every commit and diff from `24da1f6..HEAD`. Verify explicitly:
+Review every commit and diff from `faa3894..HEAD`. Verify explicitly:
 
 - no ID accepts uppercase, missing entropy, invalid calendar time, separators,
   or ID/filename mismatch;
@@ -1007,7 +1007,7 @@ the minimal fix, rerun the affected suite, and create a narrow fix commit.
 Report:
 
 - branch `codex/s4-fresh-collision-safe-proposals`;
-- base `24da1f6` (rebased local hotfix on `origin/main` `90b753b`) and final S4 commit SHA;
+- base `faa3894` (merged `origin/main`) and final S4 commit SHA;
 - focused/public/private/audit results;
 - private-vault fingerprint equality;
 - files changed and key safety behavior; and

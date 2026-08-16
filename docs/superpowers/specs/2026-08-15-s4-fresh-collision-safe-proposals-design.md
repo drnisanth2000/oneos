@@ -4,7 +4,7 @@
 
 **Status:** Approved
 
-**Base:** `origin/main` at `90b753b` (S3 plus merged S1 containment), plus the rebased local Gitleaks baseline hotfix (`24da1f6`)
+**Base:** `origin/main` at `faa3894` (S3, merged S1 containment, and the standalone Gitleaks baseline hotfix)
 
 ## Objective
 
