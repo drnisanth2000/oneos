@@ -639,20 +639,23 @@ def audit_commits(
     return result
 
 
-def _canonical_created(value: object) -> bool:
-    if not isinstance(value, str):
+def _canonical_created(proposal_id: object, value: object) -> bool:
+    if not isinstance(proposal_id, str) or not isinstance(value, str):
         return False
     try:
         parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
     except ValueError:
         return False
-    return parsed.isoformat(timespec="seconds") == value
+    return (
+        parsed.isoformat(timespec="seconds") == value
+        and parsed.strftime("%Y%m%dT%H%M%S") == proposal_id.partition("-")[0]
+    )
 
 
 def _canonical_classification_record(record: dict) -> bool:
     return (
         set(record) == _CLASSIFY_RECORD_FIELDS
-        and _canonical_created(record.get("created"))
+        and _canonical_created(record.get("id"), record.get("created"))
         and (
             record.get("rule_id") is None
             or isinstance(record.get("rule_id"), str)
@@ -670,7 +673,7 @@ def _canonical_delete_record(record: dict) -> bool:
         or kind not in _DELETE_KINDS
         or not isinstance(slug, str)
         or _CANONICAL_SLUG.fullmatch(slug) is None
-        or not _canonical_created(record.get("created"))
+        or not _canonical_created(record.get("id"), record.get("created"))
         or not isinstance(total, int)
         or isinstance(total, bool)
         or total < 0

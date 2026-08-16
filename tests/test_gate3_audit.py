@@ -514,6 +514,39 @@ def test_new_canonical_pending_registry_delete_proposal_is_sanctioned(tmp_path: 
     assert result.sanctioned_writes == [proposal.path.relative_to(vault).as_posix()]
 
 
+def test_classification_proposal_created_must_match_id_timestamp(tmp_path: Path):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    proposal = _classification_proposal(vault)
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["created"] = "2000-01-01T00:00:00"
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False))
+    rules = gate3.AuditRules.load(vault)
+
+    result = gate3.audit_dirty(
+        {}, gate3.collect_dirty_fingerprints(vault), rules, vault
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [proposal.relative_to(vault).as_posix()]
+
+
+def test_delete_proposal_created_must_match_id_timestamp(tmp_path: Path):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = propose_delete(scope, "product", "unused")
+    record = yaml.safe_load(proposal.path.read_text(encoding="utf-8"))
+    record["created"] = "2000-01-01T00:00:00"
+    proposal.path.write_text(yaml.safe_dump(record, sort_keys=False))
+    rules = gate3.AuditRules.load(vault)
+
+    result = gate3.audit_dirty(
+        {}, gate3.collect_dirty_fingerprints(vault), rules, vault
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [proposal.path.relative_to(vault).as_posix()]
+
+
 def test_new_staged_pending_proposal_is_not_a_sanctioned_dirty_write(tmp_path: Path):
     vault = _audit_vault(tmp_path, initialize_git=True)
     proposal = _classification_proposal(vault)
