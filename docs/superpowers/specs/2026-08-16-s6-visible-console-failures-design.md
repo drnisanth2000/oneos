@@ -298,8 +298,9 @@ stages nothing, creates no directory, and acquires no lock.
 - Each site in the inventory, with its error injected, returns the expected
   status, renders the expected code and message, and renders no raw exception
   text.
-- Fragment requests return 200 and are swappable; page requests return their
-  true status.
+- Fragment requests return 200 and carry the target element the route's
+  `hx-target` names, so the swap is proven rather than inferred from status
+  alone; page requests return their true status.
 - The same error yields the same message on both paths.
 - Every S5 transaction outcome — busy, reviewed-state conflict, rolled-back
   failure, blocked recovery, and committed-with-failed-cleanup — is visible
@@ -323,12 +324,29 @@ stages nothing, creates no directory, and acquires no lock.
 - Every alert carries `role="alert"`.
 - The triage Alpine scope survives a `propose` error swap.
 
-### No unintended mutation
+### State proof keyed to the declared outcome
 
 For every injected failure, state is snapshotted immediately before the request
 and compared after: `HEAD`, the Git index, tracked and untracked status,
-proposal bytes, source and destination bytes, and registry bytes. Presenting an
-error changes none of them.
+proposal bytes, source and destination bytes, and registry bytes.
+
+The assertion is keyed to the entry's `committed` value rather than assuming
+every failure leaves nothing behind:
+
+- `committed = no` requires every snapshotted value to be identical. This
+  covers every `refusal`.
+- `committed = yes` requires exactly the reviewed paths committed at one new
+  `HEAD`, with all unrelated state identical. `E-COMMITTED` reports a durable
+  commit, so a test asserting nothing changed would be asserting the wrong
+  thing and could pass only if S5 rollback were broken.
+- `committed = unknown` requires unrelated state to be identical and records
+  the observed owned-path state without demanding a particular value, because
+  `E-RECOVER` exists precisely where S5 declined to overwrite a concurrent
+  change.
+
+In all three cases, presenting the error adds no mutation of its own. This is
+what makes `committed` load-bearing rather than descriptive: it selects the
+assertion, so a wrong value fails a test instead of misleading an operator.
 
 ### Regression
 
