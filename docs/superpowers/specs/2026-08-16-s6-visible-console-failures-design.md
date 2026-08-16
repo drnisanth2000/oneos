@@ -70,13 +70,24 @@ Three constraints make the walk safe:
 - **Allowlisted.** Only classes explicitly declared chain-bearing are traversed.
   A class not on the allowlist is described by itself, and its cause is never
   read. The allowlist is `OutboxTransactionError`, `RegistryTransactionError`,
-  `OutboxDestinationError`, and `HTTPException`.
+  `OutboxDestinationError`, `HTTPException`, and `GitTransactionFailure`.
 - **`__cause__` only, never `__context__`.** Python sets `__context__`
   automatically for any exception raised while handling another, so traversing
   it would surface unrelated in-flight failures. Only explicit `raise ... from`
   expresses intent.
-- **Bounded.** Depth 4. Exceeding it yields the outermost description rather
-  than continuing.
+- **Bounded, failing closed.** Depth 4. Exceeding it yields `E-UNKNOWN` at
+  `stop` / `committed = unknown`, never the outermost description. An overrun
+  chain has not been proven free of a committed outcome, and returning the outer
+  wrapper could report `retry`/`no` over a deeper `committed`. Overflow fails
+  closed for the same reason a closed family does.
+
+`GitTransactionFailure` is allowlisted because S5 normalizes every
+in-transaction failure into it after rollback (`app/git_transaction.py:418-419`)
+while preserving the original — `raise transaction_error from transaction_cause`
+at `:459`. Without traversing it, **any** condition detected inside a
+transaction, including a redirected reviewed path, resolves to `E-GIT` at
+`retry`. Allowlisting recovers the real outcome and requires no change to S5
+code.
 
 The resolver never reads exception text, `args`, or attributes. Only the class
 identity of each link selects a curated description.
@@ -134,6 +145,7 @@ registry module imports `console_errors` **or** `console_render`.
 | `E-STALE` | refusal | refusal | recreate | no | 409 |
 | `E-MISSING` | refusal | refusal | recreate | no | 409 |
 | `E-INVALID` | refusal | refusal | recreate | no | 422 |
+| `E-UNREADABLE` | refusal | attention | stop | no | 422 |
 | `E-DEST` | refusal | refusal | recreate | no | 422 |
 | `E-BUSY` | refusal | refusal | retry | no | 409 |
 | `E-CONFLICT` | refusal | refusal | reload | no | 409 |
@@ -157,12 +169,73 @@ conditions, and the redirection family is a security finding:
 | a path is redirected, not a regular file, or type-swapped | `app/outbox.py:99,122,140`, `app/git_transaction.py:172,192,198,228` | `E-TAMPER` |
 | the reviewed file genuinely changed underneath | `app/git_transaction.py` conflict sites | `E-CONFLICT` |
 
-Distinguishing these requires the services to raise distinguishable types.
-Introducing a `RedirectedPathError` subclass of `CrossScopeError` at the
-redirection sites is a **type refinement, not a behavior change**: the same
-inputs are refused at the same points, and every existing `except
-CrossScopeError` continues to catch it. Each converted site is characterized by
-test before conversion.
+Distinguishing these requires the services to raise distinguishable types. The
+redirection sites live under two different bases, so the refinement is two
+subclasses, both described as `E-TAMPER`:
+
+| Base | New subclass | Sites |
+|---|---|---|
+| `CrossScopeError` | `RedirectedPathError` | `app/outbox.py:99,122,140`, `app/inbox.py:46,57` |
+| `ReviewedStateConflict` | `ReviewedPathIntegrityError` | `app/git_transaction.py:172,192,198,228` |
+
+Both are **type refinements, not behavior changes**: the same inputs are refused
+at the same points, and every existing `except CrossScopeError` or `except
+GitTransactionError` continues to catch them. Each converted site is
+characterized by test before conversion.
+
+`ReviewedPathIntegrityError` must be an **exact** closed-family entry, not an
+inherited one. It is raised inside `_execute_locked`, so it reaches a route
+wrapped in `GitTransactionFailure` inside `OutboxTransactionError` — a depth-3
+chain that the allowlist traverses and precedence resolves to `E-TAMPER` at
+tier `integrity`, outranking the wrapper's `refusal`.
+
+### Class mapping
+
+The table keys on these classes. `exact` means the entry applies only to that
+class; `mro` means subclasses without their own entry inherit it. Every member
+of the closed `GitTransactionError` family is `exact` by Rule 2.
+
+| Class | Code | Match |
+|---|---|---|
+| `git_transaction.GitTransactionCommittedError` | `E-COMMITTED` | exact |
+| `git_transaction.GitTransactionRecoveryError` | `E-RECOVER` | exact |
+| `git_transaction.ReviewedPathIntegrityError` | `E-TAMPER` | exact |
+| `git_transaction.ReviewedStateConflict` | `E-CONFLICT` | exact |
+| `git_transaction.VaultBusyError` | `E-BUSY` | exact |
+| `git_transaction.GitTransactionFailure` | `E-GIT` | exact |
+| `git_transaction.GitTransactionError` | `E-GIT` | exact |
+| `git_transaction._ApprovalLockCleanupFailure` | `E-GIT` | exact |
+| `git_transaction._ReviewedIndexOwnershipConflict` | `E-CONFLICT` | exact |
+| `scope.RedirectedPathError` | `E-TAMPER` | mro |
+| `scope.CrossScopeError` | `E-SCOPE` | mro |
+| `outbox.OutboxScopeError` | `E-SCOPE` | mro |
+| `outbox.ProposalFreshnessError` → `StaleProposalSource` | `E-STALE` | exact |
+| `outbox.MissingProposalSource` | `E-MISSING` | exact |
+| `outbox.OutboxTransactionError` | `E-GIT` | exact |
+| `outbox.OutboxDestinationError` | `E-INVALID` | mro |
+| `outbox.OutboxError` | `E-INVALID` | mro |
+| `proposal_identity.ProposalIdentityError` | `E-INVALID` | mro |
+| `destinations.UnsafeDestinationPath` | `E-TAMPER` | exact |
+| `destinations.DestinationError` | `E-DEST` | mro |
+| `vault.DestinationRegistryError` | `E-CONFIG` | mro |
+| `entities.SystemRegistryPathError` | `E-TAMPER` | exact |
+| `entities.RecipientConfigurationError` | `E-CONFIG` | exact |
+| `entities.EntityManifestError` | `E-CONFIG` | mro |
+| `entities.EntitySelectionError` | `E-ENTITY` | mro |
+| `registry.RegistryTransactionError` | `E-GIT` | exact |
+| `registry.RegistryError` | `E-REGISTRY` | mro |
+| `ingest.base.IngestError` and all subclasses | `E-INGEST` | mro |
+| `rename.RenameError` | `E-ADMIN` | mro |
+| `fastapi.RequestValidationError` | `E-REQUEST` | exact |
+| `fastapi.HTTPException` | `E-REQUEST` | exact |
+
+`UnsafeDestinationPath` and `SystemRegistryPathError` are `E-TAMPER` rather than
+`E-DEST`/`E-CONFIG`: both fire specifically on redirected or non-canonical
+paths, which is the integrity condition, not an ordinary resolution failure.
+Both are `exact` so their siblings keep the ordinary code.
+
+`E-UNREADABLE` is produced by the projection, not by a class mapping — no
+service raises it.
 
 ### Exact message text
 
@@ -178,6 +251,7 @@ These strings are the contract.
 | `E-STALE` | Approval refused: source changed since this proposal was created. Create a fresh proposal. |
 | `E-MISSING` | Approval refused: source is missing. Restore it or reject the proposal. |
 | `E-INVALID` | This proposal record is not valid and cannot be approved. Create a new proposal. |
+| `E-UNREADABLE` | A file in the outbox could not be read as a proposal. Creating another proposal will not clear it — repair or remove it outside the Console. |
 | `E-DEST` | The destination could not be resolved from the registries. Re-classify this item. |
 | `E-BUSY` | Another approval is in progress. Nothing was changed. Try again in a moment. |
 | `E-CONFLICT` | The reviewed files changed since this proposal was previewed. Reload and review again. |
@@ -238,7 +312,15 @@ never evidence that it will approve.
 A row that fails validation is rendered as an **unreadable record**: no approve
 control, no reject control, and no filename. Per Rule 9 the filename is
 attacker-controlled text and is not echoed; the row is generic and carries
-`E-INVALID` at `retry = stop`.
+`E-UNREADABLE`.
+
+`E-UNREADABLE` is a distinct code from `E-INVALID` because the two demand
+opposite actions. `E-INVALID` says the proposal you tried to approve is bad —
+create a new one, and the bad one disappears when you reject it. `E-UNREADABLE`
+says a file in the outbox cannot be parsed at all — creating another proposal
+does not remove it, and it cannot be rejected through the Console. One code
+carrying both `recreate` and `stop` would have told the operator to perform an
+action that cannot resolve the condition.
 
 Withholding reject is deliberate. `reject` resolves through `get_proposal` and
 the strict loader, so a malformed record cannot be rejected without a new
@@ -353,8 +435,21 @@ not be read as valid":
 | `app/vault.py:84` | `ValueError` — no `modules:` key |
 | `app/vault.py:106` | `ValueError` — unknown flag |
 | `app/vault.py:74-78` | `FileNotFoundError` — absent registry |
-| `app/registry.py:168-176` | `yaml.YAMLError` — malformed `products.yaml` |
-| `app/registry.py:128-152` | `sqlite3.DatabaseError`, `yaml.YAMLError` |
+| `app/registry.py:168-176` | `yaml.YAMLError`, **`AttributeError`, `TypeError`** — `products.yaml` |
+| `app/registry.py:110` | `AttributeError`, `TypeError` — front-matter shaped wrongly |
+| `app/registry.py:128-152` | `sqlite3.DatabaseError`, `yaml.YAMLError`, `AttributeError`, `TypeError` |
+
+`AttributeError` and `TypeError` are not incidental. A registry that is
+**syntactically valid YAML but wrongly shaped** — a list where a mapping is
+expected, a scalar where a list is — parses cleanly and then fails on attribute
+or subscript access. `yaml.safe_load(...) or {}` guards only the empty case, not
+the wrong-type case. Converting only `yaml.YAMLError` would leave the more
+likely hand-editing mistake reported as "an unexpected error was not handled",
+contradicting the `E-CONFIG` outcome this table promises.
+
+Each conversion narrows to the specific parse or access it guards. A blanket
+`except (AttributeError, TypeError)` around a whole function would mask genuine
+programmer errors, which is the catch-all Rule 5 forbids.
 
 `app/vault.py:101` (unknown archetype) is **not** converted: its only caller
 passes `archetype=None`, so it is unreachable and a characterization test would
@@ -371,11 +466,33 @@ Curated messages may not contain an entity slug, an absolute or vault-relative
 path, a filename, a module or registry value, a commit id, Git stderr, a stack
 trace, or any echoed request value. Raw exception text never reaches HTML.
 
-**Rule 8 — never reflect a submitted value.** `registry_delete_execute` builds
-its success copy from the submitted `slug` form field, which is never compared
-against the proposal's own slug, and interpolates it into an unescaped
-`HTMLResponse`. Both branches move to templates, and success copy is built from
-the **validated service result**, never from form input.
+**Rule 8 — never reflect a submitted value, and never hand-build request
+values.** Two distinct defects:
+
+*Reflected copy.* `registry_delete_execute` builds its success message from the
+submitted `slug` form field, never compared against the proposal's own slug, and
+interpolates it into an unescaped `HTMLResponse`. Both branches move to
+templates, and success copy is built from the **validated service result**.
+
+*Request rebinding.* Both registry templates hand-build `hx-vals` JSON around an
+interpolated value:
+
+```
+templates/registry.html:31             hx-vals='{"slug": "{{ slug }}"}'
+templates/blocks/delete_impact.html:14 hx-vals='{"id": "{{ prop.id }}", "slug": "{{ slug }}"}'
+```
+
+A crafted slug can close the string and inject a second `id` key after the
+browser decodes HTML entities, so the approval request refers to a proposal
+other than the one previewed — a preview/approve mismatch, not merely a display
+bug. The complete mapping must be built server-side and passed through `tojson`,
+which is the pattern `templates/triage.html:83` already uses
+(`hx-vals='{{ proposal_values | tojson }}'`) and which these two templates did
+not follow.
+
+S6 converts both, and a test asserts that a slug containing quotes, braces, and
+a second `id` key yields exactly one `id` in the parsed `hx-vals` and that it
+equals the previewed proposal.
 
 **Rule 9 — no filename disclosure.** An unreadable outbox record renders a
 generic row. Its filename is attacker-controlled and is not echoed.
@@ -417,7 +534,11 @@ what failed. The same re-entrancy argument as the outbox listing applies.
   resolves to itself.
 - Chain depth is bounded at 4.
 - Both structural invariants hold across the whole table.
-- No application module imports `console_errors` or `console_render`.
+- No **domain or service** module imports `console_errors` or `console_render`.
+  The presentation composition root — `app/main.py` and the templates it renders
+  — must import them; it is the layer that turns an exception into a response.
+  The test asserts on `app/` excluding that root, so it forbids the cycle
+  without forbidding the intended dependency.
 
 ### Routes
 
@@ -425,9 +546,14 @@ what failed. The same re-entrancy argument as the outbox listing applies.
   status, renders the expected code and message, and no raw exception text.
 - Fragment responses carry the element named by the route's `hx-target`, so the
   swap is proven rather than inferred from status.
-- **Route-level totality:** for each route, each reachable non-application
-  exception is injected and the global handler is asserted *not* to be the
-  responder.
+- **Route-level totality:** for each route, every exception in that route's
+  **declared conversion set** — the stdlib and third-party types listed in
+  Boundary conversions below — is injected, and the global handler is asserted
+  *not* to be the responder. The test enumerates the conversion set, not "every
+  exception reachable anywhere": the design deliberately routes unconverted
+  stdlib failures to `E-UNKNOWN` through the handler, so an unbounded claim
+  would contradict §10 and be unsatisfiable. Adding a boundary conversion means
+  adding it to the set, which is what makes the test grow with the code.
 - Every full-page route contains the `htmx-config` meta tag.
 - An unhandled exception during an HTMX request returns 500 and a visible body.
   This requires `TestClient(app, raise_server_exceptions=False)`, as three
@@ -447,9 +573,31 @@ what failed. The same re-entrancy argument as the outbox listing applies.
 ### State proof
 
 Snapshots before and after using the existing `conftest.py` fingerprint helpers.
-The assertion is selected by the entry's `committed` value:
 
-- `no` — every snapshotted value identical.
+**`committed` means "a Git commit was created". It does not mean "no state
+changed."** These are different claims, and conflating them makes the contract
+unsatisfiable for two routes that persist before they render:
+
+- `propose` calls `propose_classification`, which writes the proposal file, and
+  only then evaluates `preview_diff` while building the template context
+  (`app/main.py:126-135`).
+- `registry_delete_preview` calls `propose_delete`, which writes its proposal,
+  and only then calls `reference_count` (`app/main.py:211-216`).
+
+A described failure in that second phase returns `committed = no` while a
+newly written proposal remains on disk. That is **correct behavior, not a
+defect**: the domain action succeeded, and S6 must not roll back a successful
+write merely because rendering failed. The operator sees the error, and the
+proposal is in the outbox where it can be reviewed or rejected normally.
+
+Each state-proof test therefore declares an expected **persistence** outcome
+alongside `committed`, and the assertion is selected by both:
+
+- `committed = no`, persistence `none` — every snapshotted value identical.
+- `committed = no`, persistence `proposal-written` — `HEAD`, the index, and all
+  tracked content identical; exactly one new untracked proposal under the bound
+  entity's `outbox/`, and nothing else. Only the two routes above may declare
+  this.
 - `yes` — exactly the reviewed paths committed at one new `HEAD`, unrelated
   state identical. Injection must be a real post-commit cleanup `OSError` so
   `app/git_transaction.py:466` fires after a genuine commit; monkeypatching
