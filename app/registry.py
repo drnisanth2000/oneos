@@ -16,6 +16,14 @@ from pathlib import Path
 
 import yaml
 
+from .git_transaction import (
+    GitTransactionError,
+    PathChange,
+    PathState,
+    TransactionPlan,
+    capture_path_state,
+    execute_transaction,
+)
 from .inbox import split_front_matter
 from .proposal_identity import (
     ProposalIdentityError,
@@ -34,6 +42,10 @@ _SKIP_DIRS = {".git", ".obsidian", ".sensitive", "outbox", "staging"}
 
 
 class RegistryError(Exception):
+    pass
+
+
+class RegistryTransactionError(RegistryError):
     pass
 
 
@@ -256,13 +268,9 @@ _REGISTRY_FILE = {"product": "products.yaml", "member": "members.yaml"}
 
 
 def _remove_scoped_registry_value(
-    scope: Scope, kind: str, slug: str
-) -> tuple[Path, str]:
-    filename = _REGISTRY_FILE.get(kind)
-    if filename is None:
-        raise RegistryError(f"delete not supported for kind {kind!r}")
-    path = scope.system_path(filename)
-    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    scope: Scope, kind: str, slug: str, registry_bytes: bytes
+) -> bytes:
+    cfg = yaml.safe_load(registry_bytes.decode("utf-8")) or {}
     registry = cfg.get(f"{kind}s") or {}
     values = registry.get(scope.current_entity())
     if isinstance(values, dict):
@@ -276,7 +284,9 @@ def _remove_scoped_registry_value(
         registry[scope.current_entity()] = kept
     else:
         raise RegistryError(f"selected entity has no {kind} registry")
-    return path, yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True)
+    return yaml.safe_dump(
+        cfg, sort_keys=False, allow_unicode=True
+    ).encode("utf-8")
 
 
 def execute_delete(scope: Scope, proposal_id: str) -> None:
@@ -289,10 +299,55 @@ def execute_delete(scope: Scope, proposal_id: str) -> None:
             f"refusing to delete — references remain.\n{report.as_text()}"
         )
 
-    reg, text = _remove_scoped_registry_value(scope, prop.kind, prop.slug)
-    reg.write_text(text, encoding="utf-8")
     vault = scope.root
-    prop.path.unlink(missing_ok=True)  # untracked proposal
-    filename = _REGISTRY_FILE[prop.kind]
-    _git(vault, "add", f"_system/{filename}")
-    _git(vault, "commit", "-q", "-m", f"registry: delete {prop.kind} {prop.slug}")
+    filename = _REGISTRY_FILE.get(prop.kind)
+    if filename is None:
+        raise RegistryError(f"delete not supported for kind {prop.kind!r}")
+    registry_rel = scope.system_path(filename).relative_to(vault).as_posix()
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+    try:
+        registry_state = capture_path_state(vault, registry_rel)
+        proposal_state = capture_path_state(vault, proposal_rel)
+        if registry_state.contents is None or registry_state.mode is None:
+            raise RegistryError(f"{filename!r} registry is missing")
+        if proposal_state.contents is None:
+            raise RegistryError("delete proposal changed since it was loaded")
+
+        persisted = yaml.safe_load(proposal_state.contents.decode("utf-8")) or {}
+        try:
+            require_proposal_identity(prop.path, persisted.get("id"))
+        except ProposalIdentityError as exc:
+            raise RegistryError("invalid delete proposal id") from exc
+        if (
+            persisted.get("id") != prop.id
+            or persisted.get("entity") != prop.entity
+            or persisted.get("action") != "delete"
+            or persisted.get("kind") != prop.kind
+            or persisted.get("slug") != prop.slug
+        ):
+            raise RegistryError("delete proposal changed since it was loaded")
+
+        rendered_registry_bytes = _remove_scoped_registry_value(
+            scope, prop.kind, prop.slug, registry_state.contents
+        )
+        plan = TransactionPlan(
+            message=f"registry: delete {prop.kind} {prop.slug}",
+            changes=(
+                PathChange(
+                    registry_rel,
+                    registry_state,
+                    PathState.regular(
+                        rendered_registry_bytes, registry_state.mode
+                    ),
+                ),
+            ),
+            commit_paths=(registry_rel,),
+            owned_changes=(
+                PathChange(proposal_rel, proposal_state, PathState.absent()),
+            ),
+        )
+        execute_transaction(vault, plan)
+    except GitTransactionError as exc:
+        raise RegistryTransactionError(
+            "registry deletion transaction failed"
+        ) from exc

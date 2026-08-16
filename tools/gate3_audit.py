@@ -1,32 +1,110 @@
 #!/usr/bin/env python3
-"""Gate 3 audit — zero DIRECT vault writes across a session (spec §11.3).
+"""Gate 3: audit sanctioned Git transactions and exact dirty session state.
 
     ONEOS_VAULT=/path/to/vault python -m tools.gate3_audit snapshot
-    # ... use the app for a full session ...
+    # ... exercise a complete session ...
     ONEOS_VAULT=/path/to/vault python -m tools.gate3_audit check
 
-A vault change is SANCTIONED iff it is either:
-  * a commit whose message starts with an approved prefix
-    (outbox: / rename: / registry:), or
-  * an uncommitted working-tree entry under <entity>/00-inbox/active/ (ingest)
-    or <entity>/outbox/ (a proposal).
-Anything else is a DIRECT write — a gate-3 violation.
-
-The snapshot is written OUTSIDE the vault (cwd by default) so the audit tool
-never itself writes to the vault it is auditing.
+The snapshot is external to the vault.  A check accepts only the commit
+envelopes produced by the existing ingest, outbox, registry, and rename flows,
+plus genuinely new canonical pending proposal YAML.  Every initially dirty
+path must retain its exact index/worktree fingerprint for the whole session.
 """
 from __future__ import annotations
 
-import fnmatch
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+import hashlib
 import json
 import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
 import subprocess
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
+import tempfile
 
-OK_PREFIXES = ("outbox:", "rename:", "registry:")
-OK_GLOBS = ("*/00-inbox/active/*", "*/outbox/*")
+import yaml
+
+from app.entities import EntityCatalog
+from app.outbox import OutboxError, _require_destination, _to_proposal
+from app.proposal_identity import ProposalIdentityError, require_proposal_identity
+from app.registry import RegistryError, get_delete_proposal
+from app.rename import AXES, RenameError, plan_rename
+from app.scope import CrossScopeError, Scope
+from app.vault import DestinationRegistryError, Vault
+
+
+SNAPSHOT_VERSION = 3
+_OID = re.compile(r"^[0-9a-f]{40,64}$")
+_REGISTRY_MESSAGE = re.compile(
+    r"^registry: (add|edit|delete) (workspace|product|member)(?: .*)?$"
+)
+_RENAME_MESSAGE = re.compile(
+    r"^rename: ([a-z0-9]+(?:-[a-z0-9]+)*) → "
+    r"([a-z0-9]+(?:-[a-z0-9]+)*)$"
+)
+_REGISTRY_PATH = {
+    "workspace": "_system/workspaces.yaml",
+    "product": "_system/products.yaml",
+    "member": "_system/members.yaml",
+}
+_DELETE_KINDS = frozenset({"product", "member"})
+_CANONICAL_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_CLASSIFY_RECORD_FIELDS = frozenset(
+    {
+        "id",
+        "action",
+        "entity",
+        "created",
+        "status",
+        "src",
+        "source_sha256",
+        "dst",
+        "module",
+        "sub",
+        "block",
+        "rule_id",
+    }
+)
+_DELETE_RECORD_FIELDS = frozenset(
+    {
+        "id",
+        "action",
+        "entity",
+        "kind",
+        "slug",
+        "created",
+        "status",
+        "total_references",
+        "impact",
+    }
+)
+_DELETE_IMPACT_FIELDS = frozenset({"front-matter", "workspaces", "books.db"})
+
+
+@dataclass(frozen=True)
+class PathChangeRecord:
+    status: str
+    path: str
+
+
+@dataclass(frozen=True)
+class CommitRecord:
+    oid: str
+    message: str
+    parents: tuple[str, ...]
+    changes: tuple[PathChangeRecord, ...]
+
+
+@dataclass(frozen=True)
+class DirtyFingerprint:
+    status: str
+    index_entries: tuple[str, ...]
+    kind: str
+    mode: int | None
+    digest: str | None
 
 
 @dataclass
@@ -41,71 +119,848 @@ class Audit:
         return not self.violating_commits and not self.violating_writes
 
 
-def audit(commit_messages: list[str], dirty_paths: list[str]) -> Audit:
-    """Pure classifier — no git, no filesystem. This is the tested core."""
-    a = Audit()
-    for msg in commit_messages:
-        (a.sanctioned_commits if msg.startswith(OK_PREFIXES)
-         else a.violating_commits).append(msg)
-    for path in dirty_paths:
-        (a.sanctioned_writes if any(fnmatch.fnmatch(path, g) for g in OK_GLOBS)
-         else a.violating_writes).append(path)
-    return a
+@dataclass(frozen=True)
+class AuditRules:
+    root: Path
+    active_modules: dict[str, frozenset[str]]
+    active_lifecycle_modules: dict[str, frozenset[str]]
+
+    @classmethod
+    def load(cls, vault: Path) -> "AuditRules":
+        catalog = EntityCatalog.load(vault)
+        runtime = Vault(catalog)
+        active: dict[str, frozenset[str]] = {}
+        lifecycle: dict[str, frozenset[str]] = {}
+        for entity in catalog.entities:
+            scope = Scope(catalog.root, entity.slug)
+            entity_active = runtime.active_modules_for(scope)
+            active[entity.slug] = entity_active
+            lifecycle[entity.slug] = frozenset(
+                module
+                for module in entity_active
+                if runtime.module_spec(module).get("lifecycle_pattern", True)
+            )
+        return cls(
+            root=catalog.root,
+            active_modules=active,
+            active_lifecycle_modules=lifecycle,
+        )
+
+    @property
+    def entities(self) -> frozenset[str]:
+        return frozenset(self.active_modules)
 
 
-# --- CLI (git + filesystem glue) -------------------------------------------
+def _git_bytes(
+    vault: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+) -> bytes:
+    return subprocess.run(
+        ["git", *args],
+        cwd=vault,
+        env=env,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def _git_text(vault: Path, *args: str) -> str:
+    return _git_bytes(vault, *args).decode("utf-8", "surrogateescape")
+
+
+def _decode_path(value: bytes) -> str:
+    return os.fsdecode(value)
+
+
+def _parse_name_status(output: bytes) -> tuple[PathChangeRecord, ...]:
+    tokens = output.split(b"\0")
+    if tokens and tokens[-1] == b"":
+        tokens.pop()
+    records: list[PathChangeRecord] = []
+    cursor = 0
+    while cursor < len(tokens):
+        status_token = tokens[cursor]
+        cursor += 1
+        if b"\t" in status_token:
+            status_bytes, path_bytes = status_token.split(b"\t", 1)
+        else:
+            if cursor >= len(tokens):
+                raise ValueError("Git name-status output ended before its path")
+            status_bytes = status_token
+            path_bytes = tokens[cursor]
+            cursor += 1
+        try:
+            status_value = status_bytes.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Git emitted a non-ASCII change status") from exc
+        if not status_value or path_bytes == b"":
+            raise ValueError("Git emitted an empty change record")
+        records.append(PathChangeRecord(status_value, _decode_path(path_bytes)))
+    return tuple(records)
+
+
+def _head_oid(vault: Path) -> str:
+    oid = _git_text(vault, "rev-parse", "HEAD").strip()
+    if _OID.fullmatch(oid) is None:
+        raise ValueError("Gate 3 current HEAD is malformed")
+    return oid
+
+
+def collect_commit_records(
+    vault: Path, snapshot_head: str, audit_head: str | None = None
+) -> tuple[CommitRecord, ...]:
+    """Collect every post-snapshot commit in chronological order."""
+    vault = Path(vault).resolve()
+    if _OID.fullmatch(snapshot_head) is None:
+        raise ValueError("Gate 3 snapshot HEAD is malformed")
+    audit_head = _head_oid(vault) if audit_head is None else audit_head
+    if _OID.fullmatch(audit_head) is None:
+        raise ValueError("Gate 3 audit HEAD is malformed")
+    try:
+        _git_bytes(
+            vault, "merge-base", "--is-ancestor", snapshot_head, audit_head
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            "Gate 3 snapshot HEAD is not an ancestor of audit HEAD"
+        ) from exc
+    oids = tuple(
+        line
+        for line in _git_text(
+            vault, "rev-list", "--reverse", f"{snapshot_head}..{audit_head}"
+        ).splitlines()
+        if line
+    )
+    records: list[CommitRecord] = []
+    for oid in oids:
+        message = _git_text(vault, "show", "-s", "--format=%s", oid).rstrip("\n")
+        parents_text = _git_text(vault, "show", "-s", "--format=%P", oid).strip()
+        changes = _parse_name_status(
+            _git_bytes(
+                vault,
+                "diff-tree",
+                "--no-commit-id",
+                "--no-renames",
+                "--name-status",
+                "-r",
+                "-z",
+                oid,
+            )
+        )
+        records.append(
+            CommitRecord(
+                oid=oid,
+                message=message,
+                parents=tuple(parents_text.split()) if parents_text else (),
+                changes=changes,
+            )
+        )
+    return tuple(records)
+
+
+def _parse_index_entries(output: bytes) -> dict[str, tuple[str, ...]]:
+    entries: dict[str, list[tuple[int, str]]] = {}
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        header, separator, path_bytes = record.partition(b"\t")
+        fields = header.split(b" ")
+        if separator != b"\t" or len(fields) != 3:
+            raise ValueError("Git emitted a malformed index entry")
+        mode, oid, stage = fields
+        try:
+            mode_text = mode.decode("ascii")
+            oid_text = oid.decode("ascii")
+            stage_text = stage.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Git emitted non-ASCII index metadata") from exc
+        try:
+            stage_number = int(stage_text)
+        except ValueError as exc:
+            raise ValueError("Git emitted a malformed index stage") from exc
+        path = _decode_path(path_bytes)
+        path_entries = entries.setdefault(path, [])
+        if any(existing_stage == stage_number for existing_stage, _ in path_entries):
+            raise ValueError("Git emitted a duplicate index stage")
+        path_entries.append(
+            (stage_number, f"{mode_text}:{oid_text}:{stage_text}")
+        )
+    return {
+        path: tuple(value for _, value in sorted(path_entries))
+        for path, path_entries in entries.items()
+    }
+
+
+def _parse_porcelain(output: bytes) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            raise ValueError("Git emitted a malformed porcelain record")
+        try:
+            status_value = record[:2].decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Git emitted a non-ASCII porcelain status") from exc
+        path = _decode_path(record[3:])
+        if not path or path in statuses:
+            raise ValueError("Git emitted an ambiguous porcelain path")
+        statuses[path] = status_value
+    return statuses
+
+
+def _read_regular_no_follow(path: Path) -> tuple[bytes, int]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("path changed type while Gate 3 read it")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            contents = stream.read()
+        return contents, stat.S_IMODE(opened.st_mode)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _fingerprint_path(
+    vault: Path,
+    relative: str,
+    status_value: str,
+    index_entries: tuple[str, ...],
+) -> DirtyFingerprint:
+    parts = _path_parts(relative)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if parts is None or no_follow is None:
+        return DirtyFingerprint(status_value, index_entries, "redirected", None, None)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
+    try:
+        parent_descriptor = os.open(vault, directory_flags)
+    except FileNotFoundError:
+        return DirtyFingerprint(status_value, index_entries, "absence", None, None)
+    except OSError:
+        return DirtyFingerprint(status_value, index_entries, "redirected", None, None)
+    try:
+        for component in parts[:-1]:
+            try:
+                next_descriptor = os.open(
+                    component, directory_flags, dir_fd=parent_descriptor
+                )
+            except FileNotFoundError:
+                return DirtyFingerprint(
+                    status_value, index_entries, "absence", None, None
+                )
+            except OSError:
+                return DirtyFingerprint(
+                    status_value, index_entries, "redirected", None, None
+                )
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+
+        leaf = parts[-1]
+        try:
+            metadata = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return DirtyFingerprint(status_value, index_entries, "absence", None, None)
+        except OSError:
+            return DirtyFingerprint(
+                status_value, index_entries, "redirected", None, None
+            )
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISREG(metadata.st_mode):
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    leaf, os.O_RDONLY | no_follow, dir_fd=parent_descriptor
+                )
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    return DirtyFingerprint(
+                        status_value, index_entries, "redirected", None, None
+                    )
+                with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                    descriptor = -1
+                    contents = stream.read()
+            except OSError:
+                return DirtyFingerprint(
+                    status_value, index_entries, "redirected", None, None
+                )
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            return DirtyFingerprint(
+                status_value,
+                index_entries,
+                "file",
+                stat.S_IMODE(opened.st_mode),
+                hashlib.sha256(contents).hexdigest(),
+            )
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                target = os.fsencode(os.readlink(leaf, dir_fd=parent_descriptor))
+            except OSError:
+                return DirtyFingerprint(
+                    status_value, index_entries, "redirected", None, None
+                )
+            return DirtyFingerprint(
+                status_value,
+                index_entries,
+                "symlink",
+                mode,
+                hashlib.sha256(target).hexdigest(),
+            )
+        kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "other"
+        return DirtyFingerprint(status_value, index_entries, kind, mode, None)
+    finally:
+        os.close(parent_descriptor)
+
+
+def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
+    """Fingerprint every Git-dirty path without rename pairing or path quoting."""
+    vault = Path(vault).resolve()
+    statuses = _parse_porcelain(
+        _git_bytes(
+            vault,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        )
+    )
+    index_entries = _parse_index_entries(
+        _git_bytes(vault, "ls-files", "--stage", "-z")
+    )
+    return {
+        relative: _fingerprint_path(
+            vault, relative, statuses[relative], index_entries.get(relative, ())
+        )
+        for relative in sorted(statuses)
+    }
+
+
+def _path_parts(path: str) -> tuple[str, ...] | None:
+    if path.startswith("/") or "\0" in path:
+        return None
+    parts = tuple(path.split("/"))
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    return parts
+
+
+def _canonical_markdown_leaf(leaf: str) -> bool:
+    return (
+        bool(leaf)
+        and leaf not in {".", ".."}
+        and not leaf.startswith(".")
+        and leaf == leaf.strip()
+        and "\\" not in leaf
+        and "\r" not in leaf
+        and "\n" not in leaf
+        and Path(leaf).suffix == ".md"
+    )
+
+
+def _inbox_path(path: str, rules: AuditRules) -> tuple[str, str] | None:
+    parts = _path_parts(path)
+    if (
+        parts is None
+        or len(parts) != 4
+        or parts[0] not in rules.entities
+        or parts[1:3] != ("00-inbox", "active")
+        or not _canonical_markdown_leaf(parts[3])
+    ):
+        return None
+    return parts[0], parts[3]
+
+
+def _active_destination(path: str, rules: AuditRules) -> tuple[str, str] | None:
+    parts = _path_parts(path)
+    if parts is None or len(parts) != 4:
+        return None
+    entity, module, lifecycle, leaf = parts
+    if (
+        entity not in rules.entities
+        or lifecycle != "active"
+        or module in {"outbox", "staging", "_system"}
+        or module not in rules.active_lifecycle_modules[entity]
+        or not _canonical_markdown_leaf(leaf)
+    ):
+        return None
+    return entity, leaf
+
+
+def _sanctioned_ingest(record: CommitRecord, rules: AuditRules) -> bool:
+    return (
+        len(record.parents) == 1
+        and len(record.changes) == 1
+        and record.changes[0].status == "A"
+        and _inbox_path(record.changes[0].path, rules) is not None
+    )
+
+
+def _sanctioned_outbox(record: CommitRecord, rules: AuditRules) -> bool:
+    if len(record.parents) != 1 or len(record.changes) != 2:
+        return False
+    deleted = [change for change in record.changes if change.status == "D"]
+    added = [change for change in record.changes if change.status == "A"]
+    if len(deleted) != 1 or len(added) != 1:
+        return False
+    source = _inbox_path(deleted[0].path, rules)
+    destination = _active_destination(added[0].path, rules)
+    return (
+        source is not None
+        and destination is not None
+        and source == destination
+    )
+
+
+def _sanctioned_registry(record: CommitRecord) -> bool:
+    match = _REGISTRY_MESSAGE.fullmatch(record.message)
+    if match is None or len(record.parents) != 1 or len(record.changes) != 1:
+        return False
+    change = record.changes[0]
+    kind = match.group(2)
+    return change.status in {"A", "M"} and change.path == _REGISTRY_PATH[kind]
+
+
+def _parent_tree(
+    vault: Path, parent_oid: str
+) -> tuple[tempfile.TemporaryDirectory[str], Path, tuple[str, ...]]:
+    temporary = tempfile.TemporaryDirectory(prefix="oneos-gate3-rename-")
+    temporary_root = Path(temporary.name)
+    tree = temporary_root / "tree"
+    tree.mkdir()
+    index = temporary_root / "index"
+    alternate_env = os.environ.copy()
+    alternate_env["GIT_INDEX_FILE"] = os.fspath(index)
+    try:
+        _git_bytes(vault, "read-tree", parent_oid, env=alternate_env)
+        _git_bytes(
+            vault,
+            "checkout-index",
+            "--all",
+            f"--prefix={tree}{os.sep}",
+            env=alternate_env,
+        )
+        tracked = tuple(
+            sorted(
+                _parse_index_entries(
+                    _git_bytes(vault, "ls-files", "--stage", "-z", env=alternate_env)
+                )
+            )
+        )
+    except Exception:
+        temporary.cleanup()
+        raise
+    return temporary, tree, tracked
+
+
+def _audit_commit_history(
+    records: tuple[CommitRecord, ...], vault: Path
+) -> Audit:
+    result = Audit()
+    for record in records:
+        temporary: tempfile.TemporaryDirectory[str] | None = None
+        try:
+            temporary, commit_tree, _ = _parent_tree(vault, record.oid)
+            commit_rules = AuditRules.load(commit_tree)
+            audited = audit_commits((record,), commit_rules, vault)
+            result.sanctioned_commits.extend(audited.sanctioned_commits)
+            result.violating_commits.extend(audited.violating_commits)
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+    return result
+
+
+def _relative_to(path: Path, parent: Path) -> Path | None:
+    try:
+        return path.relative_to(parent)
+    except ValueError:
+        return None
+
+
+def _rename_envelope(
+    tree: Path,
+    tracked_paths: tuple[str, ...],
+    axis: str,
+    old: str,
+    new: str,
+) -> frozenset[tuple[str, str]]:
+    plan = plan_rename(tree, axis, old, new)
+    moves = tuple(
+        (source.relative_to(tree), destination.relative_to(tree))
+        for source, destination in plan.moves
+    )
+    envelope: set[tuple[str, str]] = set()
+    for tracked in tracked_paths:
+        tracked_path = Path(tracked)
+        for source, destination in moves:
+            tail = _relative_to(tracked_path, source)
+            if tail is not None:
+                envelope.add(("D", tracked_path.as_posix()))
+                envelope.add(("A", (destination / tail).as_posix()))
+                break
+    for edited in plan.edits:
+        relative = edited.relative_to(tree)
+        if any(_relative_to(relative, source) is not None for source, _ in moves):
+            continue
+        envelope.add(("M", relative.as_posix()))
+    return frozenset(envelope)
+
+
+def _sanctioned_rename(record: CommitRecord, vault: Path) -> bool:
+    match = _RENAME_MESSAGE.fullmatch(record.message)
+    if match is None or len(record.parents) != 1:
+        return False
+    actual = frozenset((change.status, change.path) for change in record.changes)
+    if len(actual) != len(record.changes) or not actual:
+        return False
+    old, new = match.groups()
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        for axis in sorted(AXES):
+            try:
+                expected = _rename_envelope(tree, tracked, axis, old, new)
+            except (OSError, RenameError, UnicodeError, sqlite3.Error):
+                continue
+            if expected and actual == expected:
+                return True
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return False
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+    return False
+
+
+def _commit_is_sanctioned(
+    record: CommitRecord, rules: AuditRules, vault: Path
+) -> bool:
+    if record.message.startswith("ingest:"):
+        return _sanctioned_ingest(record, rules)
+    if record.message.startswith("outbox:"):
+        return _sanctioned_outbox(record, rules)
+    if record.message.startswith("registry:"):
+        return _sanctioned_registry(record)
+    if record.message.startswith("rename:"):
+        return _sanctioned_rename(record, vault)
+    return False
+
+
+def audit_commits(
+    records: tuple[CommitRecord, ...], rules: AuditRules, vault: Path
+) -> Audit:
+    result = Audit()
+    for record in records:
+        destination = (
+            result.sanctioned_commits
+            if _commit_is_sanctioned(record, rules, vault)
+            else result.violating_commits
+        )
+        destination.append(record.message)
+    return result
+
+
+def _canonical_created(proposal_id: object, value: object) -> bool:
+    if not isinstance(proposal_id, str) or not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return False
+    return (
+        parsed.isoformat(timespec="seconds") == value
+        and parsed.strftime("%Y%m%dT%H%M%S") == proposal_id.partition("-")[0]
+    )
+
+
+def _canonical_classification_record(record: dict) -> bool:
+    return (
+        set(record) == _CLASSIFY_RECORD_FIELDS
+        and _canonical_created(record.get("id"), record.get("created"))
+        and (
+            record.get("rule_id") is None
+            or isinstance(record.get("rule_id"), str)
+        )
+    )
+
+
+def _canonical_delete_record(record: dict) -> bool:
+    kind = record.get("kind")
+    slug = record.get("slug")
+    total = record.get("total_references")
+    impact = record.get("impact")
+    if (
+        set(record) != _DELETE_RECORD_FIELDS
+        or kind not in _DELETE_KINDS
+        or not isinstance(slug, str)
+        or _CANONICAL_SLUG.fullmatch(slug) is None
+        or not _canonical_created(record.get("id"), record.get("created"))
+        or not isinstance(total, int)
+        or isinstance(total, bool)
+        or total < 0
+        or not isinstance(impact, dict)
+        or set(impact) != _DELETE_IMPACT_FIELDS
+    ):
+        return False
+    if not all(
+        isinstance(key, str)
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+        for key, value in impact.items()
+    ):
+        return False
+    return total == sum(impact.values())
+
+
+def _new_proposal_is_sanctioned(
+    relative: str,
+    fingerprint: DirtyFingerprint,
+    rules: AuditRules,
+    vault: Path,
+) -> bool:
+    if fingerprint.status != "??" or fingerprint.kind != "file":
+        return False
+    parts = _path_parts(relative)
+    if (
+        parts is None
+        or len(parts) != 3
+        or parts[0] not in rules.entities
+        or parts[1] != "outbox"
+        or not parts[2].endswith(".yaml")
+    ):
+        return False
+    entity, _, leaf = parts
+    scope = Scope(vault, entity)
+    lexical_outbox = rules.root / entity / "outbox"
+    path = lexical_outbox / leaf
+    try:
+        if (
+            lexical_outbox.is_symlink()
+            or not lexical_outbox.is_dir()
+            or scope.resolve("outbox") != lexical_outbox
+            or path.parent != lexical_outbox
+            or path.is_symlink()
+        ):
+            return False
+        contents, _ = _read_regular_no_follow(path)
+        loaded = yaml.safe_load(contents.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            return False
+        proposal_id = require_proposal_identity(path, loaded.get("id"))
+        action = loaded.get("action")
+        if (
+            loaded.get("entity") != entity
+            or loaded.get("status") != "pending"
+            or action not in {"classify", "delete"}
+        ):
+            return False
+        if action == "classify":
+            if not _canonical_classification_record(loaded):
+                return False
+            proposal = _to_proposal(path, loaded)
+            proposal = _require_destination(scope, proposal)
+            source = _fingerprint_path(
+                rules.root, proposal.src, "  ", index_entries=()
+            )
+            return (
+                proposal.status == "pending"
+                and source.kind == "file"
+                and source.digest == proposal.source_sha256
+            )
+        if not _canonical_delete_record(loaded):
+            return False
+        proposal = get_delete_proposal(scope, proposal_id)
+        return (
+            proposal.path == path
+            and proposal.entity == entity
+            and proposal.kind == loaded["kind"]
+            and proposal.slug == loaded["slug"]
+        )
+    except (
+        CrossScopeError,
+        DestinationRegistryError,
+        OSError,
+        OutboxError,
+        ProposalIdentityError,
+        RegistryError,
+        UnicodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        yaml.YAMLError,
+    ):
+        return False
+
+
+def audit_dirty(
+    before: dict[str, DirtyFingerprint],
+    after: dict[str, DirtyFingerprint],
+    rules: AuditRules,
+    vault: Path,
+) -> Audit:
+    result = Audit()
+    for relative in sorted(set(before) | set(after)):
+        if relative in before:
+            if after.get(relative) != before[relative]:
+                result.violating_writes.append(relative)
+            continue
+        fingerprint = after[relative]
+        destination = (
+            result.sanctioned_writes
+            if _new_proposal_is_sanctioned(
+                relative, fingerprint, rules, Path(vault).resolve()
+            )
+            else result.violating_writes
+        )
+        destination.append(relative)
+    return result
+
 
 def _vault() -> Path:
-    return Path(os.environ["ONEOS_VAULT"]).expanduser()
+    return Path(os.environ["ONEOS_VAULT"]).expanduser().resolve()
 
 
-def _snap_path() -> Path:
-    return Path(os.environ.get("GATE3_SNAP", "./.gate3-snapshot.json"))
+def _snapshot_path(vault: Path) -> Path:
+    path = Path(
+        os.environ.get("GATE3_SNAP", "./.gate3-snapshot.json")
+    ).expanduser().resolve()
+    if path == vault or path.is_relative_to(vault):
+        raise ValueError("Gate 3 snapshot must stay outside the vault")
+    return path
 
 
-def _git(vault: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=vault, capture_output=True, text=True).stdout
+def _snapshot_payload(vault: Path) -> dict:
+    dirty = collect_dirty_fingerprints(vault)
+    return {
+        "version": SNAPSHOT_VERSION,
+        "head": _git_text(vault, "rev-parse", "HEAD").strip(),
+        "dirty": {path: asdict(fingerprint) for path, fingerprint in dirty.items()},
+    }
 
 
-def _porcelain(vault: Path) -> list[str]:
-    return sorted(l[3:] for l in _git(vault, "status", "--porcelain").splitlines() if l)
+def _load_snapshot(path: Path) -> tuple[str, dict[str, DirtyFingerprint]]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or raw.get("version") != SNAPSHOT_VERSION:
+        raise ValueError("Gate 3 snapshot version is unsupported")
+    head = raw.get("head")
+    dirty = raw.get("dirty")
+    if not isinstance(head, str) or _OID.fullmatch(head) is None:
+        raise ValueError("Gate 3 snapshot HEAD is malformed")
+    if not isinstance(dirty, dict) or not all(
+        isinstance(path_value, str) and isinstance(value, dict)
+        for path_value, value in dirty.items()
+    ):
+        raise ValueError("Gate 3 snapshot dirty map is malformed")
+    fingerprints: dict[str, DirtyFingerprint] = {}
+    expected_fields = {"status", "index_entries", "kind", "mode", "digest"}
+    for relative, value in dirty.items():
+        if set(value) != expected_fields:
+            raise ValueError("Gate 3 snapshot fingerprint is malformed")
+        raw_index_entries = value.get("index_entries")
+        if not isinstance(raw_index_entries, list) or not all(
+            isinstance(entry, str) for entry in raw_index_entries
+        ):
+            raise ValueError("Gate 3 snapshot index entries are malformed")
+        fingerprint = DirtyFingerprint(
+            status=value.get("status"),
+            index_entries=tuple(raw_index_entries),
+            kind=value.get("kind"),
+            mode=value.get("mode"),
+            digest=value.get("digest"),
+        )
+        if (
+            not isinstance(fingerprint.status, str)
+            or len(fingerprint.status) != 2
+            or not isinstance(fingerprint.index_entries, tuple)
+            or not isinstance(fingerprint.kind, str)
+            or fingerprint.mode is not None
+            and not isinstance(fingerprint.mode, int)
+            or fingerprint.digest is not None
+            and not isinstance(fingerprint.digest, str)
+        ):
+            raise ValueError("Gate 3 snapshot fingerprint types are malformed")
+        fingerprints[relative] = fingerprint
+    return head, fingerprints
 
 
 def cmd_snapshot() -> int:
     vault = _vault()
-    snap = {"head": _git(vault, "rev-parse", "HEAD").strip(), "dirty": _porcelain(vault)}
-    _snap_path().write_text(json.dumps(snap, indent=2))
-    print(f"snapshot: HEAD={snap['head'][:8]} dirty={len(snap['dirty'])} -> {_snap_path()}")
+    snapshot_path = _snapshot_path(vault)
+    snapshot = _snapshot_payload(vault)
+    snapshot_path.write_text(
+        json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(
+        f"snapshot: HEAD={snapshot['head'][:8]} "
+        f"dirty={len(snapshot['dirty'])} -> {snapshot_path}"
+    )
     return 0
 
 
 def cmd_check() -> int:
     vault = _vault()
-    snap = json.loads(_snap_path().read_text())
-    messages = [l for l in _git(vault, "log", "--pretty=%s", f"{snap['head']}..HEAD").splitlines() if l]
-    new_dirty = [p for p in _porcelain(vault) if p not in set(snap["dirty"])]
-    a = audit(messages, new_dirty)
+    snapshot_path = _snapshot_path(vault)
+    head, before = _load_snapshot(snapshot_path)
+    audit_head = _head_oid(vault)
+    rules = AuditRules.load(vault)
+    records = collect_commit_records(vault, head, audit_head)
+    after = collect_dirty_fingerprints(vault)
+    commit_audit = _audit_commit_history(records, vault)
+    dirty_audit = audit_dirty(before, after, rules, vault)
+    result = Audit(
+        sanctioned_commits=commit_audit.sanctioned_commits,
+        violating_commits=commit_audit.violating_commits,
+        sanctioned_writes=dirty_audit.sanctioned_writes,
+        violating_writes=dirty_audit.violating_writes,
+    )
+    if _head_oid(vault) != audit_head:
+        raise ValueError("Gate 3 HEAD changed during the audit")
 
-    print(f"GATE 3 — {len(messages)} new commit(s), {len(new_dirty)} new working-tree change(s)")
-    print(f"  sanctioned commits: {len(a.sanctioned_commits)}")
-    print(f"  ingest/proposal writes: {len(a.sanctioned_writes)}")
-    for c in a.violating_commits:
-        print(f"  VIOLATION commit: {c}")
-    for p in a.violating_writes:
-        print(f"  VIOLATION direct write: {p}")
-    print("GATE 3:", "PASS" if a.ok else "FAIL")
-    return 0 if a.ok else 1
+    print(
+        f"GATE 3 — {len(records)} new commit(s), "
+        f"{len(after)} current dirty path(s)"
+    )
+    print(f"  sanctioned commits: {len(result.sanctioned_commits)}")
+    print(f"  pending proposal writes: {len(result.sanctioned_writes)}")
+    for message in result.violating_commits:
+        print(f"  VIOLATION commit: {message}")
+    for relative in result.violating_writes:
+        print(f"  VIOLATION direct write: {relative}")
+    print("GATE 3:", "PASS" if result.ok else "FAIL")
+    return 0 if result.ok else 1
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
-    cmd = argv[0] if argv else ""
-    if cmd == "snapshot":
-        return cmd_snapshot()
-    if cmd == "check":
-        return cmd_check()
-    print(__doc__)
-    return 2
+    command = argv[0] if argv else ""
+    try:
+        if command == "snapshot":
+            return cmd_snapshot()
+        if command == "check":
+            return cmd_check()
+        print(__doc__)
+        return 2
+    except (
+        json.JSONDecodeError,
+        KeyError,
+        OSError,
+        subprocess.CalledProcessError,
+        TypeError,
+        ValueError,
+        yaml.YAMLError,
+    ) as exc:
+        print(f"GATE 3 ERROR: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

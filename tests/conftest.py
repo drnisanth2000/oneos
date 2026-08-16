@@ -75,6 +75,28 @@ def _git(root: Path, *args: str) -> str:
     ).stdout
 
 
+def git_bytes(root: Path, *args: str, env: dict[str, str] | None = None) -> bytes:
+    return subprocess.run(
+        ["git", *args], cwd=root, env=env, check=True, capture_output=True
+    ).stdout
+
+
+def git_status_bytes(root: Path) -> bytes:
+    return git_bytes(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+
+
+def git_index_entries(root: Path) -> bytes:
+    return git_bytes(root, "ls-files", "--stage", "-z")
+
+
+def git_worktree_diff(root: Path) -> bytes:
+    return git_bytes(root, "diff", "--binary")
+
+
+def git_cached_diff(root: Path) -> bytes:
+    return git_bytes(root, "diff", "--cached", "--binary")
+
+
 def write_tree(root: Path, files: dict[str, str]) -> None:
     """Write a {relative_path: content} tree, creating parents."""
     for rel, content in files.items():

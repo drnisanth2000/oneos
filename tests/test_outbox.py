@@ -19,8 +19,14 @@ from pathlib import Path
 import pytest
 import yaml
 
+import app.git_transaction as git_transaction
 import app.outbox as outbox
 import app.proposal_identity as proposal_identity
+from app.git_transaction import (
+    GitTransactionFailure,
+    ReviewedStateConflict,
+    VaultBusyError,
+)
 from app.scope import CrossScopeError, Scope
 from app.destinations import DestinationError
 from app.outbox import (
@@ -32,11 +38,14 @@ from app.outbox import (
     reject,
 )
 from tests.conftest import (
+    git_bytes,
     git_changed_paths,
     git_count_commits,
     git_head,
     git_head_message,
+    git_index_entries,
     git_is_clean,
+    git_status_bytes,
     git_tracked_paths,
     git_entity_vault,
 )
@@ -97,6 +106,36 @@ def _approval_state(vault: Path):
         "worktree": git_bytes("diff", "--binary"),
         "tree": _vault_tree(vault),
     }
+
+
+def _add_unrelated_git_dirt(vault: Path) -> tuple[dict[str, bytes], bytes]:
+    paths = ("staged.bin", "unstaged.bin")
+    (vault / paths[0]).write_bytes(b"staged base\n")
+    (vault / paths[1]).write_bytes(b"unstaged base\n")
+    git_bytes(vault, "add", *paths)
+    git_bytes(vault, "commit", "-q", "-m", "add unrelated fixtures")
+
+    expected = {
+        paths[0]: b"staged exact\x00\xff\n",
+        paths[1]: b"unstaged exact\x00\xfe\n",
+        "untracked.bin": b"untracked exact\x00\xfd\n",
+    }
+    (vault / paths[0]).write_bytes(expected[paths[0]])
+    git_bytes(vault, "add", paths[0])
+    (vault / paths[1]).write_bytes(expected[paths[1]])
+    (vault / "untracked.bin").write_bytes(expected["untracked.bin"])
+    index_entries = git_bytes(vault, "ls-files", "--stage", "-z", "--", *paths)
+    return expected, index_entries
+
+
+def _assert_unrelated_git_dirt(
+    vault: Path, expected: dict[str, bytes], index_entries: bytes
+) -> None:
+    for relative_path, contents in expected.items():
+        assert (vault / relative_path).read_bytes() == contents
+    assert git_bytes(
+        vault, "ls-files", "--stage", "-z", "--", "staged.bin", "unstaged.bin"
+    ) == index_entries
 
 
 def _vault(tmp_path):
@@ -951,32 +990,173 @@ def test_approval_refuses_missing_source_and_preserves_proposal(tmp_path):
     assert not scope.resolve("11-knowledge", "active", "note.md").exists()
 
 
-def test_approval_commits_bytes_from_verified_snapshot(tmp_path, monkeypatch):
+def test_approval_with_unrelated_staged_unstaged_and_untracked_work_commits_only_source_and_destination(
+    tmp_path,
+):
+    vault = _vault(tmp_path)
+    unrelated, unrelated_index = _add_unrelated_git_dirt(vault)
+    scope, prop = _propose(vault)
+    head_before = git_head(vault)
+
+    approve(scope, prop.id)
+
+    assert git_changed_paths(vault) == sorted([prop.src, prop.dst])
+    assert subprocess.run(
+        ["git", "rev-list", "--count", f"{head_before}..HEAD"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "1"
+    _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
+
+
+@pytest.mark.parametrize("dirty_path", ("source", "destination"))
+def test_reviewed_source_or_destination_index_dirt_is_refused_before_mutation(
+    tmp_path, dirty_path
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = vault / prop.src
+    destination = vault / prop.dst
+    source_bytes = source.read_bytes()
+    proposal_bytes = prop.path.read_bytes()
+
+    if dirty_path == "source":
+        source.write_bytes(b"unexpected indexed source\n")
+        git_bytes(vault, "add", prop.src)
+        source.write_bytes(source_bytes)
+    else:
+        destination.write_bytes(b"unexpected indexed destination\n")
+        git_bytes(vault, "add", prop.dst)
+        destination.unlink()
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    status_before = git_status_bytes(vault)
+
+    with pytest.raises(outbox.OutboxTransactionError) as raised:
+        approve(scope, prop.id)
+
+    assert isinstance(raised.value.__cause__, ReviewedStateConflict)
+    assert git_head(vault) == head_before
+    assert source.read_bytes() == source_bytes
+    assert destination.exists() is False
+    assert prop.path.read_bytes() == proposal_bytes
+    assert git_index_entries(vault) == index_before
+    assert git_status_bytes(vault) == status_before
+
+
+def test_approval_busy_error_preserves_source_destination_proposal_and_git_state(
+    tmp_path,
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = vault / prop.src
+    destination = vault / prop.dst
+    source_bytes = source.read_bytes()
+    proposal_bytes = prop.path.read_bytes()
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    status_before = git_status_bytes(vault)
+
+    with git_transaction._approval_lock(vault):
+        with pytest.raises(outbox.OutboxTransactionError) as raised:
+            approve(scope, prop.id)
+
+    assert isinstance(raised.value.__cause__, VaultBusyError)
+    assert git_head(vault) == head_before
+    assert source.read_bytes() == source_bytes
+    assert destination.exists() is False
+    assert prop.path.read_bytes() == proposal_bytes
+    assert git_index_entries(vault) == index_before
+    assert git_status_bytes(vault) == status_before
+
+
+def test_injected_transaction_failure_restores_source_destination_and_exact_proposal_bytes(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    unrelated, unrelated_index = _add_unrelated_git_dirt(vault)
+    scope, prop = _propose(vault)
+    source = vault / prop.src
+    destination = vault / prop.dst
+    source_bytes = source.read_bytes()
+    proposal_bytes = prop.path.read_bytes()
+    head_before = git_head(vault)
+
+    def fail_after_filesystem_apply(checkpoint: str) -> None:
+        if checkpoint == "filesystem-applied":
+            raise OSError("injected classification transaction failure")
+
+    monkeypatch.setattr(git_transaction, "_checkpoint", fail_after_filesystem_apply)
+
+    with pytest.raises(outbox.OutboxTransactionError) as raised:
+        approve(scope, prop.id)
+
+    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+    assert git_head(vault) == head_before
+    assert source.read_bytes() == source_bytes
+    assert destination.exists() is False
+    assert prop.path.read_bytes() == proposal_bytes
+    _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
+
+
+def test_approval_transaction_error_is_an_outbox_error(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    def fail_transaction(*_args, **_kwargs):
+        raise GitTransactionFailure("injected transaction failure")
+
+    monkeypatch.setattr(outbox, "execute_transaction", fail_transaction, raising=False)
+
+    with pytest.raises(outbox.OutboxTransactionError) as raised:
+        approve(scope, prop.id)
+
+    assert isinstance(raised.value, outbox.OutboxError)
+    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+
+
+def test_approval_refuses_race_after_verified_snapshot_without_overwriting_source(
+    tmp_path, monkeypatch
+):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
     source = scope.resolve("00-inbox", "active", "note.md")
     reviewed_marker = b"Randomised trial protocol body."
     raced_marker = b"replacement-after-verification"
-    real_git = outbox._git
+    proposal_bytes = prop.path.read_bytes()
+    head_before = git_head(vault)
+    real_capture = outbox.capture_path_state
+    raced = False
 
-    def race_before_move(root, *args):
-        if args[:1] == ("mv",):
+    def race_after_source_capture(root, relative_path):
+        nonlocal raced
+        state = real_capture(root, relative_path)
+        if relative_path == prop.src and not raced:
+            raced = True
             source.write_bytes(
                 source.read_bytes().replace(reviewed_marker, raced_marker)
             )
-        return real_git(root, *args)
+        return state
 
-    monkeypatch.setattr(outbox, "_git", race_before_move)
+    monkeypatch.setattr(outbox, "capture_path_state", race_after_source_capture)
 
-    approve(scope, prop.id)
+    with pytest.raises(outbox.OutboxTransactionError) as raised:
+        approve(scope, prop.id)
 
     destination = scope.resolve("11-knowledge", "active", "note.md")
-    assert reviewed_marker in destination.read_bytes()
-    assert raced_marker not in destination.read_bytes()
-    assert git_is_clean(vault)
+    assert isinstance(raised.value.__cause__, ReviewedStateConflict)
+    assert git_head(vault) == head_before
+    assert raced_marker in source.read_bytes()
+    assert reviewed_marker not in source.read_bytes()
+    assert destination.exists() is False
+    assert prop.path.read_bytes() == proposal_bytes
 
 
-def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
+def test_classification_approval_still_creates_exactly_one_commit_and_one_revert_restores_both_paths(
+    tmp_path,
+):
     import subprocess
 
     from app.ingest.adapters.folder import process_drop
@@ -999,18 +1179,30 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
     assert git_changed_paths(vault) == [triage_rel]
     assert triage_rel in git_tracked_paths(vault)
 
+    unrelated = vault / "unrelated.bin"
+    unrelated_bytes = b"unrelated exact\x00\xff\n"
+    unrelated.write_bytes(unrelated_bytes)
     scope = Scope(vault, "synthetic")
     prop = propose_classification(
         scope, result.path,
         module="11-library", sub="reference", claimed_block="govern",
         rule_id="synthetic-rule",
     )
+    before_approval = git_head(vault)
     approve(scope, prop.id)
     approval_oid = git_head(vault)
 
     assert approval_oid != ingest_oid
     assert git_head_message(vault).startswith("outbox: approve")
-    assert git_count_commits(vault) == 3
+    assert subprocess.run(
+        ["git", "rev-list", "--count", f"{before_approval}..{approval_oid}"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "1"
+    assert git_changed_paths(vault, approval_oid) == sorted([prop.src, prop.dst])
+    assert unrelated.read_bytes() == unrelated_bytes
 
     subprocess.run(
         ["git", "revert", "--no-edit", approval_oid], cwd=vault,
@@ -1019,7 +1211,7 @@ def test_real_adapter_receipt_approval_is_one_later_revertible_commit(tmp_path):
     assert result.path.exists()
     assert triage_rel in git_tracked_paths(vault)
     assert not (vault / prop.dst).exists()
-    assert git_is_clean(vault)
+    assert unrelated.read_bytes() == unrelated_bytes
 
 
 def test_reject_discards_proposal_without_moving(tmp_path):
@@ -1183,6 +1375,11 @@ def test_outbox_interfaces_have_one_identity_authority():
         reject,
     ):
         assert "entity" not in inspect.signature(function).parameters
+
+
+def test_public_routes_remain_single_proposal_actions():
+    assert tuple(inspect.signature(approve).parameters) == ("scope", "proposal_id")
+    assert tuple(inspect.signature(reject).parameters) == ("scope", "proposal_id")
 
 
 def test_propose_rejects_item_path_from_another_entity(two_entity_vault):

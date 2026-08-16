@@ -15,13 +15,20 @@ import hashlib
 import os
 import re
 import stat
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 
+from .git_transaction import (
+    GitTransactionError,
+    PathChange,
+    PathState,
+    TransactionPlan,
+    capture_path_state,
+    execute_transaction,
+)
 from .inbox import split_front_matter
 from .destinations import DestinationError, resolve_classification_destination
 from .proposal_identity import (
@@ -54,6 +61,10 @@ class OutboxScopeError(OutboxError):
 
 
 class OutboxDestinationError(OutboxError):
+    pass
+
+
+class OutboxTransactionError(OutboxError):
     pass
 
 
@@ -309,12 +320,6 @@ def preview_diff(scope: Scope, proposal: Proposal) -> str:
     return header + "".join(diff)
 
 
-def _git(vault: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=vault, check=True, capture_output=True, text=True
-    ).stdout
-
-
 def _require_scope(scope: Scope, proposal: Proposal) -> Proposal:
     if proposal.entity != scope.current_entity():
         raise OutboxScopeError("proposal belongs to another entity")
@@ -351,12 +356,10 @@ def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
 
 def approve(scope: Scope, proposal_id: str) -> Proposal:
     """Perform the proposed move and commit it — exactly one revertible commit.
-    The proposal file is untracked, so it never enters git; deleting it leaves a
-    clean tree after the commit."""
+    The proposal is transaction-owned but never enters the approval commit."""
     prop = _require_destination(scope, get_proposal(scope, proposal_id))
     vault = scope.root
     src = scope.root / prop.src
-    dst = scope.resolve_stored(prop.dst)
     try:
         source_bytes = _read_no_follow_bytes(src)
     except FileNotFoundError as exc:
@@ -375,12 +378,38 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
 
     _require_destination(scope, prop)
     _require_outbox_path(scope, prop.path, require_leaf=True)
-    _git(vault, "mv", prop.src, prop.dst)          # rename (original content)
-    dst.write_bytes(approved_bytes)
-    _git(vault, "add", prop.dst)
-    _require_outbox_path(scope, prop.path, require_leaf=True).unlink()
-    _git(vault, "commit", "-q", "-m",
-         f"outbox: approve {prop.id} ({prop.src} → {prop.dst})")
+    source_state = capture_path_state(vault, prop.src)
+    if source_state.contents != source_bytes:
+        raise StaleProposalSource("proposal source has changed")
+
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+    proposal_state = capture_path_state(vault, proposal_rel)
+    persisted = _to_proposal(prop.path, yaml.safe_load(proposal_state.contents))
+    persisted = _require_destination(scope, persisted)
+    if persisted != prop:
+        raise OutboxDestinationError("proposal changed since it was loaded")
+
+    plan = TransactionPlan(
+        message=f"outbox: approve {prop.id} ({prop.src} → {prop.dst})",
+        changes=(
+            PathChange(prop.src, source_state, PathState.absent()),
+            PathChange(
+                prop.dst,
+                PathState.absent(),
+                PathState.regular(approved_bytes, source_state.mode),
+            ),
+        ),
+        commit_paths=(prop.src, prop.dst),
+        owned_changes=(
+            PathChange(proposal_rel, proposal_state, PathState.absent()),
+        ),
+    )
+    try:
+        execute_transaction(vault, plan)
+    except GitTransactionError as exc:
+        raise OutboxTransactionError(
+            "classification approval transaction failed"
+        ) from exc
     return prop
 
 

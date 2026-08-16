@@ -20,6 +20,7 @@ import pytest
 import yaml
 from starlette.testclient import TestClient
 
+from app.git_transaction import GitTransactionFailure
 from tests.conftest import git_head, write_vault, scaffold_modules
 
 ENTITIES = """
@@ -473,6 +474,40 @@ def test_approval_route_visibly_refuses_unfresh_source(
     assert not (client.vault / "alpha/02-work/active/marker.md").exists()
 
 
+def test_approval_route_transaction_error_is_not_a_500_or_general_error_panel(
+    client, monkeypatch
+):
+    import app.outbox as outbox
+
+    proposal_id = "20260815T090703-" + "11" * 16
+    proposal = client.vault / "alpha/outbox" / f"{proposal_id}.yaml"
+    source = client.vault / "alpha/00-inbox/active/marker.md"
+    destination = client.vault / "alpha/02-work/active/marker.md"
+    proposal_bytes = proposal.read_bytes()
+    source_bytes = source.read_bytes()
+    head_before = git_head(client.vault)
+
+    def fail_transaction(*_args, **_kwargs):
+        raise GitTransactionFailure("injected route transaction failure")
+
+    monkeypatch.setattr(
+        outbox, "execute_transaction", fail_transaction, raising=False
+    )
+    route_client = TestClient(client.app, raise_server_exceptions=False)
+
+    response = route_client.post(
+        "/outbox/alpha/approve", data={"id": proposal_id}
+    )
+
+    assert response.status_code == 200
+    assert 'role="alert"' not in response.text
+    assert proposal_id in response.text
+    assert git_head(client.vault) == head_before
+    assert source.read_bytes() == source_bytes
+    assert destination.exists() is False
+    assert proposal.read_bytes() == proposal_bytes
+
+
 def test_unknown_route_entity_is_404_without_entity_directory_read(client, monkeypatch):
     watched = client.vault / "directory-only"
     watched.mkdir()
@@ -524,6 +559,36 @@ def test_alpha_delete_impact_excludes_beta_totals_and_marker_text(client):
     assert "books.db: 2" in response.text
     assert "front-matter: 2" not in response.text
     assert "beta-registry-marker" not in response.text
+
+
+def test_registry_transaction_error_is_a_registry_error(client, monkeypatch):
+    import app.registry as registry
+    from app.scope import Scope
+
+    scope = Scope(client.vault, "alpha")
+    proposal = registry.propose_delete(scope, "product", "alpha-only")
+    registry_path = scope.system_path("products.yaml")
+    registry_before = registry_path.read_bytes()
+    proposal_before = proposal.path.read_bytes()
+    head_before = git_head(client.vault)
+
+    def fail_transaction(*_args, **_kwargs):
+        raise GitTransactionFailure("injected registry route transaction failure")
+
+    monkeypatch.setattr(
+        registry, "execute_transaction", fail_transaction, raising=False
+    )
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={"id": proposal.id, "slug": "alpha-only"},
+    )
+
+    assert response.status_code == 200
+    assert "registry deletion transaction failed" in response.text
+    assert registry_path.read_bytes() == registry_before
+    assert proposal.path.read_bytes() == proposal_before
+    assert git_head(client.vault) == head_before
 
 
 def test_concurrent_delete_previews_keep_reference_totals_isolated(
