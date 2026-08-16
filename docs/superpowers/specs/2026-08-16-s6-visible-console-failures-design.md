@@ -54,7 +54,7 @@ A new module owns the entire operator-facing error vocabulary. No route,
 template, or service writes error copy.
 
 ```text
-ConsoleError(code, severity, message, retry, committed)
+ConsoleError(code, severity, message, retry, committed, transparent=False)
 describe(exc) -> ConsoleError
 ```
 
@@ -75,6 +75,30 @@ a bare `except`.
 
 The module imports no route, template, service, or registry module, so it
 cannot introduce a circular import and can be tested alone.
+
+### Transparent wrappers
+
+`approve` and `execute_delete` each collapse the whole S5 error family into one
+wrapper — `OutboxTransactionError` and `RegistryTransactionError` — with the
+real outcome retained only as `__cause__`. Busy, reviewed-state conflict,
+rolled-back failure, recovery-blocked, and committed-with-cleanup-warning are
+therefore indistinguishable above the service boundary today.
+
+Left alone, this would make `E-COMMITTED` and `E-RECOVER` unreachable: every
+transaction outcome would render as `E-GIT`, telling an operator whose commit
+succeeded to retry it and producing a second commit for one reviewed action.
+That is the Gate 2 break this design exists to prevent.
+
+Re-raising S5 types through the routes would breach the typed service boundary
+S5 established. Instead, the two wrapper entries are marked `transparent`.
+When `describe` resolves to a transparent entry it recurses into `__cause__`
+exactly once and returns that description instead. A transparent entry that has
+no cause resolves to itself, so the behavior is total.
+
+Transparency is declared per entry, never inferred. `describe` never walks a
+chain of arbitrary depth and never reads a non-transparent exception's cause,
+so no internal failure can surface through an error that was not designed to
+carry it. This changes no domain behavior, no service boundary, and no refusal.
 
 No separate `category` field is defined. The code is the category identifier
 and severity already carries the grouping a renderer needs; a third axis would
@@ -103,7 +127,7 @@ express one without failing its own test.
 | `E-SCOPE` | refusal | none | no | inline | `CrossScopeError`, `OutboxScopeError` |
 | `E-BUSY` | refusal | retry | no | inline | `VaultBusyError` |
 | `E-CONFLICT` | refusal | reload | no | inline | `ReviewedStateConflict` |
-| `E-GIT` | refusal | retry | no | inline | `GitTransactionError`, `GitTransactionFailure`, `OutboxTransactionError`, `RegistryTransactionError` |
+| `E-GIT` | refusal | retry | no | inline | `GitTransactionError`, `GitTransactionFailure`, and the two transparent wrappers `OutboxTransactionError` and `RegistryTransactionError` when they carry no cause |
 | `E-RECOVER` | attention | stop | unknown | inline | `GitTransactionRecoveryError` |
 | `E-COMMITTED` | attention | stop | yes | inline | `GitTransactionCommittedError` |
 | `E-REGISTRY` | refusal | reload | no | inline | `RegistryError` |
@@ -288,6 +312,15 @@ stages nothing, creates no directory, and acquires no lock.
 - `E-COMMITTED` carries `committed = yes` and retry `stop`; `E-RECOVER` carries
   `committed = unknown` and retry `stop`.
 - A class absent from the table resolves through its MRO to its parent.
+- Each S5 outcome wrapped in `OutboxTransactionError` and in
+  `RegistryTransactionError` resolves to its own code, not to `E-GIT`. This is
+  asserted for all five outcomes through both wrappers.
+- A transparent wrapper with no `__cause__` resolves to `E-GIT`.
+- A transparent wrapper whose cause is itself transparent resolves after one
+  step and does not recurse further.
+- A non-transparent entry never consults `__cause__`, proven by wrapping a
+  described error inside a non-transparent one and asserting the outer
+  description is returned.
 - An exception unrelated to the application resolves to `E-UNKNOWN` without
   raising.
 - `severity`, `retry`, and `committed` never hold a value outside their
