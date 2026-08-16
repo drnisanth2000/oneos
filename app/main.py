@@ -21,8 +21,10 @@ from .destinations import DestinationError, resolve_classification_destination
 from .entities import EntitySelectionError
 from .inbox import read_inbox
 from .outbox import (
+    MissingProposalSource,
     OutboxDestinationError,
     OutboxError,
+    StaleProposalSource,
     approve,
     load_proposals,
     preview_diff,
@@ -133,11 +135,18 @@ def propose(
     )
 
 
-def _outbox_list(request: Request, scope: Scope) -> HTMLResponse:
+def _outbox_list(
+    request: Request,
+    scope: Scope,
+    *,
+    approval_error: str | None = None,
+) -> HTMLResponse:
     selected = scope.current_entity()
     props = [(p, preview_diff(scope, p)) for p in load_proposals(scope)]
     return templates.TemplateResponse(
-        request, "blocks/outbox_list.html", {"entity": selected, "props": props}
+        request,
+        "blocks/outbox_list.html",
+        {"entity": selected, "props": props, "approval_error": approval_error},
     )
 
 
@@ -156,11 +165,21 @@ def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
 def outbox_approve(
     request: Request, scope: EntityScope, id: str = Form(...)
 ) -> HTMLResponse:
+    approval_error = None
     try:
         approve(scope, id)
+    except MissingProposalSource:
+        approval_error = (
+            "Approval refused: source is missing. Restore it or reject the proposal."
+        )
+    except StaleProposalSource:
+        approval_error = (
+            "Approval refused: source changed since this proposal was created. "
+            "Create a fresh proposal."
+        )
     except OutboxError:
         pass
-    return _outbox_list(request, scope)
+    return _outbox_list(request, scope, approval_error=approval_error)
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)

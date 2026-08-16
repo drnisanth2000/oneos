@@ -6,7 +6,10 @@ that shows what breaks before it runs, and refuses if references remain
 """
 import inspect
 import sqlite3
+import subprocess
 import textwrap
+from datetime import datetime
+from pathlib import Path
 
 import pytest
 import yaml
@@ -28,6 +31,56 @@ from tests.conftest import (
     git_head_message,
     git_is_clean,
 )
+
+
+class _FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 8, 15, 9, 7, 3, tzinfo=tz)
+
+
+def _vault_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
+    entries = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries.append((relative, "symlink", path.readlink().as_posix()))
+        elif path.is_dir():
+            entries.append((relative, "directory", ""))
+        else:
+            entries.append((relative, "file", path.read_bytes()))
+    return tuple(sorted(entries))
+
+
+def _registry_delete_state(vault: Path) -> dict[str, bytes | tuple]:
+    def git_bytes(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": git_bytes("rev-parse", "HEAD"),
+        "status": git_bytes("status", "--porcelain=v1", "-z"),
+        "index": git_bytes("diff", "--cached", "--binary"),
+        "worktree": git_bytes("diff", "--binary"),
+        "tree": _vault_tree(vault),
+    }
+
+
+def _same_outbox_leaf_alias(scope: Scope, monkeypatch):
+    first_id = "20260815T090703-" + "ab" * 16
+    second_id = "20260815T090703-" + "cd" * 16
+    proposal_ids = iter((first_id, second_id))
+    monkeypatch.setattr(
+        registry,
+        "proposal_id_candidates",
+        lambda created: iter((next(proposal_ids),)),
+    )
+    first = propose_delete(scope, "product", "widgetx")
+    second = propose_delete(scope, "product", "widgetx")
+    first.path.unlink()
+    first.path.symlink_to(second.path)
+    return first, second
 
 
 def _products_vault(tmp_path, referenced=True):
@@ -291,6 +344,108 @@ def test_propose_delete_keeps_untrusted_slug_out_of_proposal_filename(tmp_path):
     assert target.read_bytes() == original
 
 
+def test_propose_delete_rejects_redirected_outbox_without_creating_target(
+    tmp_path,
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    redirected = vault / "demo/redirected-outbox"
+    outbox_link = vault / "demo/outbox"
+    outbox_link.parent.mkdir(parents=True)
+    outbox_link.symlink_to(redirected)
+
+    with pytest.raises(CrossScopeError):
+        propose_delete(scope, "product", "widgetx")
+
+    assert not redirected.exists()
+
+
+def test_propose_delete_preserves_collision_before_writing_later_candidate(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    first_id = "20260815T090703-" + "ab" * 16
+    second_id = "20260815T090703-" + "cd" * 16
+    first_path = scope.resolve("outbox", f"{first_id}.yaml")
+    first_path.parent.mkdir(parents=True)
+    original = b"pre-existing collision\n"
+    first_path.write_bytes(original)
+    monkeypatch.setattr(
+        registry, "proposal_id_candidates", lambda created: iter((first_id, second_id))
+    )
+
+    proposal = propose_delete(scope, "product", "widgetx")
+
+    assert first_path.read_bytes() == original
+    assert proposal.id == second_id
+    assert proposal.path == scope.resolve("outbox", f"{second_id}.yaml")
+    assert proposal.path.exists()
+
+
+def test_propose_delete_raises_after_four_collisions_without_modifying_files(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    proposal_ids = tuple(
+        f"20260815T090703-{'ab' * 15}{suffix}"
+        for suffix in ("aa", "bb", "cc", "dd")
+    )
+    outbox = scope.resolve("outbox")
+    outbox.mkdir(parents=True)
+    originals = {
+        proposal_id: f"pre-existing {proposal_id}\n".encode()
+        for proposal_id in proposal_ids
+    }
+    for proposal_id, original in originals.items():
+        (outbox / f"{proposal_id}.yaml").write_bytes(original)
+    monkeypatch.setattr(
+        registry,
+        "proposal_id_candidates",
+        lambda created: iter(proposal_ids),
+    )
+
+    with pytest.raises(
+        RegistryError, match="^unable to allocate a unique delete proposal id$"
+    ):
+        propose_delete(scope, "product", "widgetx")
+
+    assert {
+        proposal_id: (outbox / f"{proposal_id}.yaml").read_bytes()
+        for proposal_id in proposal_ids
+    } == originals
+
+
+def test_same_second_delete_proposals_are_distinct_and_preserved(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    monkeypatch.setattr(registry, "datetime", _FixedDatetime)
+
+    first = propose_delete(scope, "product", "widgetx")
+    second = propose_delete(scope, "product", "widgetx")
+
+    assert first.id != second.id
+    assert first.path != second.path
+    assert first.path.exists() and second.path.exists()
+    assert first.path.stem == first.id
+    assert second.path.stem == second.id
+
+
+def test_delete_record_id_must_equal_filename(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record["id"] = "20260815T090703-" + "ab" * 16
+    prop.path.write_text(yaml.safe_dump(record), encoding="utf-8")
+
+    with pytest.raises(RegistryError):
+        get_delete_proposal(scope, prop.path.stem)
+
+
 def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
     scope = Scope(vault, "demo")
@@ -392,22 +547,45 @@ def test_forged_delete_proposal_cannot_be_read_or_executed(
     assert git_head(two_entity_registry_vault) == head_before
 
 
+def test_same_outbox_leaf_symlink_cannot_redirect_requested_delete(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    requested, target = _same_outbox_leaf_alias(scope, monkeypatch)
+    target_before = target.path.read_bytes()
+    registry_path = scope.system_path("products.yaml")
+    registry_before = registry_path.read_bytes()
+    state_before = _registry_delete_state(vault)
+
+    with pytest.raises(CrossScopeError):
+        get_delete_proposal(scope, requested.id)
+    with pytest.raises(CrossScopeError):
+        execute_delete(scope, requested.id)
+
+    assert target.path.read_bytes() == target_before
+    assert registry_path.read_bytes() == registry_before
+    assert "widgetx:" in registry_path.read_text(encoding="utf-8")
+    assert _registry_delete_state(vault) == state_before
+
+
 def test_delete_proposal_read_rejects_cross_entity_leaf_symlink(
     two_entity_registry_vault,
 ):
     scope = Scope(two_entity_registry_vault, "alpha")
-    foreign = two_entity_registry_vault / "beta/outbox/foreign-delete.yaml"
+    proposal_id = "20260815T090703-" + "ab" * 16
+    foreign = two_entity_registry_vault / "beta/outbox" / f"{proposal_id}.yaml"
     foreign.parent.mkdir(parents=True, exist_ok=True)
     foreign.write_text(
-        "id: foreign-delete\naction: delete\nentity: beta\nkind: product\nslug: unused\n",
+        f"id: {proposal_id}\naction: delete\nentity: beta\nkind: product\nslug: unused\n",
         encoding="utf-8",
     )
-    linked = scope.resolve("outbox") / "linked-delete.yaml"
+    linked = scope.resolve("outbox") / f"{proposal_id}.yaml"
     linked.parent.mkdir(parents=True, exist_ok=True)
     linked.symlink_to(foreign)
 
     with pytest.raises(CrossScopeError):
-        get_delete_proposal(scope, "linked-delete")
+        get_delete_proposal(scope, proposal_id)
 
 
 def test_registry_interfaces_have_one_identity_authority():

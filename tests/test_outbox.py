@@ -6,8 +6,10 @@ commits (exactly one commit, git-revertible); reject discards the proposal.
 
 Temp git vaults only; the real vault is never touched.
 """
+import hashlib
 import inspect
 import re
+import subprocess
 import textwrap
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +20,7 @@ import pytest
 import yaml
 
 import app.outbox as outbox
+import app.proposal_identity as proposal_identity
 from app.scope import CrossScopeError, Scope
 from app.destinations import DestinationError
 from app.outbox import (
@@ -79,6 +82,21 @@ def _vault_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
         else:
             entries.append((relative, "file", path.read_bytes()))
     return tuple(sorted(entries))
+
+
+def _approval_state(vault: Path):
+    def git_bytes(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": git_bytes("rev-parse", "HEAD"),
+        "status": git_bytes("status", "--porcelain=v1", "-z"),
+        "index": git_bytes("diff", "--cached", "--binary"),
+        "worktree": git_bytes("diff", "--binary"),
+        "tree": _vault_tree(vault),
+    }
 
 
 def _vault(tmp_path):
@@ -155,37 +173,41 @@ def two_entity_vault(tmp_path):
     return _outbox_vault(tmp_path, ("alpha", "beta"), files)
 
 
-FORGED_BETA_PROPOSAL = textwrap.dedent(
-    """\
-    id: shared-id
-    action: classify
-    entity: beta
-    src: beta/00-inbox/active/beta.md
-    dst: beta/11-knowledge/active/beta.md
-    module: 11-knowledge
-    sub: kb
-    block: govern
-    status: pending
-    """
-)
-
-
 _MISSING = object()
 
 
-def _canonical_alpha_record() -> dict:
+def _canonical_alpha_record(scope: Scope) -> dict:
+    source = scope.resolve("00-inbox", "active", "alpha.md")
     return {
-        "id": "alpha-classification",
+        "id": "20260815T090703-" + "11" * 16,
         "action": "classify",
         "entity": "alpha",
         "created": "2026-01-02T03:04:05",
         "status": "pending",
         "src": "alpha/00-inbox/active/alpha.md",
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "dst": "alpha/11-knowledge/active/alpha.md",
         "module": "11-knowledge",
         "sub": "kb",
         "block": "govern",
         "rule_id": "synthetic-rule",
+    }
+
+
+def _forged_beta_record(scope: Scope) -> dict:
+    source = scope.root / "beta/00-inbox/active/beta.md"
+    return {
+        "id": "20260815T090703-" + "22" * 16,
+        "action": "classify",
+        "entity": "beta",
+        "created": "2026-01-02T03:04:05",
+        "status": "pending",
+        "src": "beta/00-inbox/active/beta.md",
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "dst": "beta/11-knowledge/active/beta.md",
+        "module": "11-knowledge",
+        "sub": "kb",
+        "block": "govern",
     }
 
 
@@ -196,6 +218,7 @@ def _proposal_from_record(path: Path, record: dict) -> Proposal:
         action=record["action"],
         entity=record["entity"],
         src=record["src"],
+        source_sha256=record["source_sha256"],
         dst=record["dst"],
         module=record["module"],
         sub=record["sub"],
@@ -223,6 +246,75 @@ class _FixedDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
         return cls(2026, 1, 2, 3, 4, 5, tzinfo=tz)
+
+
+def test_same_second_classification_proposals_are_distinct_and_preserved(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    source = scope.resolve("00-inbox", "active", "note.md")
+    monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
+    suffixes = iter(("11" * 16, "22" * 16))
+    monkeypatch.setattr(
+        proposal_identity.secrets, "token_hex", lambda size: next(suffixes)
+    )
+
+    first = propose_classification(
+        scope, source, module="11-knowledge", sub="kb"
+    )
+    second = propose_classification(
+        scope, source, module="11-knowledge", sub="kb"
+    )
+
+    assert first.id == "20260102T030405-" + "11" * 16
+    assert second.id == "20260102T030405-" + "22" * 16
+    assert first.path != second.path
+    assert first.path.exists() and second.path.exists()
+    assert len(list(scope.resolve("outbox").glob("*.yaml"))) == 2
+
+
+def test_proposal_hash_is_sha256_of_exact_receipt_bytes(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    source = scope.resolve("00-inbox", "active", "note.md")
+    exact = source.read_bytes()
+
+    prop = propose_classification(
+        scope, source, module="11-knowledge", sub="kb"
+    )
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+
+    assert record["source_sha256"] == hashlib.sha256(exact).hexdigest()
+    assert prop.source_sha256 == hashlib.sha256(exact).hexdigest()
+
+
+def test_snapshot_rejects_receipt_leaf_swapped_to_in_scope_symlink(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    source = scope.resolve("00-inbox", "active", "note.md")
+    redirected = scope.resolve("redirected-receipt.md")
+    redirected.write_bytes(b"redirected receipt bytes\n")
+    redirected_bytes = redirected.read_bytes()
+    real_resolve = outbox.resolve_classification_destination
+
+    def swap_after_destination(*args, **kwargs):
+        destination = real_resolve(*args, **kwargs)
+        source.unlink()
+        source.symlink_to(redirected)
+        return destination
+
+    monkeypatch.setattr(
+        outbox, "resolve_classification_destination", swap_after_destination
+    )
+
+    with pytest.raises(CrossScopeError):
+        propose_classification(scope, source, module="11-knowledge", sub="kb")
+
+    assert redirected.read_bytes() == redirected_bytes
+    assert not scope.resolve("outbox").exists()
 
 
 def _redirect_proposal_leaf(vault: Path) -> tuple[Scope, Proposal, Path]:
@@ -282,6 +374,9 @@ def test_proposal_creation_is_exclusive_and_preserves_existing_record(
     scope = Scope(vault, "demo")
     source = scope.resolve("00-inbox", "active", "note.md")
     monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
+    monkeypatch.setattr(
+        proposal_identity.secrets, "token_hex", lambda size: "11" * 16
+    )
     first = propose_classification(
         scope,
         source,
@@ -341,12 +436,15 @@ def test_proposal_creation_rejects_same_entity_leaf_symlink_without_write(
     vault = _vault(tmp_path)
     scope = Scope(vault, "demo")
     monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
+    monkeypatch.setattr(
+        proposal_identity.secrets, "token_hex", lambda size: "11" * 16
+    )
     outbox_dir = vault / "demo/outbox"
     outbox_dir.mkdir()
     protected = vault / "demo/.sensitive/protected.yaml"
     protected.parent.mkdir()
     protected.write_text("protected-marker\n", encoding="utf-8")
-    proposal = outbox_dir / "20260102T030405-note.yaml"
+    proposal = outbox_dir / ("20260102T030405-" + "11" * 16 + ".yaml")
     proposal.symlink_to(protected)
     before_head = git_head(vault)
     before_paths = git_tracked_paths(vault)
@@ -462,11 +560,93 @@ def test_preview_diff_shows_move_and_sub_change(tmp_path):
     assert "-sub: triage" in diff and "+sub: kb" in diff
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", "20260815T090703-" + "22" * 16),
+        ("source_sha256", "A" * 64),
+        ("source_sha256", "not-a-sha256"),
+        ("source_sha256", _MISSING),
+    ],
+    ids=("mismatched-id", "uppercase-hash", "malformed-hash", "missing-hash"),
+)
+def test_preview_revalidates_loaded_persisted_record_before_rendering(
+    tmp_path, field, value
+):
+    vault = _vault(tmp_path)
+    scope, proposed = _propose(vault)
+    loaded = load_proposals(scope)[0]
+    record = yaml.safe_load(proposed.path.read_text(encoding="utf-8"))
+    if value is _MISSING:
+        record.pop(field)
+    else:
+        record[field] = value
+    proposed.path.write_text(yaml.safe_dump(record), encoding="utf-8")
+    proposal_before = proposed.path.read_bytes()
+    source = scope.resolve("00-inbox", "active", "note.md")
+    source_before = source.read_bytes()
+    destination = scope.root / loaded.dst
+    before_head = git_head(vault)
+    before_paths = git_tracked_paths(vault)
+    before_tree = _vault_tree(vault)
+
+    _assert_destination_error(lambda: preview_diff(scope, loaded))
+
+    assert proposed.path.exists()
+    assert proposed.path.read_bytes() == proposal_before
+    assert source.read_bytes() == source_before
+    assert not destination.exists()
+    assert git_head(vault) == before_head
+    assert git_tracked_paths(vault) == before_paths
+    assert _vault_tree(vault) == before_tree
+
+
 def test_load_proposals(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
     props = load_proposals(scope)
     assert [p.id for p in props] == [prop.id]
+
+
+@pytest.mark.parametrize(
+    "source_hash",
+    [None, 7, "a" * 63, "a" * 65, "A" * 64, "g" * 64],
+)
+def test_classification_hash_must_be_lowercase_sha256(two_entity_vault, source_hash):
+    scope = Scope(two_entity_vault, "alpha")
+    record = _canonical_alpha_record(scope)
+    if source_hash is None:
+        record.pop("source_sha256")
+    else:
+        record["source_sha256"] = source_hash
+    _write_record(scope, f"{record['id']}.yaml", yaml.safe_dump(record))
+
+    _assert_destination_error(lambda: load_proposals(scope))
+
+
+@pytest.mark.parametrize(
+    "filename,stored_id",
+    [
+        ("legacy.yaml", "legacy"),
+        (
+            "20260815T090703-" + "11" * 16 + ".yaml",
+            "20260815T090703-" + "22" * 16,
+        ),
+        (
+            "20261315T090703-" + "11" * 16 + ".yaml",
+            "20261315T090703-" + "11" * 16,
+        ),
+    ],
+)
+def test_classification_id_and_filename_must_be_canonical(
+    two_entity_vault, filename, stored_id
+):
+    scope = Scope(two_entity_vault, "alpha")
+    record = _canonical_alpha_record(scope)
+    record["id"] = stored_id
+    _write_record(scope, filename, yaml.safe_dump(record))
+
+    _assert_destination_error(lambda: load_proposals(scope))
 
 
 def test_loading_rejects_same_entity_outbox_directory_redirect_without_read(
@@ -527,12 +707,13 @@ def test_loading_rejects_same_entity_proposal_leaf_symlink_before_target_read(
 def test_loading_classifications_skips_valid_registry_delete_record(tmp_path):
     vault = _vault(tmp_path)
     scope, classification = _propose(vault)
+    delete_id = "20260815T090703-" + "33" * 16
     _write_record(
         scope,
-        "delete-record.yaml",
+        f"{delete_id}.yaml",
         yaml.safe_dump(
             {
-                "id": "delete-record",
+                "id": delete_id,
                 "action": "delete",
                 "entity": "demo",
                 "kind": "product",
@@ -550,8 +731,9 @@ def test_loading_classifications_skips_valid_registry_delete_record(tmp_path):
 def test_loading_rejects_unknown_proposal_action(tmp_path):
     vault = _vault(tmp_path)
     scope = Scope(vault, "demo")
+    proposal_id = "20260815T090703-" + "33" * 16
     record = {
-        "id": "unknown-action",
+        "id": proposal_id,
         "action": "publish",
         "entity": "demo",
         "src": "demo/00-inbox/active/note.md",
@@ -560,7 +742,7 @@ def test_loading_rejects_unknown_proposal_action(tmp_path):
         "sub": "kb",
         "block": "govern",
     }
-    _write_record(scope, "unknown-action.yaml", yaml.safe_dump(record))
+    _write_record(scope, f"{proposal_id}.yaml", yaml.safe_dump(record))
     before_head = git_head(vault)
     before_paths = git_tracked_paths(vault)
     before_tree = _vault_tree(vault)
@@ -603,12 +785,13 @@ def test_loading_rejects_malformed_destination_scalars(
     two_entity_vault, field, value
 ):
     scope = Scope(two_entity_vault, "alpha")
-    record = _canonical_alpha_record()
+    record = _canonical_alpha_record(scope)
+    filename = f"{record['id']}.yaml"
     if value is _MISSING:
         record.pop(field)
     else:
         record[field] = value
-    _write_record(scope, "malformed.yaml", yaml.safe_dump(record))
+    _write_record(scope, filename, yaml.safe_dump(record))
 
     _assert_destination_error(lambda: load_proposals(scope))
 
@@ -667,9 +850,9 @@ def test_operations_reject_noncanonical_destination_without_mutation(
     two_entity_vault, case, field, value, operation
 ):
     scope = Scope(two_entity_vault, "alpha")
-    record = _canonical_alpha_record()
+    record = _canonical_alpha_record(scope)
     record[field] = value
-    path = _write_record(scope, "forged.yaml", yaml.safe_dump(record))
+    path = _write_record(scope, f"{record['id']}.yaml", yaml.safe_dump(record))
     before_head = git_head(two_entity_vault)
     before_paths = git_tracked_paths(two_entity_vault)
     before_tree = _vault_tree(two_entity_vault)
@@ -694,9 +877,9 @@ def test_noncanonical_destination_fails_before_source_body_read(
     two_entity_vault, monkeypatch, operation
 ):
     scope = Scope(two_entity_vault, "alpha")
-    record = _canonical_alpha_record()
+    record = _canonical_alpha_record(scope)
     record["block"] = "system"
-    path = _write_record(scope, "forged.yaml", yaml.safe_dump(record))
+    path = _write_record(scope, f"{record['id']}.yaml", yaml.safe_dump(record))
     source = scope.resolve("00-inbox", "active", "alpha.md")
     real_read = Path.read_text
 
@@ -732,6 +915,64 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
 
     assert git_count_commits(vault) == before + 1
     assert git_head_message(vault).startswith("outbox: approve")
+    assert git_is_clean(vault)
+
+
+def test_approval_refuses_changed_source_without_any_added_mutation(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = scope.resolve("00-inbox", "active", "note.md")
+    source.write_bytes(source.read_bytes() + b"changed-after-proposal\n")
+    proposal_bytes = prop.path.read_bytes()
+    before = _approval_state(vault)
+
+    with pytest.raises(outbox.StaleProposalSource):
+        approve(scope, prop.id)
+
+    assert _approval_state(vault) == before
+    assert prop.path.read_bytes() == proposal_bytes
+    assert source.exists()
+    assert not scope.resolve("11-knowledge", "active", "note.md").exists()
+
+
+def test_approval_refuses_missing_source_and_preserves_proposal(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = scope.resolve("00-inbox", "active", "note.md")
+    source.unlink()
+    proposal_bytes = prop.path.read_bytes()
+    before = _approval_state(vault)
+
+    with pytest.raises(outbox.MissingProposalSource):
+        approve(scope, prop.id)
+
+    assert _approval_state(vault) == before
+    assert prop.path.read_bytes() == proposal_bytes
+    assert not scope.resolve("11-knowledge", "active", "note.md").exists()
+
+
+def test_approval_commits_bytes_from_verified_snapshot(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = scope.resolve("00-inbox", "active", "note.md")
+    reviewed_marker = b"Randomised trial protocol body."
+    raced_marker = b"replacement-after-verification"
+    real_git = outbox._git
+
+    def race_before_move(root, *args):
+        if args[:1] == ("mv",):
+            source.write_bytes(
+                source.read_bytes().replace(reviewed_marker, raced_marker)
+            )
+        return real_git(root, *args)
+
+    monkeypatch.setattr(outbox, "_git", race_before_move)
+
+    approve(scope, prop.id)
+
+    destination = scope.resolve("11-knowledge", "active", "note.md")
+    assert reviewed_marker in destination.read_bytes()
+    assert raced_marker not in destination.read_bytes()
     assert git_is_clean(vault)
 
 
@@ -877,16 +1118,20 @@ def test_approval_never_scaffolds_destination_parent_after_validation(
 
 
 def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
-    record = textwrap.dedent(
-        """\
-        id: hidden
-        action: classify
-        entity: beta
-        src: beta/00-inbox/active/note.md
-        dst: beta/11-knowledge/active/note.md
-        module: 11-knowledge
-        sub: kb
-        """
+    proposal_id = "20260815T090703-" + "44" * 16
+    source = b"---\ntype: inbox-item\nsub: triage\n---\nbeta receipt\n"
+    record = yaml.safe_dump(
+        {
+            "id": proposal_id,
+            "action": "classify",
+            "entity": "beta",
+            "src": "beta/00-inbox/active/note.md",
+            "source_sha256": hashlib.sha256(source).hexdigest(),
+            "dst": "beta/11-knowledge/active/note.md",
+            "module": "11-knowledge",
+            "sub": "kb",
+            "block": "govern",
+        }
     )
     vault = _outbox_vault(
         tmp_path,
@@ -894,15 +1139,18 @@ def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
         {
             "alpha/00-inbox/active/.gitkeep": "",
             "beta/00-inbox/active/.gitkeep": "",
+            "beta/00-inbox/active/note.md": source.decode("utf-8"),
             "alpha/11-knowledge/active/.gitkeep": "",
             "beta/11-knowledge/active/.gitkeep": "",
             "alpha/11-library/active/.gitkeep": "",
             "beta/11-library/active/.gitkeep": "",
             "alpha/outbox/.gitkeep": "",
-            "beta/outbox/hidden.yaml": record,
+            f"beta/outbox/{proposal_id}.yaml": record,
         },
     )
-    (vault / "alpha/outbox/linked.yaml").symlink_to(vault / "beta/outbox/hidden.yaml")
+    (vault / "alpha/outbox/linked.yaml").symlink_to(
+        vault / "beta/outbox" / f"{proposal_id}.yaml"
+    )
 
     with pytest.raises(CrossScopeError):
         load_proposals(Scope(vault, "alpha"))
@@ -912,7 +1160,8 @@ def test_loading_mismatched_proposal_fails_before_other_entity_source_read(
     two_entity_vault, monkeypatch
 ):
     scope = Scope(two_entity_vault, "alpha")
-    _write_record(scope, "forged.yaml", FORGED_BETA_PROPOSAL)
+    record = _forged_beta_record(scope)
+    _write_record(scope, f"{record['id']}.yaml", yaml.safe_dump(record))
     beta_source = two_entity_vault / "beta/00-inbox/active/beta.md"
     real_read = Path.read_text
 
@@ -964,13 +1213,17 @@ def test_propose_rejects_item_path_from_another_entity(two_entity_vault):
 
 def test_preview_diff_rejects_proposal_bound_to_another_entity(two_entity_vault):
     alpha = Scope(two_entity_vault, "alpha")
-    record_path = _write_record(alpha, "forged.yaml", FORGED_BETA_PROPOSAL)
+    record = _forged_beta_record(alpha)
+    record_path = _write_record(
+        alpha, f"{record['id']}.yaml", yaml.safe_dump(record)
+    )
     proposal = Proposal(
-        id="shared-id",
+        id=record["id"],
         path=record_path,
         action="classify",
         entity="beta",
         src="beta/00-inbox/active/beta.md",
+        source_sha256=record["source_sha256"],
         dst="beta/11-knowledge/active/beta.md",
         module="11-knowledge",
         sub="kb",
@@ -995,8 +1248,13 @@ def test_mutation_rejects_foreign_record_and_leaves_both_entities_unchanged(
 ):
     alpha = Scope(two_entity_vault, "alpha")
     beta = Scope(two_entity_vault, "beta")
-    alpha_record = _write_record(alpha, "shared-id.yaml", FORGED_BETA_PROPOSAL)
-    beta_record = _write_record(beta, "shared-id.yaml", FORGED_BETA_PROPOSAL)
+    record = _forged_beta_record(alpha)
+    alpha_record = _write_record(
+        alpha, f"{record['id']}.yaml", yaml.safe_dump(record)
+    )
+    beta_record = _write_record(
+        beta, f"{record['id']}.yaml", yaml.safe_dump(record)
+    )
     watched = (
         alpha_record,
         beta_record,
@@ -1006,7 +1264,7 @@ def test_mutation_rejects_foreign_record_and_leaves_both_entities_unchanged(
     before = {path: path.read_bytes() for path in watched}
 
     with pytest.raises(outbox.OutboxScopeError):
-        operation(alpha, "shared-id")
+        operation(alpha, record["id"])
 
     assert {path: path.read_bytes() for path in watched} == before
     assert not (two_entity_vault / "alpha/11-knowledge/active/beta.md").exists()
@@ -1024,28 +1282,20 @@ def test_loading_wraps_foreign_stored_path_as_destination_error(
     two_entity_vault, field, foreign_value
 ):
     alpha = Scope(two_entity_vault, "alpha")
-    record = {
-        "id": "forged-path",
-        "action": "classify",
-        "entity": "alpha",
-        "src": "alpha/00-inbox/active/alpha.md",
-        "dst": "alpha/11-knowledge/active/alpha.md",
-        "module": "11-knowledge",
-        "sub": "kb",
-        "block": "govern",
-    }
+    record = _canonical_alpha_record(alpha)
     record[field] = foreign_value
-    _write_record(alpha, "forged-path.yaml", __import__("yaml").safe_dump(record))
+    _write_record(alpha, f"{record['id']}.yaml", yaml.safe_dump(record))
 
     _assert_destination_error(lambda: load_proposals(alpha))
 
 
 def test_loading_wraps_destination_registry_error(two_entity_vault):
     scope = Scope(two_entity_vault, "alpha")
+    record = _canonical_alpha_record(scope)
     _write_record(
         scope,
-        "canonical.yaml",
-        yaml.safe_dump(_canonical_alpha_record()),
+        f"{record['id']}.yaml",
+        yaml.safe_dump(record),
     )
     (two_entity_vault / "_system/archetypes.yaml").write_text(
         OUTBOX_ARCHETYPES.replace("submodules:\n", "submodules: []\ninvalid:\n"),

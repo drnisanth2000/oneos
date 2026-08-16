@@ -1,4 +1,7 @@
 <div id="outbox-list">
+  {% if approval_error %}
+  <p class="diff-head" role="alert">{{ approval_error }}</p>
+  {% endif %}
   {% if not props %}
   <p class="muted">No pending proposals. Approve or reject clears them from here.</p>
   {% endif %}
