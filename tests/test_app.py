@@ -561,6 +561,36 @@ def test_alpha_delete_impact_excludes_beta_totals_and_marker_text(client):
     assert "beta-registry-marker" not in response.text
 
 
+def test_registry_transaction_error_is_a_registry_error(client, monkeypatch):
+    import app.registry as registry
+    from app.scope import Scope
+
+    scope = Scope(client.vault, "alpha")
+    proposal = registry.propose_delete(scope, "product", "alpha-only")
+    registry_path = scope.system_path("products.yaml")
+    registry_before = registry_path.read_bytes()
+    proposal_before = proposal.path.read_bytes()
+    head_before = git_head(client.vault)
+
+    def fail_transaction(*_args, **_kwargs):
+        raise GitTransactionFailure("injected registry route transaction failure")
+
+    monkeypatch.setattr(
+        registry, "execute_transaction", fail_transaction, raising=False
+    )
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={"id": proposal.id, "slug": "alpha-only"},
+    )
+
+    assert response.status_code == 200
+    assert "registry deletion transaction failed" in response.text
+    assert registry_path.read_bytes() == registry_before
+    assert proposal.path.read_bytes() == proposal_before
+    assert git_head(client.vault) == head_before
+
+
 def test_concurrent_delete_previews_keep_reference_totals_isolated(
     client, monkeypatch
 ):

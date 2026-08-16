@@ -14,7 +14,13 @@ from pathlib import Path
 import pytest
 import yaml
 
+import app.git_transaction as git_transaction
 import app.registry as registry
+from app.git_transaction import (
+    GitTransactionFailure,
+    ReviewedStateConflict,
+    VaultBusyError,
+)
 from app.scope import CrossScopeError, Scope
 from app.registry import (
     RegistryError,
@@ -25,11 +31,15 @@ from app.registry import (
     reference_count,
 )
 from tests.conftest import (
+    git_bytes,
+    git_changed_paths,
     git_count_commits,
     git_entity_vault,
     git_head,
     git_head_message,
+    git_index_entries,
     git_is_clean,
+    git_status_bytes,
 )
 
 
@@ -65,6 +75,36 @@ def _registry_delete_state(vault: Path) -> dict[str, bytes | tuple]:
         "worktree": git_bytes("diff", "--binary"),
         "tree": _vault_tree(vault),
     }
+
+
+def _add_unrelated_git_dirt(vault: Path) -> tuple[dict[str, bytes], bytes]:
+    tracked = ("staged.bin", "unstaged.bin")
+    (vault / tracked[0]).write_bytes(b"staged base\n")
+    (vault / tracked[1]).write_bytes(b"unstaged base\n")
+    git_bytes(vault, "add", *tracked)
+    git_bytes(vault, "commit", "-q", "-m", "add unrelated fixtures")
+
+    expected = {
+        tracked[0]: b"staged exact\x00\xff\n",
+        tracked[1]: b"unstaged exact\x00\xfe\n",
+        "untracked.bin": b"untracked exact\x00\xfd\n",
+    }
+    (vault / tracked[0]).write_bytes(expected[tracked[0]])
+    git_bytes(vault, "add", tracked[0])
+    (vault / tracked[1]).write_bytes(expected[tracked[1]])
+    (vault / "untracked.bin").write_bytes(expected["untracked.bin"])
+    index_entries = git_bytes(vault, "ls-files", "--stage", "-z", "--", *tracked)
+    return expected, index_entries
+
+
+def _assert_unrelated_git_dirt(
+    vault: Path, expected: dict[str, bytes], index_entries: bytes
+) -> None:
+    for relative_path, contents in expected.items():
+        assert (vault / relative_path).read_bytes() == contents
+    assert git_bytes(
+        vault, "ls-files", "--stage", "-z", "--", "staged.bin", "unstaged.bin"
+    ) == index_entries
 
 
 def _same_outbox_leaf_alias(scope: Scope, monkeypatch):
@@ -503,6 +543,166 @@ def test_execute_delete_removes_when_unreferenced(tmp_path):
     assert "other:" in prods                    # sibling untouched
     assert git_head_message(vault).startswith("registry: delete product")
     assert git_is_clean(vault)
+
+
+def test_delete_with_unrelated_staged_unstaged_and_untracked_work_commits_only_registry_file(
+    tmp_path,
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    unrelated, unrelated_index = _add_unrelated_git_dirt(vault)
+    scope = Scope(vault, "demo")
+    proposal = propose_delete(scope, "product", "widgetx")
+    head_before = git_head(vault)
+
+    execute_delete(scope, proposal.id)
+
+    assert git_changed_paths(vault) == ["_system/products.yaml"]
+    assert subprocess.run(
+        ["git", "rev-list", "--count", f"{head_before}..HEAD"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "1"
+    assert proposal.path.exists() is False
+    _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
+
+
+def test_dirty_reviewed_registry_is_refused_before_proposal_or_registry_mutation(
+    tmp_path,
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    proposal = propose_delete(scope, "product", "widgetx")
+    registry_path = scope.system_path("products.yaml")
+    registry_bytes = registry_path.read_bytes()
+    proposal_bytes = proposal.path.read_bytes()
+    registry_path.write_bytes(b"unexpected staged registry\n")
+    git_bytes(vault, "add", "_system/products.yaml")
+    registry_path.write_bytes(registry_bytes)
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    status_before = git_status_bytes(vault)
+
+    with pytest.raises(registry.RegistryTransactionError) as raised:
+        execute_delete(scope, proposal.id)
+
+    assert isinstance(raised.value.__cause__, ReviewedStateConflict)
+    assert git_head(vault) == head_before
+    assert registry_path.read_bytes() == registry_bytes
+    assert proposal.path.read_bytes() == proposal_bytes
+    assert git_index_entries(vault) == index_before
+    assert git_status_bytes(vault) == status_before
+
+
+def test_registry_delete_busy_error_preserves_exact_state(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    proposal = propose_delete(scope, "product", "widgetx")
+    registry_path = scope.system_path("products.yaml")
+    registry_bytes = registry_path.read_bytes()
+    proposal_bytes = proposal.path.read_bytes()
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    status_before = git_status_bytes(vault)
+
+    with git_transaction._approval_lock(vault):
+        with pytest.raises(registry.RegistryTransactionError) as raised:
+            execute_delete(scope, proposal.id)
+
+    assert isinstance(raised.value.__cause__, VaultBusyError)
+    assert git_head(vault) == head_before
+    assert registry_path.read_bytes() == registry_bytes
+    assert proposal.path.read_bytes() == proposal_bytes
+    assert git_index_entries(vault) == index_before
+    assert git_status_bytes(vault) == status_before
+
+
+def test_registry_delete_commit_failure_restores_registry_and_proposal_bytes(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    unrelated, unrelated_index = _add_unrelated_git_dirt(vault)
+    scope = Scope(vault, "demo")
+    proposal = propose_delete(scope, "product", "widgetx")
+    registry_path = scope.system_path("products.yaml")
+    registry_bytes = registry_path.read_bytes()
+    proposal_bytes = proposal.path.read_bytes()
+    head_before = git_head(vault)
+
+    def fail_after_filesystem_apply(checkpoint: str) -> None:
+        if checkpoint == "filesystem-applied":
+            raise OSError("injected registry transaction failure")
+
+    monkeypatch.setattr(git_transaction, "_checkpoint", fail_after_filesystem_apply)
+
+    with pytest.raises(registry.RegistryTransactionError) as raised:
+        execute_delete(scope, proposal.id)
+
+    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+    assert git_head(vault) == head_before
+    assert registry_path.read_bytes() == registry_bytes
+    assert proposal.path.read_bytes() == proposal_bytes
+    _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
+
+
+def test_registry_delete_is_one_commit_and_one_revert_restores_every_registry_key(
+    two_entity_registry_vault,
+):
+    vault = two_entity_registry_vault
+    scope = Scope(vault, "alpha")
+    proposal = propose_delete(scope, "product", "unused")
+    registry_path = scope.system_path("products.yaml")
+    registry_before = registry_path.read_bytes()
+    head_before = git_head(vault)
+
+    execute_delete(scope, proposal.id)
+    approval_oid = git_head(vault)
+
+    assert subprocess.run(
+        ["git", "rev-list", "--count", f"{head_before}..{approval_oid}"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "1"
+    assert git_changed_paths(vault, approval_oid) == ["_system/products.yaml"]
+    assert proposal.path.exists() is False
+    subprocess.run(
+        ["git", "revert", "--no-edit", approval_oid],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+    )
+    assert registry_path.read_bytes() == registry_before
+
+
+def test_direct_registry_add_still_uses_existing_direct_flow(
+    two_entity_registry_vault,
+):
+    vault = two_entity_registry_vault
+    staged = vault / "direct-flow-marker.bin"
+    staged.write_bytes(b"direct add uses the real index\n")
+    git_bytes(vault, "add", staged.name)
+    before = git_count_commits(vault)
+
+    add_workspace(
+        Scope(vault, "alpha"),
+        {
+            "id": "alpha-focused",
+            "label": "Alpha Focused",
+            "kind": "entity",
+            "entity": "alpha",
+            "default_view": "blocks",
+        },
+    )
+
+    assert git_count_commits(vault) == before + 1
+    assert git_head_message(vault) == "registry: add workspace alpha-focused"
+    assert git_changed_paths(vault) == [
+        "_system/workspaces.yaml",
+        "direct-flow-marker.bin",
+    ]
 
 
 def test_delete_removes_only_bound_registry_key(two_entity_registry_vault):
