@@ -803,6 +803,7 @@ def test_pre_commit_failure_with_cleanup_failure_is_typed_and_restores_state(
     with pytest.raises(transaction.GitTransactionFailure) as raised:
         transaction.execute_transaction(vault, plan)
 
+    assert type(raised.value) is transaction.GitTransactionFailure
     assert str(raised.value) == (
         "approval transaction failed and was rolled back; "
         "temporary index cleanup failed"
@@ -816,7 +817,7 @@ def test_pre_commit_failure_with_cleanup_failure_is_typed_and_restores_state(
         pass
 
 
-def test_success_cleanup_failure_is_typed_without_rewinding_commit(
+def test_success_cleanup_failure_carries_committed_result_without_rewinding(
     tmp_path, monkeypatch
 ):
     vault, plan, index_directory, before = _prepared_transaction(
@@ -824,9 +825,16 @@ def test_success_cleanup_failure_is_typed_without_rewinding_commit(
     )
     _inject_temporary_index_cleanup_failure(monkeypatch, index_directory)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
+    assert type(raised.value) is transaction.GitTransactionCommittedError
+    assert isinstance(raised.value, transaction.GitTransactionFailure) is False
+    assert raised.value.result == transaction.TransactionResult(
+        git_head(vault), tuple(sorted(plan.commit_paths))
+    )
+    assert raised.value.commit_oid == git_head(vault)
+    assert isinstance(raised.value.cleanup_error, OSError)
     assert str(raised.value) == (
         "approval transaction committed but temporary index cleanup failed"
     )
@@ -846,3 +854,47 @@ def test_success_cleanup_failure_is_typed_without_rewinding_commit(
     assert current["temporary_indexes"]
     with transaction._approval_lock(vault):
         pass
+
+
+def test_sha256_repository_commits_full_multi_path_transaction(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GIT_DEFAULT_HASH", "sha256")
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+
+    result = transaction.execute_transaction(vault, plan)
+
+    assert len(before["head"]) == 64
+    assert len(result.commit_oid) == 64
+    assert result.commit_oid == git_head(vault)
+    assert result.changed_paths == tuple(sorted(plan.commit_paths))
+    assert git_changed_paths(vault, result.commit_oid) == list(result.changed_paths)
+    assert (vault / plan.commit_paths[0]).exists() is False
+    assert (vault / plan.commit_paths[1]).read_bytes() == b"approved\n"
+    assert (vault / plan.owned_changes[0].path).exists() is False
+    assert list(index_directory.iterdir()) == []
+
+
+def test_sha256_post_commit_failure_restores_exact_starting_state(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GIT_DEFAULT_HASH", "sha256")
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+
+    def fail_after_commit_capture(name: str) -> None:
+        if name == "commit-created":
+            raise OSError("injected SHA-256 post-commit failure")
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_after_commit_capture)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert type(raised.value) is transaction.GitTransactionFailure
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert len(before["head"]) == 64
+    assert _complete_state(vault, plan, index_directory) == before

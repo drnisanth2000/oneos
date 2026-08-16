@@ -33,6 +33,16 @@ class GitTransactionFailure(GitTransactionError):
     pass
 
 
+class GitTransactionCommittedError(GitTransactionError):
+    def __init__(self, result: TransactionResult, cleanup_error: OSError) -> None:
+        self.result = result
+        self.commit_oid = result.commit_oid
+        self.cleanup_error = cleanup_error
+        super().__init__(
+            "approval transaction committed but temporary index cleanup failed"
+        )
+
+
 class GitTransactionRecoveryError(GitTransactionError):
     def __init__(
         self, paths: tuple[str, ...], *, temporary_index_cleanup_failed: bool = False
@@ -325,7 +335,7 @@ def _execute_locked(
         committed = _git(
             vault,
             "-c",
-            "core.abbrev=40",
+            "core.abbrev=64",
             "commit",
             "--no-quiet",
             "--no-status",
@@ -386,9 +396,11 @@ def _execute_locked(
         raise transaction_error from transaction_cause
 
     if cleanup_error is not None:
-        raise GitTransactionFailure(
-            "approval transaction committed but temporary index cleanup failed"
-        ) from cleanup_error
+        if result is None:
+            raise GitTransactionFailure(
+                "approval transaction cleanup failed without a result"
+            ) from cleanup_error
+        raise GitTransactionCommittedError(result, cleanup_error) from cleanup_error
     if result is None:
         raise GitTransactionFailure("approval transaction produced no result")
     return result
@@ -490,7 +502,7 @@ def _transaction_commit_from_output(output: bytes) -> str:
     candidates = {
         match.group("oid").decode("ascii")
         for match in re.finditer(
-            rb"^\[[^\r\n]* (?P<oid>[0-9a-f]{40})\](?: .*)?$",
+            rb"^\[[^\r\n]* (?P<oid>[0-9a-f]{40}|[0-9a-f]{64})\](?: .*)?$",
             output,
             flags=re.MULTILINE,
         )
