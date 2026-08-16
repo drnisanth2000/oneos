@@ -196,6 +196,26 @@ def _exception_chain_contains(error: BaseException, expected: type[BaseException
     return False
 
 
+def _inject_temporary_index_cleanup_failure(
+    monkeypatch, index_directory: Path
+) -> None:
+    original_unlink = transaction.os.unlink
+    attempts: dict[str, int] = {}
+
+    def fail_persistent_cleanup(path, *args, **kwargs):
+        target = Path(path)
+        if (
+            target.parent == index_directory
+            and target.name.startswith("oneos-index-")
+        ):
+            attempts[target.name] = attempts.get(target.name, 0) + 1
+            if attempts[target.name] > 1 and target.exists():
+                raise OSError("injected temporary index cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(transaction.os, "unlink", fail_persistent_cleanup)
+
+
 def test_path_state_requires_absence_or_exact_regular_bytes_and_mode():
     assert PathState.absent() == PathState(None, None)
     assert PathState.regular(b"body\n", 0o644) == PathState(b"body\n", 0o644)
@@ -643,5 +663,186 @@ def test_head_ownership_preserves_newer_ref_during_recovery(tmp_path, monkeypatc
     current["head"] = before["head"]
     assert current == before
     assert list(index_directory.iterdir()) == []
+    with transaction._approval_lock(vault):
+        pass
+
+
+def test_failure_after_commit_returns_before_ownership_capture_restores_head(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+
+    def fail_before_ownership_capture(name: str) -> None:
+        if name == "commit-returned":
+            raise OSError("injected ownership capture failure")
+
+    monkeypatch.setattr(
+        transaction, "_checkpoint", fail_before_ownership_capture
+    )
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert _complete_state(vault, plan, index_directory) == before
+
+
+def test_concurrent_head_before_ownership_capture_is_never_claimed(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    newer_head = ""
+
+    def advance_before_ownership_capture(name: str) -> None:
+        nonlocal newer_head
+        if name == "commit-created":
+            raise OSError("injected failure after concurrent ownership capture")
+        if name != "commit-returned":
+            return
+        transaction_head = git_head(vault)
+        start_tree = git_bytes(
+            vault, "rev-parse", f"{before['head']}^{{tree}}"
+        ).decode("ascii").strip()
+        newer_head = git_bytes(
+            vault,
+            "commit-tree",
+            start_tree,
+            "-p",
+            transaction_head,
+            "-m",
+            "concurrent before ownership capture",
+        ).decode("ascii").strip()
+        git_bytes(vault, "update-ref", "HEAD", newer_head, transaction_head)
+
+    monkeypatch.setattr(
+        transaction, "_checkpoint", advance_before_ownership_capture
+    )
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == ("HEAD",)
+    assert git_head(vault) == newer_head
+    current = _complete_state(vault, plan, index_directory)
+    current["head"] = before["head"]
+    assert current == before
+
+
+def test_failure_after_real_mutation_before_apply_returns_restores_state(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+
+    def fail_before_apply_returns(name: str) -> None:
+        if name == "filesystem-path-applied":
+            raise OSError("injected failure before apply returns")
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_before_apply_returns)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert _complete_state(vault, plan, index_directory) == before
+
+
+def test_concurrent_replacement_before_apply_returns_is_preserved(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    source = plan.commit_paths[0]
+
+    def replace_source_before_apply_returns(name: str) -> None:
+        if name == "filesystem-path-applied":
+            (vault / source).write_bytes(b"concurrent source replacement\n")
+            raise OSError("injected concurrent replacement before apply returns")
+
+    monkeypatch.setattr(
+        transaction, "_checkpoint", replace_source_before_apply_returns
+    )
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == (source,)
+    assert (vault / source).read_bytes() == b"concurrent source replacement\n"
+    assert git_head(vault) == before["head"]
+    current = _complete_state(vault, plan, index_directory)
+    for key in (
+        "reviewed_index",
+        "unrelated_index",
+        "unrelated_status",
+        "cached_diff",
+        "temporary_indexes",
+    ):
+        assert current[key] == before[key]
+    assert (vault / "staged.bin").read_bytes() == b"staged exact\x00\xff\n"
+    assert (vault / "unstaged.bin").read_bytes() == b"unstaged exact\x00\xfe\n"
+    assert (vault / "untracked.bin").read_bytes() == b"untracked exact\x00\xfd\n"
+
+
+def test_pre_commit_failure_with_cleanup_failure_is_typed_and_restores_state(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    hook = vault / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nexit 29\n", encoding="utf-8")
+    hook.chmod(0o755)
+    _inject_temporary_index_cleanup_failure(monkeypatch, index_directory)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert str(raised.value) == (
+        "approval transaction failed and was rolled back; "
+        "temporary index cleanup failed"
+    )
+    current = _complete_state(vault, plan, index_directory)
+    leaked_indexes = current["temporary_indexes"]
+    current["temporary_indexes"] = before["temporary_indexes"]
+    assert current == before
+    assert leaked_indexes
+    with transaction._approval_lock(vault):
+        pass
+
+
+def test_success_cleanup_failure_is_typed_without_rewinding_commit(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    _inject_temporary_index_cleanup_failure(monkeypatch, index_directory)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert str(raised.value) == (
+        "approval transaction committed but temporary index cleanup failed"
+    )
+    assert git_head(vault) != before["head"]
+    assert git_head_message(vault) == plan.message
+    assert (vault / plan.commit_paths[0]).exists() is False
+    assert (vault / plan.commit_paths[1]).read_bytes() == b"approved\n"
+    assert (vault / plan.owned_changes[0].path).exists() is False
+    current = _complete_state(vault, plan, index_directory)
+    for key in (
+        "unrelated_index",
+        "unrelated_status",
+        "worktree_diff",
+        "cached_diff",
+    ):
+        assert current[key] == before[key]
+    assert current["temporary_indexes"]
     with transaction._approval_lock(vault):
         pass

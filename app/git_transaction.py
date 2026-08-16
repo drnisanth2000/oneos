@@ -9,11 +9,12 @@ import fcntl
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import re
 import secrets
 import stat
 import subprocess
 import tempfile
-from typing import Iterator
+from typing import Callable, Iterator
 
 
 class GitTransactionError(Exception):
@@ -33,9 +34,15 @@ class GitTransactionFailure(GitTransactionError):
 
 
 class GitTransactionRecoveryError(GitTransactionError):
-    def __init__(self, paths: tuple[str, ...]) -> None:
+    def __init__(
+        self, paths: tuple[str, ...], *, temporary_index_cleanup_failed: bool = False
+    ) -> None:
         self.paths = tuple(sorted(paths))
-        super().__init__("transaction recovery blocked: " + ", ".join(self.paths))
+        self.temporary_index_cleanup_failed = temporary_index_cleanup_failed
+        message = "transaction recovery blocked: " + ", ".join(self.paths)
+        if temporary_index_cleanup_failed:
+            message += "; temporary index cleanup failed"
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -285,13 +292,23 @@ def _execute_locked(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
 ) -> TransactionResult:
-    applied_changes: list[PathChange] = []
+    applied_changes: list[tuple[PathChange, PathState]] = []
     temporary_index: str | None = None
     commit_oid: str | None = None
+    commit_created = False
+    commit_output: bytes | None = None
+    result: TransactionResult | None = None
+    transaction_error: GitTransactionError | None = None
+    transaction_cause: Exception | None = None
     try:
         for change in plan.changes + plan.owned_changes:
-            _apply_state(vault, change)
-            applied_changes.append(change)
+            _apply_state(
+                vault,
+                change,
+                on_applied=lambda state, change=change: applied_changes.append(
+                    (change, state)
+                ),
+            )
         _checkpoint("filesystem-applied")
 
         descriptor, temporary_index = tempfile.mkstemp(prefix="oneos-index-")
@@ -303,8 +320,23 @@ def _execute_locked(
         _checkpoint("alternate-index-ready")
         _stage_in_alternate_index(vault, plan.commit_paths, alternate_env)
         _checkpoint("reviewed-paths-staged")
-        _git(vault, "commit", "-q", "-m", plan.message, env=alternate_env)
-        commit_oid = _git_text(vault, "rev-parse", "HEAD").strip()
+        commit_env = alternate_env.copy()
+        commit_env["LC_ALL"] = "C"
+        committed = _git(
+            vault,
+            "-c",
+            "core.abbrev=40",
+            "commit",
+            "--no-quiet",
+            "--no-status",
+            "-m",
+            plan.message,
+            env=commit_env,
+        )
+        commit_created = True
+        commit_output = committed.stdout
+        _checkpoint("commit-returned")
+        commit_oid = _transaction_commit_from_output(commit_output)
         _checkpoint("commit-created")
         _verify_commit(
             vault, commit_oid, start_head, plan.message, plan.commit_paths
@@ -314,49 +346,80 @@ def _execute_locked(
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
         _checkpoint("real-index-synchronized")
         _require_unrelated_state_unchanged(vault, unrelated, plan)
-        return TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
+        result = TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
     except Exception as exc:
+        transaction_cause = exc
         blocked_paths = _rollback_transaction(
             vault,
             start_head,
             commit_oid,
+            commit_created,
+            commit_output,
             reviewed_index,
             unrelated,
             plan,
             applied_changes,
         )
         if blocked_paths:
-            raise GitTransactionRecoveryError(blocked_paths) from exc
+            transaction_error = GitTransactionRecoveryError(blocked_paths)
+        else:
+            transaction_error = GitTransactionFailure(
+                "approval transaction failed and was rolled back"
+            )
+
+    cleanup_error = None
+    if temporary_index is not None:
+        cleanup_error = _remove_temporary_index(temporary_index)
+
+    if transaction_error is not None:
+        if cleanup_error is not None:
+            if isinstance(transaction_error, GitTransactionRecoveryError):
+                transaction_error = GitTransactionRecoveryError(
+                    transaction_error.paths,
+                    temporary_index_cleanup_failed=True,
+                )
+            else:
+                transaction_error = GitTransactionFailure(
+                    "approval transaction failed and was rolled back; "
+                    "temporary index cleanup failed"
+                )
+        raise transaction_error from transaction_cause
+
+    if cleanup_error is not None:
         raise GitTransactionFailure(
-            "approval transaction failed and was rolled back"
-        ) from exc
-    finally:
-        if temporary_index is not None:
-            _remove_temporary_index(temporary_index)
+            "approval transaction committed but temporary index cleanup failed"
+        ) from cleanup_error
+    if result is None:
+        raise GitTransactionFailure("approval transaction produced no result")
+    return result
 
 
 def _rollback_transaction(
     vault: Path,
     start_head: str,
     commit_oid: str | None,
+    commit_created: bool,
+    commit_output: bytes | None,
     reviewed_index: tuple[_IndexEntry, ...],
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
-    applied_changes: list[PathChange],
+    applied_changes: list[tuple[PathChange, PathState]],
 ) -> tuple[str, ...]:
     blocked_paths: set[str] = set()
 
-    for change in reversed(applied_changes):
+    for change, state_written in reversed(applied_changes):
         try:
             current = capture_path_state(vault, change.path)
         except (OSError, GitTransactionError):
             blocked_paths.add(change.path)
             continue
-        if current != change.after:
+        if current != state_written:
             blocked_paths.add(change.path)
             continue
         try:
-            _apply_state(vault, PathChange(change.path, change.after, change.before))
+            _apply_state(
+                vault, PathChange(change.path, state_written, change.before)
+            )
         except (OSError, GitTransactionError):
             blocked_paths.add(change.path)
 
@@ -378,6 +441,23 @@ def _rollback_transaction(
                 )
         except (OSError, GitTransactionError):
             blocked_paths.add(path)
+
+    if commit_created and commit_oid is None:
+        try:
+            if commit_output is None:
+                raise GitTransactionFailure("transaction commit ownership is missing")
+            commit_oid = _transaction_commit_from_output(commit_output)
+        except (OSError, GitTransactionError):
+            blocked_paths.add("HEAD")
+
+    if commit_oid is not None:
+        try:
+            _verify_commit(
+                vault, commit_oid, start_head, plan.message, plan.commit_paths
+            )
+        except (OSError, GitTransactionError):
+            blocked_paths.add("HEAD")
+            commit_oid = None
 
     if commit_oid is not None:
         try:
@@ -406,6 +486,20 @@ def _rollback_transaction(
     return tuple(sorted(blocked_paths))
 
 
+def _transaction_commit_from_output(output: bytes) -> str:
+    candidates = {
+        match.group("oid").decode("ascii")
+        for match in re.finditer(
+            rb"^\[[^\r\n]* (?P<oid>[0-9a-f]{40})\](?: .*)?$",
+            output,
+            flags=re.MULTILINE,
+        )
+    }
+    if len(candidates) != 1:
+        raise GitTransactionFailure("could not identify transaction commit")
+    return candidates.pop()
+
+
 def _changed_unrelated_paths(
     expected: _UnrelatedState, current: _UnrelatedState
 ) -> tuple[str, ...]:
@@ -426,12 +520,17 @@ def _changed_unrelated_paths(
     return tuple(sorted(changed))
 
 
-def _remove_temporary_index(temporary_index: str) -> None:
+def _remove_temporary_index(temporary_index: str) -> OSError | None:
+    cleanup_error = None
     for path in (temporary_index, f"{temporary_index}.lock"):
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+    return cleanup_error
 
 
 def _git(
@@ -638,7 +737,12 @@ def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
             os.close(descriptor)
 
 
-def _apply_state(vault: Path, change: PathChange) -> None:
+def _apply_state(
+    vault: Path,
+    change: PathChange,
+    *,
+    on_applied: Callable[[PathState], None] | None = None,
+) -> None:
     parts = PurePosixPath(change.path).parts
     directory_descriptor = _open_checked_directory(vault, "vault root")
     try:
@@ -660,6 +764,9 @@ def _apply_state(vault: Path, change: PathChange) -> None:
                     os.unlink(leaf, dir_fd=directory_descriptor)
                 except OSError as exc:
                     raise GitTransactionFailure("could not remove reviewed file") from exc
+                if on_applied is not None:
+                    on_applied(change.after)
+                    _checkpoint("filesystem-path-applied")
             return
 
         temporary_leaf = ""
@@ -693,6 +800,9 @@ def _apply_state(vault: Path, change: PathChange) -> None:
                 dst_dir_fd=directory_descriptor,
             )
             temporary_leaf = ""
+            if on_applied is not None:
+                on_applied(change.after)
+                _checkpoint("filesystem-path-applied")
         except GitTransactionError:
             raise
         except OSError as exc:
