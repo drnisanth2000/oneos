@@ -1,2 +1,4 @@
 # Synthetic private-key-shaped PII fixture in the immutable sanitized baseline.
 177a49c1971ac3603e8479ba3f21b2916fe27415:tests/test_pii.py:private-key:101
+# Same synthetic fixture in the retained pre-rewrite local lineage.
+24a4a36e3a848678a067acef3e1415e6d4e9ba56:tests/test_pii.py:private-key:100
