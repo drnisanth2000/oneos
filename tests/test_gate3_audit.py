@@ -33,6 +33,7 @@ AUDIT_ARCHETYPES = textwrap.dedent(
       00-inbox:    {block: system}
       02-pipeline: {block: build}
       11-library:  {block: knowledge}
+      12-archive:  {block: knowledge, lifecycle_pattern: false}
       15-inactive: {block: self, requires_flag: gated}
     submodules:
       11-library:
@@ -257,6 +258,13 @@ def test_each_registry_action_kind_pair_accepts_only_its_conventional_file(
             (
                 ("D", "synthetic/00-inbox/active/r.md"),
                 ("A", "_system/active/r.md"),
+            ),
+        ),
+        (
+            "outbox: non-lifecycle destination",
+            (
+                ("D", "synthetic/00-inbox/active/r.md"),
+                ("A", "synthetic/12-archive/active/r.md"),
             ),
         ),
         (
@@ -530,6 +538,10 @@ def test_new_staged_pending_proposal_is_not_a_sanctioned_dirty_write(tmp_path: P
         "non-pending",
         "missing-status",
         "unknown-action",
+        "invalid-created-type",
+        "invalid-rule-id-type",
+        "mismatched-source-hash",
+        "extra-classify-field",
     ],
 )
 def test_new_outbox_yaml_must_be_a_canonical_pending_proposal(
@@ -555,6 +567,18 @@ def test_new_outbox_yaml_must_be_a_canonical_pending_proposal(
     elif mutation == "unknown-action":
         record["action"] = "publish"
         proposal.write_text(yaml.safe_dump(record, sort_keys=False))
+    elif mutation == "invalid-created-type":
+        record["created"] = 20260816
+        proposal.write_text(yaml.safe_dump(record, sort_keys=False))
+    elif mutation == "invalid-rule-id-type":
+        record["rule_id"] = {"unexpected": "mapping"}
+        proposal.write_text(yaml.safe_dump(record, sort_keys=False))
+    elif mutation == "mismatched-source-hash":
+        record["source_sha256"] = "0" * 64
+        proposal.write_text(yaml.safe_dump(record, sort_keys=False))
+    elif mutation == "extra-classify-field":
+        record["unexpected"] = True
+        proposal.write_text(yaml.safe_dump(record, sort_keys=False))
     else:
         raise AssertionError(mutation)
     rules = gate3.AuditRules.load(vault)
@@ -565,6 +589,36 @@ def test_new_outbox_yaml_must_be_a_canonical_pending_proposal(
 
     assert result.ok is False
     assert result.violating_writes == [proposal.relative_to(vault).as_posix()]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing-impact-key", "extra-impact-key", "extra-delete-field"],
+)
+def test_new_delete_proposal_must_match_the_writer_record_shape(
+    tmp_path: Path, mutation: str
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = propose_delete(scope, "product", "unused")
+    record = yaml.safe_load(proposal.path.read_text(encoding="utf-8"))
+    if mutation == "missing-impact-key":
+        del record["impact"]["books.db"]
+    elif mutation == "extra-impact-key":
+        record["impact"]["unexpected"] = 0
+    elif mutation == "extra-delete-field":
+        record["unexpected"] = True
+    else:
+        raise AssertionError(mutation)
+    proposal.path.write_text(yaml.safe_dump(record, sort_keys=False))
+    rules = gate3.AuditRules.load(vault)
+
+    result = gate3.audit_dirty(
+        {}, gate3.collect_dirty_fingerprints(vault), rules, vault
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [proposal.path.relative_to(vault).as_posix()]
 
 
 def test_new_outbox_leaf_for_unknown_entity_is_refused(tmp_path: Path):
@@ -745,6 +799,27 @@ def test_untracked_symlink_hashes_its_target_bytes_without_following_it(tmp_path
     assert fingerprint.digest != hashlib.sha256(external.read_bytes()).hexdigest()
 
 
+def test_dirty_fingerprint_never_follows_a_redirected_parent_directory(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    relative = "synthetic/11-library/active/tracked.md"
+    (vault / relative).write_text("committed bytes\n")
+    _git(vault, "add", relative)
+    _git(vault, "commit", "-q", "-m", "fixture: redirected parent")
+    module = vault / "synthetic/11-library"
+    module.rename(tmp_path / "original-module")
+    external_module = tmp_path / "external-module"
+    write_tree(external_module, {"active/tracked.md": "outside bytes\n"})
+    os.symlink(external_module, module, target_is_directory=True)
+
+    fingerprint = gate3.collect_dirty_fingerprints(vault)[relative]
+
+    assert fingerprint.kind == "redirected"
+    assert fingerprint.digest is None
+    assert fingerprint.digest != hashlib.sha256(b"outside bytes\n").hexdigest()
+
+
 def test_dirty_status_uses_no_renames_and_preserves_spaces_in_paths(tmp_path: Path):
     vault = _audit_vault(tmp_path, initialize_git=True)
     old = "synthetic/11-library/active/old name.md"
@@ -846,3 +921,21 @@ def test_cli_check_rejects_a_changed_baseline_dirty_path(
     path.write_text("after\n")
 
     assert gate3.main(["check"]) == 1
+
+
+def test_cli_check_uses_commit_relative_rules_before_an_entity_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    receipt = f"{old}/00-inbox/active/new-receipt.md"
+    (vault / receipt).write_text("redacted receipt\n")
+    _git(vault, "add", receipt)
+    _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+
+    assert gate3.main(["check"]) == 0

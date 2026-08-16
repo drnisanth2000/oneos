@@ -52,6 +52,36 @@ _REGISTRY_PATH = {
 }
 _DELETE_KINDS = frozenset({"product", "member"})
 _CANONICAL_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_CLASSIFY_RECORD_FIELDS = frozenset(
+    {
+        "id",
+        "action",
+        "entity",
+        "created",
+        "status",
+        "src",
+        "source_sha256",
+        "dst",
+        "module",
+        "sub",
+        "block",
+        "rule_id",
+    }
+)
+_DELETE_RECORD_FIELDS = frozenset(
+    {
+        "id",
+        "action",
+        "entity",
+        "kind",
+        "slug",
+        "created",
+        "status",
+        "total_references",
+        "impact",
+    }
+)
+_DELETE_IMPACT_FIELDS = frozenset({"front-matter", "workspaces", "books.db"})
 
 
 @dataclass(frozen=True)
@@ -93,16 +123,28 @@ class Audit:
 class AuditRules:
     root: Path
     active_modules: dict[str, frozenset[str]]
+    active_lifecycle_modules: dict[str, frozenset[str]]
 
     @classmethod
     def load(cls, vault: Path) -> "AuditRules":
         catalog = EntityCatalog.load(vault)
         runtime = Vault(catalog)
-        active = {
-            entity.slug: runtime.active_modules_for(Scope(catalog.root, entity.slug))
-            for entity in catalog.entities
-        }
-        return cls(root=catalog.root, active_modules=active)
+        active: dict[str, frozenset[str]] = {}
+        lifecycle: dict[str, frozenset[str]] = {}
+        for entity in catalog.entities:
+            scope = Scope(catalog.root, entity.slug)
+            entity_active = runtime.active_modules_for(scope)
+            active[entity.slug] = entity_active
+            lifecycle[entity.slug] = frozenset(
+                module
+                for module in entity_active
+                if runtime.module_spec(module).get("lifecycle_pattern", True)
+            )
+        return cls(
+            root=catalog.root,
+            active_modules=active,
+            active_lifecycle_modules=lifecycle,
+        )
 
     @property
     def entities(self) -> frozenset[str]:
@@ -262,32 +304,90 @@ def _fingerprint_path(
     status_value: str,
     index_entry: str | None,
 ) -> DirtyFingerprint:
-    path = vault / relative
+    parts = _path_parts(relative)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if parts is None or no_follow is None:
+        return DirtyFingerprint(status_value, index_entry, "redirected", None, None)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
     try:
-        metadata = path.lstat()
+        parent_descriptor = os.open(vault, directory_flags)
     except FileNotFoundError:
         return DirtyFingerprint(status_value, index_entry, "absence", None, None)
-    mode = stat.S_IMODE(metadata.st_mode)
-    if stat.S_ISREG(metadata.st_mode):
-        contents, opened_mode = _read_regular_no_follow(path)
-        return DirtyFingerprint(
-            status_value,
-            index_entry,
-            "file",
-            opened_mode,
-            hashlib.sha256(contents).hexdigest(),
-        )
-    if stat.S_ISLNK(metadata.st_mode):
-        target = os.fsencode(os.readlink(path))
-        return DirtyFingerprint(
-            status_value,
-            index_entry,
-            "symlink",
-            mode,
-            hashlib.sha256(target).hexdigest(),
-        )
-    kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "other"
-    return DirtyFingerprint(status_value, index_entry, kind, mode, None)
+    except OSError:
+        return DirtyFingerprint(status_value, index_entry, "redirected", None, None)
+    try:
+        for component in parts[:-1]:
+            try:
+                next_descriptor = os.open(
+                    component, directory_flags, dir_fd=parent_descriptor
+                )
+            except FileNotFoundError:
+                return DirtyFingerprint(
+                    status_value, index_entry, "absence", None, None
+                )
+            except OSError:
+                return DirtyFingerprint(
+                    status_value, index_entry, "redirected", None, None
+                )
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+
+        leaf = parts[-1]
+        try:
+            metadata = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return DirtyFingerprint(status_value, index_entry, "absence", None, None)
+        except OSError:
+            return DirtyFingerprint(
+                status_value, index_entry, "redirected", None, None
+            )
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISREG(metadata.st_mode):
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    leaf, os.O_RDONLY | no_follow, dir_fd=parent_descriptor
+                )
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode):
+                    return DirtyFingerprint(
+                        status_value, index_entry, "redirected", None, None
+                    )
+                with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                    descriptor = -1
+                    contents = stream.read()
+            except OSError:
+                return DirtyFingerprint(
+                    status_value, index_entry, "redirected", None, None
+                )
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            return DirtyFingerprint(
+                status_value,
+                index_entry,
+                "file",
+                stat.S_IMODE(opened.st_mode),
+                hashlib.sha256(contents).hexdigest(),
+            )
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                target = os.fsencode(os.readlink(leaf, dir_fd=parent_descriptor))
+            except OSError:
+                return DirtyFingerprint(
+                    status_value, index_entry, "redirected", None, None
+                )
+            return DirtyFingerprint(
+                status_value,
+                index_entry,
+                "symlink",
+                mode,
+                hashlib.sha256(target).hexdigest(),
+            )
+        kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "other"
+        return DirtyFingerprint(status_value, index_entry, kind, mode, None)
+    finally:
+        os.close(parent_descriptor)
 
 
 def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
@@ -358,7 +458,7 @@ def _active_destination(path: str, rules: AuditRules) -> tuple[str, str] | None:
         entity not in rules.entities
         or lifecycle != "active"
         or module in {"outbox", "staging", "_system"}
-        or module not in rules.active_modules[entity]
+        or module not in rules.active_lifecycle_modules[entity]
         or not _canonical_markdown_leaf(leaf)
     ):
         return None
@@ -429,6 +529,24 @@ def _parent_tree(
         temporary.cleanup()
         raise
     return temporary, tree, tracked
+
+
+def _audit_commit_history(
+    records: tuple[CommitRecord, ...], vault: Path
+) -> Audit:
+    result = Audit()
+    for record in records:
+        temporary: tempfile.TemporaryDirectory[str] | None = None
+        try:
+            temporary, commit_tree, _ = _parent_tree(vault, record.oid)
+            commit_rules = AuditRules.load(commit_tree)
+            audited = audit_commits((record,), commit_rules, vault)
+            result.sanctioned_commits.extend(audited.sanctioned_commits)
+            result.violating_commits.extend(audited.violating_commits)
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+    return result
 
 
 def _relative_to(path: Path, parent: Path) -> Path | None:
@@ -521,27 +639,44 @@ def audit_commits(
     return result
 
 
+def _canonical_created(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return False
+    return parsed.isoformat(timespec="seconds") == value
+
+
+def _canonical_classification_record(record: dict) -> bool:
+    return (
+        set(record) == _CLASSIFY_RECORD_FIELDS
+        and _canonical_created(record.get("created"))
+        and (
+            record.get("rule_id") is None
+            or isinstance(record.get("rule_id"), str)
+        )
+    )
+
+
 def _canonical_delete_record(record: dict) -> bool:
     kind = record.get("kind")
     slug = record.get("slug")
-    created = record.get("created")
     total = record.get("total_references")
     impact = record.get("impact")
     if (
-        kind not in _DELETE_KINDS
+        set(record) != _DELETE_RECORD_FIELDS
+        or kind not in _DELETE_KINDS
         or not isinstance(slug, str)
         or _CANONICAL_SLUG.fullmatch(slug) is None
-        or not isinstance(created, str)
-        or not created
+        or not _canonical_created(record.get("created"))
         or not isinstance(total, int)
         or isinstance(total, bool)
         or total < 0
         or not isinstance(impact, dict)
+        or set(impact) != _DELETE_IMPACT_FIELDS
     ):
-        return False
-    try:
-        datetime.fromisoformat(created)
-    except ValueError:
         return False
     if not all(
         isinstance(key, str)
@@ -597,8 +732,18 @@ def _new_proposal_is_sanctioned(
         ):
             return False
         if action == "classify":
+            if not _canonical_classification_record(loaded):
+                return False
             proposal = _to_proposal(path, loaded)
-            return _require_destination(scope, proposal).status == "pending"
+            proposal = _require_destination(scope, proposal)
+            source = _fingerprint_path(
+                rules.root, proposal.src, "  ", index_entry=None
+            )
+            return (
+                proposal.status == "pending"
+                and source.kind == "file"
+                and source.digest == proposal.source_sha256
+            )
         if not _canonical_delete_record(loaded):
             return False
         proposal = get_delete_proposal(scope, proposal_id)
@@ -726,7 +871,7 @@ def cmd_check() -> int:
     rules = AuditRules.load(vault)
     records = collect_commit_records(vault, head)
     after = collect_dirty_fingerprints(vault)
-    commit_audit = audit_commits(records, rules, vault)
+    commit_audit = _audit_commit_history(records, vault)
     dirty_audit = audit_dirty(before, after, rules, vault)
     result = Audit(
         sanctioned_commits=commit_audit.sanctioned_commits,
