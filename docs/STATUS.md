@@ -24,7 +24,8 @@ current step. Phase 2 is not authorized.
 | S3 — server-owned destinations | **COMPLETE** | One canonical resolver validates module/sub/flags/lifecycle paths, derives block, and revalidates stored proposals before reads or writes. |
 | S4 — proposal identity and freshness | **COMPLETE** | Collision-safe proposal IDs, exact-byte source SHA-256, no-follow snapshots, and visible stale/missing refusals are merged. |
 | S5 — Git transaction and audit | **COMPLETE** | Classification approval and registry deletion use exact-path alternate-index transactions with ownership-aware rollback; Gate 3 validates action-specific messages, paths, and dirty-state fingerprints. |
-| S6 — Console failures | **NEXT** | General safe error presentation follows the stable S2-S5 error taxonomy. |
+| S6 — Console failures | **IN DESIGN** | Design at `docs/superpowers/specs/2026-08-16-s6-visible-console-failures-design.md`, Review Pending after seven rounds. No application code written. |
+| S7 — bound review tokens | **PROPOSED** | Discovered while designing S6; not designed. See `BUILD.md`. |
 
 Merged S5 baseline: `0f71cd3`. Fresh verification of this reconciled branch
 recorded 603 public tests. The most recent private gate recorded 37 private
@@ -86,6 +87,42 @@ unless they demonstrate a reproducible defect in those guarantees.
 - **Console navigation** — the workspace switcher selects an entity or saved
   scope. `Blocks / Modules` are registry-backed views inside that scope.
 
+### Found while designing S6 — defects that predate it
+
+These were discovered by review of existing code, not introduced by S6. None is
+fixed yet; each is either scheduled inside S6 or recorded as its own step.
+
+- **Approval is not bound to reviewed content.** A proposal id names a mutable
+  file. See S7 in `BUILD.md`. Confirmed real by three independent reviews.
+- **Request rebinding through hand-built `hx-vals`.** Two registry templates
+  interpolate a value into hand-written JSON. Jinja escapes the quote, the
+  browser decodes it inside the attribute, and duplicate JSON keys resolve
+  last-wins — so a crafted slug can append a second `id` and rebind approval to
+  a proposal other than the one previewed. `templates/triage.html` already uses
+  the correct `| tojson` pattern; the registry templates did not follow it.
+- **One malformed outbox record disables the entity.** `load_proposals` raises
+  on the first bad file, so `approve`, `reject`, and the outbox screen all fail
+  for every proposal, not just the bad one.
+- **Ambiguous exception bases.** `CrossScopeError`, `ReviewedStateConflict`,
+  `UnsafeDestinationPath`, and `InvalidSourceLeaf` each cover both an integrity
+  finding and an ordinary condition, so a redirected path and a merely absent
+  one are indistinguishable to any caller.
+- **Exception narrowing hides outcomes.** Four service boundaries collapse a
+  specific outcome into a generic wrapper. The worst reports a *committed*
+  transaction as "rolled back, nothing changed, retry" — a Gate 2 break, since
+  retrying produces a second commit for one reviewed action.
+- **Registry readers are shape-fragile.** A registry that is valid YAML but
+  wrongly shaped parses cleanly and then raises `AttributeError`/`TypeError` on
+  access; `yaml.safe_load(...) or {}` guards only the empty case.
+- **Unescaped reflection in registry delete.** Both branches of
+  `registry_delete_execute` interpolate into an f-string `HTMLResponse`, and the
+  success branch reflects the submitted `slug`, which is never compared against
+  the proposal's own.
+- **The Gate 1 stopwatch infers success from transport.** It counts
+  `htmx:afterRequest` successes, so any refusal returned as 200 would be counted
+  as a triaged item. S6 moves it to a success-only signal emitted after
+  persistence.
+
 The full S1-S5 failure record, fixes, threat boundaries, and workflow lessons
 are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
@@ -106,8 +143,14 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-Complete S6 from merged `origin/main`. Do not start Phase 2, deploy, or add
-deferred UI while S6 or the live exit gates remain open.
+S6 is in design, not implementation. Its design has been through seven review
+rounds and remains **Review Pending**; no application code has been written. The
+implementation plan is superseded and will be rewritten only after the design
+receives fresh whole-document approval, from a base rebased onto current
+`origin/main`.
+
+Do not start Phase 2, deploy, or add deferred UI while S6 or the live exit gates
+remain open. S7 is proposed but must not begin before S6 merges.
 
 ---
 

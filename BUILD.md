@@ -57,10 +57,26 @@ This is hardening of Phase 1, not a new feature phase. Complete in this order:
 | S4 | **COMPLETE** | **Fresh, collision-safe proposals.** Store source SHA-256 and use a collision-safe proposal id. | Changed or missing sources are visibly refused at approval; same-second proposals never overwrite each other. |
 | S5 | **COMPLETE** | **Isolated Git transaction and audit.** Commit exactly the reviewed paths, restore filesystem/index/proposal state on failure, and make Gate 3 validate both sanctioned message type and changed paths—including `ingest:` receipts. | Unrelated staged and unstaged changes remain untouched; injected commit failure leaves no partial move; a misleading commit prefix cannot sanction unrelated paths; one revert restores the full approved batch. |
 | S6 | **NEXT** | **Visible Console failures.** Return specific safe errors through the Command Center surface. | Stale, invalid, missing, cross-scope, and Git failures are visible and no route silently swallows them. |
+| S7 | **PROPOSED** | **Bound review tokens.** Bind an approval to the exact proposal bytes the operator reviewed, not to a mutable id. | A proposal rewritten between preview and approval, keeping its id and filename, is visibly refused before any mutation; approve, reject, and registry-delete execution all carry the reviewed digest. |
 
 S1-S5 are recorded as built, including review findings and intentional threat
 boundaries, in `docs/SAFETY-FOUNDATION-S1-S4.md` and its S5 addendum. Their old
 execution plans are historical records and must not be run again.
+
+S7 was discovered while designing S6 and is **proposed, not designed**. A
+proposal id names a mutable file: `require_proposal_identity` checks id grammar
+and filename equality only, and `approve`, `reject`, and `execute_delete` each
+take an id alone and compare the record only against another read made during
+the same request. Nothing binds an approval to the bytes the operator reviewed,
+so a same-id rewrite between preview and approval passes every existing check.
+
+Three independent reviews confirmed the gap is real, that S6 neither introduces
+nor widens it — the malformed file needed to degrade the listing also makes
+`approve` and `reject` raise for every id — and that S6 may merge with it open.
+The fix mirrors S4 exactly, one artifact further out: S4 bound the source
+receipt with a SHA-256 and refused stale approvals; S7 binds the proposal record
+the same way. It adds a refusal condition and changes three service signatures,
+which is why it is a step and not an S6 edit.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved
