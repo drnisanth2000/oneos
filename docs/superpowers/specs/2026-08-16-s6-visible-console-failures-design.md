@@ -1,6 +1,6 @@
 # S6 — Visible Console Failures
 
-**Status:** Approved
+**Status:** Review pending — not approved for implementation planning
 
 **Base:** `origin/main` at `3585938` (merged S5 and the S1-S5 documentation
 reconciliation). Public baseline: 603 tests.
