@@ -1,5 +1,15 @@
 # S6 Visible Console Failures Implementation Plan
 
+> **SUPERSEDED — DO NOT EXECUTE.** This plan was written against an earlier
+> design structure that two independent reviews rejected. It contradicts the
+> current design on at least four points: it omits the HTMX `responseHandling`
+> configuration entirely and still asserts the pre-fix premise; it renders a
+> working reject control on unreadable outbox records; it discards the per-code
+> page-status table; and its route bodies use blanket `except Exception`, which
+> is the catch-all the design forbids and would launder every programmer error
+> into a 200 fragment. It will be replaced once the rewritten design receives a
+> fresh whole-document approval.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make every typed Command Center refusal reach the operator as a
