@@ -1,5 +1,10 @@
 # S4 Fresh, Collision-Safe Proposals Implementation Plan
 
+> **Historical execution plan:** S4 is implemented and merged through PR #9 at
+> `3c56119`. Retain this file for design/test rationale; do not run its branch,
+> commit, stop, or test-count instructions again. Current state is in
+> `BUILD.md`, `docs/STATUS.md`, and `docs/SAFETY-FOUNDATION-S1-S4.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make every proposal collision-safe and bind each classification approval to the exact source receipt bytes present when the proposal was created.

@@ -1,5 +1,10 @@
 # OneOS S2 Request-Local Scope Implementation Plan
 
+> **Historical execution plan:** S2 is implemented and merged in the PR #6
+> lineage. Retain this file for design/test rationale; do not run its branch,
+> commit, stop, or test-count instructions again. Current state is in
+> `BUILD.md`, `docs/STATUS.md`, and `docs/SAFETY-FOUNDATION-S1-S4.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace OneOS's mutable process-wide entity selection with an immutable, manifest-validated request scope and deterministically route shared-mailbox email to exactly one configured entity.

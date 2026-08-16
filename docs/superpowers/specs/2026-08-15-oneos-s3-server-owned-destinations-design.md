@@ -2,7 +2,10 @@
 
 **Date:** 2026-08-15
 
-**Status:** Approved for implementation planning
+**Status:** Implemented and merged; historical design record
+
+**Implementation:** PR #6 merged at `21da6fe`. Do not use this file as a
+current execution plan.
 
 **Authority:** `BUILD.md` Safety Foundation, the private OneOS specification,
 the authoritative vault conventions, and the approved module-general decision

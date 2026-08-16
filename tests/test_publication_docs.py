@@ -55,3 +55,45 @@ def test_local_install_creates_binary_directory_first():
 
     assert create in text
     assert text.index(create) < text.index(install)
+
+
+def test_safety_foundation_status_tracks_merged_s1_through_s5():
+    build = Path("BUILD.md").read_text(encoding="utf-8")
+    status = Path("docs/STATUS.md").read_text(encoding="utf-8")
+
+    for step in ("S1", "S2", "S3", "S4", "S5"):
+        assert f"| {step} | **COMPLETE** |" in build
+    assert "| S6 | **NEXT** |" in build
+    assert "Merged S5 baseline: `0f71cd3`" in status
+
+    stale_claims = (
+        "real ingest currently creates an uncommitted item",
+        "Start with commit-on-ingest",
+        "app/ingest/base.write_inbox_item",
+        "canonical `f84625b` is the fifth remote commit",
+        "**and an empty git status**",
+        "S5 is the current step",
+        "**OPEN — S5**",
+    )
+    combined = build + "\n" + status
+    assert all(claim not in combined for claim in stale_claims)
+
+
+def test_completed_execution_plans_are_marked_historical():
+    paths = (
+        "docs/superpowers/plans/2026-08-07-oneos-canonical-naming-cutover.md",
+        "docs/superpowers/plans/2026-08-07-oneos-private-github-agent-workflow.md",
+        "docs/superpowers/plans/2026-08-13-oneos-s2-request-local-scope.md",
+        "docs/superpowers/plans/2026-08-15-oneos-s3-server-owned-destinations.md",
+        "docs/superpowers/plans/2026-08-15-s4-fresh-collision-safe-proposals.md",
+        "docs/superpowers/plans/2026-08-16-s5-isolated-git-transaction-audit.md",
+    )
+
+    for path in paths:
+        opening = Path(path).read_text(encoding="utf-8")[:600]
+        assert "Historical execution plan" in opening
+
+    lessons = Path("docs/SAFETY-FOUNDATION-S1-S4.md").read_text(
+        encoding="utf-8"
+    )
+    assert "This document records the built guarantees" in lessons

@@ -1,5 +1,9 @@
 # OneOS Canonical Naming Cutover Implementation Plan
 
+> **Historical execution plan:** the canonical naming cutover is complete.
+> Retain this file for migration rationale; do not rerun its private/public
+> rename commands or historical test-count instructions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make OneOS the sole active product name across the application and private system material while preserving Grey Matter, Command Center, and Hermes as component names.

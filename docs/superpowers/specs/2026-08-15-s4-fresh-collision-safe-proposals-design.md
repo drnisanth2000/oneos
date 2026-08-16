@@ -2,7 +2,10 @@
 
 **Date:** 2026-08-15
 
-**Status:** Approved
+**Status:** Implemented and merged; historical design record
+
+**Implementation:** PR #9 merged at `3c56119`. Do not use this file as a
+current execution plan.
 
 **Base:** `origin/main` at `faa3894` (S3, merged S1 containment, and the standalone Gitleaks baseline hotfix)
 

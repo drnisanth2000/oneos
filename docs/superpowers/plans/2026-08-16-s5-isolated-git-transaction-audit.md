@@ -1,5 +1,10 @@
 # S5 Isolated Git Transaction and Audit Implementation Plan
 
+> **Historical execution plan:** S5 was implemented and merged through PR #10
+> at `0f71cd3`. Do not create its branch, execute its tasks, or use its old test
+> counts and stop conditions as current instructions. Current sequencing lives
+> in `BUILD.md` and `docs/STATUS.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make classification approval and approved registry deletion isolated, exactly-scoped, revertible Git transactions, and make Gate 3 sanction commits only when both their action message and changed paths are valid.

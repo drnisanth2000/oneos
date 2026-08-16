@@ -1,5 +1,9 @@
 # OneOS Private GitHub and Agent Workflow Implementation Plan
 
+> **Historical execution plan:** the private GitHub/agent bootstrap is complete.
+> Retain this file for publication-boundary rationale; do not recreate the
+> repository or rerun its bootstrap/history-cutover commands.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Publish a clean, private OneOS source repository to GitHub and establish CI, pull-request review, Codex cloud, and local private-vault integration gates without uploading old contaminated history or Grey Matter.

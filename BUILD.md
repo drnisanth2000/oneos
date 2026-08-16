@@ -16,7 +16,8 @@ stop and ask a human.
 2. Build it. Smallest thing that satisfies the done-when.
 3. Run §3 self-check. All three must pass.
 4. Commit. One commit per step, message naming the step number.
-5. Move to the next step. Do not skip. Do not batch two steps
+5. Merge the reviewed step into `origin/main` and rerun its merged baseline.
+6. Move to the next step. Do not skip. Do not batch two steps
    unless the first would only exist to be deleted (see step 1-2
    precedent: they were merged for exactly that reason).
 ```
@@ -42,20 +43,24 @@ done-when to match what you built.
 
 ---
 
-## Safety Foundation — next, before live gate trials
+## Safety Foundation — before live gate trials
 
 The original steps 1–10 exist, but review found that their tests do not yet
 prove the safety guarantees against real adapter output or concurrent requests.
 This is hardening of Phase 1, not a new feature phase. Complete in this order:
 
-| # | Hardening task | Done when |
-|---|---|---|
-| S1 | **Commit on ingest.** After redaction, the shared ingest path creates one `ingest:` commit containing only the inbox receipt. Raw content stays outside the vault. | A real adapter-created item is tracked; approval is one later commit; reverting approval restores it to triage. Duplicate intake is a no-op. |
-| S2 | **Request-local entity scope and deterministic adapter routing.** Bind an immutable scope per request, validate the entity against `entities.yaml`, and route shared-mailbox intake by the recipient addresses configured for each entity in that manifest. | Concurrent requests for different entities cannot read, propose, approve, or render each other's paths. Email addressed to one configured entity creates intake only in that entity; unknown or ambiguous recipients create nothing. |
-| S3 | **Server-owned destinations.** Validate active module and `sub:` against registries, derive `block` server-side, and prove resolved paths remain in scope. | Tampered entity/module/sub/block values and traversal attempts fail before a proposal is written. |
-| S4 | **Fresh, collision-safe proposals.** Store source SHA-256 and use a collision-safe proposal id. | Changed or missing sources are visibly refused at approval; same-second proposals never overwrite each other. |
-| S5 | **Isolated Git transaction and audit.** Commit exactly the reviewed paths, restore filesystem/index/proposal state on failure, and make Gate 3 validate both sanctioned message type and changed paths—including `ingest:` receipts. | Unrelated staged and unstaged changes remain untouched; injected commit failure leaves no partial move; a misleading commit prefix cannot sanction unrelated paths; one revert restores the full approved batch. |
-| S6 | **Visible Console failures.** Return specific safe errors through the Command Center surface. | Stale, invalid, missing, cross-scope, and Git failures are visible and no route silently swallows them. |
+| # | State | Hardening task | Done when |
+|---|---|---|---|
+| S1 | **COMPLETE** | **Commit on ingest.** After redaction, the shared ingest path creates one `ingest:` commit containing only the inbox receipt. Raw content stays outside the vault. | A real adapter-created item is tracked; approval is one later commit; reverting approval restores it to triage. Duplicate intake is a no-op. |
+| S2 | **COMPLETE** | **Request-local entity scope and deterministic adapter routing.** Bind an immutable scope per request, validate the entity against `entities.yaml`, and route shared-mailbox intake by the recipient addresses configured for each entity in that manifest. | Concurrent requests for different entities cannot read, propose, approve, or render each other's paths. Email addressed to one configured entity creates intake only in that entity; unknown or ambiguous recipients create nothing. |
+| S3 | **COMPLETE** | **Server-owned destinations.** Validate active module and `sub:` against registries, derive `block` server-side, and prove resolved paths remain in scope. | Tampered entity/module/sub/block values and traversal attempts fail before a proposal is written. |
+| S4 | **COMPLETE** | **Fresh, collision-safe proposals.** Store source SHA-256 and use a collision-safe proposal id. | Changed or missing sources are visibly refused at approval; same-second proposals never overwrite each other. |
+| S5 | **COMPLETE** | **Isolated Git transaction and audit.** Commit exactly the reviewed paths, restore filesystem/index/proposal state on failure, and make Gate 3 validate both sanctioned message type and changed paths—including `ingest:` receipts. | Unrelated staged and unstaged changes remain untouched; injected commit failure leaves no partial move; a misleading commit prefix cannot sanction unrelated paths; one revert restores the full approved batch. |
+| S6 | **NEXT** | **Visible Console failures.** Return specific safe errors through the Command Center surface. | Stale, invalid, missing, cross-scope, and Git failures are visible and no route silently swallows them. |
+
+S1-S5 are recorded as built, including review findings and intentional threat
+boundaries, in `docs/SAFETY-FOUNDATION-S1-S4.md` and its S5 addendum. Their old
+execution plans are historical records and must not be run again.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved
@@ -75,15 +80,18 @@ uv run python -m pytest -q
 # 2. The vault's tests — you must not have broken them
 cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover -q; cd -
 
-# 3. The vault is unchanged and clean
+# 3. The vault remains byte-identical to its before-state
 python3 "$ONEOS_VAULT/_system/scripts/check_v2.py" "$ONEOS_VAULT" | tail -2
-git -C "$ONEOS_VAULT" status --short
 ```
 
-Check 2 must show 34+ tests OK. Check 3 must show
-`0 error(s), 0 warning(s)` **and an empty git status** — if the vault has
-uncommitted changes, you wrote to it, which is invariant 1 violated. Revert
-and start the step again.
+Check 2 must show 37+ tests OK. Check 3 must show
+`0 error(s), 0 warning(s)`. Before the first private command, capture opaque
+`git status --porcelain=v2 --untracked-files=all`, worktree binary diff, and
+cached binary diff outside both repositories. Compare each file byte-for-byte
+immediately after the private gates. A clean vault remains clean; a vault with
+approved pre-existing edits must retain exactly those edits. Never print the
+snapshots or treat an already-dirty vault as proof that the current task wrote
+to it.
 
 ### Public and private repository audits
 
@@ -110,6 +118,13 @@ tools/run_gitleaks.sh .
 uv run python -m tools.public_repo_audit --repo . --history
 uv run python -m tools.public_repo_audit --repo . --vault "$ONEOS_VAULT" --history
 ```
+
+`tools/run_gitleaks.sh` uses Gitleaks Git mode and therefore scans every
+reachable local ref. If identical trees behave differently across clones,
+locate the retaining branch, tag, or worktree ref first. Do not weaken the
+scanner or add a broad ignore to hide clone-local obsolete history. An ignore
+entry is acceptable only as an exact fingerprint for history that is
+deliberately retained.
 
 GitHub CI runs Gitleaks and the vault-free OneOS command against synthetic
 repository state only. It receives no vault path, registry, database, or
