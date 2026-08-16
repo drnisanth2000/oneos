@@ -2,8 +2,8 @@
 
 **Status:** Approved for implementation planning
 
-**Base:** `origin/main` at `3585938` (merged S5 and the S1-S5 documentation
-reconciliation). Public baseline: 603 tests. Private baseline: 37 tests.
+**Base:** `origin/main` at `a42ee12`. Public baseline: 603 tests. Private
+baseline: 37 tests.
 
 **History:** eight review rounds plus a closure pass. The document was rewritten
 twice — once when the recurring cause proved architectural rather than local,
