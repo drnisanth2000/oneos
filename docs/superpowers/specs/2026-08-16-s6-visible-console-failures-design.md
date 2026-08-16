@@ -73,8 +73,21 @@ resolve through their parent by this rule and need no entry.
 `E-UNKNOWN`. It never raises, never returns `None`, and never falls through to
 a bare `except`.
 
-The module imports no route, template, service, or registry module, so it
-cannot introduce a circular import and can be tested alone.
+### Import direction
+
+`console_errors.py` imports the application's exception classes directly and
+keys the table on the classes themselves. String-qualified class names were
+considered and rejected: they are not refactor-safe, and a renamed class would
+degrade silently to `E-UNKNOWN` rather than failing at import.
+
+The boundary is therefore one-way and asserted, not avoided: presentation
+imports domain, and **no application service, route helper, or registry module
+imports `console_errors`.** A test walks `app/` and fails if any module other
+than the route layer and the renderer imports it.
+
+This is why the degradation in the outbox listing produces no `ConsoleError`
+inside the service (see below). Had the service needed to describe its own
+failures, the cycle would be real.
 
 ### Transparent wrappers
 
@@ -118,24 +131,65 @@ express one without failing its own test.
 
 ### Codes
 
-| Code | Severity | Retry | Committed | Surface | Covers |
-|---|---|---|---|---|---|
-| `E-STALE` | refusal | recreate | no | inline | `StaleProposalSource` |
-| `E-MISSING` | refusal | recreate | no | inline | `MissingProposalSource` |
-| `E-INVALID` | refusal | recreate | no | inline | `OutboxError`, `OutboxDestinationError`, `ProposalIdentityError` |
-| `E-DEST` | refusal | recreate | no | inline | `DestinationError` and subclasses |
-| `E-SCOPE` | refusal | none | no | inline | `CrossScopeError`, `OutboxScopeError` |
-| `E-BUSY` | refusal | retry | no | inline | `VaultBusyError` |
-| `E-CONFLICT` | refusal | reload | no | inline | `ReviewedStateConflict` |
-| `E-GIT` | refusal | retry | no | inline | `GitTransactionError`, `GitTransactionFailure`, and the two transparent wrappers `OutboxTransactionError` and `RegistryTransactionError` when they carry no cause |
-| `E-RECOVER` | attention | stop | unknown | inline | `GitTransactionRecoveryError` |
-| `E-COMMITTED` | attention | stop | yes | inline | `GitTransactionCommittedError` |
-| `E-REGISTRY` | refusal | reload | no | inline | `RegistryError` |
-| `E-CONFIG` | attention | none | no | page | `DestinationRegistryError`, `EntityManifestError` and subclasses |
-| `E-ENTITY` | refusal | none | no | page | `EntitySelectionError` |
-| `E-INGEST` | refusal | none | no | inline | `IngestError` and subclasses |
-| `E-ADMIN` | refusal | none | no | inline | `RenameError` |
-| `E-UNKNOWN` | attention | stop | unknown | page | anything unmapped |
+| Code | Severity | Retry | Committed | Surface | Page status | Covers |
+|---|---|---|---|---|---|---|
+| `E-STALE` | refusal | recreate | no | inline | 409 | `StaleProposalSource` |
+| `E-MISSING` | refusal | recreate | no | inline | 409 | `MissingProposalSource` |
+| `E-INVALID` | refusal | recreate | no | inline | 422 | `OutboxError`, `OutboxDestinationError`, `ProposalIdentityError` |
+| `E-DEST` | refusal | recreate | no | inline | 422 | `DestinationError` and subclasses |
+| `E-SCOPE` | refusal | none | no | inline | 404 | `CrossScopeError`, `OutboxScopeError` |
+| `E-BUSY` | refusal | retry | no | inline | 409 | `VaultBusyError` |
+| `E-CONFLICT` | refusal | reload | no | inline | 409 | `ReviewedStateConflict` |
+| `E-GIT` | refusal | retry | no | inline | 500 | `GitTransactionError`, `GitTransactionFailure`, and the two transparent wrappers when they carry no cause |
+| `E-RECOVER` | attention | stop | unknown | inline | 500 | `GitTransactionRecoveryError` |
+| `E-COMMITTED` | attention | stop | yes | inline | 500 | `GitTransactionCommittedError` |
+| `E-REGISTRY` | refusal | reload | no | inline | 422 | `RegistryError` |
+| `E-REQUEST` | refusal | recreate | no | inline | 422 | `RequestValidationError`, `HTTPException` below 500 |
+| `E-CONFIG` | attention | none | no | page | 500 | `DestinationRegistryError`, `EntityManifestError` and subclasses |
+| `E-ENTITY` | refusal | none | no | page | 404 | `EntitySelectionError` |
+| `E-INGEST` | refusal | none | no | inline | 500 | `IngestError` and subclasses |
+| `E-ADMIN` | refusal | none | no | inline | 500 | `RenameError` |
+| `E-UNKNOWN` | attention | stop | unknown | page | 500 | anything unmapped |
+
+`E-SCOPE` returns 404 rather than 403 deliberately: a distinct authorization
+status would itself confirm that the resolved-toward resource exists. See the
+disclosure boundary below.
+
+### Exact message text
+
+These strings are the contract. They are versioned with the code and may not be
+reworded casually, because an operator learns them.
+
+| Code | Message |
+|---|---|
+| `E-STALE` | Approval refused: the source changed after this proposal was created. Create a fresh proposal. |
+| `E-MISSING` | Approval refused: the source is missing. Restore it or reject the proposal. |
+| `E-INVALID` | This proposal record is not valid and cannot be approved. Create a new proposal. |
+| `E-DEST` | The destination could not be resolved from the registries. Re-classify this item. |
+| `E-SCOPE` | Refused: the request resolved outside the selected entity. |
+| `E-BUSY` | Another approval is in progress. Nothing was changed. Try again in a moment. |
+| `E-CONFLICT` | The reviewed files changed since this proposal was previewed. Reload and review again. |
+| `E-GIT` | The commit failed and was rolled back. Nothing was changed. |
+| `E-RECOVER` | Rollback was blocked by a change made at the same time. Do not retry. Inspect vault state with git status and resolve it before continuing. |
+| `E-COMMITTED` | The commit succeeded; only the cleanup afterwards failed. Do not retry — retrying would commit this action twice. Inspect vault state with git status. |
+| `E-REGISTRY` | The registry operation was refused. Review the impact report and try again. |
+| `E-REQUEST` | The form could not be read. Reload the screen and try again. |
+| `E-CONFIG` | The vault registries could not be read. The Console cannot operate on this entity until they are valid. |
+| `E-ENTITY` | That entity is not in the manifest. |
+| `E-INGEST` | Intake failed. Nothing was written to the vault. |
+| `E-ADMIN` | The administrative operation was refused. |
+| `E-UNKNOWN` | An unexpected error was not handled. Inspect vault state with git status before continuing. |
+
+Two wording invariants are asserted by test rather than left to review:
+
+- The `E-COMMITTED` message must contain both an affirmative statement that the
+  commit succeeded and an explicit instruction not to retry.
+- No `attention` message may contain the word "again" in a retry sense; both
+  `E-RECOVER` and `E-COMMITTED` must direct the operator to inspect state.
+
+Retry guidance is **text only**. S6 renders no retry button, because an
+affordance would invite exactly the second commit `E-COMMITTED` exists to
+prevent. `retry` drives test assertions and future affordances, not markup.
 
 Codes are stable identifiers. They may be added but never renamed or reused,
 because an operator's screenshot must stay resolvable against a later build.
@@ -182,6 +236,56 @@ header:
 
 Both paths read the same `ConsoleError`. Message text exists in one place and
 is never duplicated per surface.
+
+### Fragments must stay visible without laundering a fault
+
+Returning 200 for a handled domain refusal is sound: the refusal is an expected
+outcome and the body carries it. It is **not** sound for an unhandled
+exception, which must stay a 500 so monitoring and tests can see a defect. But
+a 500 that HTMX will not swap leaves the operator staring at an unchanged
+screen — the exact failure S6 exists to remove.
+
+HTMX 2.0.4 resolves this in configuration rather than status laundering. Its
+`htmx.config.responseHandling` defaults to
+`[{code:"204",swap:false},{code:"[23]..",swap:true},{code:"[45]..",swap:false,error:true}]`.
+The Console overrides the last entry so 4xx and 5xx responses swap while still
+being recorded as errors:
+
+```js
+htmx.config.responseHandling = [
+  {code: "204", swap: false},
+  {code: "[23]..", swap: true},
+  {code: "[45]..", swap: true, error: true},
+];
+```
+
+This is a configuration line in the existing shell template. It adds no
+dependency, no extension, and no new JavaScript file, and it is set once for
+every screen so no route can forget it.
+
+With it, the two statuses stop competing: handled refusals return 200, unhandled
+faults return their true 500, and both are swapped and visible. The fragment
+renderer therefore returns the code's page status for `E-UNKNOWN` even on an
+HTMX request.
+
+A test asserts the configuration is present in the rendered shell, because a
+silent revert would make every unhandled HTMX failure invisible again while
+every other test continued to pass.
+
+### Framework validation failures
+
+Every mutating route declares required `Form(...)` parameters. A missing or
+malformed field is rejected by FastAPI before any handler runs, producing a 422
+JSON body that HTMX will not render and no route can catch.
+
+`RequestValidationError` and `HTTPException` below 500 therefore map to
+`E-REQUEST` through dedicated FastAPI exception handlers. Those handlers use the
+same description table and the same renderers.
+
+`E-REQUEST` never echoes the rejected value, the field name, or FastAPI's
+validation detail. A malformed field is a client-side or tampering condition,
+and reflecting the submitted value back into HTML is precisely the leak the
+disclosure boundary forbids.
 
 `static/app.css` gains `.alert` and `.alert-attention`. S4's borrowed
 `.diff-head` styling for `approval_error` is replaced. Every alert carries
@@ -240,11 +344,21 @@ S6 must not become a catch-all that hides defects. Three rules keep it honest:
 - Stdlib exception types are **not** in the table. Mapping `ValueError` would
   silently capture every application error inheriting from it, and describing
   an unanticipated programming fault as a routine refusal would be dishonest.
-  `vault.py` raises bare `ValueError` for malformed registries and those raises
-  are reachable from the reading routes; where such a raise represents a
-  registry-validity condition the Console should name, S6 may convert that
-  single raise to the existing `DestinationRegistryError`. It adds no new error
-  type and changes no refusal.
+  `vault.py` raises bare `ValueError` at exactly three reachable sites, all
+  registry-validity conditions the Console should name:
+
+  | Site | Condition |
+  |---|---|
+  | `app/vault.py:84` | `archetypes.yaml` has no `modules:` key |
+  | `app/vault.py:101` | an entity declares an unknown archetype |
+  | `app/vault.py:106` | an entity declares an unknown flag |
+
+  All three convert to the existing `DestinationRegistryError`, which already
+  means "a registry could not be read as valid" and already maps to `E-CONFIG`.
+  No new error type is introduced and no refusal changes: the same inputs are
+  rejected at the same points. Each site gets a characterization test capturing
+  its current behavior before the type changes, so the conversion is proven to
+  preserve it. No other bare `raise` in the application is converted.
 - The global handler returns **500**, never 200. A programmer error must not be
   laundered into a successful-looking response.
 - A test asserts the global handler is not reached for any described error, so
@@ -258,18 +372,36 @@ and because the error-rendering path calls `load_proposals` again, rendering
 the alert raises the same exception and produces a server fault instead of the
 message.
 
-Under S6 the listing degrades per record. Each file resolves either to a valid
-proposal or to an unreadable-record placeholder carrying its `ConsoleError`.
-Valid proposals continue to render and remain approvable. A placeholder renders
-as a refused row showing its code, with approval unavailable and rejection
-available, so a bad record can be cleared through the Console rather than by
-editing the vault by hand.
+Under S6 the strict loader is left exactly as it is. Every mutating path —
+`approve`, `reject`, `get_proposal` — keeps calling `load_proposals` and keeps
+its fail-closed behavior. S6 adds a **presentation-only tolerant projection**
+used solely to render the listing.
 
-This narrows the blast radius; it does not relax a refusal. An unreadable
-record is still never approvable, and every identity, destination, scope, and
-freshness check keeps its existing authority. Reporting the bad record is also
-strictly safer than a blank screen, which conceals the tampering it is
-reacting to.
+The projection yields, per file, either a usable proposal or a refused row
+identified by filename alone. A refused row is **neither approvable nor
+rejectable**, and carries `retry = stop`.
+
+Rejection is deliberately withheld. `reject` resolves its target through
+`get_proposal`, which calls the strict loader, so a malformed record fails
+before a proposal can be returned. Making such a file deletable would require a
+new destructive service contract that deletes a path the domain has never
+validated — a change to what the Console is allowed to destroy, not to how a
+refusal is displayed. That contradicts this design's central promise and is out
+of scope. If Console deletion of malformed records is wanted, it needs its own
+design with explicit lexical-path and ownership rules.
+
+The projection produces no `ConsoleError` inside the service. It reports the
+failure as data the route layer describes, which is what keeps the import
+boundary one-way.
+
+The operator's recovery path for a malformed record is therefore to repair or
+remove the file outside the Console. The refused row names the file and says so.
+
+This narrows the blast radius without relaxing a refusal: valid proposals stay
+visible and approvable, the bad record stays unusable, and every identity,
+destination, scope, and freshness check keeps its existing authority. Reporting
+the bad record is also strictly safer than a blank screen, which conceals the
+tampering it is reacting to.
 
 ## Disclosure boundary
 
@@ -312,9 +444,14 @@ stages nothing, creates no directory, and acquires no lock.
 - `E-COMMITTED` carries `committed = yes` and retry `stop`; `E-RECOVER` carries
   `committed = unknown` and retry `stop`.
 - A class absent from the table resolves through its MRO to its parent.
-- Each S5 outcome wrapped in `OutboxTransactionError` and in
-  `RegistryTransactionError` resolves to its own code, not to `E-GIT`. This is
-  asserted for all five outcomes through both wrappers.
+- Each S5 outcome resolves to its own code, not to `E-GIT`, asserted for all
+  five outcomes through **both real service paths**. The failure is injected
+  into the transaction layer and allowed to propagate through the actual
+  `approve` and `execute_delete` wrappers; the test never constructs a wrapper
+  by hand, because a hand-built wrapper would still pass if the service stopped
+  chaining with `from exc`.
+- No application service, route helper, or registry module imports
+  `console_errors`. A test walks `app/` and asserts the boundary is one-way.
 - A transparent wrapper with no `__cause__` resolves to `E-GIT`.
 - A transparent wrapper whose cause is itself transparent resolves after one
   step and does not recurse further.
@@ -348,7 +485,15 @@ stages nothing, creates no directory, and acquires no lock.
 - Rendering an alert never raises, including when the outbox contains a
   malformed record alongside valid ones.
 - A malformed record renders as one refused row while every valid proposal
-  still renders and remains approvable.
+  still renders and remains approvable. The refused row offers neither an
+  approve nor a reject control, and posting either action for that filename is
+  still refused by the unchanged strict loader.
+- A missing or malformed form field renders `E-REQUEST` on both surfaces and
+  echoes neither the field name nor the submitted value.
+- The rendered shell contains the `responseHandling` override, so an unhandled
+  HTMX failure is swapped and visible while still returning 500.
+- An unhandled exception during an HTMX request returns 500 **and** a body the
+  operator can see.
 - An error whose internal text contains markup renders escaped.
 - Rendered alerts contain no path separators, no entity slug from the fixture
   manifest, no commit id, and no echoed request value.
