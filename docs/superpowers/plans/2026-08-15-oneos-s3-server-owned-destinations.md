@@ -1,5 +1,10 @@
 # OneOS Safety Foundation S3 — Server-Owned Destinations Implementation Plan
 
+> **Historical execution plan:** S3 is implemented and merged through PR #6 at
+> `21da6fe`. Retain this file for design/test rationale; do not run its branch,
+> commit, stop, or test-count instructions again. Current state is in
+> `BUILD.md`, `docs/STATUS.md`, and `docs/SAFETY-FOUNDATION-S1-S4.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make one server-side resolver the only authority for classification module, sub-module, block, and destination path, rejecting tampered or non-canonical values before proposal writes or unsafe reads.

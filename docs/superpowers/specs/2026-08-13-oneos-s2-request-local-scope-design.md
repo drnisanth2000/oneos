@@ -2,7 +2,10 @@
 
 **Date:** 2026-08-13
 
-**Status:** Approved for implementation planning
+**Status:** Implemented and merged; historical design record
+
+**Implementation:** Included in the PR #6 lineage merged at `21da6fe`. Do not
+use this file as a current execution plan.
 
 **Authority:** `BUILD.md` Safety Foundation, the private OneOS specification,
 and the approved recipient-address routing decision

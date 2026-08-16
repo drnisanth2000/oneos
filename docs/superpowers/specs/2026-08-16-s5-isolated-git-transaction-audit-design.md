@@ -1,6 +1,9 @@
 # S5 — Isolated Git Transaction and Audit
 
-**Status:** Approved
+**Status:** Implemented and merged; historical design record
+
+**Implementation:** PR #10 merged at `0f71cd3`. Do not use this file as a
+current execution plan.
 
 **Base:** `origin/main` at `3c56119` (merged S4)
 

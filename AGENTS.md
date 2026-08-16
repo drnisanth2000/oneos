@@ -33,9 +33,9 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 **Where `conventions.md` v2 and anything in `docs/` disagree, v2 wins.**
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
-Current task: the **Safety Foundation** in `BUILD.md`, required before live
-Phase 1 gate trials. It hardens the existing steps 1–10; it does not unlock a
-new phase or authorize deferred screens.
+Current task: the remaining **Safety Foundation** work marked in `BUILD.md`,
+required before live Phase 1 gate trials. S1-S5 are merged; S6 is next. This
+hardening does not unlock a new phase or authorize deferred screens.
 
 Product direction and naming are frozen in `PRODUCT-THESIS.md`.
 
@@ -70,6 +70,33 @@ gate in `BUILD.md` before merge.
 The authenticated GitHub owner is never written into tracked source or
 configuration. GitHub-generated remote and merge metadata may include it; that
 is the sole owner exception and does not relax the tracked-content rule.
+
+## Repository and task hygiene
+
+The canonical development baseline is the current fetched `origin/main`, not a
+local `main` name or another clone's object graph. Before creating a worktree,
+fetch and record the exact `origin/main` SHA. Create the branch from that ref,
+then prove the new worktree starts at the recorded SHA. A local checkout that
+has not fetched the merged predecessor is stale even when its own `main` is
+clean.
+
+Safety Foundation steps are sequential integration boundaries:
+
+- do not begin the next step until its predecessor is merged into
+  `origin/main` and the fresh merged baseline passes;
+- use one task/session and one branch per step; do not continue the next step
+  inside the previous step's task or pull request;
+- a handoff must state repository root, recorded `origin/main`, branch,
+  worktree, head, merge/PR state, public and private gate results, and whether
+  Grey Matter had preserved pre-existing edits; and
+- completed design and implementation-plan files are historical records. Their
+  old branch commands, test counts, and stop conditions are not current
+  instructions unless `BUILD.md` explicitly reactivates them.
+
+Gitleaks' Git mode scans every reachable local ref, not only the checked-out
+branch. When a finding appears in one clone but not another, identify the exact
+retaining ref before changing `.gitleaksignore`. Prune only a proven-obsolete
+ref; add an exact fingerprint only when that retained history is intentional.
 
 ## The one rule
 
@@ -237,7 +264,7 @@ coverage:
   resolves. Must also assert a `.sensitive/` read is still denied afterwards
 
 Existing suite: `cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover`
-— 34 tests, all passing. Keep them passing. `check_v2` is at 0 errors and
+— 37 tests, all passing. Keep them passing. `check_v2` is at 0 errors and
 0 warnings; keep it there.
 
 ## Do not
