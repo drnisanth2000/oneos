@@ -1,14 +1,15 @@
 # S6 — Visible Console Failures
 
-**Status:** Review Pending — not approved for implementation planning
+**Status:** Approved for implementation planning
 
 **Base:** `origin/main` at `3585938` (merged S5 and the S1-S5 documentation
 reconciliation). Public baseline: 603 tests. Private baseline: 37 tests.
 
-**History:** this document is a rewrite. Two independent reviews of the previous
-structure each returned Critical findings, and the recurring cause was
-architectural rather than local. All prior findings are treated here as claims
-re-verified against current code, not as settled fixes.
+**History:** eight review rounds plus a closure pass. The document was rewritten
+twice — once when the recurring cause proved architectural rather than local,
+once when the recurring cause proved to be hand-maintained enumerations. Every
+finding was verified against source before being accepted, several by executing
+probes rather than reading. The closure review's three conditions are applied.
 
 ## Objective
 
@@ -203,7 +204,7 @@ finding and an ordinary one — and are therefore never raised directly:
 
 | Ambiguous base | Subtypes |
 |---|---|
-| `CrossScopeError` | `RedirectedPathError` → `E-TAMPER`; `OutOfScopeError` → `E-SCOPE` |
+| `CrossScopeError` | `RedirectedPathError` → `E-TAMPER`; `OutOfScopeError` → `E-SCOPE`; `ProposalSourceUnavailable` → `E-UNAVAILABLE` |
 | `ReviewedStateConflict` | `ReviewedPathIntegrityError` → `E-TAMPER`; `ReviewedStateChanged` → `E-CONFLICT`; `ReviewedPathUnavailable` → `E-CONFLICT`; `InvalidTransactionPath` → `E-INVALID` |
 | `UnsafeDestinationPath` | `RedirectedDestination` → `E-TAMPER`; `MissingDestination` → `E-DEST` |
 | `InvalidSourceLeaf` | `RedirectedSourceLeaf` → `E-TAMPER`; `MissingSourceLeaf` → `E-DEST`; `NonCanonicalLeaf` → `E-DEST` |
@@ -220,6 +221,26 @@ exists to prevent: a false tamper alarm on an unreadable file, or "reload and
 review again" advice for a path that will never become valid. The taxonomy is
 sized to the conditions that exist, and invariant 3 fails on any raise site that
 has not chosen one.
+
+**Where one `except OSError` covers two conditions, the site must
+discriminate.** `_read_no_follow_bytes` re-raises `FileNotFoundError` and
+collapses every other `OSError` into one `CrossScopeError` — so a receipt whose
+permission bit is wrong arrives indistinguishable from a symlinked one. Choosing
+the integrity subtype there would tell an operator with an unreadable file that
+their vault has been tampered with; choosing the ordinary one would silence a
+real redirection.
+
+The rule at every such site:
+
+| Observed | Subtype |
+|---|---|
+| `ELOOP`, `O_NOFOLLOW` rejection, or a non-regular `fstat` | integrity subtype → `E-TAMPER` |
+| any other `OSError` | unavailable subtype → `E-UNAVAILABLE` |
+
+`ProposalSourceUnavailable` is a `CrossScopeError` subclass, so every existing
+`except CrossScopeError` still catches it and no refusal changes. The same rule
+settles the transaction-side site whose message is "could not be opened safely",
+which has the identical two-conditions-one-site shape.
 
 Every existing `except` clause continues to catch all of them, so this is a type
 refinement and no refusal changes.
@@ -267,6 +288,7 @@ without their own entry inherit it. Every member of the closed
 | `git_transaction._ApprovalLockCleanupFailure` | `E-GIT` | exact |
 | `git_transaction._ReviewedIndexOwnershipConflict` | `E-CONFLICT` | exact, unreachable |
 | `scope.RedirectedPathError` | `E-TAMPER` | mro |
+| `outbox.ProposalSourceUnavailable` | `E-UNAVAILABLE` | exact |
 | `scope.OutOfScopeError` | `E-SCOPE` | mro |
 | `outbox.OutboxScopeError` | `E-SCOPE` | mro |
 | `outbox.UnreadableProposalRecord` | `E-UNREADABLE` | mro |
@@ -748,7 +770,7 @@ Reading routes are listed even where currently silent.
 | `registry_delete_preview` | `E-CONFIG` inline |
 | `registry_delete_execute` | template on both branches |
 | `entity_scope` | `EntitySelectionError` to its dedicated handler |
-| global handler | describes, returns 500 |
+| global handler | describes, returns the code's page status |
 
 The **Current** column is deleted. It described what each route does today — a fact about source that drifts the moment anything changes, and the last such
 inventory in this document. What each route must *do* is a contract and stays;
@@ -910,7 +932,10 @@ to `E-UNKNOWN`, so a new exception is unmapped until someone maps it.
 
 **2. Closed families are exhaustive.** A test walks
 `GitTransactionError.__subclasses__()` transitively and fails on any subclass
-without its own exact entry. Same walk for the allowlist's membership.
+without its own exact entry, **except the abstract ambiguous bases of §2**,
+which invariant 3 proves are never raised. Without that clause the test is red
+on day one: `ReviewedStateConflict` is a direct subclass and deliberately
+carries no entry. Same walk for the allowlist's membership.
 
 **3. Ambiguous bases are never raised directly.** An AST test over `app/` parses
 every `raise` statement and fails when the raised type is one of the four
@@ -1208,8 +1233,7 @@ This defeats the human approval gate, which is the product's central claim.
 The fix is well understood and bounded: hash the validated proposal snapshot
 used to render, submit `id + review_sha256`, pass the expected digest into all
 three actions, compare against the exact snapshot before the first mutation, and
-refuse visibly on mismatch. The registry execute request then drops `slug`
-entirely, since the server derives kind and slug from the validated proposal.
+refuse visibly on mismatch.
 
 But it changes `approve`, `reject`, and `execute_delete` signatures and **adds a
 new refusal condition**. S6's defining constraint is that it changes no refusal
