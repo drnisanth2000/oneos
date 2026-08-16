@@ -1039,6 +1039,62 @@ def test_forward_index_sync_holds_real_index_lock_across_compare_and_replace(
     assert list(index_directory.iterdir()) == []
 
 
+def test_forward_index_replace_then_exception_restores_exact_starting_state(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+    conflict = "unrelated-conflict.md"
+    (vault / conflict).write_bytes(b"worktree remains exact\n")
+    git_bytes(vault, "add", conflict)
+    git_bytes(vault, "commit", "-q", "-m", "fixture: unmerged index base")
+    base_oid = _write_blob(vault, b"base stage\n")
+    ours_oid = _write_blob(vault, b"ours stage\n")
+    theirs_oid = _write_blob(vault, b"theirs stage\n")
+    _set_unmerged_index(vault, conflict, (base_oid, ours_oid, theirs_oid))
+    index_directory = tmp_path.parent / f"{tmp_path.name}-replace-indexes"
+    index_directory.mkdir()
+    monkeypatch.setattr(transaction.tempfile, "tempdir", os.fspath(index_directory))
+    before = _complete_state(vault, plan, index_directory)
+    starting_index = git_index_entries(vault)
+    assert all(
+        f" {stage}\t{conflict}".encode("ascii") in starting_index
+        for stage in (1, 2, 3)
+    )
+    index_path = transaction._real_index_path(vault)
+    index_lock = Path(f"{index_path}.lock")
+    original_replace = transaction.os.replace
+    replace_completed = False
+
+    def fail_after_real_index_replace(source, destination, *args, **kwargs):
+        nonlocal replace_completed
+        result = original_replace(source, destination, *args, **kwargs)
+        if (
+            not replace_completed
+            and Path(source) == index_lock
+            and Path(destination) == index_path
+        ):
+            replace_completed = True
+            raise OSError("injected exception after real index replace")
+        return result
+
+    monkeypatch.setattr(transaction.os, "replace", fail_after_real_index_replace)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert type(raised.value) is transaction.GitTransactionFailure
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert _exception_chain_contains(raised.value, OSError)
+    assert replace_completed is True
+    assert git_index_entries(vault) == starting_index
+    assert _complete_state(vault, plan, index_directory) == before
+    assert index_lock.exists() is False
+    with transaction._approval_lock(vault):
+        pass
+
+
 def test_recovery_preserves_concurrent_reviewed_index_replacement(
     tmp_path, monkeypatch
 ):

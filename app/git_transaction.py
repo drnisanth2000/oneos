@@ -397,13 +397,18 @@ def _execute_locked(
         desired_index = _head_index_entries(
             vault, commit_oid, plan.commit_paths
         )
+
+        def mark_index_potentially_owned() -> None:
+            nonlocal transaction_index
+            transaction_index = desired_index
+
         _sync_reviewed_index(
             vault,
             reviewed_index,
             desired_index,
             plan.commit_paths,
+            on_replace_ready=mark_index_potentially_owned,
         )
-        transaction_index = desired_index
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
         _checkpoint("real-index-synchronized")
         _require_unrelated_state_unchanged(vault, unrelated, plan)
@@ -1217,6 +1222,8 @@ def _sync_reviewed_index(
     expected_entries: tuple[_IndexEntry, ...],
     transaction_entries: tuple[_IndexEntry, ...],
     paths: tuple[str, ...],
+    *,
+    on_replace_ready: Callable[[], None],
 ) -> None:
     """Replace reviewed entries only if their complete preflight state remains."""
     index_path = _real_index_path(vault)
@@ -1295,6 +1302,7 @@ def _sync_reviewed_index(
                 "reviewed index synchronization verification failed"
             )
 
+        on_replace_ready()
         os.replace(lock_path, index_path)
         replace_completed = True
     except BaseException as exc:
