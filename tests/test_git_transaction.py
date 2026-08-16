@@ -942,6 +942,103 @@ def test_head_ownership_preserves_newer_ref_during_recovery(tmp_path, monkeypatc
         pass
 
 
+def test_forward_index_sync_preserves_concurrent_reviewed_index_update(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    destination = plan.commit_paths[1]
+    concurrent_oid = _write_blob(vault, b"concurrent pre-sync index update\n")
+
+    def replace_reviewed_index_before_sync(name: str) -> None:
+        if name != "commit-verified":
+            return
+        git_bytes(
+            vault,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            concurrent_oid,
+            destination,
+        )
+
+    monkeypatch.setattr(
+        transaction, "_checkpoint", replace_reviewed_index_before_sync
+    )
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == (destination,)
+    assert git_head(vault) == before["head"]
+    assert concurrent_oid.encode("ascii") in b"\0".join(
+        _reviewed_index_entries(vault, plan.commit_paths)
+    )
+    current = _complete_state(vault, plan, index_directory)
+    for key in ("unrelated_index", "unrelated_status", "temporary_indexes"):
+        assert current[key] == before[key]
+    assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
+    assert (vault / destination).exists() is False
+    assert (vault / plan.owned_changes[0].path).read_bytes() == b"proposal\n"
+    assert list(index_directory.iterdir()) == []
+
+
+def test_forward_index_sync_holds_real_index_lock_across_compare_and_replace(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    destination = plan.commit_paths[1]
+    concurrent_oid = _write_blob(vault, b"racing forward index writer\n")
+    index_lock = Path(f"{transaction._real_index_path(vault)}.lock")
+    original_git = transaction._git
+    concurrent_attempt: subprocess.CompletedProcess[bytes] | None = None
+
+    def race_forward_sync(vault_arg, *args, env=None, check=True):
+        nonlocal concurrent_attempt
+        at_locked_compare = (
+            args[0] == "ls-files" and env is None and index_lock.exists()
+        )
+        at_unlocked_legacy_sync = args[0] == "reset" and "--" in args
+        if (
+            concurrent_attempt is None
+            and (at_locked_compare or at_unlocked_legacy_sync)
+        ):
+            concurrent_attempt = subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    "100644",
+                    concurrent_oid,
+                    destination,
+                ],
+                cwd=vault,
+                check=False,
+                capture_output=True,
+            )
+        return original_git(vault_arg, *args, env=env, check=check)
+
+    monkeypatch.setattr(transaction, "_git", race_forward_sync)
+
+    result = transaction.execute_transaction(vault, plan)
+
+    assert result.commit_oid == git_head(vault)
+    assert concurrent_attempt is not None
+    assert concurrent_attempt.returncode != 0
+    assert concurrent_oid.encode("ascii") not in b"\0".join(
+        _reviewed_index_entries(vault, plan.commit_paths)
+    )
+    assert _unrelated_index_entries(vault, plan.commit_paths) == before[
+        "unrelated_index"
+    ]
+    assert list(index_directory.iterdir()) == []
+
+
 def test_recovery_preserves_concurrent_reviewed_index_replacement(
     tmp_path, monkeypatch
 ):

@@ -200,21 +200,35 @@ def _parse_name_status(output: bytes) -> tuple[PathChangeRecord, ...]:
     return tuple(records)
 
 
-def collect_commit_records(vault: Path, snapshot_head: str) -> tuple[CommitRecord, ...]:
+def _head_oid(vault: Path) -> str:
+    oid = _git_text(vault, "rev-parse", "HEAD").strip()
+    if _OID.fullmatch(oid) is None:
+        raise ValueError("Gate 3 current HEAD is malformed")
+    return oid
+
+
+def collect_commit_records(
+    vault: Path, snapshot_head: str, audit_head: str | None = None
+) -> tuple[CommitRecord, ...]:
     """Collect every post-snapshot commit in chronological order."""
     vault = Path(vault).resolve()
     if _OID.fullmatch(snapshot_head) is None:
         raise ValueError("Gate 3 snapshot HEAD is malformed")
+    audit_head = _head_oid(vault) if audit_head is None else audit_head
+    if _OID.fullmatch(audit_head) is None:
+        raise ValueError("Gate 3 audit HEAD is malformed")
     try:
-        _git_bytes(vault, "merge-base", "--is-ancestor", snapshot_head, "HEAD")
+        _git_bytes(
+            vault, "merge-base", "--is-ancestor", snapshot_head, audit_head
+        )
     except subprocess.CalledProcessError as exc:
         raise ValueError(
-            "Gate 3 snapshot HEAD is not an ancestor of current HEAD"
+            "Gate 3 snapshot HEAD is not an ancestor of audit HEAD"
         ) from exc
     oids = tuple(
         line
         for line in _git_text(
-            vault, "rev-list", "--reverse", f"{snapshot_head}..HEAD"
+            vault, "rev-list", "--reverse", f"{snapshot_head}..{audit_head}"
         ).splitlines()
         if line
     )
@@ -897,8 +911,9 @@ def cmd_check() -> int:
     vault = _vault()
     snapshot_path = _snapshot_path(vault)
     head, before = _load_snapshot(snapshot_path)
+    audit_head = _head_oid(vault)
     rules = AuditRules.load(vault)
-    records = collect_commit_records(vault, head)
+    records = collect_commit_records(vault, head, audit_head)
     after = collect_dirty_fingerprints(vault)
     commit_audit = _audit_commit_history(records, vault)
     dirty_audit = audit_dirty(before, after, rules, vault)
@@ -908,6 +923,8 @@ def cmd_check() -> int:
         sanctioned_writes=dirty_audit.sanctioned_writes,
         violating_writes=dirty_audit.violating_writes,
     )
+    if _head_oid(vault) != audit_head:
+        raise ValueError("Gate 3 HEAD changed during the audit")
 
     print(
         f"GATE 3 — {len(records)} new commit(s), "

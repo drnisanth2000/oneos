@@ -47,6 +47,12 @@ class _ApprovalLockCleanupFailure(GitTransactionFailure):
         super().__init__("approval lock cleanup failed")
 
 
+class _ReviewedIndexOwnershipConflict(GitTransactionFailure):
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        self.paths = tuple(sorted(paths))
+        super().__init__("reviewed index changed before synchronization")
+
+
 class GitTransactionRecoveryError(GitTransactionError):
     def __init__(
         self, paths: tuple[str, ...], *, temporary_index_cleanup_failed: bool = False
@@ -388,10 +394,16 @@ def _execute_locked(
         _checkpoint("commit-created")
         _verify_commit(vault, commit_oid, start_head, plan)
         _checkpoint("commit-verified")
-        transaction_index = _head_index_entries(
+        desired_index = _head_index_entries(
             vault, commit_oid, plan.commit_paths
         )
-        _sync_reviewed_index(vault, commit_oid, plan.commit_paths)
+        _sync_reviewed_index(
+            vault,
+            reviewed_index,
+            desired_index,
+            plan.commit_paths,
+        )
+        transaction_index = desired_index
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
         _checkpoint("real-index-synchronized")
         _require_unrelated_state_unchanged(vault, unrelated, plan)
@@ -400,20 +412,24 @@ def _execute_locked(
         result = TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
     except Exception as exc:
         transaction_cause = exc
-        blocked_paths = _rollback_transaction(
-            vault,
-            start_head,
-            commit_oid,
-            commit_created,
-            commit_output,
-            reviewed_index,
-            transaction_index,
-            unrelated,
-            plan,
-            applied_changes,
+        blocked_paths = set(
+            _rollback_transaction(
+                vault,
+                start_head,
+                commit_oid,
+                commit_created,
+                commit_output,
+                reviewed_index,
+                transaction_index,
+                unrelated,
+                plan,
+                applied_changes,
+            )
         )
+        if isinstance(exc, _ReviewedIndexOwnershipConflict):
+            blocked_paths.update(exc.paths)
         if blocked_paths:
-            transaction_error = GitTransactionRecoveryError(blocked_paths)
+            transaction_error = GitTransactionRecoveryError(tuple(blocked_paths))
         else:
             transaction_error = GitTransactionFailure(
                 "approval transaction failed and was rolled back"
@@ -1196,8 +1212,122 @@ def _require_head_matches(vault: Path, commit_oid: str) -> None:
         raise GitTransactionFailure("HEAD changed before transaction success")
 
 
-def _sync_reviewed_index(vault: Path, commit_oid: str, paths: tuple[str, ...]) -> None:
-    _git(vault, "reset", "-q", commit_oid, "--", *paths)
+def _sync_reviewed_index(
+    vault: Path,
+    expected_entries: tuple[_IndexEntry, ...],
+    transaction_entries: tuple[_IndexEntry, ...],
+    paths: tuple[str, ...],
+) -> None:
+    """Replace reviewed entries only if their complete preflight state remains."""
+    index_path = _real_index_path(vault)
+    lock_path = Path(f"{index_path}.lock")
+    lock_descriptor = -1
+    owns_lock = False
+    replace_completed = False
+    primary_error: BaseException | None = None
+    try:
+        try:
+            lock_descriptor = os.open(
+                lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            owns_lock = True
+        except OSError as exc:
+            raise GitTransactionFailure(
+                "could not acquire the real Git index lock"
+            ) from exc
+
+        current_entries = _capture_reviewed_index(vault, paths)
+        expected_by_path = _entries_by_path(expected_entries)
+        current_by_path = _entries_by_path(current_entries)
+        changed_paths = tuple(
+            path
+            for path in paths
+            if current_by_path.get(path, ()) != expected_by_path.get(path, ())
+        )
+        if changed_paths:
+            raise _ReviewedIndexOwnershipConflict(changed_paths)
+
+        index_mode = stat.S_IMODE(os.stat(index_path).st_mode)
+        with index_path.open("rb") as source, os.fdopen(
+            lock_descriptor, "wb", closefd=True
+        ) as destination:
+            lock_descriptor = -1
+            while chunk := source.read(1024 * 1024):
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
+            os.fchmod(destination.fileno(), index_mode)
+
+        transaction_by_path = _entries_by_path(transaction_entries)
+        locked_env = os.environ.copy()
+        locked_env["GIT_INDEX_FILE"] = os.fspath(lock_path)
+        for path in paths:
+            _git(
+                vault,
+                "update-index",
+                "--force-remove",
+                "--",
+                path,
+                env=locked_env,
+            )
+            entries = transaction_by_path.get(path, ())
+            if len(entries) > 1 or entries and entries[0].stage != 0:
+                raise GitTransactionFailure(
+                    "transaction index state is not stage zero"
+                )
+            if entries:
+                entry = entries[0]
+                _git(
+                    vault,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    entry.mode,
+                    entry.oid,
+                    path,
+                    env=locked_env,
+                )
+
+        if _capture_reviewed_index(
+            vault, paths, env=locked_env
+        ) != transaction_entries:
+            raise GitTransactionFailure(
+                "reviewed index synchronization verification failed"
+            )
+
+        os.replace(lock_path, index_path)
+        replace_completed = True
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error: OSError | None = None
+        if lock_descriptor >= 0:
+            try:
+                os.close(lock_descriptor)
+            except OSError as exc:
+                cleanup_error = exc
+        if owns_lock and not replace_completed:
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    cleanup_error.add_note(
+                        f"real index lock unlink also failed: {exc}"
+                    )
+        if cleanup_error is not None:
+            if primary_error is not None:
+                primary_error.add_note(
+                    f"real index lock cleanup also failed: {cleanup_error}"
+                )
+            else:
+                raise GitTransactionFailure(
+                    "real Git index lock cleanup failed"
+                ) from cleanup_error
 
 
 def _require_unrelated_state_unchanged(

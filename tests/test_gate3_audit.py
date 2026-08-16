@@ -1040,6 +1040,75 @@ def test_cli_check_fails_closed_for_divergent_sanctioned_replacement_history(
     assert gate3.main(["check"]) == 2
 
 
+def test_cli_check_fails_closed_when_head_rewinds_after_ancestry_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    marker = vault / "snapshot-marker.txt"
+    marker.write_text("snapshot state\n")
+    _git(vault, "add", marker.relative_to(vault).as_posix())
+    _git(vault, "commit", "-q", "-m", "fixture: snapshot state")
+    snapshot_head = _git(vault, "rev-parse", "HEAD").strip()
+    snapshot_parent = _git(vault, "rev-parse", "HEAD^").strip()
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    original_git_bytes = gate3._git_bytes
+    rewound = False
+
+    def rewind_after_ancestry(vault_arg, *args, env=None):
+        nonlocal rewound
+        output = original_git_bytes(vault_arg, *args, env=env)
+        if args[:2] == ("merge-base", "--is-ancestor") and not rewound:
+            rewound = True
+            _git(vault, "reset", "--hard", snapshot_parent)
+        return output
+
+    monkeypatch.setattr(gate3, "_git_bytes", rewind_after_ancestry)
+
+    assert gate3.main(["check"]) == 2
+    assert rewound is True
+    assert _git(vault, "rev-parse", "HEAD").strip() == snapshot_parent
+    assert snapshot_head != snapshot_parent
+    assert _git(vault, "status", "--porcelain") == ""
+
+
+def test_cli_check_fails_closed_when_head_advances_after_range_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    first = "synthetic/00-inbox/active/first.md"
+    (vault / first).write_text("redacted first\n")
+    _git(vault, "add", first)
+    _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+    audit_head = _git(vault, "rev-parse", "HEAD").strip()
+    original_git_bytes = gate3._git_bytes
+    advanced = False
+
+    def advance_after_range(vault_arg, *args, env=None):
+        nonlocal advanced
+        output = original_git_bytes(vault_arg, *args, env=env)
+        if args and args[0] == "rev-list" and "--reverse" in args and not advanced:
+            advanced = True
+            second = "synthetic/00-inbox/active/second.md"
+            (vault / second).write_text("redacted second\n")
+            _git(vault, "add", second)
+            _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+        return output
+
+    monkeypatch.setattr(gate3, "_git_bytes", advance_after_range)
+
+    assert gate3.main(["check"]) == 2
+    assert advanced is True
+    assert _git(vault, "rev-parse", "HEAD").strip() != audit_head
+    assert _git(vault, "status", "--porcelain") == ""
+
+
 def test_cli_check_rejects_a_changed_baseline_dirty_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
