@@ -36,7 +36,7 @@ from app.scope import CrossScopeError, Scope
 from app.vault import DestinationRegistryError, Vault
 
 
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 _OID = re.compile(r"^[0-9a-f]{40,64}$")
 _REGISTRY_MESSAGE = re.compile(
     r"^registry: (add|edit|delete) (workspace|product|member)(?: .*)?$"
@@ -101,7 +101,7 @@ class CommitRecord:
 @dataclass(frozen=True)
 class DirtyFingerprint:
     status: str
-    index_entry: str | None
+    index_entries: tuple[str, ...]
     kind: str
     mode: int | None
     digest: str | None
@@ -205,6 +205,12 @@ def collect_commit_records(vault: Path, snapshot_head: str) -> tuple[CommitRecor
     vault = Path(vault).resolve()
     if _OID.fullmatch(snapshot_head) is None:
         raise ValueError("Gate 3 snapshot HEAD is malformed")
+    try:
+        _git_bytes(vault, "merge-base", "--is-ancestor", snapshot_head, "HEAD")
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            "Gate 3 snapshot HEAD is not an ancestor of current HEAD"
+        ) from exc
     oids = tuple(
         line
         for line in _git_text(
@@ -239,8 +245,8 @@ def collect_commit_records(vault: Path, snapshot_head: str) -> tuple[CommitRecor
     return tuple(records)
 
 
-def _parse_index_entries(output: bytes) -> dict[str, str]:
-    entries: dict[str, str] = {}
+def _parse_index_entries(output: bytes) -> dict[str, tuple[str, ...]]:
+    entries: dict[str, list[tuple[int, str]]] = {}
     for record in output.split(b"\0"):
         if not record:
             continue
@@ -255,11 +261,21 @@ def _parse_index_entries(output: bytes) -> dict[str, str]:
             stage_text = stage.decode("ascii")
         except UnicodeDecodeError as exc:
             raise ValueError("Git emitted non-ASCII index metadata") from exc
-        if stage_text == "0":
-            entries[_decode_path(path_bytes)] = (
-                f"{mode_text}:{oid_text}:{stage_text}"
-            )
-    return entries
+        try:
+            stage_number = int(stage_text)
+        except ValueError as exc:
+            raise ValueError("Git emitted a malformed index stage") from exc
+        path = _decode_path(path_bytes)
+        path_entries = entries.setdefault(path, [])
+        if any(existing_stage == stage_number for existing_stage, _ in path_entries):
+            raise ValueError("Git emitted a duplicate index stage")
+        path_entries.append(
+            (stage_number, f"{mode_text}:{oid_text}:{stage_text}")
+        )
+    return {
+        path: tuple(value for _, value in sorted(path_entries))
+        for path, path_entries in entries.items()
+    }
 
 
 def _parse_porcelain(output: bytes) -> dict[str, str]:
@@ -302,19 +318,19 @@ def _fingerprint_path(
     vault: Path,
     relative: str,
     status_value: str,
-    index_entry: str | None,
+    index_entries: tuple[str, ...],
 ) -> DirtyFingerprint:
     parts = _path_parts(relative)
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if parts is None or no_follow is None:
-        return DirtyFingerprint(status_value, index_entry, "redirected", None, None)
+        return DirtyFingerprint(status_value, index_entries, "redirected", None, None)
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
     try:
         parent_descriptor = os.open(vault, directory_flags)
     except FileNotFoundError:
-        return DirtyFingerprint(status_value, index_entry, "absence", None, None)
+        return DirtyFingerprint(status_value, index_entries, "absence", None, None)
     except OSError:
-        return DirtyFingerprint(status_value, index_entry, "redirected", None, None)
+        return DirtyFingerprint(status_value, index_entries, "redirected", None, None)
     try:
         for component in parts[:-1]:
             try:
@@ -323,11 +339,11 @@ def _fingerprint_path(
                 )
             except FileNotFoundError:
                 return DirtyFingerprint(
-                    status_value, index_entry, "absence", None, None
+                    status_value, index_entries, "absence", None, None
                 )
             except OSError:
                 return DirtyFingerprint(
-                    status_value, index_entry, "redirected", None, None
+                    status_value, index_entries, "redirected", None, None
                 )
             os.close(parent_descriptor)
             parent_descriptor = next_descriptor
@@ -336,10 +352,10 @@ def _fingerprint_path(
         try:
             metadata = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
-            return DirtyFingerprint(status_value, index_entry, "absence", None, None)
+            return DirtyFingerprint(status_value, index_entries, "absence", None, None)
         except OSError:
             return DirtyFingerprint(
-                status_value, index_entry, "redirected", None, None
+                status_value, index_entries, "redirected", None, None
             )
         mode = stat.S_IMODE(metadata.st_mode)
         if stat.S_ISREG(metadata.st_mode):
@@ -351,21 +367,21 @@ def _fingerprint_path(
                 opened = os.fstat(descriptor)
                 if not stat.S_ISREG(opened.st_mode):
                     return DirtyFingerprint(
-                        status_value, index_entry, "redirected", None, None
+                        status_value, index_entries, "redirected", None, None
                     )
                 with os.fdopen(descriptor, "rb", closefd=True) as stream:
                     descriptor = -1
                     contents = stream.read()
             except OSError:
                 return DirtyFingerprint(
-                    status_value, index_entry, "redirected", None, None
+                    status_value, index_entries, "redirected", None, None
                 )
             finally:
                 if descriptor >= 0:
                     os.close(descriptor)
             return DirtyFingerprint(
                 status_value,
-                index_entry,
+                index_entries,
                 "file",
                 stat.S_IMODE(opened.st_mode),
                 hashlib.sha256(contents).hexdigest(),
@@ -375,17 +391,17 @@ def _fingerprint_path(
                 target = os.fsencode(os.readlink(leaf, dir_fd=parent_descriptor))
             except OSError:
                 return DirtyFingerprint(
-                    status_value, index_entry, "redirected", None, None
+                    status_value, index_entries, "redirected", None, None
                 )
             return DirtyFingerprint(
                 status_value,
-                index_entry,
+                index_entries,
                 "symlink",
                 mode,
                 hashlib.sha256(target).hexdigest(),
             )
         kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "other"
-        return DirtyFingerprint(status_value, index_entry, kind, mode, None)
+        return DirtyFingerprint(status_value, index_entries, kind, mode, None)
     finally:
         os.close(parent_descriptor)
 
@@ -408,7 +424,7 @@ def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
     )
     return {
         relative: _fingerprint_path(
-            vault, relative, statuses[relative], index_entries.get(relative)
+            vault, relative, statuses[relative], index_entries.get(relative, ())
         )
         for relative in sorted(statuses)
     }
@@ -740,7 +756,7 @@ def _new_proposal_is_sanctioned(
             proposal = _to_proposal(path, loaded)
             proposal = _require_destination(scope, proposal)
             source = _fingerprint_path(
-                rules.root, proposal.src, "  ", index_entry=None
+                rules.root, proposal.src, "  ", index_entries=()
             )
             return (
                 proposal.status == "pending"
@@ -832,16 +848,26 @@ def _load_snapshot(path: Path) -> tuple[str, dict[str, DirtyFingerprint]]:
     ):
         raise ValueError("Gate 3 snapshot dirty map is malformed")
     fingerprints: dict[str, DirtyFingerprint] = {}
-    expected_fields = {"status", "index_entry", "kind", "mode", "digest"}
+    expected_fields = {"status", "index_entries", "kind", "mode", "digest"}
     for relative, value in dirty.items():
         if set(value) != expected_fields:
             raise ValueError("Gate 3 snapshot fingerprint is malformed")
-        fingerprint = DirtyFingerprint(**value)
+        raw_index_entries = value.get("index_entries")
+        if not isinstance(raw_index_entries, list) or not all(
+            isinstance(entry, str) for entry in raw_index_entries
+        ):
+            raise ValueError("Gate 3 snapshot index entries are malformed")
+        fingerprint = DirtyFingerprint(
+            status=value.get("status"),
+            index_entries=tuple(raw_index_entries),
+            kind=value.get("kind"),
+            mode=value.get("mode"),
+            digest=value.get("digest"),
+        )
         if (
             not isinstance(fingerprint.status, str)
             or len(fingerprint.status) != 2
-            or fingerprint.index_entry is not None
-            and not isinstance(fingerprint.index_entry, str)
+            or not isinstance(fingerprint.index_entries, tuple)
             or not isinstance(fingerprint.kind, str)
             or fingerprint.mode is not None
             and not isinstance(fingerprint.mode, int)

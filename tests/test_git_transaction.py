@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import os
 import shlex
 import stat
@@ -216,6 +217,66 @@ def _inject_temporary_index_cleanup_failure(
     monkeypatch.setattr(transaction.os, "unlink", fail_persistent_cleanup)
 
 
+def _inject_lock_teardown_failure(monkeypatch, failure: str) -> list[int]:
+    original_open = transaction.os.open
+    original_close = transaction.os.close
+    original_flock = transaction.fcntl.flock
+    lock_descriptors: list[int] = []
+
+    def record_lock_open(path, *args, **kwargs):
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path).name == "oneos-approval.lock":
+            lock_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_unlock(descriptor, operation):
+        if (
+            failure == "unlock"
+            and descriptor in lock_descriptors
+            and operation == fcntl.LOCK_UN
+        ):
+            raise OSError("injected approval lock unlock failure")
+        return original_flock(descriptor, operation)
+
+    def fail_close_after_closing(descriptor):
+        if failure == "close" and descriptor in lock_descriptors:
+            original_close(descriptor)
+            raise OSError("injected approval lock close failure")
+        return original_close(descriptor)
+
+    monkeypatch.setattr(transaction.os, "open", record_lock_open)
+    monkeypatch.setattr(transaction.fcntl, "flock", fail_unlock)
+    monkeypatch.setattr(transaction.os, "close", fail_close_after_closing)
+    return lock_descriptors
+
+
+def _write_blob(vault: Path, contents: bytes) -> str:
+    return subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=vault,
+        input=contents,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+
+
+def _set_unmerged_index(
+    vault: Path, path: str, stage_oids: tuple[str, str, str]
+) -> None:
+    git_bytes(vault, "update-index", "--force-remove", "--", path)
+    records = "".join(
+        f"100644 {oid} {stage}\t{path}\n"
+        for stage, oid in enumerate(stage_oids, start=1)
+    ).encode("ascii")
+    subprocess.run(
+        ["git", "update-index", "--index-info"],
+        cwd=vault,
+        input=records,
+        check=True,
+        capture_output=True,
+    )
+
+
 def test_path_state_requires_absence_or_exact_regular_bytes_and_mode():
     assert PathState.absent() == PathState(None, None)
     assert PathState.regular(b"body\n", 0o644) == PathState(b"body\n", 0o644)
@@ -316,6 +377,32 @@ def test_capture_allows_only_an_absent_leaf_not_a_missing_parent(tmp_path):
         capture_path_state(vault, "synthetic/missing/active/new-item.md")
 
 
+def test_unrelated_fingerprint_never_hashes_through_redirected_parent(tmp_path):
+    vault = _vault(tmp_path / "vault")
+    relative = "synthetic/11-library/active/tracked.md"
+    (vault / relative).write_bytes(b"committed bytes\n")
+    git_bytes(vault, "add", relative)
+    git_bytes(vault, "commit", "-q", "-m", "fixture: tracked fingerprint path")
+    module = vault / "synthetic/11-library"
+    original_module = tmp_path / "original-module"
+    module.rename(original_module)
+    external_module = tmp_path / "external-module"
+    (external_module / "active").mkdir(parents=True)
+    external_bytes = b"external bytes must not be hashed\n"
+    (external_module / "active/tracked.md").write_bytes(external_bytes)
+    module.symlink_to(external_module, target_is_directory=True)
+
+    dirty = {
+        state.path: state
+        for state in transaction._capture_dirty_paths(vault, set())
+    }
+    fingerprint = dirty[relative]
+
+    assert fingerprint.kind == "redirected"
+    assert fingerprint.fingerprint is None
+    assert fingerprint.fingerprint != hashlib.sha256(external_bytes).digest()
+
+
 def test_second_approval_lock_fails_without_waiting_or_mutating(tmp_path):
     vault = _vault(tmp_path)
     with transaction._approval_lock(vault):
@@ -370,10 +457,12 @@ def test_approval_lock_closes_and_releases_when_unlock_fails(tmp_path, monkeypat
     monkeypatch.setattr(transaction.os, "close", record_close)
     monkeypatch.setattr(transaction.os, "open", record_lock_open)
 
-    with pytest.raises(OSError, match="injected unlock failure"):
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
         with transaction._approval_lock(vault):
             pass
 
+    assert isinstance(raised.value.__cause__, OSError)
+    assert str(raised.value.__cause__) == "injected unlock failure"
     assert set(opened_descriptors).issubset(closed_descriptors)
     monkeypatch.setattr(transaction.fcntl, "flock", original_flock)
     monkeypatch.setattr(transaction.os, "close", original_close)
@@ -472,6 +561,166 @@ def test_existing_pre_commit_hook_runs_against_only_alternate_index_paths(tmp_pa
     assert "staged.md" not in hook_record.read_text(encoding="utf-8").splitlines()
 
 
+def test_same_path_replacement_before_staging_is_not_committed(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+
+    def replace_reviewed_destination(name: str) -> None:
+        if name == "filesystem-applied":
+            destination.write_bytes(b"same-path replacement\n")
+
+    monkeypatch.setattr(transaction, "_checkpoint", replace_reviewed_destination)
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == (plan.commit_paths[1],)
+    assert git_head(vault) == start_head
+    assert source.read_bytes() == b"reviewed\n"
+    assert destination.read_bytes() == b"same-path replacement\n"
+    assert proposal.read_bytes() == b"proposal\n"
+
+
+@pytest.mark.parametrize(
+    "hook_body",
+    (
+        (
+            "printf 'unreviewed bytes\\n' > synthetic/11-library/active/item.md\n"
+            "git add -- synthetic/11-library/active/item.md\n"
+            "printf 'approved\\n' > synthetic/11-library/active/item.md\n"
+        ),
+        (
+            "chmod 755 synthetic/11-library/active/item.md\n"
+            "git add -- synthetic/11-library/active/item.md\n"
+            "chmod 644 synthetic/11-library/active/item.md\n"
+        ),
+    ),
+    ids=("bytes", "git-mode"),
+)
+def test_hook_cannot_replace_reviewed_commit_tree_entry(
+    tmp_path, hook_body
+):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+    hook = vault / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nset -eu\n" + hook_body, encoding="utf-8")
+    hook.chmod(0o755)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert git_head(vault) == start_head
+    assert source.read_bytes() == b"reviewed\n"
+    assert destination.exists() is False
+    assert proposal.read_bytes() == b"proposal\n"
+
+
+def test_commit_tree_mode_uses_git_owner_execute_normalization(tmp_path):
+    vault = _vault(tmp_path)
+    base_plan = _approval_plan()
+    _write_proposal(vault)
+    destination_change = base_plan.changes[1]
+    plan = TransactionPlan(
+        base_plan.message,
+        (
+            base_plan.changes[0],
+            PathChange(
+                destination_change.path,
+                destination_change.before,
+                PathState.regular(b"approved\n", 0o654),
+            ),
+        ),
+        base_plan.commit_paths,
+        base_plan.owned_changes,
+    )
+
+    result = transaction.execute_transaction(vault, plan)
+
+    tree_entry = git_bytes(
+        vault, "ls-tree", result.commit_oid, "--", destination_change.path
+    ).split(b" ", 1)[0]
+    assert tree_entry == b"100644"
+    assert stat.S_IMODE((vault / destination_change.path).stat().st_mode) == 0o654
+
+
+def test_hook_same_path_replacement_after_staging_blocks_success(tmp_path):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+    hook = vault / ".git/hooks/pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        "printf 'concurrent replacement\\n' > "
+        "synthetic/11-library/active/item.md\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == (plan.commit_paths[1],)
+    assert git_head(vault) == start_head
+    assert source.read_bytes() == b"reviewed\n"
+    assert destination.read_bytes() == b"concurrent replacement\n"
+    assert proposal.read_bytes() == b"proposal\n"
+
+
+def test_head_advance_after_transaction_commit_blocks_success(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+    newer_head = ""
+
+    def advance_head_without_failing(name: str) -> None:
+        nonlocal newer_head
+        if name != "commit-created":
+            return
+        transaction_head = git_head(vault)
+        tree = git_bytes(vault, "rev-parse", f"{transaction_head}^{{tree}}").decode(
+            "ascii"
+        ).strip()
+        newer_head = git_bytes(
+            vault,
+            "commit-tree",
+            tree,
+            "-p",
+            transaction_head,
+            "-m",
+            "concurrent head",
+        ).decode("ascii").strip()
+        git_bytes(vault, "update-ref", "HEAD", newer_head, transaction_head)
+
+    monkeypatch.setattr(transaction, "_checkpoint", advance_head_without_failing)
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == ("HEAD",)
+    assert git_head(vault) == newer_head
+    assert source.read_bytes() == b"reviewed\n"
+    assert destination.exists() is False
+    assert proposal.read_bytes() == b"proposal\n"
+    assert git_head(vault) != start_head
+
+
 def test_reviewed_staged_change_is_refused_before_filesystem_mutation(tmp_path):
     vault = _vault(tmp_path)
     plan = _approval_plan()
@@ -525,6 +774,32 @@ def test_owned_proposal_mismatch_is_refused_before_filesystem_mutation(tmp_path)
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
     assert proposal.read_bytes() == b"different proposal\n"
+
+
+@pytest.mark.parametrize("proposal_git_state", ("staged", "tracked"))
+def test_owned_proposal_must_be_absent_from_real_index_and_head(
+    tmp_path, proposal_git_state
+):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    git_bytes(vault, "add", proposal_relative)
+    if proposal_git_state == "tracked":
+        git_bytes(vault, "commit", "-q", "-m", "fixture: tracked proposal")
+    start_head = git_head(vault)
+    status_before = git_status_bytes(vault)
+    index_before = git_index_entries(vault)
+
+    with pytest.raises(ReviewedStateConflict):
+        transaction.execute_transaction(vault, plan)
+
+    assert git_head(vault) == start_head
+    assert git_status_bytes(vault) == status_before
+    assert git_index_entries(vault) == index_before
+    assert proposal.read_bytes() == b"proposal\n"
+    assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
+    assert (vault / plan.commit_paths[1]).exists() is False
 
 
 def test_temporary_alternate_index_is_removed_after_success(tmp_path, monkeypatch):
@@ -665,6 +940,138 @@ def test_head_ownership_preserves_newer_ref_during_recovery(tmp_path, monkeypatc
     assert list(index_directory.iterdir()) == []
     with transaction._approval_lock(vault):
         pass
+
+
+def test_recovery_preserves_concurrent_reviewed_index_replacement(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    destination = plan.commit_paths[1]
+    concurrent_oid = _write_blob(vault, b"concurrent index replacement\n")
+
+    def replace_reviewed_index_after_sync(name: str) -> None:
+        if name != "real-index-synchronized":
+            return
+        git_bytes(
+            vault,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            concurrent_oid,
+            destination,
+        )
+        raise OSError("injected concurrent reviewed-index replacement")
+
+    monkeypatch.setattr(
+        transaction, "_checkpoint", replace_reviewed_index_after_sync
+    )
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == (destination,)
+    assert git_head(vault) == before["head"]
+    assert concurrent_oid.encode("ascii") in b"\0".join(
+        _reviewed_index_entries(vault, plan.commit_paths)
+    )
+    current = _complete_state(vault, plan, index_directory)
+    for key in ("unrelated_index", "unrelated_status", "temporary_indexes"):
+        assert current[key] == before[key]
+    assert (vault / "staged.bin").read_bytes() == b"staged exact\x00\xff\n"
+    assert (vault / "unstaged.bin").read_bytes() == b"unstaged exact\x00\xfe\n"
+    assert (vault / "untracked.bin").read_bytes() == b"untracked exact\x00\xfd\n"
+    assert list(index_directory.iterdir()) == []
+
+
+def test_recovery_holds_real_index_lock_across_compare_and_restore(
+    tmp_path, monkeypatch
+):
+    vault, plan, index_directory, before = _prepared_transaction(
+        tmp_path, monkeypatch
+    )
+    destination = plan.commit_paths[1]
+    concurrent_oid = _write_blob(vault, b"racing index writer\n")
+    original_git = transaction._git
+    rollback_started = False
+    concurrent_attempt: subprocess.CompletedProcess[bytes] | None = None
+
+    def fail_after_index_sync(name: str) -> None:
+        nonlocal rollback_started
+        if name == "real-index-synchronized":
+            rollback_started = True
+            raise OSError("injected post-index-sync failure")
+
+    def race_restore(vault_arg, *args, env=None, check=True):
+        nonlocal concurrent_attempt
+        if rollback_started and concurrent_attempt is None and args[0] == "update-index":
+            concurrent_attempt = subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    "100644",
+                    concurrent_oid,
+                    destination,
+                ],
+                cwd=vault,
+                check=False,
+                capture_output=True,
+            )
+        return original_git(vault_arg, *args, env=env, check=check)
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_after_index_sync)
+    monkeypatch.setattr(transaction, "_git", race_restore)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert type(raised.value) is transaction.GitTransactionFailure
+    assert concurrent_attempt is not None
+    assert concurrent_attempt.returncode != 0
+    assert _complete_state(vault, plan, index_directory) == before
+
+
+def test_unmerged_unrelated_stage_mutation_is_detected_during_recovery(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    conflict = "unrelated-conflict.md"
+    (vault / conflict).write_bytes(b"worktree stays constant\n")
+    git_bytes(vault, "add", conflict)
+    git_bytes(vault, "commit", "-q", "-m", "fixture: conflict base")
+    base_oid = _write_blob(vault, b"base\n")
+    ours_oid = _write_blob(vault, b"ours\n")
+    theirs_oid = _write_blob(vault, b"theirs\n")
+    replacement_oid = _write_blob(vault, b"replacement ours\n")
+    _set_unmerged_index(vault, conflict, (base_oid, ours_oid, theirs_oid))
+    start_head = git_head(vault)
+
+    def mutate_only_stage_two(name: str) -> None:
+        if name != "filesystem-applied":
+            return
+        _set_unmerged_index(
+            vault, conflict, (base_oid, replacement_oid, theirs_oid)
+        )
+        raise OSError("injected unmerged stage mutation")
+
+    monkeypatch.setattr(transaction, "_checkpoint", mutate_only_stage_two)
+
+    with pytest.raises(transaction.GitTransactionRecoveryError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.paths == (conflict,)
+    assert git_head(vault) == start_head
+    assert replacement_oid.encode("ascii") in git_index_entries(vault)
+    assert (vault / conflict).read_bytes() == b"worktree stays constant\n"
+    assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
+    assert (vault / plan.commit_paths[1]).exists() is False
+    assert proposal.read_bytes() == b"proposal\n"
 
 
 def test_failure_after_commit_returns_before_ownership_capture_restores_head(
@@ -835,9 +1242,7 @@ def test_success_cleanup_failure_carries_committed_result_without_rewinding(
     )
     assert raised.value.commit_oid == git_head(vault)
     assert isinstance(raised.value.cleanup_error, OSError)
-    assert str(raised.value) == (
-        "approval transaction committed but temporary index cleanup failed"
-    )
+    assert str(raised.value) == "approval transaction committed but cleanup failed"
     assert git_head(vault) != before["head"]
     assert git_head_message(vault) == plan.message
     assert (vault / plan.commit_paths[0]).exists() is False
@@ -854,6 +1259,62 @@ def test_success_cleanup_failure_carries_committed_result_without_rewinding(
     assert current["temporary_indexes"]
     with transaction._approval_lock(vault):
         pass
+
+
+@pytest.mark.parametrize("failure", ("unlock", "close"))
+def test_lock_teardown_failure_after_commit_carries_structured_result(
+    tmp_path, monkeypatch, failure
+):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+    start_head = git_head(vault)
+    lock_descriptors = _inject_lock_teardown_failure(monkeypatch, failure)
+
+    with pytest.raises(transaction.GitTransactionCommittedError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raised.value.result == transaction.TransactionResult(
+        git_head(vault), tuple(sorted(plan.commit_paths))
+    )
+    assert raised.value.commit_oid == git_head(vault)
+    assert git_head(vault) != start_head
+    assert isinstance(raised.value.cleanup_error, OSError)
+    assert failure in str(raised.value.cleanup_error)
+    assert raised.value.__cause__ is raised.value.cleanup_error
+    assert lock_descriptors
+    for descriptor in lock_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_lock_teardown_failure_preserves_original_transaction_failure(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+    start_head = git_head(vault)
+    lock_descriptors = _inject_lock_teardown_failure(monkeypatch, "unlock")
+
+    def fail_before_commit(name: str) -> None:
+        if name == "filesystem-applied":
+            raise OSError("injected transaction body failure")
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_before_commit)
+
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert type(raised.value) is transaction.GitTransactionFailure
+    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert isinstance(raised.value.__cause__, OSError)
+    assert str(raised.value.__cause__) == "injected transaction body failure"
+    assert git_head(vault) == start_head
+    assert lock_descriptors
+    for descriptor in lock_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_sha256_repository_commits_full_multi_path_transaction(

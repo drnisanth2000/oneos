@@ -38,9 +38,13 @@ class GitTransactionCommittedError(GitTransactionError):
         self.result = result
         self.commit_oid = result.commit_oid
         self.cleanup_error = cleanup_error
-        super().__init__(
-            "approval transaction committed but temporary index cleanup failed"
-        )
+        super().__init__("approval transaction committed but cleanup failed")
+
+
+class _ApprovalLockCleanupFailure(GitTransactionFailure):
+    def __init__(self, cleanup_error: OSError) -> None:
+        self.cleanup_error = cleanup_error
+        super().__init__("approval lock cleanup failed")
 
 
 class GitTransactionRecoveryError(GitTransactionError):
@@ -261,6 +265,7 @@ def _approval_lock(vault: Path) -> Iterator[None]:
         raise GitTransactionFailure("could not open approval lock") from exc
 
     locked = False
+    primary_error: BaseException | None = None
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -270,24 +275,56 @@ def _approval_lock(vault: Path) -> Iterator[None]:
                 raise VaultBusyError("another approval is already running") from exc
             raise GitTransactionFailure("could not acquire approval lock") from exc
         yield
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
+        cleanup_error: OSError | None = None
         try:
             if locked:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
+        except OSError as exc:
+            cleanup_error = exc
+        try:
             os.close(descriptor)
+        except OSError as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+            else:
+                cleanup_error.add_note(f"approval lock close also failed: {exc}")
+        if cleanup_error is not None:
+            if primary_error is not None:
+                primary_error.add_note(
+                    f"approval lock cleanup also failed: {cleanup_error}"
+                )
+            else:
+                raise _ApprovalLockCleanupFailure(cleanup_error) from cleanup_error
 
 
 def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult:
     """Commit exactly the reviewed paths while preserving unrelated Git state."""
     vault = Path(vault).resolve()
-    with _approval_lock(vault):
-        start_head = _git_text(vault, "rev-parse", "HEAD").strip()
-        reviewed_index = _capture_reviewed_index(vault, plan.commit_paths)
-        unrelated = _capture_unrelated_state(vault, plan)
-        _require_expected_states(vault, plan)
-        _require_reviewed_index_matches_head(vault, start_head, plan.commit_paths)
-        return _execute_locked(vault, start_head, reviewed_index, unrelated, plan)
+    result: TransactionResult | None = None
+    try:
+        with _approval_lock(vault):
+            start_head = _git_text(vault, "rev-parse", "HEAD").strip()
+            reviewed_index = _capture_reviewed_index(vault, plan.commit_paths)
+            _require_owned_paths_untracked(vault, start_head, plan.owned_changes)
+            unrelated = _capture_unrelated_state(vault, plan)
+            _require_expected_states(vault, plan)
+            _require_reviewed_index_matches_head(
+                vault, start_head, plan.commit_paths
+            )
+            result = _execute_locked(
+                vault, start_head, reviewed_index, unrelated, plan
+            )
+    except _ApprovalLockCleanupFailure as exc:
+        if result is None:
+            raise
+        raise GitTransactionCommittedError(result, exc.cleanup_error) from exc.cleanup_error
+    if result is None:
+        raise GitTransactionFailure("approval transaction produced no result")
+    return result
 
 
 def _checkpoint(name: str) -> None:
@@ -307,6 +344,7 @@ def _execute_locked(
     commit_oid: str | None = None
     commit_created = False
     commit_output: bytes | None = None
+    transaction_index: tuple[_IndexEntry, ...] | None = None
     result: TransactionResult | None = None
     transaction_error: GitTransactionError | None = None
     transaction_cause: Exception | None = None
@@ -328,7 +366,7 @@ def _execute_locked(
         alternate_env["GIT_INDEX_FILE"] = temporary_index
         _git(vault, "read-tree", start_head, env=alternate_env)
         _checkpoint("alternate-index-ready")
-        _stage_in_alternate_index(vault, plan.commit_paths, alternate_env)
+        _stage_in_alternate_index(vault, plan, alternate_env)
         _checkpoint("reviewed-paths-staged")
         commit_env = alternate_env.copy()
         commit_env["LC_ALL"] = "C"
@@ -348,14 +386,17 @@ def _execute_locked(
         _checkpoint("commit-returned")
         commit_oid = _transaction_commit_from_output(commit_output)
         _checkpoint("commit-created")
-        _verify_commit(
-            vault, commit_oid, start_head, plan.message, plan.commit_paths
-        )
+        _verify_commit(vault, commit_oid, start_head, plan)
         _checkpoint("commit-verified")
+        transaction_index = _head_index_entries(
+            vault, commit_oid, plan.commit_paths
+        )
         _sync_reviewed_index(vault, commit_oid, plan.commit_paths)
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
         _checkpoint("real-index-synchronized")
         _require_unrelated_state_unchanged(vault, unrelated, plan)
+        _require_final_states(vault, plan)
+        _require_head_matches(vault, commit_oid)
         result = TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
     except Exception as exc:
         transaction_cause = exc
@@ -366,6 +407,7 @@ def _execute_locked(
             commit_created,
             commit_output,
             reviewed_index,
+            transaction_index,
             unrelated,
             plan,
             applied_changes,
@@ -413,6 +455,7 @@ def _rollback_transaction(
     commit_created: bool,
     commit_output: bytes | None,
     reviewed_index: tuple[_IndexEntry, ...],
+    transaction_index: tuple[_IndexEntry, ...] | None,
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
     applied_changes: list[tuple[PathChange, PathState]],
@@ -435,24 +478,15 @@ def _rollback_transaction(
         except (OSError, GitTransactionError):
             blocked_paths.add(change.path)
 
-    original_entries = {entry.path: entry for entry in reviewed_index}
-    for path in plan.commit_paths:
-        try:
-            entry = original_entries.get(path)
-            if entry is None:
-                _git(vault, "update-index", "--force-remove", "--", path)
-            else:
-                _git(
-                    vault,
-                    "update-index",
-                    "--add",
-                    "--cacheinfo",
-                    entry.mode,
-                    entry.oid,
-                    path,
-                )
-        except (OSError, GitTransactionError):
-            blocked_paths.add(path)
+    if transaction_index is not None:
+        blocked_paths.update(
+            _restore_reviewed_index_if_owned(
+                vault,
+                reviewed_index,
+                transaction_index,
+                plan.commit_paths,
+            )
+        )
 
     if commit_created and commit_oid is None:
         try:
@@ -464,7 +498,7 @@ def _rollback_transaction(
 
     if commit_oid is not None:
         try:
-            _verify_commit(
+            _verify_commit_identity(
                 vault, commit_oid, start_head, plan.message, plan.commit_paths
             )
         except (OSError, GitTransactionError):
@@ -498,6 +532,149 @@ def _rollback_transaction(
     return tuple(sorted(blocked_paths))
 
 
+def _entries_by_path(
+    entries: tuple[_IndexEntry, ...],
+) -> dict[str, tuple[_IndexEntry, ...]]:
+    grouped: dict[str, list[_IndexEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(entry.path, []).append(entry)
+    return {
+        path: tuple(sorted(path_entries, key=lambda entry: entry.stage))
+        for path, path_entries in grouped.items()
+    }
+
+
+def _real_index_path(vault: Path) -> Path:
+    value = _git_text(
+        vault,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "index",
+    ).strip()
+    if not value:
+        raise GitTransactionFailure("could not determine the real Git index")
+    return Path(value)
+
+
+def _restore_reviewed_index_if_owned(
+    vault: Path,
+    original_entries: tuple[_IndexEntry, ...],
+    transaction_entries: tuple[_IndexEntry, ...],
+    paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Compare and restore reviewed entries while holding Git's real index lock."""
+    blocked: set[str] = set()
+    try:
+        index_path = _real_index_path(vault)
+    except (OSError, GitTransactionError):
+        return tuple(sorted(paths))
+    lock_path = Path(f"{index_path}.lock")
+    lock_descriptor = -1
+    owns_lock = False
+    replace_completed = False
+    eligible: list[str] = []
+    try:
+        try:
+            lock_descriptor = os.open(
+                lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            owns_lock = True
+        except OSError:
+            return tuple(sorted(paths))
+
+        current_entries = _capture_reviewed_index(vault, paths)
+        original_by_path = _entries_by_path(original_entries)
+        transaction_by_path = _entries_by_path(transaction_entries)
+        current_by_path = _entries_by_path(current_entries)
+        for path in paths:
+            original = original_by_path.get(path, ())
+            current = current_by_path.get(path, ())
+            if current == original:
+                continue
+            if current == transaction_by_path.get(path, ()):
+                eligible.append(path)
+            else:
+                blocked.add(path)
+
+        if not eligible:
+            return tuple(sorted(blocked))
+
+        index_mode = stat.S_IMODE(os.stat(index_path).st_mode)
+        with index_path.open("rb") as source, os.fdopen(
+            lock_descriptor, "wb", closefd=True
+        ) as destination:
+            lock_descriptor = -1
+            while chunk := source.read(1024 * 1024):
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
+            os.fchmod(destination.fileno(), index_mode)
+
+        locked_env = os.environ.copy()
+        locked_env["GIT_INDEX_FILE"] = os.fspath(lock_path)
+        for path in eligible:
+            _git(
+                vault,
+                "update-index",
+                "--force-remove",
+                "--",
+                path,
+                env=locked_env,
+            )
+            original = original_by_path.get(path, ())
+            if len(original) > 1 or original and original[0].stage != 0:
+                raise GitTransactionFailure(
+                    "reviewed index rollback state is not stage zero"
+                )
+            if original:
+                entry = original[0]
+                _git(
+                    vault,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    entry.mode,
+                    entry.oid,
+                    path,
+                    env=locked_env,
+                )
+
+        restored_entries = _capture_reviewed_index(
+            vault, paths, env=locked_env
+        )
+        restored_by_path = _entries_by_path(restored_entries)
+        for path in paths:
+            expected = (
+                original_by_path.get(path, ())
+                if path in eligible
+                else current_by_path.get(path, ())
+            )
+            if restored_by_path.get(path, ()) != expected:
+                raise GitTransactionFailure(
+                    "reviewed index rollback verification failed"
+                )
+
+        os.replace(lock_path, index_path)
+        replace_completed = True
+    except (OSError, GitTransactionError):
+        blocked.update(eligible or paths)
+    finally:
+        if lock_descriptor >= 0:
+            try:
+                os.close(lock_descriptor)
+            except OSError:
+                blocked.update(eligible or paths)
+        if owns_lock and not replace_completed:
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                blocked.update(eligible or paths)
+    return tuple(sorted(blocked))
+
+
 def _transaction_commit_from_output(output: bytes) -> str:
     candidates = {
         match.group("oid").decode("ascii")
@@ -515,8 +692,8 @@ def _transaction_commit_from_output(output: bytes) -> str:
 def _changed_unrelated_paths(
     expected: _UnrelatedState, current: _UnrelatedState
 ) -> tuple[str, ...]:
-    expected_index = {entry.path: entry for entry in expected.index_entries}
-    current_index = {entry.path: entry for entry in current.index_entries}
+    expected_index = _entries_by_path(expected.index_entries)
+    current_index = _entries_by_path(current.index_entries)
     expected_dirty = {state.path: state for state in expected.dirty_paths}
     current_dirty = {state.path: state for state in current.dirty_paths}
     changed = {
@@ -591,9 +768,13 @@ def _parse_index_entries(output: bytes) -> tuple[_IndexEntry, ...]:
 
 
 def _capture_reviewed_index(
-    vault: Path, paths: tuple[str, ...]
+    vault: Path,
+    paths: tuple[str, ...],
+    env: dict[str, str] | None = None,
 ) -> tuple[_IndexEntry, ...]:
-    output = _git(vault, "ls-files", "--stage", "-z", "--", *paths).stdout
+    output = _git(
+        vault, "ls-files", "--stage", "-z", "--", *paths, env=env
+    ).stdout
     return _parse_index_entries(output)
 
 
@@ -625,6 +806,22 @@ def _require_reviewed_index_matches_head(
         raise ReviewedStateConflict("reviewed path has an unexpected staged change")
 
 
+def _require_owned_paths_untracked(
+    vault: Path,
+    revision: str,
+    owned_changes: tuple[PathChange, ...],
+) -> None:
+    paths = tuple(change.path for change in owned_changes)
+    if not paths:
+        return
+    if _capture_reviewed_index(vault, paths) or _head_index_entries(
+        vault, revision, paths
+    ):
+        raise ReviewedStateConflict(
+            "transaction-owned path must be absent from Git index and HEAD"
+        )
+
+
 def _verify_reviewed_index_matches_head(
     vault: Path, revision: str, paths: tuple[str, ...]
 ) -> None:
@@ -641,7 +838,7 @@ def _capture_unrelated_state(vault: Path, plan: TransactionPlan) -> _UnrelatedSt
         _git(vault, "ls-files", "--stage", "-z").stdout
     )
     unrelated_entries = tuple(
-        entry for entry in all_entries if entry.stage == 0 and entry.path not in reviewed
+        entry for entry in all_entries if entry.path not in reviewed
     )
     dirty_paths = _capture_dirty_paths(vault, reviewed | owned)
     return _UnrelatedState(unrelated_entries, dirty_paths)
@@ -671,41 +868,91 @@ def _capture_dirty_paths(
         path = os.fsdecode(record[3:])
         if path in excluded_paths:
             continue
-        kind, mode, fingerprint = _fingerprint_path(vault / path)
+        kind, mode, fingerprint = _fingerprint_path(vault, path)
         dirty.append(_DirtyPathState(path, status_code, kind, mode, fingerprint))
     return tuple(sorted(dirty, key=lambda state: state.path))
 
 
-def _fingerprint_path(path: Path) -> tuple[str, int | None, bytes | None]:
+def _fingerprint_path(
+    vault: Path, relative_path: str
+) -> tuple[str, int | None, bytes | None]:
+    parts = tuple(relative_path.split("/"))
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if (
+        no_follow is None
+        or relative_path.startswith("/")
+        or "\0" in relative_path
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return "redirected", None, None
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
     try:
-        path_stat = os.lstat(path)
+        directory_descriptor = os.open(vault, directory_flags)
     except FileNotFoundError:
         return "absent", None, None
-    except OSError as exc:
-        raise GitTransactionFailure("could not fingerprint unrelated path") from exc
+    except OSError:
+        return "redirected", None, None
+    try:
+        for component in parts[:-1]:
+            try:
+                next_descriptor = os.open(
+                    component, directory_flags, dir_fd=directory_descriptor
+                )
+            except FileNotFoundError:
+                return "absent", None, None
+            except OSError:
+                return "redirected", None, None
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
 
-    mode = stat.S_IMODE(path_stat.st_mode)
-    if stat.S_ISREG(path_stat.st_mode):
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        leaf = parts[-1]
         try:
-            descriptor = os.open(path, flags)
-            with os.fdopen(descriptor, "rb", closefd=True) as opened_file:
-                descriptor = -1
-                digest = hashlib.sha256(opened_file.read()).digest()
-        except OSError as exc:
-            raise GitTransactionFailure("could not fingerprint unrelated file") from exc
-        finally:
-            if "descriptor" in locals() and descriptor >= 0:
-                os.close(descriptor)
-        return "regular", mode, digest
-    if stat.S_ISLNK(path_stat.st_mode):
-        try:
-            return "symlink", mode, os.fsencode(os.readlink(path))
-        except OSError as exc:
-            raise GitTransactionFailure("could not fingerprint unrelated symlink") from exc
-    if stat.S_ISDIR(path_stat.st_mode):
-        return "directory", mode, None
-    return "other", mode, None
+            path_stat = os.stat(
+                leaf, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            return "absent", None, None
+        except OSError:
+            return "redirected", None, None
+
+        mode = stat.S_IMODE(path_stat.st_mode)
+        if stat.S_ISREG(path_stat.st_mode):
+            descriptor = -1
+            try:
+                descriptor = os.open(
+                    leaf, os.O_RDONLY | no_follow, dir_fd=directory_descriptor
+                )
+                opened_stat = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or (opened_stat.st_dev, opened_stat.st_ino)
+                    != (path_stat.st_dev, path_stat.st_ino)
+                ):
+                    return "redirected", None, None
+                with os.fdopen(descriptor, "rb", closefd=True) as opened_file:
+                    descriptor = -1
+                    digest = hashlib.sha256(opened_file.read()).digest()
+            except OSError:
+                return "redirected", None, None
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            return "regular", stat.S_IMODE(opened_stat.st_mode), digest
+        if stat.S_ISLNK(path_stat.st_mode):
+            try:
+                return (
+                    "symlink",
+                    mode,
+                    os.fsencode(os.readlink(leaf, dir_fd=directory_descriptor)),
+                )
+            except OSError:
+                return "redirected", None, None
+        if stat.S_ISDIR(path_stat.st_mode):
+            return "directory", mode, None
+        return "other", mode, None
+    finally:
+        os.close(directory_descriptor)
 
 
 def _require_expected_states(vault: Path, plan: TransactionPlan) -> None:
@@ -839,9 +1086,9 @@ def _name_only(
 
 
 def _stage_in_alternate_index(
-    vault: Path, paths: tuple[str, ...], alternate_env: dict[str, str]
+    vault: Path, plan: TransactionPlan, alternate_env: dict[str, str]
 ) -> None:
-    _git(vault, "add", "--all", "--", *paths, env=alternate_env)
+    _git(vault, "add", "--all", "--", *plan.commit_paths, env=alternate_env)
     staged = _name_only(
         vault,
         "diff",
@@ -851,11 +1098,17 @@ def _stage_in_alternate_index(
         "-z",
         env=alternate_env,
     )
-    if tuple(sorted(staged)) != tuple(sorted(paths)):
+    if tuple(sorted(staged)) != tuple(sorted(plan.commit_paths)):
         raise GitTransactionFailure("alternate index staged an unexpected path")
+    _require_entries_match_after_states(
+        vault,
+        _capture_reviewed_index(vault, plan.commit_paths, env=alternate_env),
+        plan.changes,
+        "alternate index does not contain the reviewed state",
+    )
 
 
-def _verify_commit(
+def _verify_commit_identity(
     vault: Path,
     commit_oid: str,
     start_head: str,
@@ -880,6 +1133,67 @@ def _verify_commit(
     )
     if tuple(sorted(changed)) != tuple(sorted(paths)):
         raise GitTransactionFailure("transaction commit changed an unexpected path")
+
+
+def _verify_commit(
+    vault: Path,
+    commit_oid: str,
+    start_head: str,
+    plan: TransactionPlan,
+) -> None:
+    _verify_commit_identity(
+        vault, commit_oid, start_head, plan.message, plan.commit_paths
+    )
+    _require_entries_match_after_states(
+        vault,
+        _head_index_entries(vault, commit_oid, plan.commit_paths),
+        plan.changes,
+        "transaction commit does not contain the reviewed state",
+    )
+
+
+def _require_entries_match_after_states(
+    vault: Path,
+    entries: tuple[_IndexEntry, ...],
+    changes: tuple[PathChange, ...],
+    message: str,
+) -> None:
+    by_path: dict[str, _IndexEntry] = {}
+    for entry in entries:
+        if entry.stage != 0 or entry.path in by_path:
+            raise GitTransactionFailure(message)
+        by_path[entry.path] = entry
+
+    expected_paths = {
+        change.path for change in changes if change.after.contents is not None
+    }
+    if set(by_path) != expected_paths:
+        raise GitTransactionFailure(message)
+
+    for change in changes:
+        if change.after.contents is None:
+            continue
+        entry = by_path[change.path]
+        expected_mode = (
+            "100755" if change.after.mode & stat.S_IXUSR else "100644"
+        )
+        if entry.mode != expected_mode:
+            raise GitTransactionFailure(message)
+        if _git(vault, "cat-file", "blob", entry.oid).stdout != change.after.contents:
+            raise GitTransactionFailure(message)
+
+
+def _require_final_states(vault: Path, plan: TransactionPlan) -> None:
+    for change in plan.changes + plan.owned_changes:
+        if capture_path_state(vault, change.path) != change.after:
+            raise GitTransactionFailure(
+                f"transaction-owned path changed before success: {change.path}"
+            )
+
+
+def _require_head_matches(vault: Path, commit_oid: str) -> None:
+    if _git_text(vault, "rev-parse", "HEAD").strip() != commit_oid:
+        raise GitTransactionFailure("HEAD changed before transaction success")
 
 
 def _sync_reviewed_index(vault: Path, commit_oid: str, paths: tuple[str, ...]) -> None:

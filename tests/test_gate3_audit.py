@@ -81,6 +81,33 @@ def _git(vault: Path, *args: str) -> str:
     ).stdout
 
 
+def _write_blob(vault: Path, contents: bytes) -> str:
+    return subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=vault,
+        input=contents,
+        check=True,
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+
+
+def _set_unmerged_index(
+    vault: Path, path: str, stage_oids: tuple[str, str, str]
+) -> None:
+    _git(vault, "update-index", "--force-remove", "--", path)
+    records = "".join(
+        f"100644 {oid} {stage}\t{path}\n"
+        for stage, oid in enumerate(stage_oids, start=1)
+    ).encode("ascii")
+    subprocess.run(
+        ["git", "update-index", "--index-info"],
+        cwd=vault,
+        input=records,
+        check=True,
+        capture_output=True,
+    )
+
+
 def _audit_files() -> dict[str, str]:
     return {
         "_system/archetypes.yaml": AUDIT_ARCHETYPES,
@@ -744,7 +771,7 @@ def test_changed_worktree_bytes_on_an_initially_modified_path_are_refused(
     result = gate3.audit_dirty(before, after, rules, vault)
 
     assert before[relative].status == after[relative].status == " M"
-    assert before[relative].index_entry == after[relative].index_entry
+    assert before[relative].index_entries == after[relative].index_entries
     assert before[relative].digest != after[relative].digest
     assert result.violating_writes == [relative]
 
@@ -764,7 +791,32 @@ def test_changed_index_oid_on_an_initially_staged_path_is_refused(tmp_path: Path
     result = gate3.audit_dirty(before, after, rules, vault)
 
     assert before[relative].status == after[relative].status == "A "
-    assert before[relative].index_entry != after[relative].index_entry
+    assert before[relative].index_entries != after[relative].index_entries
+    assert result.violating_writes == [relative]
+
+
+def test_changed_unmerged_index_stage_is_refused(tmp_path: Path):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    relative = "synthetic/11-library/active/conflict.md"
+    path = vault / relative
+    path.write_bytes(b"worktree stays constant\n")
+    _git(vault, "add", relative)
+    _git(vault, "commit", "-q", "-m", "fixture: conflict base")
+    base_oid = _write_blob(vault, b"base\n")
+    ours_oid = _write_blob(vault, b"ours\n")
+    theirs_oid = _write_blob(vault, b"theirs\n")
+    replacement_oid = _write_blob(vault, b"replacement ours\n")
+    _set_unmerged_index(vault, relative, (base_oid, ours_oid, theirs_oid))
+    before = gate3.collect_dirty_fingerprints(vault)
+
+    _set_unmerged_index(vault, relative, (base_oid, replacement_oid, theirs_oid))
+    after = gate3.collect_dirty_fingerprints(vault)
+    rules = gate3.AuditRules.load(vault)
+    result = gate3.audit_dirty(before, after, rules, vault)
+
+    assert before[relative].status == after[relative].status == "UU"
+    assert before[relative].digest == after[relative].digest
+    assert before[relative] != after[relative]
     assert result.violating_writes == [relative]
 
 
@@ -814,7 +866,7 @@ def test_deleted_tracked_path_has_explicit_absence_fingerprint(tmp_path: Path):
     assert fingerprint.kind == "absence"
     assert fingerprint.mode is None
     assert fingerprint.digest is None
-    assert fingerprint.index_entry is not None
+    assert fingerprint.index_entries
 
 
 def test_untracked_symlink_hashes_its_target_bytes_without_following_it(tmp_path: Path):
@@ -889,7 +941,7 @@ def test_commit_collection_uses_no_renames_and_preserves_spaces(tmp_path: Path):
     }
 
 
-def test_cli_snapshot_writes_version_two_fingerprints_outside_vault(
+def test_cli_snapshot_writes_version_three_fingerprints_outside_vault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     vault = _audit_vault(tmp_path / "vault", initialize_git=True)
@@ -903,10 +955,10 @@ def test_cli_snapshot_writes_version_two_fingerprints_outside_vault(
 
     data = json.loads(snapshot.read_text(encoding="utf-8"))
     fingerprint = data["dirty"][relative]
-    assert data["version"] == 2
+    assert data["version"] == 3
     assert data["head"] == _git(vault, "rev-parse", "HEAD").strip()
     assert fingerprint["status"] == "??"
-    assert fingerprint["index_entry"] is None
+    assert fingerprint["index_entries"] == []
     assert fingerprint["kind"] == "file"
     assert fingerprint["mode"] == 0o644
     assert fingerprint["digest"] == hashlib.sha256(b"baseline bytes\n").hexdigest()
@@ -938,6 +990,54 @@ def test_cli_check_accepts_a_sanctioned_commit_after_snapshot(
     _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
 
     assert gate3.main(["check"]) == 0
+
+
+def test_cli_check_fails_closed_after_clean_rewind_behind_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    marker = vault / "snapshot-marker.txt"
+    marker.write_text("snapshot state\n")
+    _git(vault, "add", marker.relative_to(vault).as_posix())
+    _git(vault, "commit", "-q", "-m", "fixture: snapshot state")
+    snapshot_head = _git(vault, "rev-parse", "HEAD").strip()
+    snapshot_parent = _git(vault, "rev-parse", "HEAD^").strip()
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+
+    _git(vault, "reset", "--hard", snapshot_parent)
+    assert _git(vault, "status", "--porcelain") == ""
+    assert _git(vault, "rev-parse", "HEAD").strip() != snapshot_head
+
+    assert gate3.main(["check"]) == 2
+
+
+def test_cli_check_fails_closed_for_divergent_sanctioned_replacement_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    base = _git(vault, "rev-parse", "HEAD").strip()
+    original = "synthetic/00-inbox/active/original.md"
+    (vault / original).write_text("redacted original\n")
+    _git(vault, "add", original)
+    _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+    snapshot_head = _git(vault, "rev-parse", "HEAD").strip()
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+
+    _git(vault, "reset", "--hard", base)
+    replacement = "synthetic/00-inbox/active/replacement.md"
+    (vault / replacement).write_text("redacted replacement\n")
+    _git(vault, "add", replacement)
+    _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+    assert _git(vault, "status", "--porcelain") == ""
+    assert _git(vault, "merge-base", "HEAD", snapshot_head).strip() == base
+
+    assert gate3.main(["check"]) == 2
 
 
 def test_cli_check_rejects_a_changed_baseline_dirty_path(
