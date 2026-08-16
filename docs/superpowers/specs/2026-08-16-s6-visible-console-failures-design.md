@@ -156,6 +156,8 @@ dependency.
 | `E-MISSING` | refusal | refusal | recreate | no | 409 |
 | `E-INVALID` | refusal | refusal | recreate | no | 422 |
 | `E-UNREADABLE` | refusal | attention | stop | no | 422 |
+| `E-UNAVAILABLE` | refusal | refusal | retry | no | 500 |
+| `E-INTERNAL` | refusal | attention | stop | no | 500 |
 | `E-DEST` | refusal | refusal | recreate | no | 422 |
 | `E-BUSY` | refusal | refusal | retry | no | 409 |
 | `E-CONFLICT` | refusal | refusal | reload | no | 409 |
@@ -256,12 +258,14 @@ without their own entry inherit it. Every member of the closed
 | `git_transaction.GitTransactionCommittedError` | `E-COMMITTED` | exact |
 | `git_transaction.GitTransactionRecoveryError` | `E-RECOVER` | exact |
 | `git_transaction.ReviewedPathIntegrityError` | `E-TAMPER` | exact |
-| `git_transaction.ReviewedPathUnavailable` | `E-CONFLICT` | exact |
+| `git_transaction.ReviewedPathUnavailable` | `E-UNAVAILABLE` | exact |
 | `git_transaction.ReviewedStateChanged` | `E-CONFLICT` | exact |
-| `git_transaction.InvalidTransactionPath` | `E-INVALID` | exact |
+| `git_transaction.InvalidTransactionPath` | `E-INTERNAL` | exact |
 | `git_transaction.VaultBusyError` | `E-BUSY` | exact |
 | `git_transaction.GitTransactionFailure` | `E-GIT` | exact |
 | `git_transaction.GitTransactionError` | `E-GIT` | exact |
+| `git_transaction._ApprovalLockCleanupFailure` | `E-GIT` | exact |
+| `git_transaction._ReviewedIndexOwnershipConflict` | `E-CONFLICT` | exact, unreachable |
 | `scope.RedirectedPathError` | `E-TAMPER` | mro |
 | `scope.OutOfScopeError` | `E-SCOPE` | mro |
 | `outbox.OutboxScopeError` | `E-SCOPE` | mro |
@@ -300,6 +304,23 @@ application code raises it at all.
 Invariant 1 additionally asserts that **every class in this table resolves to the
 code named here**, not merely to something other than `E-UNKNOWN`.
 
+**Abstract ambiguous bases are exempt, and the exemption is earned.**
+`CrossScopeError`, `ReviewedStateConflict`, `UnsafeDestinationPath`, and
+`InvalidSourceLeaf` carry no entry, because a class that is never raised has no
+honest single description — that is precisely why they were split. Invariant 1
+skips exactly these four; invariant 3 proves they are never raised. The
+exemption is therefore backed by a test rather than asserted, and removing
+invariant 3 would break invariant 1.
+
+`E-UNAVAILABLE` and `E-INTERNAL` exist because two refined subtypes had no
+truthful code. `ReviewedPathUnavailable` is an ordinary read failure, so telling
+the operator "the reviewed files changed — reload and review again" would be a
+fabrication. `InvalidTransactionPath` is raised by path validation before any
+I/O and serves registry transactions and internal plan paths as well as
+proposals, so `E-INVALID`'s "this proposal record is not valid" would be wrong
+in most of its uses and would send the operator after their data for a defect in
+ours.
+
 ### Exact message text
 
 These strings are the contract.
@@ -315,6 +336,8 @@ These strings are the contract.
 | `E-MISSING` | Approval refused: source is missing. Restore it or reject the proposal. |
 | `E-INVALID` | This proposal record is not valid and cannot be approved. Create a new proposal. |
 | `E-UNREADABLE` | A file in the outbox could not be read as a proposal. Creating another proposal will not clear it — repair or remove it outside the Console. |
+| `E-UNAVAILABLE` | A file involved in this action could not be read. Nothing was changed. Try again; if it persists, check that the file is readable. |
+| `E-INTERNAL` | The action was refused by an internal safety check. Nothing was changed. This indicates a defect rather than a problem with your data. |
 | `E-DEST` | The destination could not be resolved from the registries. Re-classify this item. |
 | `E-BUSY` | Another approval is in progress. Nothing was changed. Try again in a moment. |
 | `E-CONFLICT` | The reviewed files changed since this proposal was previewed. Reload and review again. |
@@ -443,12 +466,30 @@ projection, so there is no completed listing to aggregate over. One broken
 registry reads as one broken registry because it is reported once, from the
 abort — not because rows were compared.
 
-**Phase 3 — diff rendering.** `_render_diff` reads the source receipt and may
-raise `UnicodeDecodeError`, `OSError`, or scope errors. These are **row-local
-and non-poisoning**: the record is valid, the strict loader is unaffected, and
-every other proposal still approves. Such a row renders with a described error in
-place of its diff, keeps `can_reject`, loses `can_approve` — because `approve`
-decodes the same receipt and refuses — and does **not** set `blocked`.
+**Phase 3 — diff rendering.** These are **row-local and non-poisoning**: the
+record is valid, the strict loader is unaffected, and every other proposal still
+approves. Such a row renders with a described error in place of its diff, keeps
+`can_reject`, loses `can_approve`, and does **not** set `blocked`.
+
+`_render_diff` must read the receipt **through the same safe-read boundary
+`approve` uses**, and translate failures into the same domain types. Otherwise
+the row and the button describe different conditions for one physical cause:
+raw `UnicodeDecodeError` and `OSError` resolve to `E-UNKNOWN`, while `approve`
+turns the identical conditions into `MissingProposalSource`, `CrossScopeError`,
+and `OutboxDestinationError`. The listing would say "an unexpected error was not
+handled" about a file whose approve button says "source is missing".
+
+The translation is therefore normative, not incidental:
+
+| Condition | Type | Code |
+|---|---|---|
+| receipt absent | `MissingProposalSource` | `E-MISSING` |
+| receipt redirected or unsafe | `RedirectedSourceLeaf` | `E-TAMPER` |
+| receipt not decodable as UTF-8 | `OutboxDestinationError` | `E-INVALID` |
+| receipt unreadable for any other reason | `ProposalSourceUnavailable` | `E-UNAVAILABLE` |
+
+Row and button then agree by construction: both read through one boundary and
+both describe what that boundary raised.
 
 ### Delete proposals are skipped, exactly as today
 
@@ -498,13 +539,15 @@ attacker-controlled text and is not echoed.
 `OutboxRow.error` carries the **raw exception**, never a code. `app/main.py` —
 the presentation composition root — calls `describe()` on it, so a propagating
 `E-CONFIG` or `E-TAMPER` keeps its own description and its own wording.
-`E-UNREADABLE` is the fallback the composition root selects only for the
-record-local family, which no class mapping covers.
+`E-UNREADABLE` reaches rows through the normative map, since phase 1 raises the
+typed `UnreadableProposalRecord`. The composition root does not select codes by
+hand; it calls `describe()` on whatever the row carries.
 
-When several rows carry conditions, the listing-level notice takes the **highest
-precedence** description among them, by the Rule 1 tier order. One broken
-registry therefore reads as a broken registry, not as one of many unreadable
-files.
+There is no cross-row aggregation. Phase 2 conditions abort the projection and
+are reported once from that abort, so a broken registry reads as a broken
+registry because it is the only thing reported — not because rows were compared.
+A completed listing contains only record-local and diff-local conditions, each
+described on its own row.
 
 `E-UNREADABLE` is distinct from `E-INVALID` because the two demand opposite
 actions. `E-INVALID` says the proposal you tried to approve is bad — create a
@@ -691,21 +734,30 @@ without mapping the status into the taxonomy.
 All eleven registered routes, the scope dependency, and the global handler.
 Reading routes are listed even where currently silent.
 
-| Site | Current | Required |
-|---|---|---|
-| `shell` | `Vault().bundles()` uncaught | `E-CONFIG` page |
-| `pulse` | reads no vault state | unchanged |
-| `triage_default` | `Vault().bundles()` uncaught | `E-CONFIG` page |
-| `triage` | `except (DestinationError, DestinationRegistryError): destination = None`; `CrossScopeError` escapes the tuple entirely | per-row code and message; tuple extended to cover scope and tamper conditions |
-| `propose` | uncaught | described alert into the existing `#diff-{index}` target |
-| `outbox_screen` | strict loader; one bad record blanks the screen | the projection |
-| `outbox_approve` | `except OutboxError: pass` — this **already swallows every transaction failure**, including committed outcomes, since `OutboxTransactionError` subclasses `OutboxError` | described inline |
-| `outbox_reject` | `except OutboxError: pass` | described inline |
-| `registry_products` | `products_for` uncaught; raises `yaml.YAMLError`, not `RegistryError` | `E-CONFIG` inline |
-| `registry_delete_preview` | uncaught; `reference_count` raises `sqlite3.DatabaseError` and `yaml.YAMLError` | `E-CONFIG` inline |
-| `registry_delete_execute` | unescaped f-string on **both** branches | template on both branches |
-| `entity_scope` | `HTTPException(404)`, empty body | `EntitySelectionError` to its dedicated handler |
-| global handler | absent | describes, returns 500 |
+| Site | Required outcome |
+|---|---|
+| `shell` | `E-CONFIG` page |
+| `pulse` | unchanged |
+| `triage_default` | `E-CONFIG` page |
+| `triage` | per-row code and message; tuple extended to cover scope and tamper conditions |
+| `propose` | described alert into the existing `#diff-{index}` target |
+| `outbox_screen` | the projection |
+| `outbox_approve` | described inline |
+| `outbox_reject` | described inline |
+| `registry_products` | `E-CONFIG` inline |
+| `registry_delete_preview` | `E-CONFIG` inline |
+| `registry_delete_execute` | template on both branches |
+| `entity_scope` | `EntitySelectionError` to its dedicated handler |
+| global handler | describes, returns 500 |
+
+The **Current** column is deleted. It described what each route does today — a fact about source that drifts the moment anything changes, and the last such
+inventory in this document. What each route must *do* is a contract and stays;
+what it does *now* is discoverable by reading it.
+
+The site list itself is not an inventory to maintain: invariant 6 enumerates
+routes from `app.routes`, so a route added later is covered without editing
+this table, and a route present here but absent from the app fails the same
+test.
 
 `E-CONFIG` renders **inline on a fragment request and as a page on a full-page
 request**, like every other code. Surface follows the request, not the code; the
@@ -866,16 +918,28 @@ ambiguous bases. This is what closes the tamper classification: the choice is
 made at the raise site, in code, and a new site is unclassified until it picks a
 subtype. No line numbers anywhere.
 
-**4. Registry readers convert by shape.** A reader declares itself with a
-`@registry_reader` decorator that records its tolerant-absence contract. Tests
-read the decorator registry — but a decorator alone is just a second manifest,
-so a **structural guard** closes it: an AST test finds every function under
-`app/` that parses a registry (calls `yaml.safe_load`, opens a `system_path`
-result, or connects to `books.db`) and fails on any that is undecorated. You
-cannot add a reader the tests do not know about, because the AST test finds it
-by what it does, not by whether someone remembered to list it. The suite then
-injects each escaping shape through each registered reader and asserts
-`E-CONFIG`, and asserts each absorbed case still returns its tolerant value.
+**4. Structured readers declare their category.** The guard cannot be "anything
+that calls `yaml.safe_load`" — that also finds proposal records, delete
+proposals, front matter, and the rename database, none of which are registries
+and none of which may become `E-CONFIG`. A malformed proposal is
+`E-UNREADABLE`; a malformed `archetypes.yaml` is `E-CONFIG`; conflating them
+reproduces the defect Rule 1 exists to fix.
+
+So every structured reader declares a **category** at its definition:
+
+| Category | Failure becomes |
+|---|---|
+| `registry` | `DestinationRegistryError` → `E-CONFIG` |
+| `proposal` | `UnreadableProposalRecord` → `E-UNREADABLE` |
+| `front-matter` | absorbed, per its existing tolerant contract |
+| `admin-db` | its existing administrative error |
+
+The structural guard finds candidates by what they do — parsing YAML, opening a
+`system_path` result, connecting to a SQLite file — and fails on any that
+carries no category. It does not infer which category; it only refuses silence.
+Conversion tests then apply to the `registry` category alone, and separately
+assert that a `proposal`-category failure yields `E-UNREADABLE` rather than
+`E-CONFIG`.
 
 **5. No template hand-builds `hx-vals`.** A test scans `templates/` for
 `hx-vals` attributes and fails on any whose value is not a single
@@ -889,7 +953,10 @@ application, none of which can satisfy a Console requirement.
 A route declares its catch family with a `@console_route(catches=(...))`
 decorator on the handler, and the same structural guard applies: an AST test
 fails on any handler in `app.main` that is registered with FastAPI but carries no
-declaration, and on any handler whose body contains a bare `except Exception`.
+declaration, on any handler whose body contains a bare `except Exception`, and on any
+declaration whose tuple contains `Exception` or `BaseException` — checking only
+the body would still permit a declared catch-all, which is the same laundering
+by another route.
 Tests then read each declaration, inject each member of the declared family, and
 assert the route describes it rather than reaching the global handler.
 
@@ -1037,20 +1104,6 @@ existing status assertion therefore holds, and the two additional tests earlier
 drafts predicted would break — the stale-source refusal and the cross-entity
 isolation test — do **not** change. That is the main reason route-shape-first
 was chosen over header-only selection.
-
-The last two were **not** in the previous draft, which listed two tests and then
-declared that any other change was a scope breach. That claim was false against
-this design's own text, and `tests/test_app.py:468` sits inside the very test
-the previous draft named as one that does *not* change. Recording them is the
-point: an enumeration that quietly omits its inconvenient members is the failure
-this project keeps re-learning.
-
-`tests/test_app.py:538` deserves particular care. It is an **S2 cross-entity
-isolation test** — a state-safety test, the category that is supposed to survive
-untouched. What changes is only the status code carrying the refusal; the
-refusal itself, and the isolation it proves, are unchanged. The updated test
-must continue to assert that entity A's action cannot touch entity B's proposal,
-and only its status expectation moves.
 
 The rule this table replaces: **an S1-S5 service or state-safety test whose
 subject is a refusal decision, an isolation guarantee, or a state proof must not
