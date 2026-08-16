@@ -1,6 +1,8 @@
 import fcntl
 import os
+import shlex
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,7 +16,17 @@ from app.git_transaction import (
     VaultBusyError,
     capture_path_state,
 )
-from tests.conftest import git_entity_vault
+from tests.conftest import (
+    git_bytes,
+    git_cached_diff,
+    git_changed_paths,
+    git_entity_vault,
+    git_head,
+    git_head_message,
+    git_index_entries,
+    git_status_bytes,
+    git_worktree_diff,
+)
 
 
 def _vault(tmp_path: Path) -> Path:
@@ -25,6 +37,63 @@ def _vault(tmp_path: Path) -> Path:
             "synthetic/00-inbox/active/item.md": "reviewed\n",
             "synthetic/11-library/active/.gitkeep": "",
         },
+    )
+
+
+def _approval_plan() -> TransactionPlan:
+    source = "synthetic/00-inbox/active/item.md"
+    destination = "synthetic/11-library/active/item.md"
+    proposal = "synthetic/outbox/proposal.yaml"
+    return TransactionPlan(
+        "outbox: approve synthetic item",
+        (
+            PathChange(
+                source,
+                PathState.regular(b"reviewed\n", 0o644),
+                PathState.absent(),
+            ),
+            PathChange(
+                destination,
+                PathState.absent(),
+                PathState.regular(b"approved\n", 0o644),
+            ),
+        ),
+        (source, destination),
+        (
+            PathChange(
+                proposal,
+                PathState.regular(b"proposal\n", 0o644),
+                PathState.absent(),
+            ),
+        ),
+    )
+
+
+def _write_proposal(vault: Path, contents: bytes = b"proposal\n") -> Path:
+    proposal = vault / "synthetic/outbox/proposal.yaml"
+    proposal.parent.mkdir(parents=True, exist_ok=True)
+    proposal.write_bytes(contents)
+    return proposal
+
+
+def _unrelated_index_entries(vault: Path, reviewed: tuple[str, ...]) -> tuple[bytes, ...]:
+    reviewed_bytes = {os.fsencode(path) for path in reviewed}
+    return tuple(
+        sorted(
+            record
+            for record in git_index_entries(vault).split(b"\0")
+            if record and record.split(b"\t", 1)[1] not in reviewed_bytes
+        )
+    )
+
+
+def _unrelated_status(vault: Path, excluded: set[str]) -> tuple[bytes, ...]:
+    return tuple(
+        sorted(
+            record
+            for record in git_status_bytes(vault).split(b"\0")
+            if record and os.fsdecode(record[3:]) not in excluded
+        )
     )
 
 
@@ -192,3 +261,161 @@ def test_approval_lock_closes_and_releases_when_unlock_fails(tmp_path, monkeypat
     monkeypatch.setattr(transaction.os, "open", original_open)
     with transaction._approval_lock(vault):
         pass
+
+
+def test_list_capable_plan_commits_two_reviewed_changes_once(tmp_path):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan()
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+
+    result = transaction.execute_transaction(vault, plan)
+
+    assert result.changed_paths == (
+        "synthetic/00-inbox/active/item.md",
+        "synthetic/11-library/active/item.md",
+    )
+    assert git_changed_paths(vault, result.commit_oid) == list(result.changed_paths)
+    assert git_head_message(vault) == plan.message
+    assert subprocess.run(
+        ["git", "rev-list", "--count", f"{start_head}..{result.commit_oid}"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "1"
+    assert source.exists() is False
+    assert destination.read_bytes() == b"approved\n"
+    assert proposal.exists() is False
+
+
+def test_unrelated_staged_unstaged_and_untracked_state_is_preserved_exactly(tmp_path):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+    unrelated_staged = vault / "staged.md"
+    unrelated_unstaged = vault / "unstaged.md"
+    unrelated_untracked = vault / "untracked.bin"
+    unrelated_staged.write_bytes(b"staged base\n")
+    unrelated_unstaged.write_bytes(b"unstaged base\n")
+    git_bytes(vault, "add", "staged.md", "unstaged.md")
+    git_bytes(vault, "commit", "-q", "-m", "add unrelated fixtures")
+    staged_bytes = b"staged exact\x00\xff\n"
+    unstaged_bytes = b"unstaged exact\x00\xfe\n"
+    untracked_bytes = b"untracked exact\x00\xfd\n"
+    unrelated_staged.write_bytes(staged_bytes)
+    git_bytes(vault, "add", "staged.md")
+    unrelated_unstaged.write_bytes(unstaged_bytes)
+    unrelated_untracked.write_bytes(untracked_bytes)
+    status_exclusions = set(plan.commit_paths) | {
+        change.path for change in plan.owned_changes
+    }
+    status_before = _unrelated_status(vault, status_exclusions)
+    worktree_diff_before = git_worktree_diff(vault)
+    cached_diff_before = git_cached_diff(vault)
+    unrelated_index_entries_before = _unrelated_index_entries(vault, plan.commit_paths)
+
+    transaction.execute_transaction(vault, plan)
+
+    assert unrelated_staged.read_bytes() == staged_bytes
+    assert unrelated_unstaged.read_bytes() == unstaged_bytes
+    assert unrelated_untracked.read_bytes() == untracked_bytes
+    assert _unrelated_index_entries(vault, plan.commit_paths) == unrelated_index_entries_before
+    assert _unrelated_status(vault, status_exclusions) == status_before
+    assert git_worktree_diff(vault) == worktree_diff_before
+    assert git_cached_diff(vault) == cached_diff_before
+
+
+def test_existing_pre_commit_hook_runs_against_only_alternate_index_paths(tmp_path):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+    unrelated_staged = vault / "staged.md"
+    unrelated_staged.write_bytes(b"base\n")
+    git_bytes(vault, "add", "staged.md")
+    git_bytes(vault, "commit", "-q", "-m", "add hook fixture")
+    unrelated_staged.write_bytes(b"unrelated staged\n")
+    git_bytes(vault, "add", "staged.md")
+    hook_record = tmp_path.parent / f"{tmp_path.name}-hook-paths.txt"
+    hook = vault / ".git/hooks/pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"git diff --cached --name-only > {shlex.quote(os.fspath(hook_record))}\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    transaction.execute_transaction(vault, plan)
+
+    assert hook_record.read_text(encoding="utf-8").splitlines() == sorted(plan.commit_paths)
+    assert "staged.md" not in hook_record.read_text(encoding="utf-8").splitlines()
+
+
+def test_reviewed_staged_change_is_refused_before_filesystem_mutation(tmp_path):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+    source.write_bytes(b"unexpected staged\n")
+    git_bytes(vault, "add", plan.commit_paths[0])
+    source.write_bytes(b"reviewed\n")
+
+    with pytest.raises(ReviewedStateConflict):
+        transaction.execute_transaction(vault, plan)
+
+    assert git_head(vault) == start_head
+    assert source.read_bytes() == b"reviewed\n"
+    assert destination.exists() is False
+    assert proposal.read_bytes() == b"proposal\n"
+
+
+def test_reviewed_unstaged_change_is_refused_before_filesystem_mutation(tmp_path):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault)
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+    source.write_bytes(b"unexpected unstaged\n")
+
+    with pytest.raises(ReviewedStateConflict):
+        transaction.execute_transaction(vault, plan)
+
+    assert git_head(vault) == start_head
+    assert source.read_bytes() == b"unexpected unstaged\n"
+    assert destination.exists() is False
+    assert proposal.read_bytes() == b"proposal\n"
+
+
+def test_owned_proposal_mismatch_is_refused_before_filesystem_mutation(tmp_path):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    proposal = _write_proposal(vault, b"different proposal\n")
+    source = vault / plan.commit_paths[0]
+    destination = vault / plan.commit_paths[1]
+    start_head = git_head(vault)
+
+    with pytest.raises(ReviewedStateConflict):
+        transaction.execute_transaction(vault, plan)
+
+    assert git_head(vault) == start_head
+    assert source.read_bytes() == b"reviewed\n"
+    assert destination.exists() is False
+    assert proposal.read_bytes() == b"different proposal\n"
+
+
+def test_temporary_alternate_index_is_removed_after_success(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+    index_directory = tmp_path.parent / f"{tmp_path.name}-indexes"
+    index_directory.mkdir()
+    monkeypatch.setattr(transaction.tempfile, "tempdir", os.fspath(index_directory))
+
+    transaction.execute_transaction(vault, plan)
+
+    assert list(index_directory.iterdir()) == []
