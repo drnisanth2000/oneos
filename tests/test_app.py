@@ -20,6 +20,7 @@ import pytest
 import yaml
 from starlette.testclient import TestClient
 
+from app.git_transaction import GitTransactionFailure
 from tests.conftest import git_head, write_vault, scaffold_modules
 
 ENTITIES = """
@@ -471,6 +472,40 @@ def test_approval_route_visibly_refuses_unfresh_source(
     assert proposal_path.read_bytes() == proposal_before
     assert git_head(client.vault) == head_before
     assert not (client.vault / "alpha/02-work/active/marker.md").exists()
+
+
+def test_approval_route_transaction_error_is_not_a_500_or_general_error_panel(
+    client, monkeypatch
+):
+    import app.outbox as outbox
+
+    proposal_id = "20260815T090703-" + "11" * 16
+    proposal = client.vault / "alpha/outbox" / f"{proposal_id}.yaml"
+    source = client.vault / "alpha/00-inbox/active/marker.md"
+    destination = client.vault / "alpha/02-work/active/marker.md"
+    proposal_bytes = proposal.read_bytes()
+    source_bytes = source.read_bytes()
+    head_before = git_head(client.vault)
+
+    def fail_transaction(*_args, **_kwargs):
+        raise GitTransactionFailure("injected route transaction failure")
+
+    monkeypatch.setattr(
+        outbox, "execute_transaction", fail_transaction, raising=False
+    )
+    route_client = TestClient(client.app, raise_server_exceptions=False)
+
+    response = route_client.post(
+        "/outbox/alpha/approve", data={"id": proposal_id}
+    )
+
+    assert response.status_code == 200
+    assert 'role="alert"' not in response.text
+    assert proposal_id in response.text
+    assert git_head(client.vault) == head_before
+    assert source.read_bytes() == source_bytes
+    assert destination.exists() is False
+    assert proposal.read_bytes() == proposal_bytes
 
 
 def test_unknown_route_entity_is_404_without_entity_directory_read(client, monkeypatch):

@@ -846,6 +846,7 @@ def _stage_in_alternate_index(
         vault,
         "diff",
         "--cached",
+        "--no-renames",
         "--name-only",
         "-z",
         env=alternate_env,
