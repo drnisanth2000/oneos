@@ -70,7 +70,13 @@ Three constraints make the walk safe:
 - **Allowlisted.** Only classes explicitly declared chain-bearing are traversed.
   A class not on the allowlist is described by itself, and its cause is never
   read. The allowlist is `OutboxTransactionError`, `RegistryTransactionError`,
-  `OutboxDestinationError`, `HTTPException`, and `GitTransactionFailure`.
+  `OutboxDestinationError`, and `GitTransactionFailure`. Membership is by
+  **exact class identity**, with one stated exception: the two private
+  subclasses of `GitTransactionFailure` (`app/git_transaction.py:44,50`) are
+  members too, and a test over `GitTransactionFailure.__subclasses__()`
+  transitively fails if a new one is added without being listed. Silent
+  membership by `isinstance` would let a future subclass stop the walk and
+  re-hide a committed outcome — the Gate 2 break Rule 2 exists to prevent.
 - **`__cause__` only, never `__context__`.** Python sets `__context__`
   automatically for any exception raised while handling another, so traversing
   it would surface unrelated in-flight failures. Only explicit `raise ... from`
@@ -175,8 +181,23 @@ subclasses, both described as `E-TAMPER`:
 
 | Base | New subclass | Sites |
 |---|---|---|
-| `CrossScopeError` | `RedirectedPathError` | `app/outbox.py:99,122,140`, `app/inbox.py:46,57` |
-| `ReviewedStateConflict` | `ReviewedPathIntegrityError` | `app/git_transaction.py:172,192,198,228` |
+| `CrossScopeError` | `RedirectedPathError` | `app/outbox.py:99,102,107,109,122,125,140,144`, `app/inbox.py:46,57`, `app/scope.py:41,64` |
+| `ReviewedStateConflict` | `ReviewedPathIntegrityError` | `app/git_transaction.py:172,192,198,228,816,993,995,1001,1009` |
+
+The earlier draft of this table listed four sites per base and missed twelve.
+The omissions were not incidental: `app/git_transaction.py:993,995,1001` are
+**verbatim duplicates** of `:190,192,198`, differing only in that the mutation
+half of the transaction noticed the condition rather than the capture half.
+Under the short table, one physical condition — a symlinked reviewed path —
+produced "Do not retry. Inspect the vault" or "Reload and review again"
+depending purely on timing.
+
+A hand-written enumeration cannot report the sites it omits, which is the
+`BUILD.md` §5 failure this project keeps hitting. So the inventory is closed by
+test rather than by review: **every `raise CrossScopeError` and every `raise
+ReviewedStateConflict` site under `app/` must appear in an explicit
+classification table, and the test enumerates the raise sites from source.** A
+new site fails the test until it is classified.
 
 Both are **type refinements, not behavior changes**: the same inputs are refused
 at the same points, and every existing `except CrossScopeError` or `except
@@ -228,12 +249,43 @@ of the closed `GitTransactionError` family is `exact` by Rule 2.
 | `ingest.base.IngestError` and all subclasses | `E-INGEST` | mro |
 | `rename.RenameError` | `E-ADMIN` | mro |
 | `fastapi.RequestValidationError` | `E-REQUEST` | exact |
-| `fastapi.HTTPException` | `E-REQUEST` | exact |
+
+`HTTPException` is deliberately **absent** from this table and from the
+traversal allowlist. `fastapi.HTTPException` subclasses
+`starlette.exceptions.HTTPException`, and the framework raises that same class
+for unmatched URLs, wrong methods, and `StaticFiles` misses — so a mapping would
+return 422 with copy about a form for a missing vendor script, which Rule 6
+explicitly forbids. After Rule 6 removes the conversion at `app/main.py:57`, no
+application code raises `HTTPException` at all, leaving the row with no producer
+and only that harmful effect. Starlette's and FastAPI's own handlers are left
+intact. `RequestValidationError` alone carries `E-REQUEST`, and
+`EntitySelectionError` reaches its own handler as `E-ENTITY`.
 
 `UnsafeDestinationPath` and `SystemRegistryPathError` are `E-TAMPER` rather than
-`E-DEST`/`E-CONFIG`: both fire specifically on redirected or non-canonical
-paths, which is the integrity condition, not an ordinary resolution failure.
-Both are `exact` so their siblings keep the ordinary code.
+`E-DEST`/`E-CONFIG` because both fire on redirected or non-canonical paths,
+which is an integrity condition rather than an ordinary resolution failure. Both
+are `exact` so their siblings keep the ordinary code.
+
+Two refinements are required before that is true:
+
+**`UnsafeDestinationPath` must stop covering plain absence.**
+`app/destinations.py:70-75` raises it for two conditions in one statement —
+`resolved != lexical` (redirection) **or** `not lexical.is_dir()` (the directory
+simply is not there). A module the flags require but the disk lacks is a
+first-class expected state in this system: `app/vault.py:41-43` models it as
+`Module.missing`, `check_v2` reports it as E4, and `BUILD.md:134-143` makes it a
+standing regression. Today such an item renders "invalid destination — needs a
+call" (`templates/triage.html:70`). Under an unsplit `E-TAMPER` the operator
+would instead be told to go hunting for tampering because a scaffolding step was
+skipped. Crying wolf here costs more than under-classifying, because the code's
+entire value is that it is rare. Absence raises the ordinary `DestinationError`;
+only `resolved != lexical` raises `UnsafeDestinationPath`.
+
+**`SystemRegistryPathError` must be reachable.** `app/scope.py:60-64` converts
+it to a plain `CrossScopeError`, so on the service path it describes as
+`E-SCOPE` and survives as `E-TAMPER` only through `Vault.system_path`
+(`app/vault.py:69-70`) — one condition, two codes, decided by caller. That
+conversion site joins the `RedirectedPathError` list below.
 
 `E-UNREADABLE` is produced by the projection, not by a class mapping — no
 service raises it.
@@ -288,59 +340,115 @@ S6 leaves every mutation path untouched. `approve`, `reject`, `get_proposal`,
 and `load_proposals` keep their exact current behavior and fail-closed
 semantics.
 
-S6 adds a **presentation projection** that validates one record at a time:
+### The projection
 
 ```text
-project_outbox(scope) -> list[OutboxRow]
+project_outbox(scope) -> OutboxListing
+OutboxListing(rows, blocked)
 OutboxRow(kind, proposal | None, diff | None, error | None)
 ```
 
-The strict loader's per-file body is extracted into two shared helpers —
-`_read_record(path)` and `_validate_record(scope, path, record)` — and both the
-strict loader and the projection call them. The validation logic moves; it does
-not change or fork.
+`kind` is `readable`, `unreadable`, or `skipped`. `blocked` is true when any row
+is `unreadable`.
 
-This preserves S4's revalidation authority. S4 required that a stored record be
-revalidated before its diff is shown; it achieved that by re-reading the whole
-listing, which is why one bad file poisons every row. The projection performs
-the same revalidation on the same record, without the global loop. What is
-removed is the global re-entry, not a check.
+The strict loader's per-file body is extracted into three shared helpers —
+`_read_record(path)`, `_validate_record(scope, path, record)`, and
+`_render_diff(scope, proposal)` — and the strict loader and the projection both
+call them. The validation logic moves; it does not change or fork.
+
+`_render_diff` takes an **already-validated** record and performs only the
+`difflib` work. `preview_diff` keeps its public contract unchanged: it performs
+its strict reload first, then delegates to `_render_diff`. The projection calls
+`_render_diff` directly on the record it has just validated.
+
+`project_outbox` never calls `get_proposal`, `load_proposals`, or
+`preview_diff`. That is the whole point of the extraction, and it is asserted by
+test.
+
+### Delete proposals are skipped, exactly as today
+
+Registry delete proposals live in the same `outbox/` directory the projection
+globs (`app/registry.py:200-245`). The strict loader tolerates them with
+`if action == "delete": continue` (`app/outbox.py:281-282`), placed after the
+identity check.
+
+The projection preserves that skip precisely, yielding `kind = skipped`. This
+matters because `app/main.py:211` calls `propose_delete` on **every**
+delete-preview click, so an abandoned preview leaves a valid delete proposal
+behind permanently. A well-formed delete record must therefore render nothing,
+count as nothing, and block nothing — exactly its behavior today.
+
+Only a **malformed** delete record — one failing the read or identity check that
+precedes the skip — is unreadable. The skip follows validation; it does not
+bypass it.
+
+### S4 revalidation is preserved
+
+S4 required a stored record to be revalidated before its diff is shown, and
+achieved it by re-reading the whole listing — which is why one bad file poisons
+every row. The projection performs the same revalidation on the same record
+without the global loop. What is removed is the global re-entry, not a check.
 
 The displayed diff carries **no approval authority**. Approval revalidates from
 scratch through the untouched strict path, so a row rendering successfully is
-never evidence that it will approve.
+never evidence that it will approve. That sentence is honest about the
+implementation and, read carefully, concedes something S6 must not paper over:
+**nothing binds an approval to the bytes the operator reviewed.** See §11.
 
-That sentence is honest about the implementation and, read carefully, concedes
-something S6 must not paper over: **nothing binds an approval to the bytes the
-operator reviewed.** See §11.
+### An unreadable record blocks the whole listing, visibly
 
-A row that fails validation is rendered as an **unreadable record**: no approve
-control, no reject control, and no filename. Per Rule 9 the filename is
+Because `approve` and `reject` resolve through the untouched strict loader, a
+single malformed record makes **every** action in that entity fail — including
+actions on proposals that are perfectly valid. The failure surfaces as
+`E-INVALID`, "create a new proposal", which cannot possibly resolve the
+condition.
+
+Rendering approve and reject controls beside valid rows in that state would be
+worse than today's blank screen. Today the operator sees a hard failure and
+knows something is wrong. A listing full of buttons that are all silently
+guaranteed to fail is a legibility regression inside the step whose purpose is
+legibility.
+
+So the projection is **all-or-nothing**:
+
+- When `blocked` is false, valid rows render with their normal approve and
+  reject controls.
+- When `blocked` is true, valid rows still render — with their id, destination,
+  and diff, so the operator can see what is pending — but **no classification
+  controls at all**, and the listing carries one `E-UNREADABLE` notice stating
+  that a file in the outbox cannot be read and that no proposal in this entity
+  can be approved or rejected until it is repaired or removed outside the
+  Console.
+
+This states the coupling instead of hiding it behind controls that cannot work,
+and it does so without weakening a single check: the strict loader still refuses
+everything, exactly as it does today. The projection only stops lying about it.
+
+An unreadable row itself carries no filename. Per Rule 9 the filename is
 attacker-controlled text and is not echoed; the row is generic.
 
-The projection is a service function, so it must not name a presentation code —
-that would breach the one-way import boundary the design asserts elsewhere.
-`OutboxRow` therefore carries a **domain-neutral** kind (`readable` /
-`unreadable`) plus the raw exception, and `app/main.py` — the presentation
-composition root — selects `E-UNREADABLE` for the unreadable kind and calls
-`describe()` for anything else. No service module imports the taxonomy.
+### The taxonomy stays out of the service
 
-`E-UNREADABLE` is a distinct code from `E-INVALID` because the two demand
-opposite actions. `E-INVALID` says the proposal you tried to approve is bad —
-create a new one, and the bad one disappears when you reject it. `E-UNREADABLE`
-says a file in the outbox cannot be parsed at all — creating another proposal
-does not remove it, and it cannot be rejected through the Console. One code
-carrying both `recreate` and `stop` would have told the operator to perform an
-action that cannot resolve the condition.
+The projection is a service function, so it must not name a presentation code.
+`OutboxRow` carries a **domain-neutral** kind plus the raw exception, and
+`app/main.py` — the presentation composition root — selects `E-UNREADABLE` for
+the unreadable kind and for the blocked-listing notice, and calls `describe()`
+for anything else. No service module imports the taxonomy.
+
+`E-UNREADABLE` is distinct from `E-INVALID` because the two demand opposite
+actions. `E-INVALID` says the proposal you tried to approve is bad — create a
+new one, and rejecting it clears it. `E-UNREADABLE` says a file in the outbox
+cannot be parsed at all — creating another proposal does not remove it, and it
+cannot be rejected through the Console. One code carrying both `recreate` and
+`stop` would have told the operator to take an action that cannot resolve the
+condition.
 
 Withholding reject is deliberate. `reject` resolves through `get_proposal` and
 the strict loader, so a malformed record cannot be rejected without a new
 service contract that deletes a path the domain never validated. That is a
 change to what the Console may destroy, not to how a refusal is shown, and it
 is out of scope. The operator repairs or removes such a file outside the
-Console; the row says so without naming it.
-
----
+Console; the blocked notice says so without naming it.
 
 ## 4. Rule 4 — HTMX configuration reaches every document
 
@@ -381,6 +489,22 @@ The test **enumerates every full-page route** and asserts the configuration in
 each rendered response. Asserting it on one page is the BUILD.md §5 failure
 mode inside the guard written to prevent it.
 
+### The override must not swap framework error bodies
+
+`{"code":"[45]..","swap":true}` matches every non-2xx, including the responses
+Rule 6 deliberately keeps out of the taxonomy. An HTMX request to an unmatched
+URL or with a wrong method would swap Starlette's raw `Not Found` or
+`Method Not Allowed` body into `#outbox-list` or `#diff-{index}` — framework
+text reaching the operator through the swap path, which §6 forbids through the
+render path.
+
+A `default` exception handler for `StarletteHTTPException` therefore renders any
+framework status the taxonomy does not own as a described `E-UNKNOWN` fragment
+when `HX-Request` is present, and leaves the framework's own plain response
+untouched otherwise. The status is preserved in both cases; only the swapped
+body is replaced. This keeps Rule 6's exclusion — those responses are still not
+*mapped* to `E-REQUEST` — while closing the swap that the exclusion overlooked.
+
 ---
 
 ## 5. Rule 5 — Typed route handling only
@@ -410,16 +534,42 @@ Keying on severity resolves `E-COMMITTED`, `E-RECOVER`, `E-CONFIG`, `E-TAMPER`,
 and leaving every other attention outcome undefined. It also guarantees the one
 class of outcome that must not look routine never returns 200.
 
+### The Gate 1 stopwatch must not count refusals
+
+`templates/triage.html:130-136` increments the triage counter on
+`htmx:afterRequest` when `e.detail.successful` is true. HTMX derives that from
+the matched `responseHandling` entry's `error` flag, so today an uncaught 500
+from a failed `propose` is not counted. Under Rule 5, `E-DEST`, `E-INVALID`, and
+`E-REQUEST` are refusals returning **200**, and the counter would increment on a
+proposal that was refused and wrote nothing — silently corrupting the spec §11
+Gate 1 measurement that the whole Safety Foundation exists to make trustworthy.
+
+The fix does **not** change any HTTP status. Refusals keep 200 and the S1-S5
+HTTP contracts stay intact. Instead the counter stops inferring success from
+transport: `propose` emits an `HX-Trigger` event **only after the proposal is
+persisted**, and the stopwatch listens for that event rather than for
+`htmx:afterRequest`. A success-only server signal cannot be produced by a
+refusal, so the metric is truthful by construction rather than by a client-side
+guard that a later edit could drop.
+
 ### Rule 6 — Framework wrapping is explicit
 
 `entity_scope` stops converting `EntitySelectionError` into `HTTPException`. It
 raises `EntitySelectionError`, and a dedicated handler describes it as
 `E-ENTITY` at 404 — the same status the route returns today.
 
-`E-REQUEST` covers `RequestValidationError` and `HTTPException` **raised by
-application code only**. Starlette's automatic 404 for an unmatched URL, its 405,
-and `StaticFiles` 404s keep their default handling; mapping them would return
-422 with copy about a form for a missing vendor script.
+`E-REQUEST` covers **`RequestValidationError` only**. An earlier draft added
+"`HTTPException` raised by application code" and then excluded the framework's
+own instances in the next sentence — but they are the same class, with no
+discriminator available at handler time, so the exclusion was unenforceable.
+After this rule removes the conversion at `app/main.py:57`, no application code
+raises `HTTPException` at all, which settles it: the class is absent from the
+table and the allowlist, and Starlette's automatic 404, its 405, and
+`StaticFiles` misses keep their own handlers untouched.
+
+Their *bodies* still need handling once the `responseHandling` override makes
+non-2xx swap; that is covered in Rule 4, and it replaces the swapped body
+without mapping the status into the taxonomy.
 
 ### Route inventory
 
@@ -495,7 +645,16 @@ values.** Two distinct defects:
 *Reflected copy.* `registry_delete_execute` builds its success message from the
 submitted `slug` form field, never compared against the proposal's own slug, and
 interpolates it into an unescaped `HTMLResponse`. Both branches move to
-templates, and success copy is built from the **validated service result**.
+templates, and success copy is built from the **server-derived** slug.
+
+`execute_delete` returns `None` (`app/registry.py:292`) and removes the proposal
+file as an owned change (`:346`), so the record cannot be read afterwards. The
+route therefore calls `get_delete_proposal` **before** executing and holds the
+validated slug from it. Changing `execute_delete`'s signature would be a service
+change and is not authorized here; the requirement is satisfied entirely in the
+route. The submitted `slug` field is then unused for display and the execute
+request stops sending it at all, since the server derives kind and slug from the
+validated proposal.
 
 *Request rebinding.* Both registry templates hand-build `hx-vals` JSON around an
 interpolated value:
@@ -573,7 +732,9 @@ what failed. The same re-entrancy argument as the outbox listing applies.
   `innerHTML` route must **not** — reproducing it there would nest a duplicate
   id inside itself. The current shapes are `#outbox-list` / `outerHTML` for
   approve and reject, `#diff-{index}` / `innerHTML` for propose, and
-  `#impact-{index}` / `innerHTML` for delete preview. The test asserts the
+  `#impact-{index}` / `innerHTML` for delete preview, and `closest
+  .delete-impact` / `innerHTML` for delete execute — a relative selector rather
+  than an id, and the route S6 rewrites most heavily. The test asserts the
   declared shape for each and never echoes the client-supplied `HX-Target`
   header, which is attacker-controlled.
 - **Route-level totality:** for each route, every exception in that route's
@@ -593,12 +754,26 @@ what failed. The same re-entrancy argument as the outbox listing applies.
 
 ### Projection
 
-- A malformed record renders one generic unreadable row while every valid
-  proposal renders and remains approvable.
-- The unreadable row offers neither control, echoes no filename, and posting
-  either action for it is still refused by the untouched strict loader.
+- With no unreadable record, every valid proposal renders with its normal
+  approve and reject controls and remains approvable.
+- With one unreadable record, the listing is `blocked`: the unreadable row is
+  generic and echoes no filename, valid rows still render with id, destination,
+  and diff, **no classification control appears anywhere in the listing**, and
+  one `E-UNREADABLE` notice states that nothing in this entity can be approved
+  or rejected until the file is repaired outside the Console.
+- Posting approve or reject in the blocked state is still refused by the
+  unchanged strict loader — proving the projection describes the coupling rather
+  than creating it.
+- A **well-formed** delete proposal renders nothing, does not block the listing,
+  and never appears as unreadable, matching `load_proposals` exactly. A
+  malformed delete record does block it.
+- An outbox containing only delete proposals renders as empty, not as blocked.
+- `project_outbox` calls neither `get_proposal`, `load_proposals`, nor
+  `preview_diff`; asserted by patching all three to raise.
 - Approval of a row rendered by the projection still performs full strict
   revalidation.
+- The Gate 1 counter does not increment on a refused `propose` and does
+  increment on a persisted one.
 
 ### State proof
 
@@ -645,6 +820,36 @@ listed individually rather than discovered during implementation:
 |---|---|
 | `tests/test_app.py:477-503` | asserts `role="alert"` is absent for an injected transaction error — S6 makes it present |
 | `tests/test_app.py:588` | asserts the raw string `"registry deletion transaction failed"` renders — the disclosure boundary forbids it |
+| `tests/test_app.py:468` | asserts `status_code == 200` for a stale-source refusal. No existing test sends `HX-Request`, so it takes the full-page branch, where `E-STALE` declares 409 |
+| `tests/test_app.py:538` | asserts `status_code == 200` for a cross-entity outbox action. That id reaches the plain `OutboxError` at `app/outbox.py:354`, described `E-INVALID` at 422 |
+
+The last two were **not** in the previous draft, which listed two tests and then
+declared that any other change was a scope breach. That claim was false against
+this design's own text, and `tests/test_app.py:468` sits inside the very test
+the previous draft named as one that does *not* change. Recording them is the
+point: an enumeration that quietly omits its inconvenient members is the failure
+this project keeps re-learning.
+
+`tests/test_app.py:538` deserves particular care. It is an **S2 cross-entity
+isolation test** — a state-safety test, the category that is supposed to survive
+untouched. What changes is only the status code carrying the refusal; the
+refusal itself, and the isolation it proves, are unchanged. The updated test
+must continue to assert that entity A's action cannot touch entity B's proposal,
+and only its status expectation moves.
+
+An alternative worth weighing during planning: route `propose`, `outbox_approve`,
+`outbox_reject`, and the two registry POSTs through the fragment renderer
+regardless of `HX-Request`. None has a full-page template, so the full-page
+branch is unreachable in production and exercised only by tests. That would keep
+both status assertions at 200 and shrink this table back to two rows. It is
+recorded as an option, not chosen here, because it makes the renderer selection
+depend on route shape as well as request headers.
+
+The rule this table replaces: **an S1-S5 service or state-safety test whose
+subject is a refusal decision, an isolation guarantee, or a state proof must not
+change.** A route test's status or markup expectation may change where S6
+deliberately alters presentation, and every such test is listed above. Any test
+not listed here requiring modification is a scope breach.
 
 `tests/test_app.py:434` and `:439` do **not** change: `E-STALE` and `E-MISSING`
 are byte-identical to the strings they assert.
@@ -657,6 +862,10 @@ consequence.
 ## 8. Completion gates
 
 - Focused resolver, route, projection, outbox, registry, triage, and scope tests.
+- `uv run pytest tests/test_vault.py -q` — the `BUILD.md` standing E4 regression,
+  required after any change to `vault.py`, the sidebar, or `scope.py`. S6 converts
+  three `vault.py` sites and touches `scope.py`, so it is named rather than left
+  to the full suite incidentally.
 - `uv run pytest tests/test_app.py -q`
 - `uv run pytest tests/test_outbox.py tests/test_registry.py tests/test_git_transaction.py -q`
 - `uv run python -m pytest -q`
@@ -695,6 +904,10 @@ Modules terminology preserved exactly.
   but unreachable until the deferred upload route exists.
 - Stdlib exceptions outside the converted boundary sites resolve to `E-UNKNOWN`
   by design, so a programmer error is never described as a routine refusal.
+- Keying the table on classes pulls `app/rename.py` and `app/ingest/` into the
+  web app's import graph for the first time, to reach `RenameError` and
+  `IngestError`. Both are import-light, but this widens the module-scope failure
+  surface noted above, where an exception during import precedes any handler.
 
 ---
 
@@ -716,7 +929,7 @@ registry.execute_delete(scope, proposal_id)
 ```
 
 Each re-reads the record and compares it only against another read made during
-the **same request** (`app/outbox.py:387-390`, `app/registry.py:294-296`). No
+the **same request** (`app/outbox.py:387-390`, `app/registry.py:309-328`). No
 service knows what the browser rendered.
 
 So between preview and approval, another process may rewrite a proposal while
