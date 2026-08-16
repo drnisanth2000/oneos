@@ -128,7 +128,7 @@ describe(exc) -> ConsoleError
 `refusal` or `attention`. `retry` is `retry`, `reload`, `recreate`, `stop`, or
 `none`. `committed` is `no`, `yes`, or `unknown`.
 
-Two structural invariants, both asserted:
+Structural invariants, all asserted:
 
 - `severity = refusal` implies `committed = no`.
 - `tier = committed` implies `committed = yes` and `retry = stop`;
@@ -199,12 +199,25 @@ subtype.**
 These four types each cover two materially different conditions — an integrity
 finding and an ordinary one — and are therefore never raised directly:
 
-| Ambiguous base | Integrity subtype → `E-TAMPER` | Ordinary subtype |
-|---|---|---|
-| `CrossScopeError` | `RedirectedPathError` | `OutOfScopeError` → `E-SCOPE` |
-| `ReviewedStateConflict` | `ReviewedPathIntegrityError` | `ReviewedStateChanged` → `E-CONFLICT` |
-| `UnsafeDestinationPath` | `RedirectedDestination` | `MissingDestination` → `E-DEST` |
-| `InvalidSourceLeaf` | `RedirectedSourceLeaf` | `MissingSourceLeaf` → `E-DEST` |
+| Ambiguous base | Subtypes |
+|---|---|
+| `CrossScopeError` | `RedirectedPathError` → `E-TAMPER`; `OutOfScopeError` → `E-SCOPE` |
+| `ReviewedStateConflict` | `ReviewedPathIntegrityError` → `E-TAMPER`; `ReviewedStateChanged` → `E-CONFLICT`; `ReviewedPathUnavailable` → `E-CONFLICT`; `InvalidTransactionPath` → `E-INVALID` |
+| `UnsafeDestinationPath` | `RedirectedDestination` → `E-TAMPER`; `MissingDestination` → `E-DEST` |
+| `InvalidSourceLeaf` | `RedirectedSourceLeaf` → `E-TAMPER`; `MissingSourceLeaf` → `E-DEST`; `NonCanonicalLeaf` → `E-DEST` |
+
+A two-subtype split was not enough. `InvalidSourceLeaf` carries three distinct
+conditions — a leaf **name** that is not canonical (empty, `.`, `..`, a dotfile,
+or containing a separator), a source **location** that is not canonical, and a
+receipt that is missing or redirected. `ReviewedStateConflict` carries four: an
+integrity or type change, a genuine concurrent change, an invalid transaction
+path rejected before any I/O, and ordinary unavailability such as a read error.
+
+Forcing four conditions into two buckets produces exactly the harm this rule
+exists to prevent: a false tamper alarm on an unreadable file, or "reload and
+review again" advice for a path that will never become valid. The taxonomy is
+sized to the conditions that exist, and invariant 3 fails on any raise site that
+has not chosen one.
 
 Every existing `except` clause continues to catch all of them, so this is a type
 refinement and no refusal changes.
@@ -220,6 +233,72 @@ with a standing E4 regression — which would raise a tampering alarm for a
 skipped scaffolding step. `InvalidSourceLeaf` conflates a **symlinked inbox
 receipt** with a missing one, and `triage` resolves a destination for every
 inbox row, making it the most reachable redirection site in the application.
+
+### Class mapping — normative
+
+This table is a **product contract**, not a source inventory, and belongs here.
+The previous revision deleted it while removing line-number inventories. That
+was an over-correction: invariant 1 only proves a class does not resolve to
+`E-UNKNOWN`, so an implementation mapping `SystemRegistryPathError` to
+`E-CONFIG` instead of `E-TAMPER` would pass every test while telling an operator
+"the registries cannot be read" about a redirected system path.
+
+The distinction the previous revision missed: **which code a class maps to is a
+decision; which line raises that class is a fact about layout.** Decisions belong
+in this document. Facts about layout belong in tests.
+
+`exact` means the entry applies only to that class. `mro` means subclasses
+without their own entry inherit it. Every member of the closed
+`GitTransactionError` family is `exact` by Rule 2.
+
+| Class | Code | Match |
+|---|---|---|
+| `git_transaction.GitTransactionCommittedError` | `E-COMMITTED` | exact |
+| `git_transaction.GitTransactionRecoveryError` | `E-RECOVER` | exact |
+| `git_transaction.ReviewedPathIntegrityError` | `E-TAMPER` | exact |
+| `git_transaction.ReviewedPathUnavailable` | `E-CONFLICT` | exact |
+| `git_transaction.ReviewedStateChanged` | `E-CONFLICT` | exact |
+| `git_transaction.InvalidTransactionPath` | `E-INVALID` | exact |
+| `git_transaction.VaultBusyError` | `E-BUSY` | exact |
+| `git_transaction.GitTransactionFailure` | `E-GIT` | exact |
+| `git_transaction.GitTransactionError` | `E-GIT` | exact |
+| `scope.RedirectedPathError` | `E-TAMPER` | mro |
+| `scope.OutOfScopeError` | `E-SCOPE` | mro |
+| `outbox.OutboxScopeError` | `E-SCOPE` | mro |
+| `outbox.UnreadableProposalRecord` | `E-UNREADABLE` | mro |
+| `outbox.StaleProposalSource` | `E-STALE` | exact |
+| `outbox.MissingProposalSource` | `E-MISSING` | exact |
+| `outbox.ProposalFreshnessError` | `E-STALE` | exact |
+| `outbox.OutboxTransactionError` | `E-GIT` | exact |
+| `outbox.OutboxDestinationError` | `E-INVALID` | mro |
+| `outbox.OutboxError` | `E-INVALID` | mro |
+| `proposal_identity.ProposalIdentityError` | `E-INVALID` | mro |
+| `destinations.RedirectedDestination` | `E-TAMPER` | exact |
+| `destinations.RedirectedSourceLeaf` | `E-TAMPER` | exact |
+| `destinations.NonCanonicalLeaf` | `E-DEST` | exact |
+| `destinations.MissingSourceLeaf` | `E-DEST` | exact |
+| `destinations.MissingDestination` | `E-DEST` | exact |
+| `destinations.DestinationError` | `E-DEST` | mro |
+| `vault.DestinationRegistryError` | `E-CONFIG` | mro |
+| `entities.SystemRegistryPathError` | `E-TAMPER` | exact |
+| `entities.RecipientConfigurationError` | `E-CONFIG` | exact |
+| `entities.EntityManifestError` | `E-CONFIG` | mro |
+| `entities.EntitySelectionError` | `E-ENTITY` | mro |
+| `registry.RegistryTransactionError` | `E-GIT` | exact |
+| `registry.RegistryError` | `E-REGISTRY` | mro |
+| `ingest.base.IngestError` | `E-INGEST` | mro |
+| `rename.RenameError` | `E-ADMIN` | mro |
+| `fastapi.RequestValidationError` | `E-REQUEST` | exact |
+
+`HTTPException` is deliberately absent from this table and from the traversal
+allowlist. `fastapi.HTTPException` subclasses `starlette.exceptions.HTTPException`,
+which the framework raises for unmatched URLs, wrong methods, and `StaticFiles`
+misses, so a mapping would return 422 with copy about a form for a missing
+vendor script. After Rule 6 removes the conversion in `entity_scope`, no
+application code raises it at all.
+
+Invariant 1 additionally asserts that **every class in this table resolves to the
+code named here**, not merely to something other than `E-UNKNOWN`.
 
 ### Exact message text
 
@@ -319,22 +398,57 @@ fails renders with a described error in place of the diff, keeps `can_reject`,
 loses `can_approve` (the same decode refuses in `approve`), and does not set
 `blocked`.
 
-### Only a record-local family is caught
+### Three phases, three handling rules
 
-The projection catches **only** an exact, record-local unreadable family — the
-parse and identity conditions that make a file not a proposal at all: invalid
-YAML, a non-mapping record, a failed identity check, an unknown action.
+The projection does three separable things per file, and conflating them
+produced a contradiction in the previous revision: diff failures became row
+errors while "every other exception propagates", yet a broken registry was also
+said to participate in multi-row aggregation — which propagation makes
+impossible, because it aborts the projection.
 
-Every other exception **propagates intact**. This is the point. Rule 1 exists to
-recover `E-CONFIG` from a broken `archetypes.yaml` and `E-TAMPER` from a
-redirected proposal leaf; a projection that swallowed those into a generic
-"could not be read" would re-hide exactly what Rule 1 was written to surface —
-and would tell an operator whose `archetypes.yaml` is malformed to delete valid
-proposals one at a time, which is the fourth row of the §1 problem table
-reappearing on the only screen that lists proposals.
+Each phase is handled explicitly.
 
-A propagating condition is described by the route and rendered as a listing-level
-alert. It is not flattened into a row.
+**Phase 1 — record read and schema.** A file that is not a proposal at all.
+Caught, per row, as an unreadable record. This is the family that poisons the
+strict loader, so its rows set `blocked`.
+
+The family must be **exact and complete**, because anything it misses escapes
+the promised blocked listing. `UnreadableProposalRecord` therefore covers every
+way reading or shaping a record can fail:
+
+| Condition | Escapes today as |
+|---|---|
+| unparseable YAML | `yaml.YAMLError` |
+| non-mapping record | `OutboxDestinationError` |
+| **non-UTF-8 record bytes** | `UnicodeDecodeError` |
+| **record read failure** | `OSError` |
+| identity failure | `ProposalIdentityError` |
+| unknown action | `OutboxDestinationError` |
+| **missing or malformed required field** | `OutboxDestinationError` from `_to_proposal` |
+
+The three in bold were absent from the previous revision's family and would have
+escaped as `E-UNKNOWN` at 500 — a blank screen, from one non-UTF-8 byte in a
+proposal file. The strict loader raises them too, so they genuinely poison, and
+they belong here.
+
+**Phase 2 — destination validation.** Registry and path conditions. These
+**propagate**. They are not record-local: a broken `archetypes.yaml` or a
+redirected outbox is a property of the vault, not of one file, and Rule 1 exists
+to recover `E-CONFIG` and `E-TAMPER` from them. The projection aborts and the
+route renders the described condition as a **listing-level** alert with no rows.
+
+This replaces the previous revision's "aggregate the highest-precedence
+description across rows", which could not work: a propagating exception ends the
+projection, so there is no completed listing to aggregate over. One broken
+registry reads as one broken registry because it is reported once, from the
+abort — not because rows were compared.
+
+**Phase 3 — diff rendering.** `_render_diff` reads the source receipt and may
+raise `UnicodeDecodeError`, `OSError`, or scope errors. These are **row-local
+and non-poisoning**: the record is valid, the strict loader is unaffected, and
+every other proposal still approves. Such a row renders with a described error in
+place of its diff, keeps `can_reject`, loses `can_approve` — because `approve`
+decodes the same receipt and refuses — and does **not** set `blocked`.
 
 ### Delete proposals are skipped, exactly as today
 
@@ -607,20 +721,39 @@ wrong — one cited a function containing no YAML at all, while the reader that
 actually raises the promised error was cited by no row. The list is therefore
 replaced by a rule and a shape test:
 
-**Every shared registry reader converts parse and shape failures to
-`DestinationRegistryError`.** A reader is any function that loads
-`archetypes.yaml`, `entities.yaml`, `products.yaml`, `members.yaml`,
-`workspaces.yaml`, front-matter, or `books.db` on behalf of a route.
+**Every shared registry reader normalizes failures that already escape it, and
+changes nothing else.**
 
-Three failure shapes must convert, because all three are reachable by hand-editing:
+The previous revision said "unparseable, absent, or wrongly shaped → `E-CONFIG`
+for every reader". That was wrong, and it violated this design's own core
+constraint by inventing refusals:
+
+| Reader | Existing contract on absence |
+|---|---|
+| `products_for` | returns `[]` |
+| workspace counting | counts zero |
+| `books.db` counting | counts zero |
+| `split_front_matter` | returns `{}` for malformed or absent front matter |
+| front-matter scanning | skips a file it cannot read |
+
+These tolerances are deliberate. Converting them to `DestinationRegistryError`
+would make absent registries fatal where they are currently neutral — a new
+refusal decision, which S6 does not make. Whether those registries should be
+mandatory is a real question and belongs outside S6.
+
+So the rule is narrower and strictly presentational: **a failure that already
+escapes a reader is normalized to `DestinationRegistryError`; a failure the
+reader already absorbs continues to be absorbed.** S6 changes the *type* of
+something already fatal, never the *fatality* of something already tolerated.
+
+What escapes today, and therefore converts:
 
 | Shape | Example |
 |---|---|
-| unparseable | invalid YAML, a corrupt SQLite file |
-| absent | the registry file is not there |
+| unparseable | invalid YAML in a registry the reader does parse; a corrupt SQLite file |
 | **wrongly shaped but valid** | a list where a mapping is expected, a scalar where a list is |
 
-The third is the one enumerations keep missing. `yaml.safe_load(...) or {}`
+The second is the one enumerations keep missing. `yaml.safe_load(...) or {}`
 guards the empty case, not the wrong-type case, so a syntactically valid file
 parses cleanly and then raises `AttributeError` or `TypeError` on access — the
 likelier hand-editing mistake, and the one that would otherwise reach the
@@ -630,9 +763,10 @@ Each conversion narrows to the specific parse or access it guards. A blanket
 `except (AttributeError, TypeError)` around a whole function would mask genuine
 programmer errors, which Rule 5 forbids.
 
-The closing test injects each shape through each reader and asserts `E-CONFIG`
-rather than `E-UNKNOWN` (§7). It names readers, not lines, so a reader added
-later is covered when it is registered and a moved line breaks nothing.
+The closing test injects each escaping shape through each reader and asserts
+`E-CONFIG` rather than `E-UNKNOWN`. It also asserts each reader's **absorbed**
+cases still return their tolerant value, so a future change that quietly makes
+an absent registry fatal fails here.
 
 ## 6. Disclosure boundary
 
@@ -732,20 +866,36 @@ ambiguous bases. This is what closes the tamper classification: the choice is
 made at the raise site, in code, and a new site is unclassified until it picks a
 subtype. No line numbers anywhere.
 
-**4. Registry readers convert by shape.** A test injects each of the three
-failure shapes — unparseable, absent, wrongly-shaped-but-valid — through each
-shared reader and asserts `E-CONFIG`. Readers are enumerated by registration,
-not by line.
+**4. Registry readers convert by shape.** A reader declares itself with a
+`@registry_reader` decorator that records its tolerant-absence contract. Tests
+read the decorator registry — but a decorator alone is just a second manifest,
+so a **structural guard** closes it: an AST test finds every function under
+`app/` that parses a registry (calls `yaml.safe_load`, opens a `system_path`
+result, or connects to `books.db`) and fails on any that is undecorated. You
+cannot add a reader the tests do not know about, because the AST test finds it
+by what it does, not by whether someone remembered to list it. The suite then
+injects each escaping shape through each registered reader and asserts
+`E-CONFIG`, and asserts each absorbed case still returns its tolerant value.
 
 **5. No template hand-builds `hx-vals`.** A test scans `templates/` for
 `hx-vals` attributes and fails on any whose value is not a single
 `{{ ... | tojson }}` expression.
 
-**6. Route coverage derives from the app.** Route tests enumerate
-`app.routes` rather than a written list, so a route added later is covered
-without editing this document. Every registered route must have a described
-outcome for its declared catch families and must not reach the global handler
-for any of them.
+**6. Route coverage derives from the app.** Route tests enumerate `app.routes`,
+filtered to routes whose endpoint function is defined in `app.main` — which
+excludes FastAPI's OpenAPI and docs routes and the mounted `StaticFiles`
+application, none of which can satisfy a Console requirement.
+
+A route declares its catch family with a `@console_route(catches=(...))`
+decorator on the handler, and the same structural guard applies: an AST test
+fails on any handler in `app.main` that is registered with FastAPI but carries no
+declaration, and on any handler whose body contains a bare `except Exception`.
+Tests then read each declaration, inject each member of the declared family, and
+assert the route describes it rather than reaching the global handler.
+
+This does not claim tests can *discover* which exceptions a route can reach —
+they cannot. It claims that whatever a route declares it handles, it must
+actually handle, and that a route cannot silently declare nothing.
 
 If a future finding is "the design's list omits X", the correct fix is to delete
 the list and add the invariant that would have caught X.
@@ -763,14 +913,15 @@ the list and add the invariant that would have caught X.
   the failure is injected into the transaction layer and propagates through the
   actual `approve` and `execute_delete` wrappers. A hand-built wrapper would
   pass even if a service stopped chaining with `from exc`.
-- `EntitySelectionError` inside `HTTPException` resolves to `E-ENTITY`;
-  `DestinationRegistryError` inside `OutboxDestinationError` resolves to
-  `E-CONFIG`.
+- `DestinationRegistryError` inside `OutboxDestinationError` resolves to
+  `E-CONFIG`, not to the wrapper's `E-INVALID`. (`EntitySelectionError` inside
+  `HTTPException` is no longer a case: Rule 6 removes that wrapper, and the
+  exception reaches its own handler directly.)
 - A class not on the allowlist never has its cause read.
 - `__context__` is never traversed: an error raised while handling another
   resolves to itself.
 - Chain depth is bounded at 4.
-- Both structural invariants hold across the whole table.
+- Every structural invariant in §2 holds across the whole table.
 - No **domain or service** module imports `console_errors` or `console_render`.
   The presentation composition root — `app/main.py` and the templates it renders
   — must import them; it is the layer that turns an exception into a response.
@@ -779,8 +930,9 @@ the list and add the invariant that would have caught X.
 
 ### Routes
 
-- Each site in the inventory, with its error injected, returns the expected
-  status, renders the expected code and message, and no raw exception text.
+- Each route enumerated by invariant 6, with each member of its declared catch
+  family injected, returns the expected status, renders the expected code and
+  message, and no raw exception text.
 - Fragment responses match their route's **declared swap shape**, so the swap is
   proven rather than inferred from status. The shape is per route, not global:
   an `outerHTML` route must reproduce the target root element, while an
@@ -800,7 +952,8 @@ the list and add the invariant that would have caught X.
   stdlib failures to `E-UNKNOWN` through the handler, so an unbounded claim
   would contradict §10 and be unsatisfiable. Adding a boundary conversion means
   adding it to the set, which is what makes the test grow with the code.
-- Every full-page route contains the `htmx-config` meta tag.
+- Every full-page route — enumerated by invariant 6's filter, so framework and
+  static routes are excluded — contains the `htmx-config` meta tag.
 - An unhandled exception during an HTMX request returns 500 and a visible body.
   This requires `TestClient(app, raise_server_exceptions=False)`, as three
   existing tests already do.
@@ -876,8 +1029,14 @@ listed individually rather than discovered during implementation:
 |---|---|
 | `tests/test_app.py:477-503` | asserts `role="alert"` is absent for an injected transaction error — S6 makes it present |
 | `tests/test_app.py:588` | asserts the raw string `"registry deletion transaction failed"` renders — the disclosure boundary forbids it |
-| `tests/test_app.py:468` | asserts `status_code == 200` for a stale-source refusal. No existing test sends `HX-Request`, so it takes the full-page branch, where `E-STALE` declares 409 |
-| `tests/test_app.py:538` | asserts `status_code == 200` for a cross-entity outbox action. That id reaches the plain `OutboxError` at `app/outbox.py:354`, described `E-INVALID` at 422 |
+
+Rule 5's route-shape-first selection settles what earlier drafts left open:
+`propose`, `outbox_approve`, `outbox_reject`, and the two registry POSTs always
+use the fragment renderer, so refusals on those routes stay at **200**. Every
+existing status assertion therefore holds, and the two additional tests earlier
+drafts predicted would break — the stale-source refusal and the cross-entity
+isolation test — do **not** change. That is the main reason route-shape-first
+was chosen over header-only selection.
 
 The last two were **not** in the previous draft, which listed two tests and then
 declared that any other change was a scope breach. That claim was false against
@@ -892,14 +1051,6 @@ untouched. What changes is only the status code carrying the refusal; the
 refusal itself, and the isolation it proves, are unchanged. The updated test
 must continue to assert that entity A's action cannot touch entity B's proposal,
 and only its status expectation moves.
-
-An alternative worth weighing during planning: route `propose`, `outbox_approve`,
-`outbox_reject`, and the two registry POSTs through the fragment renderer
-regardless of `HX-Request`. None has a full-page template, so the full-page
-branch is unreachable in production and exercised only by tests. That would keep
-both status assertions at 200 and shrink this table back to two rows. It is
-recorded as an option, not chosen here, because it makes the renderer selection
-depend on route shape as well as request headers.
 
 The rule this table replaces: **an S1-S5 service or state-safety test whose
 subject is a refusal decision, an isolation guarantee, or a state proof must not
