@@ -209,8 +209,9 @@ of the closed `GitTransactionError` family is `exact` by Rule 2.
 | `scope.RedirectedPathError` | `E-TAMPER` | mro |
 | `scope.CrossScopeError` | `E-SCOPE` | mro |
 | `outbox.OutboxScopeError` | `E-SCOPE` | mro |
-| `outbox.ProposalFreshnessError` → `StaleProposalSource` | `E-STALE` | exact |
+| `outbox.StaleProposalSource` | `E-STALE` | exact |
 | `outbox.MissingProposalSource` | `E-MISSING` | exact |
+| `outbox.ProposalFreshnessError` | `E-STALE` | exact |
 | `outbox.OutboxTransactionError` | `E-GIT` | exact |
 | `outbox.OutboxDestinationError` | `E-INVALID` | mro |
 | `outbox.OutboxError` | `E-INVALID` | mro |
@@ -309,10 +310,20 @@ The displayed diff carries **no approval authority**. Approval revalidates from
 scratch through the untouched strict path, so a row rendering successfully is
 never evidence that it will approve.
 
+That sentence is honest about the implementation and, read carefully, concedes
+something S6 must not paper over: **nothing binds an approval to the bytes the
+operator reviewed.** See §11.
+
 A row that fails validation is rendered as an **unreadable record**: no approve
 control, no reject control, and no filename. Per Rule 9 the filename is
-attacker-controlled text and is not echoed; the row is generic and carries
-`E-UNREADABLE`.
+attacker-controlled text and is not echoed; the row is generic.
+
+The projection is a service function, so it must not name a presentation code —
+that would breach the one-way import boundary the design asserts elsewhere.
+`OutboxRow` therefore carries a **domain-neutral** kind (`readable` /
+`unreadable`) plus the raw exception, and `app/main.py` — the presentation
+composition root — selects `E-UNREADABLE` for the unreadable kind and calls
+`describe()` for anything else. No service module imports the taxonomy.
 
 `E-UNREADABLE` is a distinct code from `E-INVALID` because the two demand
 opposite actions. `E-INVALID` says the proposal you tried to approve is bad —
@@ -383,9 +394,21 @@ its page status — 500 for `E-UNKNOWN`. It never returns 200. A test asserts it
 is not reached for any described error, so relying on it is a failure rather
 than a silent default.
 
-Two renderers share the one table, selected by the `HX-Request` header. A
-fragment returns 200 for a handled refusal and the code's page status for
-`E-UNKNOWN`; a full page returns the code's page status.
+Two renderers share the one table, selected by the `HX-Request` header. Fragment
+status follows **severity**, not code:
+
+- `severity = refusal` → **200**. The refusal is expected and the body carries
+  it.
+- `severity = attention` → the code's **declared page status**. HTMX still swaps
+  it under the `responseHandling` override, so the operator sees the message
+  while monitoring sees an honest status.
+
+A full page always returns the code's page status.
+
+Keying on severity resolves `E-COMMITTED`, `E-RECOVER`, `E-CONFIG`, `E-TAMPER`,
+`E-UNREADABLE`, and `E-UNKNOWN` uniformly instead of naming `E-UNKNOWN` alone
+and leaving every other attention outcome undefined. It also guarantees the one
+class of outcome that must not look routine never returns 200.
 
 ### Rule 6 — Framework wrapping is explicit
 
@@ -544,8 +567,15 @@ what failed. The same re-entrancy argument as the outbox listing applies.
 
 - Each site in the inventory, with its error injected, returns the expected
   status, renders the expected code and message, and no raw exception text.
-- Fragment responses carry the element named by the route's `hx-target`, so the
-  swap is proven rather than inferred from status.
+- Fragment responses match their route's **declared swap shape**, so the swap is
+  proven rather than inferred from status. The shape is per route, not global:
+  an `outerHTML` route must reproduce the target root element, while an
+  `innerHTML` route must **not** — reproducing it there would nest a duplicate
+  id inside itself. The current shapes are `#outbox-list` / `outerHTML` for
+  approve and reject, `#diff-{index}` / `innerHTML` for propose, and
+  `#impact-{index}` / `innerHTML` for delete preview. The test asserts the
+  declared shape for each and never echoes the client-supplied `HX-Target`
+  header, which is attacker-controlled.
 - **Route-level totality:** for each route, every exception in that route's
   **declared conversion set** — the stdlib and third-party types listed in
   Boundary conversions below — is injected, and the global handler is asserted
@@ -665,3 +695,69 @@ Modules terminology preserved exactly.
   but unreachable until the deferred upload route exists.
 - Stdlib exceptions outside the converted boundary sites resolve to `E-UNKNOWN`
   by design, so a programmer error is never described as a routine refusal.
+
+---
+
+## 11. Unresolved: the review gate does not bind reviewed content
+
+Round-four review identified a Critical gap that S6 exposes but does not close.
+It is recorded here rather than absorbed, because closing it is a domain change.
+
+### The gap
+
+A proposal id names a **mutable file**, not the bytes an operator reviewed.
+`require_proposal_identity` (`app/proposal_identity.py:42-46`) checks only id
+grammar and filename equality. All three actions take an id and nothing else:
+
+```
+outbox.approve(scope, proposal_id)
+outbox.reject(scope, proposal_id)
+registry.execute_delete(scope, proposal_id)
+```
+
+Each re-reads the record and compares it only against another read made during
+the **same request** (`app/outbox.py:387-390`, `app/registry.py:294-296`). No
+service knows what the browser rendered.
+
+So between preview and approval, another process may rewrite a proposal while
+preserving its id and filename. Approval then moves the source to a different
+valid destination, deletes a different product, or rejects a different record —
+each passing every existing check, because every check validates the *current*
+record's internal consistency, never its correspondence to what was reviewed.
+
+`tojson` (Rule 8) closes request rebinding — the browser now submits the id that
+was rendered. It cannot close this, because the id is not the content.
+
+This defeats the human approval gate, which is the product's central claim.
+
+### Why it is not fixed here
+
+The fix is well understood and bounded: hash the validated proposal snapshot
+used to render, submit `id + review_sha256`, pass the expected digest into all
+three actions, compare against the exact snapshot before the first mutation, and
+refuse visibly on mismatch. The registry execute request then drops `slug`
+entirely, since the server derives kind and slug from the validated proposal.
+
+But it changes `approve`, `reject`, and `execute_delete` signatures and **adds a
+new refusal condition**. S6's defining constraint is that it changes no refusal
+decision, and that line has already been breached twice in this design's history
+and caught in review both times. Absorbing a third breach — a larger one, in the
+approval path — because it arrived labelled "bounded" would be the same mistake.
+
+The precedent is exact. S4 bound the **source receipt** bytes with a SHA-256 and
+refused stale approvals. This binds the **proposal record** bytes with a SHA-256
+and refuses stale reviews: the same mechanism, one artifact further out. S4 was
+its own step, with its own design, plan, and review. This deserves the same.
+
+### Disposition
+
+Proposed as **S7 — bound review tokens**, to be designed after S6 merges.
+
+Until then the gap is live. It is not introduced by S6 and is not widened by it:
+the projection revalidates each record with the same checks the strict loader
+applies, and approval still runs the full strict path. S6 leaves the exposure
+exactly where it found it, and now states it plainly instead of implying the
+displayed diff means more than it does.
+
+If the gap is judged too severe to leave open across an S6 merge, the correct
+response is to **suspend S6 and design S7 first**, not to widen S6.
