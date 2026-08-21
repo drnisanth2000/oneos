@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from .scope import CrossScopeError, Scope
+from .scope import RedirectedPathError, Scope
 
 
 @dataclass
@@ -43,7 +43,7 @@ def _require_real_directory(scope: Scope, *parts: str) -> Path | None:
         return None
     resolved = scope.resolve(*parts)
     if lexical.is_symlink() or resolved != lexical or not lexical.is_dir():
-        raise CrossScopeError("inbox lifecycle directory is redirected")
+        raise RedirectedPathError("inbox lifecycle directory is redirected")
     return lexical
 
 
@@ -54,7 +54,7 @@ def _require_real_receipt(directory: Path, discovered: Path) -> Path:
         or not discovered.is_file()
         or discovered.resolve() != discovered
     ):
-        raise CrossScopeError("inbox receipt is redirected")
+        raise RedirectedPathError("inbox receipt is redirected")
     return discovered
 
 

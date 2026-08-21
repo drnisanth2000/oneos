@@ -164,4 +164,27 @@ success event header only after `propose_classification` returns.
   and `ReviewedPathUnavailable`); resolution unchanged — the normative class
   map wins in Task 5.
 - **Fix rounds:** 0.
-- **Commit:** recorded in the Task 3 entry.
+- **Commit:** `d916048`.
+
+### Task 3 — Pin the safe-read contract and convert the CrossScopeError sites
+
+- **RED:** `uv run pytest tests/test_console_invariants.py -q` → 5 failed,
+  2 passed — `test_safe_read_symlink_raises_redirected`,
+  `test_safe_read_nonregular_raises_redirected`,
+  `test_safe_read_permission_error_raises_unavailable`,
+  `test_safe_read_replacement_race_raises_redirected`,
+  `test_safe_read_other_oserror_raises_unavailable` all failed because every
+  non-missing case raised bare `CrossScopeError` (e.g.
+  `app/outbox.py:148: CrossScopeError`).
+- **GREEN:** same command → 7 passed.
+- **Full suite:** 615 passed (609 + 6 new). `grep -rn "raise CrossScopeError"
+  app/` → empty.
+- **Reviewer verdict:** clean; two Minors recorded, no action required:
+  (1) a mid-read `OSError` after `fstat` passes still escapes raw — the
+  pre-existing shape, outside the open-time discrimination site the design
+  names; (2) `inbox._require_real_receipt` raises the integrity subtype for
+  an absence race on a just-enumerated path — pre-existing shape,
+  discrimination would add its own race. Reviewer confirmed the
+  `system_path` → `RedirectedPathError` judgment against the normative map.
+- **Fix rounds:** 0.
+- **Commit:** recorded in the Task 4 entry.

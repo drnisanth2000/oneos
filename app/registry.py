@@ -31,7 +31,7 @@ from .proposal_identity import (
     require_proposal_id,
     require_proposal_identity,
 )
-from .scope import CrossScopeError, Scope
+from .scope import OutOfScopeError, RedirectedPathError, Scope
 
 # Columns in books.db that carry a product/member value.
 _DB_COLUMNS = {
@@ -206,12 +206,12 @@ def _delete_proposal_path(scope: Scope, proposal_id: str) -> Path:
     bound_outbox = entity_root / "outbox"
     resolved_outbox = scope.resolve("outbox")
     if resolved_outbox != bound_outbox:
-        raise CrossScopeError("outbox redirects outside the bound outbox")
+        raise RedirectedPathError("outbox redirects outside the bound outbox")
     candidate = resolved_outbox / f"{proposal_id}.yaml"
     if candidate.is_symlink():
-        raise CrossScopeError("delete proposal redirects from the requested leaf")
+        raise RedirectedPathError("delete proposal redirects from the requested leaf")
     if candidate.parent != resolved_outbox:
-        raise CrossScopeError("delete proposal leaves the bound outbox")
+        raise OutOfScopeError("delete proposal leaves the bound outbox")
     return candidate
 
 

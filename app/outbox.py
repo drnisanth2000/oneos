@@ -11,6 +11,7 @@ block-mapping validation — so it never trips check_v2 or the module lint.
 from __future__ import annotations
 
 import difflib
+import errno
 import hashlib
 import os
 import re
@@ -36,7 +37,7 @@ from .proposal_identity import (
     proposal_id_candidates,
     require_proposal_identity,
 )
-from .scope import CrossScopeError, Scope
+from .scope import CrossScopeError, OutOfScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError
 
 
@@ -104,17 +105,17 @@ def _require_outbox_path(
     lexical_outbox = scope.root / scope.current_entity() / "outbox"
     resolved_outbox = scope.resolve("outbox")
     if lexical_outbox.is_symlink() or resolved_outbox != lexical_outbox:
-        raise CrossScopeError("outbox directory is redirected")
+        raise RedirectedPathError("outbox directory is redirected")
     if lexical_outbox.exists():
         if not lexical_outbox.is_dir():
-            raise CrossScopeError("outbox path is not a real directory")
+            raise RedirectedPathError("outbox path is not a real directory")
     elif create_directory:
         try:
             lexical_outbox.mkdir()
         except FileExistsError as exc:
-            raise CrossScopeError("outbox directory changed during creation") from exc
+            raise RedirectedPathError("outbox directory changed during creation") from exc
         if lexical_outbox.is_symlink() or scope.resolve("outbox") != lexical_outbox:
-            raise CrossScopeError("outbox directory is redirected")
+            raise RedirectedPathError("outbox directory is redirected")
 
     if proposal_path is None:
         return lexical_outbox
@@ -125,12 +126,12 @@ def _require_outbox_path(
         or candidate != lexical_outbox / candidate.name
         or candidate.suffix != ".yaml"
     ):
-        raise CrossScopeError("proposal is outside the lexical outbox")
+        raise OutOfScopeError("proposal is outside the lexical outbox")
     if candidate.is_symlink():
-        raise CrossScopeError("proposal leaf is redirected")
+        raise RedirectedPathError("proposal leaf is redirected")
     if candidate.exists():
         if not candidate.is_file() or candidate.resolve() != candidate:
-            raise CrossScopeError("proposal leaf is not a real file")
+            raise RedirectedPathError("proposal leaf is not a real file")
     elif require_leaf:
         raise OutboxError("proposal leaf no longer exists")
     return candidate
@@ -145,11 +146,18 @@ def _read_no_follow_bytes(path: Path) -> bytes:
     except FileNotFoundError:
         raise
     except OSError as exc:
-        raise CrossScopeError("source receipt is redirected or unsafe") from exc
+        if exc.errno in {errno.ELOOP, errno.EMLINK}:
+            # O_NOFOLLOW rejection: ELOOP on Linux/macOS, EMLINK on some BSDs.
+            raise RedirectedPathError(
+                "source receipt is redirected or unsafe"
+            ) from exc
+        raise ProposalSourceUnavailable(
+            "source receipt could not be read"
+        ) from exc
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
-            raise CrossScopeError("source receipt is not a regular file")
+            raise RedirectedPathError("source receipt is not a regular file")
         with os.fdopen(descriptor, "rb", closefd=True) as stream:
             descriptor = -1
             return stream.read()
