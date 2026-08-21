@@ -203,18 +203,50 @@ def triage_default(request: Request):
     return RedirectResponse(url=f"/triage/{bundles[0].slug}", status_code=307)
 
 
+#: Gate 1 stopwatch (design §5; ledger's binding resolution of the
+#: discrepancy between §5's mechanism sentence and §8's "any unlisted test
+#: change is a scope breach"). Emitted only once `propose_classification` has
+#: returned below — i.e. only once the proposal is durably persisted — never
+#: earlier. `triage.html`'s existing `htmx:afterRequest` listener reads this
+#: exact value from the `HX-Trigger` response header rather than from
+#: `e.detail.successful`, so a refusal (which never reaches the line that
+#: sets this header) can never increment the operator's count.
+_PROPOSAL_PERSISTED_EVENT = "console:proposal-persisted"
+
+
+#: Declared once so the decorator and the route's own `except` cannot drift.
+_TRIAGE_CATCHES = (DestinationError, DestinationRegistryError, CrossScopeError)
+
+
 @app.get("/triage/{entity}", response_class=HTMLResponse)
-@console_route(
-    catches=(DestinationError, DestinationRegistryError, CrossScopeError),
-    surface="page",
-)
+@console_route(catches=_TRIAGE_CATCHES, surface="page")
 def triage(request: Request, scope: EntityScope) -> HTMLResponse:
+    """Every member of the declared family is answered by the route itself.
+
+    design §5: the global handler "catches only what escapes a route", and
+    "relying on it is a failure rather than a silent default" — so a declared
+    member reaching it is a defect, not a fallback. Two members can arise
+    outside the per-row guard and would otherwise escape: `read_inbox` raises
+    `RedirectedPathError` (a `CrossScopeError`) for a redirected inbox, and
+    `Vault.bundles()` raises `DestinationRegistryError` while the template
+    context is built. Both abort the page, which is correct — a redirected
+    inbox and a broken registry are vault-wide properties, not row-local ones
+    — but they abort into *this* handler, not out of the route.
+    """
+    try:
+        return _triage_page(request, scope)
+    except _TRIAGE_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+
+
+def _triage_page(request: Request, scope: Scope) -> HTMLResponse:
     selected = scope.current_entity()
     vault = Vault(catalog)
     clf = Classifier(vault)
     rows = []
     for item in read_inbox(scope):
         classification = clf.classify(item.title, item.summary, item.source)
+        destination, error = None, None
         try:
             destination = resolve_classification_destination(
                 scope,
@@ -223,13 +255,23 @@ def triage(request: Request, scope: EntityScope) -> HTMLResponse:
                 sub=classification.sub,
                 claimed_block=classification.block,
             )
-        except (DestinationError, DestinationRegistryError):
-            destination = None
-        rows.append((item, classification, destination))
+        except (DestinationError, CrossScopeError) as exc:
+            # DestinationRegistryError is deliberately NOT caught here: a
+            # broken registry is a vault-wide property, not a row-local one
+            # (design §3's Phase 2 reasoning applies here too), so it
+            # propagates to abort the whole page as one described E-CONFIG
+            # page rather than a per-row alert.
+            error = describe(exc)
+        rows.append((item, classification, destination, error))
     return templates.TemplateResponse(
         request,
         "triage.html",
-        {"bundles": vault.bundles(), "entity": selected, "rows": rows},
+        {
+            "bundles": vault.bundles(),
+            "entity": selected,
+            "rows": rows,
+            "persisted_event": _PROPOSAL_PERSISTED_EVENT,
+        },
     )
 
 
@@ -248,18 +290,34 @@ def propose(
     block: str | None = Form(None),
     entity_claim: str | None = Form(None, alias="entity"),
 ) -> HTMLResponse:
-    if entity_claim is not None:
-        raise OutboxDestinationError("entity is owned by request scope")
-    item_path = scope.resolve("00-inbox", "active") / filename
-    prop = propose_classification(
-        scope, item_path,
-        module=module, sub=sub, claimed_block=block,
-    )
-    return templates.TemplateResponse(
-        request,
-        "blocks/diff.html",
-        {"proposal": prop, "diff": preview_diff(scope, prop)},
-    )
+    try:
+        if entity_claim is not None:
+            raise OutboxDestinationError("entity is owned by request scope")
+        item_path = scope.resolve("00-inbox", "active") / filename
+        prop = propose_classification(
+            scope, item_path,
+            module=module, sub=sub, claimed_block=block,
+        )
+    except (OutboxError, DestinationError, CrossScopeError,
+            DestinationRegistryError) as exc:
+        # Refused before propose_classification returned: nothing was
+        # written, so no persisted-proposal signal is emitted.
+        return _render_console_error(request, describe(exc))
+
+    # The proposal is durably persisted from this point on. Whatever the
+    # rest of this function does — including a described failure below —
+    # that fact is now true, so the stopwatch signal below is honest either
+    # way.
+    try:
+        diff = preview_diff(scope, prop)
+        response = templates.TemplateResponse(
+            request, "blocks/diff.html", {"proposal": prop, "diff": diff},
+        )
+    except (OutboxError, DestinationError, CrossScopeError,
+            DestinationRegistryError) as exc:
+        response = _render_console_error(request, describe(exc))
+    response.headers["HX-Trigger"] = _PROPOSAL_PERSISTED_EVENT
+    return response
 
 
 def _outbox_list(

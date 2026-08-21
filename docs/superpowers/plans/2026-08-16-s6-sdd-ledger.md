@@ -776,3 +776,253 @@ exactly the three state proofs the ruling preserves.
 
 - **Reviewer verdict:** clean after fix round 3 (three rounds: 1 Critical +
   2 Important + 5 Minor, then 1 Critical + 4 Minor, then clean with 2 Minor).
+
+---
+
+### Task 11 — Routes, triage and propose
+
+- **RED, measured rather than asserted.** Against an untouched HEAD tree built
+  with `git archive` and given the **final** test files:
+
+  | Selection | Result |
+  |---|---|
+  | `tests/test_console_routes.py` | 8 failed, 11 passed |
+  | the same plus `test_app.py::test_tampered_proposal_form_writes_nothing` | 14 failed, 11 passed |
+
+  Signatures: `app.destinations.InvalidModule: destination module is not
+  active` propagating uncaught through `propose`, and `assert 422 == 200` on
+  the six tampered-form cases.
+
+  **Eight of the nine** new route tests are red at HEAD. The ninth,
+  `test_propose_success_fragment_also_honours_the_innerhtml_shape`, is green at
+  HEAD **by construction** — added during a fix round to close review finding
+  M1, asserting a shape the unfixed implementation already satisfied. It never
+  had a RED phase and is pinned by mutation instead (wrapping
+  `blocks/diff.html` in `id="diff-0" x-data="{}"` reds it). The other two
+  fix-round tests, for the fallback regression and the post-persistence branch,
+  are both red at HEAD.
+
+  An earlier draft of this entry said "11 failed / 11 passed" and "all six new
+  tests confirmed red". The second went stale once fix rounds took the count to
+  nine, and it asserted a RED phase one test never had. The first is **not
+  reproducible against any revision** and is recorded as an error: review
+  measured the intermediate six-test revision at HEAD as 6 failed / 10 passed,
+  so the figure matches neither that nor the shipped file. A first attempt at
+  this very correction explained it away as "the implementer's count against an
+  intermediate revision" — itself an unmeasured claim, and caught in the next
+  round.
+
+  **This is the fourth time on this branch a ledger has stated a number that
+  was asserted rather than measured, and the fifth counting the explanation.
+  Review caught every one.**
+- **GREEN:** `triage` rows carry `(item, classification, destination, error)`
+  with the error **described** in the composition root; `propose` catches its
+  declared family in two phases and emits `HX-Trigger:
+  console:proposal-persisted` only once `propose_classification` has returned.
+- **Suite:** 747 (738 + 9). `diff --check` clean.
+
+**The stopwatch followed the ledger's binding preflight resolution literally.**
+The `htmx:afterRequest` listener and that literal string survive — so the
+unlisted `test_triage_screen_has_gate1_timing_instrument` is untouched — while
+what the listener *keys on* changed from `e.detail.successful` to the
+`HX-Trigger` response header compared against a server-rendered constant. A
+refusal never reaches the line that sets the header, so it cannot increment the
+Gate 1 count.
+
+**Fix round 1** — reviewer returned *not clean*: 2 Critical, 3 Important,
+4 Minor.
+
+- **C1 (Critical) — `triage` relied on the global fallback for a member of its
+  own declared family.** It declares `DestinationRegistryError` but the per-row
+  clause had been narrowed to `(DestinationError, CrossScopeError)`, and there
+  was no outer handler, so a broken registry escaped the route entirely. A
+  fallback spy on the exact fixture returned `FALLBACK CALLS
+  ['DestinationRegistryError']`. Two consequences: Task 14 Step 3 would have
+  been red, and — worse — Starlette's `ServerErrorMiddleware` re-raises after
+  handling, so **every triage request against a broken registry logged an
+  unhandled-exception traceback**, the raw server fault the S6 Objective
+  forbids, for a first-class described condition. Design §3's Phase-2 reasoning
+  justifies aborting the *page*; it does not justify aborting out of the
+  *route* — its own wording is "the route renders the described condition".
+- **C2 (Critical) — the same escape for `CrossScopeError`, on the realistic
+  path the new tamper test patched around.** `read_inbox` raises
+  `RedirectedPathError` outside the per-row guard, and
+  `test_triage_row_with_symlinked_receipt_shows_e_tamper` stubs `read_inbox`
+  precisely to bypass it, so nothing exercised the unpatched condition — design
+  §2's "most reachable redirection site in the application". Pre-existing in
+  origin, but Task 11 is the task assigned to make `triage` handle
+  `CrossScopeError`, and the new test concealed it.
+- Both closed by extracting `_triage_page` and giving the route one outer
+  handler over `_TRIAGE_CATCHES`, a module constant feeding both the decorator
+  and the `except` so they cannot drift. Verified on the real filesystem path,
+  not just the injected one: an unpatched symlinked receipt now gives
+  `status 409, E-TAMPER, fallback reached: []`.
+- **I1 — the stopwatch's client half was pinned by token presence only.** Two
+  mutations kept all 744 green: flipping `===` to `!==`, which makes the counter
+  increment on **refusals only** — verbatim the Gate 1 corruption design §5
+  exists to prevent — and drifting the header name, which makes it never
+  increment at all. Now the whole rendered comparison is asserted.
+- **I2 — `propose`'s post-persistence branch was entirely untested.** Deleting
+  it left the suite green, so the load-bearing half of its own comment was
+  unpinned in both directions. Now covered by a test asserting alert +
+  `HX-Trigger` + exactly one new proposal on disk; the reviewer confirmed the
+  disk assertion is load-bearing by making the route roll the write back — the
+  behaviour design §8 forbids — which turns it red.
+- **I3 — a Task 10 test rested on a false premise and structurally blocked the
+  fix.** `test_refusal_severity_escapee_keeps_page_status_under_htmx` injected
+  `OutOfScopeError` as "undeclared by this route's catch family", but that is a
+  `CrossScopeError`, which `triage` declares. It passed only *because* of C2.
+  Vehicle swapped to `OutboxError` (E-INVALID, refusal, 422). Not a scope
+  breach: `git log -S` places the test in this branch's own Task 10 commit
+  `8df9977`, so §8's S1-S5 bright line does not reach it — recorded here
+  because a `numstat` reader sees deletions in a test file.
+- **M1** the swap shape was asserted only on the refusal fragment, not on
+  `blocks/diff.html`, which is what actually swaps in the normal flow — now
+  covered. **M2** the alert include was guarded by `{% if destination %}`
+  rather than by `error`; changed to `{% elif error %}`. **Applied, not
+  proven** — the state is unreachable while `resolve_classification_destination`
+  either returns a truthy dataclass or raises, so reverting it leaves the suite
+  green.
+
+**Fix round 2** — reviewer returned *not clean*: 1 Important, 4 Minor, no
+Critical. All round-1 findings confirmed genuinely fixed by the reviewer's own
+mutations, including two narrowings of the new outer catch that each go red.
+
+- **The comment asserted the opposite of the fix.** A comment in
+  `test_triage_page_with_broken_registry_shows_e_config_page` described the C1
+  escape — "reaches the global fallback, which ServerErrorMiddleware re-raises"
+  — as intended contract, three tests above the test that now forbids it, with
+  a `raise_server_exceptions=False` that was no longer needed. On a branch whose
+  ledger has twice shipped a claim it had not established, a comment stating
+  removed behaviour as contract is the same failure in the same place: a future
+  reader could restore the escape on its authority. Rewritten; the opt-out
+  dropped.
+- **The accepted "aliased catch-all" blind spot expired the moment Task 11
+  created the shape.** Task 10a recorded it as acceptable *on the explicit
+  grounds that no such shape existed in `app/`*; `except _TRIAGE_CATCHES` is
+  the first. The reviewer laundered the route with `_LAUNDER = Exception` while
+  leaving the decorator intact and the AST guard stayed **green**. Rather than
+  weaken the ledger's justification, the guard grew: `_exception_aliases`
+  now resolves names bound to an exception class or tuple, and the
+  positive control gained aliased clauses so the resolution itself is
+  controlled. Both mutations now red.
+
+  Round 3 then showed that first version closed one spelling and left five
+  one-line variants open, so the guard was widened rather than the claim
+  softened: it now walks `Assign`, `AnnAssign` and `NamedExpr` anywhere in the
+  module rather than only `tree.body`, unions tuple targets instead of pairing
+  them positionally — over-approximating, the fail-closed direction — and
+  resolves to a bounded fixpoint so an alias of an alias closes. Probed
+  directly: alias-of-alias, `AnnAssign`, walrus, tuple target, alias bound
+  inside a module-level `if`, chained `A = B = Exception`, and an alias nested
+  in an `except` tuple are **all flagged**; a legitimately typed
+  `E = ValueError` is not.
+
+  **Coverage stated as the rule the code implements, not as a list of
+  unsupported shapes** — an enumeration here would be wrong in the direction it
+  cannot see, which is the §7 failure this whole guard exists to avoid. What is
+  resolved: `Assign`, `AnnAssign` and `NamedExpr` bindings, with `Name`
+  targets or `Tuple`/`List` targets **at any nesting depth**. What is not: every other binding form — a
+  `for` target, a `with ... as`, an `except ... as`, an import — and every
+  non-trivial value expression, including a ternary and a computed
+  `except (A,) + _EXTRA`. A first draft of this paragraph listed two residuals;
+  review found three more (ternary, `for` target, `with ... as`), which is
+  exactly why it is now a rule.
+
+  Two accepted false positives, both fail-closed: the resolver **collects
+  bindings from every scope** — module level, function bodies, class bodies,
+  comprehensions — with no scope model, so a function-local name shadows an
+  unrelated module-level one; and it is **order-blind** — every binding for a
+  name unions into one set, so position is irrelevant and a name bound twice
+  carries both. It also fires harmlessly on real code today
+  (`destination, error = None, None` binds both names to `{""}`). None of these
+  reds anything in `app/`, and all fail red rather than green.
+
+  The widening was itself briefly uncontrolled, and the mutation battery
+  caught it rather than review: restricting the walk back to `tree.body`
+  passed **green**, because every alias in the control fixture was already
+  top-level. The fixture gained an `if True:`-nested binding, and each of the
+  three widening stages is now individually pinned — restricting the walk,
+  dropping `AnnAssign`/`NamedExpr`, and removing the fixpoint each turn it
+  red. A control that does not exercise a stage does not control it; that is
+  the same lesson as Task 10a's C2, found a second time in the same file.
+
+  And a third time, one level down: the claim "each of the three widening
+  stages is now individually pinned" was itself false when written. `AnnAssign`
+  and `NamedExpr` shared one branch with only an `AnnAssign` clause in the
+  fixture, so dropping the walrus half alone stayed green; and the tuple-target
+  union was named as a widening while no tuple target existed in the fixture at
+  all. The fixture now carries one clause per stage — literal catch-all, direct
+  alias, alias-of-alias, `AnnAssign`, `NamedExpr`, a binding outside
+  `tree.body`, a tuple target, and a **nested** tuple target — and each
+  widening stage is red under its own mutation. Six mutations, each turning
+  the assertion red: four isolate a single asserted line (drop `NamedExpr`
+  alone → 39; drop `AnnAssign` alone → 29; neutralise the target union → 44;
+  remove the fixpoint → 24), restricting the walk reds two (34 and 39, since
+  the walrus binding sits inside a module-level `Assign` and so is not in
+  `tree.body` either), and removing resolution entirely reds every
+  alias-dependent line. An earlier draft claimed all six isolated exactly one
+  stage; review measured it and two did not.
+
+  Round 5 then found the rule statement was **broader than the code**: a
+  nested target such as `_A, (_B,) = Exception, (Exception,)` binds a working
+  runtime catch-all one level down, and the collector descended only one
+  level, so `except _B` escaped while the rule said `Tuple`/`List` targets
+  were resolved. Fixed by recursing (`_target_names`) rather than by narrowing
+  the words, so the broad claim became true; a nested clause was added to the
+  fixture and an eighth asserted line, because an unpinned recursion would
+  have been the same gap a third time.
+- **An unrecorded status change, now pinned.** A refusal-severity declared
+  member escaping the row loop returns **200 under `HX-Request`**, where the
+  fallback's `force_page_status` previously forced 404. Design-correct under
+  Rule 5, and `force_page_status` exists only because a fallback response is a
+  defect rather than an expected refusal — but it is a live status change on the
+  same class the I3 test used to assert 404 for, so it is asserted rather than
+  left to be discovered.
+- **A docstring overstated its reach.** The symlinked-receipt test claimed the
+  condition is described "per-row, without the page failing". For a receipt
+  already symlinked on disk the page *does* fail at 409, because `read_inbox`'s
+  `_require_real_receipt` aborts the whole listing — one symlinked receipt hides
+  every valid row. Corrected to state that the page-level 409 is the reachable
+  case and the per-row branch is the TOCTOU race the stub isolates.
+
+**Mutation evidence.** Every behavioural claim broken, confirmed red, restored
+byte-identical (`shasum -a 256 -c`), using explicit backups — never
+`git checkout`, which during implementation reverted the whole task and had to
+be reapplied by hand:
+
+| Mutation | Test | Result |
+|---|---|---|
+| delete `triage`'s outer `try`/`except` | fallback regression | red |
+| narrow the outer catch to `(DestinationRegistryError,)` | fallback regression | red |
+| narrow the outer catch to `(CrossScopeError,)` | fallback regression | red |
+| `===` → `!==` in the stopwatch (count refusals only) | stopwatch | red (was **green**) |
+| drift the `HX-Trigger` header name | stopwatch | red (was **green**) |
+| delete `propose`'s post-persistence `try`/`except` | post-persistence | red (was **green**) |
+| roll the persisted proposal back on render failure | post-persistence | red |
+| wrap `blocks/diff.html` in `id="diff-0" x-data="{}"` | success-fragment shape | red |
+| alias-launder `triage` with `_LAUNDER = Exception` | invariant 6 body guard | red (was **green**) |
+| remove the guard's alias resolution | invariant 6 body guard | red |
+
+**Step 3a — the authorized third regression-table row.**
+`test_tampered_proposal_form_writes_nothing`: the sole deletion across
+`tests/test_app.py` is `assert response.status_code >= 400`, replaced by
+`== 200`. The three state proofs are **byte-identical**, verified by diffing
+them against `HEAD`. It gained `role="alert"`, the expected code (`E-DEST` for
+five cases, `E-INVALID` for the `entity` case — the reviewer confirmed each
+renders exactly one code, for the right reason), the exact
+`_CODES[...].message`, and a no-echo loop proven non-vacuous by making the
+route echo every submitted value, which turns all six red.
+
+**Accepted limits, recorded not fixed** (the reviewer independently agreed
+recording is correct for both):
+
+- A post-persistence failure **outside** `propose`'s declared family reaches the
+  fallback carrying no `HX-Trigger`, so a genuinely persisted proposal goes
+  uncounted. Unfixable without either widening toward the bare `except` Rule 5
+  forbids or moving the header onto a path that no longer means "persisted".
+  Undercounting is the safe direction for a Gate 1 measurement — it never
+  inflates.
+- The header comparison assumes the plain-string `HX-Trigger` form. Correct
+  against the vendored bundle, which treats a value not starting with `{` as a
+  comma-separated name list; nothing in this repo emits the object form.

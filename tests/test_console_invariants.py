@@ -480,14 +480,90 @@ def _handled_exception_names(node: ast.expr | None) -> set[str]:
     return {getattr(node, "id", getattr(node, "attr", ""))}
 
 
+def _target_names(target: ast.expr):
+    """Every plain name an assignment target binds, at any nesting depth."""
+    if isinstance(target, ast.Name):
+        yield target.id
+    for element in getattr(target, "elts", ()):
+        yield from _target_names(element)
+
+
+def _exception_aliases(tree: ast.Module) -> dict[str, set[str]]:
+    """Names bound anywhere in the module to an exception class or a tuple of
+    them, so `except _SOME_TUPLE` is resolved rather than read as an opaque
+    name.
+
+    Bindings are harvested from EVERY scope — module level, function bodies,
+    class bodies, comprehensions — with no scope model, so a function-local
+    name can shadow an unrelated module-level one. That over-approximates,
+    which is the fail-closed direction for a guard.
+
+    Resolved binding forms are exactly `Assign`, `AnnAssign` and `NamedExpr`,
+    with `Name` targets or `Tuple`/`List` targets at any nesting depth
+    (starred elements excepted — a starred target binds a list, which cannot
+    be a runtime-valid `except` operand). Every other binding form — a `for`
+    target, a `with ... as`, an `except ... as`, an import — and every
+    non-trivial value expression such as a ternary or a computed tuple is NOT
+    resolved. Stated as the rule the code implements rather than as a list of
+    unsupported shapes, because a list is wrong in the direction it cannot
+    see.
+
+    Task 11 introduced the first such form in `app/` (`except
+    _TRIAGE_CATCHES`). Before it, the ledger recorded aliased catch targets
+    as an accepted blind spot on the explicit grounds that no such shape
+    existed — the moment one does, the justification expires and the guard
+    has to grow instead. An alias is exactly how a catch-all would hide from
+    a name-matching scan.
+    """
+    aliases: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            if node.value is None:
+                continue
+            targets, value = [node.target], node.value
+        else:
+            continue
+        bound = _handled_exception_names(value)
+        for target in targets:
+            # A tuple target unions rather than pairs positionally: that
+            # over-approximates, which is the fail-closed direction for a
+            # guard. `ast.walk` rather than `tree.body` so an alias bound
+            # inside a module-level `if`/`try` is seen too. `_target_names`
+            # recurses, because `_A, (_B,) = Exception, (Exception,)` binds a
+            # working catch-all one level down.
+            for name in _target_names(target):
+                aliases.setdefault(name, set()).update(bound)
+
+    # Fixpoint, so an alias of an alias resolves. Bounded by the number of
+    # aliases: each pass either grows a set or terminates.
+    for _ in range(len(aliases) + 1):
+        grown = False
+        for name, bound in list(aliases.items()):
+            expanded = set(bound)
+            for inner in bound:
+                expanded |= aliases.get(inner, set())
+            if expanded != bound:
+                aliases[name] = expanded
+                grown = True
+        if not grown:
+            break
+    return aliases
+
+
 def _catch_all_offenders(source: pathlib.Path) -> list[str]:
     tree = ast.parse(source.read_text(encoding="utf-8"))
+    aliases = _exception_aliases(tree)
     offenders = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.ExceptHandler):
             continue
         names = _handled_exception_names(node.type)
-        if node.type is None or names & {"Exception", "BaseException"}:
+        resolved = set(names)
+        for name in names:
+            resolved |= aliases.get(name, set())
+        if node.type is None or resolved & {"Exception", "BaseException"}:
             offenders.append(f"{_label(source)}:{node.lineno}")
     return offenders
 
@@ -538,15 +614,56 @@ def test_no_route_source_file_launders_with_a_catch_all(
 
     positive = controls / "catch_all_control.py"
     positive.write_text(
-        "def f():\n"
-        "    try:\n        g()\n"
-        "    except ValueError:\n        pass\n"
-        "    except Exception:\n        pass\n",
+        "_LAUNDER = Exception\n"                    # 1
+        "_INDIRECT = _LAUNDER\n"                    # 2   alias of an alias
+        "_ANNOTATED: type = Exception\n"            # 3   AnnAssign
+        "_WAL = (_W := Exception)\n"                # 4   NamedExpr, alone
+        "_TA, _TB = Exception, ValueError\n"        # 5   tuple target union
+        "_NA, (_NB,) = Exception, (Exception,)\n"   # 6   NESTED tuple target
+        "if True:\n    _NESTED = Exception\n"       # 7, 8  not in tree.body
+        "def f():\n"                                # 9
+        "    try:\n        g()\n"                   # 10, 11
+        "    except ValueError:\n        pass\n"     # 12, 13
+        "    except Exception:\n        pass\n"      # 14, 15
+        "def h():\n"                                # 16
+        "    try:\n        g()\n"                   # 17, 18
+        "    except _LAUNDER:\n        pass\n"       # 19, 20
+        "def i():\n"                                # 21
+        "    try:\n        g()\n"                   # 22, 23
+        "    except _INDIRECT:\n        pass\n"      # 24, 25
+        "def j():\n"                                # 26
+        "    try:\n        g()\n"                   # 27, 28
+        "    except _ANNOTATED:\n        pass\n"     # 29, 30
+        "def k():\n"                                # 31
+        "    try:\n        g()\n"                   # 32, 33
+        "    except _NESTED:\n        pass\n"        # 34, 35
+        "def m():\n"                                # 36
+        "    try:\n        g()\n"                   # 37, 38
+        "    except _W:\n        pass\n"             # 39, 40
+        "def n():\n"                                # 41
+        "    try:\n        g()\n"                   # 42, 43
+        "    except _TA:\n        pass\n"            # 44, 45
+        "def o():\n"                                # 46
+        "    try:\n        g()\n"                   # 47, 48
+        "    except _NB:\n        pass\n",           # 49, 50
         encoding="utf-8",
     )
-    # The exact line pins `lineno` reporting; the typed `except ValueError`
-    # above it doubles as proof that a declared family is *not* reported.
-    assert _catch_all_offenders(positive) == ["catch_all_control.py:6"]
+    # One clause per resolution stage, so no stage can rot into a no-op while
+    # another carries the assertion: 14 the literal catch-all, 19 a direct
+    # alias, 24 alias-of-alias (the fixpoint), 29 AnnAssign, 34 a binding
+    # outside tree.body, 39 NamedExpr alone, 44 a tuple target (the union),
+    # 49 a NESTED tuple target (the recursion). `except ValueError` at line
+    # 12 proves a declared family is not reported.
+    assert sorted(_catch_all_offenders(positive)) == [
+        "catch_all_control.py:14",
+        "catch_all_control.py:19",
+        "catch_all_control.py:24",
+        "catch_all_control.py:29",
+        "catch_all_control.py:34",
+        "catch_all_control.py:39",
+        "catch_all_control.py:44",
+        "catch_all_control.py:49",
+    ]
 
     negative = controls / "catch_all_clean.py"
     negative.write_text(
