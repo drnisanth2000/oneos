@@ -204,4 +204,28 @@ success event header only after `propose_classification` returns.
   faithful reading of "O_NOFOLLOW rejection". Reviewer re-flagged the Task 5
   code-map discrepancy; resolution unchanged (normative class map wins).
 - **Fix rounds:** 0.
-- **Commit:** recorded in the Task 5 entry.
+- **Commit:** `1b02df0`.
+
+### Task 5 — The class map and `describe()`
+
+- **RED:** `uv run pytest tests/test_console_errors.py -q` → 60 failed,
+  5 passed (`ImportError`/`AttributeError`: `describe`, `_EXACT`, `_MRO`,
+  `_CODES` undefined).
+- **GREEN:** same command → 65 passed.
+- **Full suite:** 676 passed (616 + 60 new; no pre-existing test modified).
+- **Reviewer verdict:** clean; reviewer verified all 39 normative map rows,
+  all 21 codes, and all 21 messages byte-for-byte against the design
+  (including E-STALE/E-MISSING against `tests/test_app.py:434`/`:439`),
+  executed resolver probes for allowlist identity, `__context__`
+  non-traversal, depth overflow, tie-breaking, and the closed family, and
+  confirmed the S5-outcome tests use the real wrappers. Confirmed the
+  ledger's adjudication of the design's internal discrepancy is applied.
+  Three Minors: (1) the second prong of `test_exact_mapping_does_not_inherit`
+  was missing — **fixed** (synthetic `RegistryTransactionError` subclass →
+  E-REGISTRY, not E-GIT); (2) the "never raised" half of the abstract-base
+  test is deliberately delegated to invariant 3 (Task 6); (3) two redundant
+  guards in `_lookup` carried from the plan's own pseudocode — left as
+  plan-written.
+- **Fix rounds:** 1 (Minor 1 addressed; 65 passed, full suite 676 re-run
+  green).
+- **Commit:** recorded in the Task 6 entry.
