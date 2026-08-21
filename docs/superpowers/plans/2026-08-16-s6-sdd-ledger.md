@@ -228,4 +228,22 @@ success event header only after `propose_classification` returns.
   plan-written.
 - **Fix rounds:** 1 (Minor 1 addressed; 65 passed, full suite 676 re-run
   green).
-- **Commit:** recorded in the Task 6 entry.
+- **Commit:** `d8db708`.
+
+### Task 6 — Invariants 1 and 2
+
+- **RED evidence:** Task 6 is guard-tests-only over an already-complete map;
+  the plan's Step 4 anticipated map gaps and none existed, so the tests
+  passed on first run. Falsifiability proven by mutation probe instead: an
+  injected unmapped `GitTransactionError` subclass fails invariant 2
+  ("ProbeGitError lacks its own exact entry") and invariant 1
+  ("app.git_transaction.ProbeGitError is unmapped"). The reviewer
+  independently reproduced both mutations plus a boundary-test mutation
+  (injected `from . import console_errors` into `app/scope.py` → red).
+- **GREEN:** `uv run pytest tests/test_console_invariants.py -q` → 11 passed.
+- **Full suite:** 679 passed (676 + 3 new).
+- **Reviewer verdict:** clean; two Minors: (1) `app/__init__.py` invisible to
+  both walks — **fixed** with the same AST guard `app.main` carries;
+  (2) name-based heuristics in the AST guards — standard trade-off, left.
+- **Fix rounds:** 1 (Minor 1; 11 passed, full suite 679 re-run green).
+- **Commit:** recorded in the Task 7 entry.
