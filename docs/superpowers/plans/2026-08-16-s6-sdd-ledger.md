@@ -660,7 +660,12 @@ says `pulse | unchanged`, so a literal guard fails on it on day one. Declared
   Task 6 AST-guard precedent: an aliased `_LAUNDER = Exception` or a computed
   `except (X,) + _EXTRA` is not detected (neither shape exists in `app/`), and
   a legitimate `except Exception: raise` is flagged, which is design-literal
-  over-reach. Nested-function laundering **is** caught.
+  over-reach. Nested-function laundering **is** caught. A third limit was
+  found in round 3 and accepted on the same terms: FastAPI accepts a
+  `functools.partial` endpoint, which is swept and declarable but whose source
+  `inspect.getsourcefile` cannot resolve, so it fails the `unresolved` check by
+  name. That is fail-closed and documented; if it ever bites, follow
+  `partial.func`.
 
 **Fix round 2** — reviewer returned *not clean*: 1 Critical, newly introduced by
 the round-1 M3 fix, plus 4 Minor.
@@ -696,9 +701,16 @@ byte-identical:
 | undeclared laundering handler in another module via `add_api_route` | 1 and 2 | both red (both were **green** — I1) |
 | flip `pulse`'s `surface` to `"page"` | pulse | red |
 | break the traversal **and** launder `outbox_reject` | 2 | red (was **green** — C2) |
+| break the endpoint-source collection loop | 2 | red (was **green** — MN2) |
 
-- **Suite:** 738 passed (735 + 3). `git diff --check` clean. Zero deletions in
-  any file, so no pre-existing test was modified.
+- **Suite:** 738 passed (735 + 3). `git diff --check` clean. **Zero deletions
+  in `app/` or `tests/` across the task span (`463955d..HEAD`)**, so no
+  pre-existing test line was ever touched. Stated precisely because an earlier
+  draft of this entry claimed "zero deletions in any file", which is false and
+  which a reviewer running `git show --numstat` would catch: the span deletes
+  six documentation lines, and `3c75a55` deletes 22 lines from
+  `tests/test_console_invariants.py` — every one of them a line `3c0eee0` had
+  itself added.
 
 **Process deviation, recorded.** A concurrent session committed `3c0eee0` in
 this worktree and swept this task's then-uncommitted, un-re-reviewed working
@@ -730,3 +742,37 @@ are six cases of one declared presentation regression, not six new exceptions.
 
 `3c0eee0` applied the design and plan halves but omitted the observable-refusal
 assertion; that clause was added to both documents here. Task 11 owns Step 3a.
+
+**Fix round 3 — reviewer returned CLEAN.** No Critical, no Important. Two
+Minors, both closed rather than carried:
+
+- **MN1 — the ledger overstated its own evidence.** "Zero deletions in any
+  file" was false. Corrected above to the true and equally strong claim. This
+  branch has twice shipped a ledger asserting something it had not established;
+  a third would have been the same failure in the document whose whole purpose
+  is to stay checkable.
+- **MN2 — the endpoint-source collection loop was the one uncontrolled stage.**
+  The C2 controls prove the *scanner*; nothing proved the *collection*. With
+  the loop broken, a laundering handler in a module other than the composition
+  root escaped both guards. The design-required scope was never at risk —
+  `_COMPOSITION_ROOT` is seeded unconditionally and asserted — so this was
+  defence-in-depth on the widening I1 added. Closed by extracting
+  `_endpoint_source_files()` and controlling it with a throwaway module and a
+  scratch `FastAPI()`, in the same pattern as the C2 fix. Verified: breaking
+  the loop is now red.
+
+Also applied from round 3's observations: offender labels are repo-relative
+rather than basenames, so two scanned files sharing a name stay
+distinguishable; and the control fixtures moved into a `_controls/`
+subdirectory so the synthetic vault root stays a clean vault.
+
+The reviewer independently reproduced all seven mutation-table rows on the
+committed tree, broke `_catch_all_offenders` three further ways not previously
+tried — all red — and verified the ledger's checkable claims by measurement
+rather than by reading: the enclosing checkout's `app/main.py` has seven
+`ExceptHandler` nodes by AST count; `test_app.py` collects 28 tests;
+`test_tampered_proposal_form_writes_nothing` is at line 393 with six cases and
+exactly the three state proofs the ruling preserves.
+
+- **Reviewer verdict:** clean after fix round 3 (three rounds: 1 Critical +
+  2 Important + 5 Minor, then 1 Critical + 4 Minor, then clean with 2 Minor).

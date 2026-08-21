@@ -402,11 +402,11 @@ def _load_console_app(tmp_path, monkeypatch):
     return importlib.reload(main)
 
 
-def _registered_console_endpoints(main):
+def _registered_console_endpoints(app):
     """Every endpoint the router will actually dispatch to, minus the
     framework's own. A Mount (the StaticFiles application) exposes no
     `endpoint` attribute at all."""
-    for route in main.app.routes:
+    for route in app.routes:
         endpoint = getattr(route, "endpoint", None)
         if endpoint is None:
             continue
@@ -423,7 +423,7 @@ def test_every_registered_route_declares_its_catch_family(tmp_path, monkeypatch)
     main = _load_console_app(tmp_path, monkeypatch)
 
     checked, undeclared = [], []
-    for endpoint in _registered_console_endpoints(main):
+    for endpoint in _registered_console_endpoints(main.app):
         name = getattr(endpoint, "__qualname__", None) or repr(endpoint)
         checked.append(name)
         # Identity, not mere presence: an arbitrary attribute of that name
@@ -437,6 +437,36 @@ def test_every_registered_route_declares_its_catch_family(tmp_path, monkeypatch)
     # [] == []. S6 adds no route, so the count only ever falls by regression.
     assert len(checked) >= 11, f"the sweep saw only {checked}"
     assert undeclared == []
+
+
+def _endpoint_source_files(app):
+    """The files owning every registered application endpoint, and the
+    endpoints whose source could not be resolved. An unresolvable endpoint —
+    a callable instance, or a `functools.partial` — cannot be scanned, so it
+    is returned for the caller to fail on by name rather than being dropped
+    silently."""
+    import inspect
+
+    sources, unresolved = set(), []
+    for endpoint in _registered_console_endpoints(app):
+        try:
+            source = inspect.getsourcefile(endpoint)
+        except TypeError:      # a callable instance, not a function
+            source = None
+        if source:
+            sources.add(pathlib.Path(source).resolve())
+        else:
+            unresolved.append(repr(endpoint))
+    return sources, unresolved
+
+
+def _label(source: pathlib.Path) -> str:
+    """Repo-relative where possible, so two scanned files sharing a basename
+    stay distinguishable in an offender list."""
+    try:
+        return str(source.relative_to(_REPO_ROOT))
+    except ValueError:
+        return source.name
 
 
 def _handled_exception_names(node: ast.expr | None) -> set[str]:
@@ -458,7 +488,7 @@ def _catch_all_offenders(source: pathlib.Path) -> list[str]:
             continue
         names = _handled_exception_names(node.type)
         if node.type is None or names & {"Exception", "BaseException"}:
-            offenders.append(f"{source.name}:{node.lineno}")
+            offenders.append(f"{_label(source)}:{node.lineno}")
     return offenders
 
 
@@ -482,20 +512,10 @@ def test_no_route_source_file_launders_with_a_catch_all(
     from the enclosing checkout, passing green while the laundering it
     forbids is live — the same defect the ledger records as Task 8 finding I1.
     """
-    import inspect
-
     main = _load_console_app(tmp_path, monkeypatch)
 
-    sources, unresolved = {_COMPOSITION_ROOT}, []
-    for endpoint in _registered_console_endpoints(main):
-        try:
-            source = inspect.getsourcefile(endpoint)
-        except TypeError:      # a callable instance, not a function
-            source = None
-        if source:
-            sources.add(pathlib.Path(source).resolve())
-        else:
-            unresolved.append(repr(endpoint))
+    sources, unresolved = _endpoint_source_files(main.app)
+    sources.add(_COMPOSITION_ROOT)
 
     # Controls, driven through `_catch_all_offenders` itself — the function
     # the real scan calls, reading a real file off disk. An earlier revision
@@ -510,7 +530,13 @@ def test_no_route_source_file_launders_with_a_catch_all(
     # current `except` clauses, and a floor tuned to today's total would go
     # spuriously red and invite the next implementer to lower it. These two
     # controls prove the scanner works regardless of what `app/` contains.
-    positive = tmp_path / "catch_all_control.py"
+    #
+    # They live in their own directory so the synthetic vault root stays a
+    # clean vault.
+    controls = tmp_path / "_controls"
+    controls.mkdir(exist_ok=True)
+
+    positive = controls / "catch_all_control.py"
     positive.write_text(
         "def f():\n"
         "    try:\n        g()\n"
@@ -518,14 +544,38 @@ def test_no_route_source_file_launders_with_a_catch_all(
         "    except Exception:\n        pass\n",
         encoding="utf-8",
     )
+    # The exact line pins `lineno` reporting; the typed `except ValueError`
+    # above it doubles as proof that a declared family is *not* reported.
     assert _catch_all_offenders(positive) == ["catch_all_control.py:6"]
 
-    negative = tmp_path / "catch_all_clean.py"
+    negative = controls / "catch_all_clean.py"
     negative.write_text(
         "def f():\n    try:\n        g()\n    except ValueError:\n        pass\n",
         encoding="utf-8",
     )
     assert _catch_all_offenders(negative) == []
+
+    # Control for the *collection* stage, which the two above cannot reach:
+    # with it broken, a laundering handler in a module other than the
+    # composition root would never be scanned. `_COMPOSITION_ROOT` is seeded
+    # unconditionally, so the design-required scope survives regardless —
+    # this controls the widening beyond it.
+    import importlib.util
+
+    from fastapi import FastAPI
+
+    probe_source = controls / "endpoint_source_control.py"
+    probe_source.write_text("def endpoint():\n    return None\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(
+        "endpoint_source_control", probe_source
+    )
+    probe_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe_module)
+    scratch = FastAPI()
+    scratch.add_api_route("/control", probe_module.endpoint, methods=["GET"])
+    collected, collected_unresolved = _endpoint_source_files(scratch)
+    assert probe_source.resolve() in collected
+    assert collected_unresolved == []
 
     # An endpoint whose source cannot be resolved cannot be scanned, so it
     # fails here by name rather than escaping the ban unnoticed.
