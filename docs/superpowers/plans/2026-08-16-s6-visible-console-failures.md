@@ -824,12 +824,15 @@ uv run python -m pytest -q
 git diff --check
 tools/run_gitleaks.sh .
 uv run python -m tools.public_repo_audit --repo . --history
+uv run python -m tools.public_repo_audit --repo . --vault "$ONEOS_VAULT" --history
 ```
 
-  If any private-gate input changed (it should not — documentation touches no
-  vault reader), re-run the private audit and repeat the fingerprint comparison
-  from Step 3. The branch is complete only when this round passes with the
-  documentation commit as HEAD.
+  The combined audit is unconditional: it reads the repository's HEAD as well as
+  the vault, so the documentation commit changed its input even though Grey
+  Matter did not. Then repeat the **complete** Step 3 fingerprint comparison.
+  The private unit, `check_v2`, and policy-enforcer suites need not repeat —
+  documentation changes no application code. The branch is complete only when
+  this round passes with the documentation commit as HEAD.
 
 ---
 
