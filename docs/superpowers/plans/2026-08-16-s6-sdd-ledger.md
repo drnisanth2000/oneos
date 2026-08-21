@@ -522,11 +522,15 @@ with it.
 | Item | Owner | Note |
 |---|---|---|
 | Non-canonical `dst` aborts the listing rather than blocking it | Task 12 | Faithful — the strict loader poisons identically and design §3 assigns destination validation to phase 2 — but it is the one poisoning condition producing an abort rather than a blocked listing. |
-| Stopwatch still infers success from transport | Task 11 | `templates/triage.html:123` still listens on `htmx:afterRequest`. The `HX-Trigger` fix is Task 11's, as planned. Until then, refusals returning 200 would be counted — but no route returns a described 200 refusal yet, so it is not yet live. |
+| ~~Stopwatch still infers success from transport~~ | Task 11 | **DONE** at `d8d0dbe`. The listener and the literal `htmx:afterRequest` string survive (so the unlisted gate-1 test is untouched); what it keys on moved to the `HX-Trigger` header. |
 | `outbox_list.html` still renders the old `props` API | Task 12 | Expected; Task 12 converts it to the projection. |
 | `add_workspace` and `_count_front_matter` let `UnicodeDecodeError` escape | S7 | Absorbing it would change an existing fatality, which S6 has no authority to do. |
 | Reader-guard heuristic gaps (tuple-unpack, walrus, alias rebinding, `Path(...)` wrapping, builtin `open` on a tracked name) | S7 | None present in `app/` today; invariant 4 only refuses silence. |
 | The review gate does not bind reviewed content | S7 | Unchanged. Design §12. |
+| A post-persistence failure outside `propose`'s declared family carries no `HX-Trigger`, so a genuinely persisted proposal goes uncounted | S7 or later | Task 11, accepted. Unfixable without widening toward the bare `except` Rule 5 forbids, or moving the header onto a path that no longer means "persisted". Undercounting is the safe direction for a Gate 1 measurement — it never inflates. |
+| The stopwatch compares the whole `HX-Trigger` value, assuming the plain-string form | S7 or later | Task 11, accepted. Correct against the vendored bundle, which treats a value not starting with `{` as a comma-separated name list; nothing in this repo emits the object form. |
+| The invariant 6 alias resolver does not follow imported aliases or computed targets, collects bindings from every scope, and is order-blind | S7 or later | Tasks 10a/11, accepted and stated as a rule rather than a list. All fail-closed; none reds anything in `app/` today. |
+| `test_console_routes.py` was amended twice (Task 10's escapee vehicle, Task 10a's) | — | Not scope breaches: `git log -S` places the file in this branch's own Task 10 commit `8df9977`, so design §8's S1-S5 bright line does not reach it. Recorded because a `numstat` reader sees deletions in a test file. |
 
 ### Plan drift
 
