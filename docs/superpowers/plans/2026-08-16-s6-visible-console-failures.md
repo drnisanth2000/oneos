@@ -651,6 +651,13 @@ test_stopwatch_counts_only_persisted_proposals       (HX-Trigger present on
   proofs stay verbatim; they are the test's subject and must keep passing
   unchanged. This is the third and final permitted pre-existing test change,
   added to the design's regression table for exactly this reason.
+
+  The test also **gains** an observable-refusal assertion: `role="alert"`, the
+  described code and message for the condition, and no echo of the submitted
+  value. Replacing `>= 400` with `== 200` on its own would weaken the test — a
+  200 carrying no alert would pass — so the added assertion is what keeps the
+  refusal proven once the status stops proving it. The six parameters are six
+  cases of one declared presentation regression, not six new exceptions.
 - [ ] **Step 4:** `uv run python -m pytest -q`.
 - [ ] **Step 5:**
 

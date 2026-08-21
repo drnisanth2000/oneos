@@ -354,7 +354,6 @@ def test_safe_read_other_oserror_raises_unavailable(tmp_path):
     assert isinstance(raised.value, CrossScopeError)
 
 
-
 # --- Invariant 6: the route declaration guard (design §7) --------------------
 #
 # design §7 invariant 6 requires a structural test that fails
@@ -425,13 +424,14 @@ def test_every_registered_route_declares_its_catch_family(tmp_path, monkeypatch)
 
     checked, undeclared = [], []
     for endpoint in _registered_console_endpoints(main):
-        checked.append(endpoint.__qualname__)
+        name = getattr(endpoint, "__qualname__", None) or repr(endpoint)
+        checked.append(name)
         # Identity, not mere presence: an arbitrary attribute of that name
         # must not pass for a declaration.
         if not isinstance(
             getattr(endpoint, "__console_route__", None), ConsoleRoute
         ):
-            undeclared.append(endpoint.__qualname__)
+            undeclared.append(name)
 
     # Floor, so a sweep that silently matched nothing cannot pass by asserting
     # [] == []. S6 adds no route, so the count only ever falls by regression.
@@ -462,7 +462,7 @@ def _catch_all_offenders(source: pathlib.Path) -> list[str]:
     return offenders
 
 
-def test_no_handler_in_the_composition_root_launders_with_a_catch_all(
+def test_no_route_source_file_launders_with_a_catch_all(
     tmp_path, monkeypatch
 ):
     """Design §5: "Routes catch declared domain families, never bare
@@ -486,29 +486,50 @@ def test_no_handler_in_the_composition_root_launders_with_a_catch_all(
 
     main = _load_console_app(tmp_path, monkeypatch)
 
-    sources = {_COMPOSITION_ROOT}
+    sources, unresolved = {_COMPOSITION_ROOT}, []
     for endpoint in _registered_console_endpoints(main):
-        source = inspect.getsourcefile(endpoint)
+        try:
+            source = inspect.getsourcefile(endpoint)
+        except TypeError:      # a callable instance, not a function
+            source = None
         if source:
             sources.add(pathlib.Path(source).resolve())
+        else:
+            unresolved.append(repr(endpoint))
 
-    # Positive control: the detector must fire on a known catch-all
-    # regardless of what the scanned files happen to contain, so this cannot
-    # degrade into "the files were clean" the way a bare count would. A count
-    # floor is deliberately absent — Task 12 rewrites four of the six current
-    # `except` clauses, and a floor tuned to today's total would go
-    # spuriously red and invite the next implementer to lower it.
-    control = _REPO_ROOT / "tests" / "conftest.py"
-    assert control.exists()
-    synthetic = ast.parse("try:\n    f()\nexcept Exception:\n    pass\n")
-    fired = [
-        node
-        for node in ast.walk(synthetic)
-        if isinstance(node, ast.ExceptHandler)
-        and _handled_exception_names(node.type) & {"Exception"}
-    ]
-    assert len(fired) == 1, "the catch-all detector does not fire"
+    # Controls, driven through `_catch_all_offenders` itself — the function
+    # the real scan calls, reading a real file off disk. An earlier revision
+    # re-implemented the detection inline here, which exercised only
+    # `_handled_exception_names` and left the traversal that opens the files
+    # uncontrolled: breaking `ast.walk` passed green with live laundering in
+    # the composition root. A control that does not run the code under test
+    # is this branch's signature defect (ledger, Task 8 round 2 — "the test
+    # added to prove the trigger passed while the trigger was dead").
+    #
+    # A count floor is deliberately absent — Task 12 rewrites four of the six
+    # current `except` clauses, and a floor tuned to today's total would go
+    # spuriously red and invite the next implementer to lower it. These two
+    # controls prove the scanner works regardless of what `app/` contains.
+    positive = tmp_path / "catch_all_control.py"
+    positive.write_text(
+        "def f():\n"
+        "    try:\n        g()\n"
+        "    except ValueError:\n        pass\n"
+        "    except Exception:\n        pass\n",
+        encoding="utf-8",
+    )
+    assert _catch_all_offenders(positive) == ["catch_all_control.py:6"]
 
+    negative = tmp_path / "catch_all_clean.py"
+    negative.write_text(
+        "def f():\n    try:\n        g()\n    except ValueError:\n        pass\n",
+        encoding="utf-8",
+    )
+    assert _catch_all_offenders(negative) == []
+
+    # An endpoint whose source cannot be resolved cannot be scanned, so it
+    # fails here by name rather than escaping the ban unnoticed.
+    assert unresolved == []
     assert _COMPOSITION_ROOT in sources and _COMPOSITION_ROOT.exists()
     offenders = []
     for source in sorted(sources):

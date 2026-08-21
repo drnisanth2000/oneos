@@ -541,7 +541,8 @@ task depends on it by name. Recorded rather than amended.
   behaviour must not change.
 - **GREEN:** `entity_scope` raises `EntitySelectionError` to a dedicated
   handler; `RequestValidationError` and `StarletteHTTPException` handlers; a
-  global `Exception` fallback; `@console_route` on all eleven routes.
+  global `Exception` fallback; `@console_route` on ten of the eleven
+  routes — `pulse` was missed, and nothing caught it. Task 10a below.
 - **Suite:** 735 passed. `diff --check` clean.
 
 **Escalation raised and then WITHDRAWN — it rested on a false premise.** Task 10
@@ -591,3 +592,141 @@ Task 7→10 regression window is closed. `RequestValidationError` cannot reach
 `Exception` in a `catches=` tuple, no instance-specific values.
 
 - **Reviewer verdict:** 1 Critical, 2 Important — all fixed; escalation withdrawn.
+
+---
+
+### Task 10a — invariant 6's guard, and `pulse`'s declaration
+
+Not a plan task. Two gaps a post-Task-10 review found, covered by no task's step
+list, closed before Task 11 wrote any code.
+
+**Gap 1 — design §7 invariant 6's structural guard existed in no test file.**
+Only its third check (rejecting `Exception` inside a `catches=` tuple) existed,
+as a runtime `ValueError` in `console_route`. The other two — a registered
+handler carrying no declaration, and a route body containing a bare
+`except Exception` — were unguarded. Task 10's step list omits them and Task 14
+Step 3 is the injection-totality test, not this. The gap had already bitten:
+five handlers went undecorated during Task 10 and nothing would have caught it.
+
+**Gap 2 — `pulse` carried no declaration** while the design's route inventory
+says `pulse | unchanged`, so a literal guard fails on it on day one. Declared
+`@console_route(catches=(), surface="fragment-only")`.
+
+- **RED:** `assert ['pulse'] == []` — the new guard found the one undeclared
+  handler on first run, with its `>= 11` floor passing, so the sweep was live.
+- **GREEN:** `pulse` declared. Suite 735 → 738 (three new tests, zero
+  deletions; no pre-existing test modified).
+
+**Fix round 1** — reviewer returned *not clean*: 1 Critical, 2 Important,
+5 Minor.
+
+- **C1 (Critical) — the body guard was cwd-relative and produced a silent false
+  green.** `pathlib.Path("app/main.py")` is relative to the process cwd. The
+  enclosing checkout at the repository root holds a *different* `app/main.py`
+  on a moving branch with seven `except` clauses, which cleared the `>= 6`
+  floor added to prevent exactly this. Proven: with a bare `except Exception`
+  live in the worktree's `app/main.py`, the same guard was red from the
+  worktree and **green from the main checkout**, having never read the file it
+  guards. This is the ledger's own Task 8 finding I1 repeated, with the fix
+  standing three files away at `tests/test_console_readers.py:16`. Anchored to
+  `pathlib.Path(__file__).resolve().parents[1]`.
+- **I1 — both guards were blind to any handler outside `app/main.py`.** Guard 1
+  filtered *in* on `__module__ == "app.main"`; guard 2 read only that file. A
+  handler defined elsewhere and registered via `add_api_route` — undeclared and
+  laundering — passed **both** green. The `app.main` filter's stated purpose is
+  to exclude FastAPI's OpenAPI/docs endpoints and the `StaticFiles` mount, not
+  to exempt application code; §7's closing rule governs ("delete the list and
+  add the invariant that would have caught X"). The filter now excludes
+  `fastapi.`/`starlette.` endpoints, and guard 2 scans the union of
+  `inspect.getsourcefile()` over the swept endpoints plus the anchored
+  composition root.
+- **I2 — `pulse | unchanged` is false, and the change was shipped claimed as no
+  change and pinned by nothing.** `is_fragment()` short-circuits on
+  `surface == "fragment-only"`, so an error escaping `pulse` **without**
+  `HX-Request` moved from the full `error.html` page (2755 bytes) to the
+  `blocks/alert.html` fragment (233 bytes). Status is unaffected, by two
+  independent mechanisms: the global fallback forces the page status, and
+  `E-UNKNOWN` is `attention` severity anyway. The new behaviour is
+  design-correct — §5's normative rule is "a route with no full-page template
+  always uses the fragment renderer", and `pulse` has none; §5's parenthetical
+  list omits it, and §7 records that every enumeration in the design was wrong
+  in the direction of omission. So the defect was the false claim, not the
+  behaviour. The `app/main.py` comment now states what changes and why it is
+  correct, and `test_pulse_declaration_selects_the_fragment_surface` pins it.
+- **M1** presence-not-identity: guard 1 now asserts `isinstance(..., ConsoleRoute)`.
+- **M3** the `seen >= 6` floor had zero headroom and was coupled to a count
+  Task 12 will change — replaced with controls (see C2).
+- **M2 and M4 recorded, not fixed** — accepted heuristic limits, matching the
+  Task 6 AST-guard precedent: an aliased `_LAUNDER = Exception` or a computed
+  `except (X,) + _EXTRA` is not detected (neither shape exists in `app/`), and
+  a legitimate `except Exception: raise` is flagged, which is design-literal
+  over-reach. Nested-function laundering **is** caught.
+
+**Fix round 2** — reviewer returned *not clean*: 1 Critical, newly introduced by
+the round-1 M3 fix, plus 4 Minor.
+
+- **C2 (Critical) — the positive control did not control the real scanner, and
+  was a net regression against the floor it replaced.** It re-implemented the
+  detection inline, exercising only `_handled_exception_names` and never
+  `_catch_all_offenders` — the traversal that opens the files. Breaking
+  `ast.walk(tree)` → `tree.body` with a live `except Exception` in
+  `app/main.py` passed **green**. The deleted count floor had caught that exact
+  mutation in round 1. This is the branch's signature defect verbatim — Task 8
+  round 2's "the test added to prove the trigger passed while the trigger was
+  dead". Replaced with a positive **and** negative control written to
+  `tmp_path` and driven through `_catch_all_offenders` itself. Verified: the
+  broken-traversal mutation is now red.
+- **N2** the dead `control` variable is gone, subsumed by the C2 fix.
+- **N3** an endpoint whose source cannot be resolved is now reported by name as
+  an unscannable route instead of an `AttributeError`/`TypeError` trace.
+- **N4** the guard scans every file owning a registered endpoint, not only the
+  composition root, so it is renamed
+  `test_no_route_source_file_launders_with_a_catch_all`.
+- **N5** blank-line seam normalized to the file's two-line convention.
+
+**Mutation evidence.** Every guard proven non-vacuous, each mutant restored
+byte-identical:
+
+| Mutation | Guard | Result |
+|---|---|---|
+| strip `pulse`'s declaration | 1 | red |
+| strip `shell`'s declaration | 1 | red |
+| launder `outbox_reject` with `except Exception` | 2 | red |
+| the same laundered file, cwd = the enclosing checkout | 2 | red (was **green** — C1) |
+| undeclared laundering handler in another module via `add_api_route` | 1 and 2 | both red (both were **green** — I1) |
+| flip `pulse`'s `surface` to `"page"` | pulse | red |
+| break the traversal **and** launder `outbox_reject` | 2 | red (was **green** — C2) |
+
+- **Suite:** 738 passed (735 + 3). `git diff --check` clean. Zero deletions in
+  any file, so no pre-existing test was modified.
+
+**Process deviation, recorded.** A concurrent session committed `3c0eee0` in
+this worktree and swept this task's then-uncommitted, un-re-reviewed working
+tree into it, so the C1/I1/I2 fixes were committed and pushed carrying the
+still-open C2 Critical. The C2 fix was therefore committed **before** its
+review round rather than after, because the defect was already live on the
+pushed branch and leaving the fix uncommitted would have left it there. Review
+of the committed state follows. Two sessions writing one branch is the hazard;
+one session per step is the rule.
+
+### The ruling on `test_tampered_proposal_form_writes_nothing`
+
+Escalated to the human and **granted**, since it breaches the standing "exactly
+two pre-existing tests may change" constraint.
+
+Proven before asking, in an isolated copy at HEAD rather than by argument: with
+`propose` catching its declared family, all six parametrized cases return 200,
+and with only the status line changed all six pass — `HEAD` unchanged, entity
+bytes unchanged, no proposal written; full `test_app.py` 28 passed. So the
+collision is a Rule 5 consequence (fragment-only + refusal → 200), not the
+global-fallback defect that caused the withdrawn Task 10 escalation.
+
+The ruling: one new regression-table row; **status expectation only**, `>= 400`
+→ `== 200`; every state and isolation assertion preserved verbatim; the test
+**gains** an observable-refusal assertion (`role="alert"` plus the described
+code and message) so that dropping the status check strengthens rather than
+weakens it; design first, plan second, test during Task 11. The six parameters
+are six cases of one declared presentation regression, not six new exceptions.
+
+`3c0eee0` applied the design and plan halves but omitted the observable-refusal
+assertion; that clause was added to both documents here. Task 11 owns Step 3a.
