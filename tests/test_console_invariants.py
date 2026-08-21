@@ -1,7 +1,24 @@
+import ast
 import os
+import pathlib
 import stat as stat_module
 
 import pytest
+
+AMBIGUOUS = {"CrossScopeError", "ReviewedStateConflict",
+             "UnsafeDestinationPath", "InvalidSourceLeaf"}
+
+
+def test_no_direct_raise_of_an_ambiguous_base():
+    offenders = []
+    for path in pathlib.Path("app").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+                name = getattr(node.exc.func, "id", getattr(node.exc.func, "attr", ""))
+                if name in AMBIGUOUS:
+                    offenders.append(f"{path}:{node.lineno}")
+    assert offenders == []
 
 
 def test_every_new_subtype_is_caught_as_its_base():

@@ -185,7 +185,7 @@ def capture_path_state(vault: Path, relative_path: str) -> PathState:
     try:
         _validate_transaction_path(relative_path)
     except ValueError as exc:
-        raise ReviewedStateConflict("reviewed path is unsafe") from exc
+        raise InvalidTransactionPath("reviewed path is unsafe") from exc
 
     root = Path(os.path.abspath(os.fspath(vault)))
     parts = PurePosixPath(relative_path).parts
@@ -203,15 +203,17 @@ def capture_path_state(vault: Path, relative_path: str) -> PathState:
         except FileNotFoundError:
             return PathState.absent()
         except OSError as exc:
-            raise ReviewedStateConflict("reviewed path is unavailable") from exc
+            raise ReviewedPathUnavailable("reviewed path is unavailable") from exc
         if stat.S_ISLNK(leaf_stat.st_mode) or not stat.S_ISREG(leaf_stat.st_mode):
-            raise ReviewedStateConflict("reviewed path is not a regular file")
+            raise ReviewedPathIntegrityError("reviewed path is not a regular file")
 
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(parts[-1], flags, dir_fd=directory_descriptor)
         except OSError as exc:
-            raise ReviewedStateConflict("reviewed path could not be opened safely") from exc
+            raise _unsafe_open_failure(
+                exc, "reviewed path could not be opened safely"
+            ) from exc
 
         try:
             opened_stat = os.fstat(descriptor)
@@ -220,7 +222,7 @@ def capture_path_state(vault: Path, relative_path: str) -> PathState:
                 or (opened_stat.st_dev, opened_stat.st_ino)
                 != (leaf_stat.st_dev, leaf_stat.st_ino)
             ):
-                raise ReviewedStateConflict("reviewed path changed while being captured")
+                raise ReviewedPathIntegrityError("reviewed path changed while being captured")
             with os.fdopen(descriptor, "rb", closefd=True) as opened_file:
                 descriptor = -1
                 return PathState.regular(
@@ -233,15 +235,26 @@ def capture_path_state(vault: Path, relative_path: str) -> PathState:
         os.close(directory_descriptor)
 
 
+def _unsafe_open_failure(exc: OSError, message: str) -> ReviewedStateConflict:
+    """Discriminate one open-time `OSError` into its truthful subtype.
+
+    ELOOP (and EMLINK, the O_NOFOLLOW rejection on some BSDs) is a
+    redirection finding; every other `OSError` is ordinary unavailability.
+    """
+    if exc.errno in {errno.ELOOP, errno.EMLINK}:
+        return ReviewedPathIntegrityError(message)
+    return ReviewedPathUnavailable(message)
+
+
 def _open_checked_directory(
     path: str | Path, description: str, *, dir_fd: int | None = None
 ) -> int:
     try:
         checked_stat = os.lstat(path, dir_fd=dir_fd)
     except OSError as exc:
-        raise ReviewedStateConflict(f"{description} is unavailable") from exc
+        raise ReviewedPathUnavailable(f"{description} is unavailable") from exc
     if stat.S_ISLNK(checked_stat.st_mode) or not stat.S_ISDIR(checked_stat.st_mode):
-        raise ReviewedStateConflict(f"{description} is not a directory")
+        raise ReviewedPathIntegrityError(f"{description} is not a directory")
 
     flags = (
         os.O_RDONLY
@@ -251,7 +264,9 @@ def _open_checked_directory(
     try:
         descriptor = os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
-        raise ReviewedStateConflict(f"{description} could not be opened safely") from exc
+        raise _unsafe_open_failure(
+            exc, f"{description} could not be opened safely"
+        ) from exc
     try:
         opened_stat = os.fstat(descriptor)
         if (
@@ -259,7 +274,7 @@ def _open_checked_directory(
             or (opened_stat.st_dev, opened_stat.st_ino)
             != (checked_stat.st_dev, checked_stat.st_ino)
         ):
-            raise ReviewedStateConflict(f"{description} changed while being captured")
+            raise ReviewedPathIntegrityError(f"{description} changed while being captured")
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -829,7 +844,7 @@ def _head_index_entries(
         except (UnicodeDecodeError, ValueError) as exc:
             raise GitTransactionFailure("Git returned malformed tree state") from exc
         if object_type != "blob":
-            raise ReviewedStateConflict("reviewed index path is not a regular file")
+            raise ReviewedPathIntegrityError("reviewed index path is not a regular file")
         entries.append(_IndexEntry(os.fsdecode(path_bytes), mode, oid, 0))
     return tuple(sorted(entries, key=lambda entry: (entry.path, entry.stage)))
 
@@ -840,7 +855,7 @@ def _require_reviewed_index_matches_head(
     if _capture_reviewed_index(vault, paths) != _head_index_entries(
         vault, revision, paths
     ):
-        raise ReviewedStateConflict("reviewed path has an unexpected staged change")
+        raise ReviewedStateChanged("reviewed path has an unexpected staged change")
 
 
 def _require_owned_paths_untracked(
@@ -854,7 +869,7 @@ def _require_owned_paths_untracked(
     if _capture_reviewed_index(vault, paths) or _head_index_entries(
         vault, revision, paths
     ):
-        raise ReviewedStateConflict(
+        raise ReviewedStateChanged(
             "transaction-owned path must be absent from Git index and HEAD"
         )
 
@@ -995,7 +1010,7 @@ def _fingerprint_path(
 def _require_expected_states(vault: Path, plan: TransactionPlan) -> None:
     for change in plan.changes + plan.owned_changes:
         if capture_path_state(vault, change.path) != change.before:
-            raise ReviewedStateConflict(
+            raise ReviewedStateChanged(
                 f"reviewed path does not match expected state: {change.path}"
             )
 
@@ -1006,15 +1021,17 @@ def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
     except FileNotFoundError:
         return PathState.absent()
     except OSError as exc:
-        raise ReviewedStateConflict("reviewed path is unavailable") from exc
+        raise ReviewedPathUnavailable("reviewed path is unavailable") from exc
     if stat.S_ISLNK(leaf_stat.st_mode) or not stat.S_ISREG(leaf_stat.st_mode):
-        raise ReviewedStateConflict("reviewed path is not a regular file")
+        raise ReviewedPathIntegrityError("reviewed path is not a regular file")
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(leaf, flags, dir_fd=directory_descriptor)
     except OSError as exc:
-        raise ReviewedStateConflict("reviewed path could not be opened safely") from exc
+        raise _unsafe_open_failure(
+            exc, "reviewed path could not be opened safely"
+        ) from exc
     try:
         opened_stat = os.fstat(descriptor)
         if (
@@ -1022,7 +1039,7 @@ def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
             or (opened_stat.st_dev, opened_stat.st_ino)
             != (leaf_stat.st_dev, leaf_stat.st_ino)
         ):
-            raise ReviewedStateConflict("reviewed path changed before mutation")
+            raise ReviewedPathIntegrityError("reviewed path changed before mutation")
         with os.fdopen(descriptor, "rb", closefd=True) as opened_file:
             descriptor = -1
             return PathState.regular(
@@ -1051,7 +1068,7 @@ def _apply_state(
 
         leaf = parts[-1]
         if _capture_leaf_state(directory_descriptor, leaf) != change.before:
-            raise ReviewedStateConflict(
+            raise ReviewedStateChanged(
                 f"reviewed path changed before mutation: {change.path}"
             )
         if change.after.contents is None:

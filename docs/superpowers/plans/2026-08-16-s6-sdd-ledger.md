@@ -187,4 +187,21 @@ success event header only after `propose_classification` returns.
   discrimination would add its own race. Reviewer confirmed the
   `system_path` → `RedirectedPathError` judgment against the normative map.
 - **Fix rounds:** 0.
-- **Commit:** recorded in the Task 4 entry.
+- **Commit:** `40f5554`.
+
+### Task 4 — Convert the git_transaction and destinations sites
+
+- **RED:** `test_no_direct_raise_of_an_ambiguous_base` failed listing 25
+  offender lines (18 in `app/git_transaction.py`, 7 in
+  `app/destinations.py`; first extra item `app/destinations.py:87`).
+- **GREEN:** `uv run pytest tests/test_console_invariants.py -q` → 8 passed.
+- **Full suite:** 616 passed (615 + 1). `git diff --stat` touched only the
+  three in-scope files; S5's normalization/chaining region unmodified.
+- **Reviewer verdict:** clean; reviewer independently reproduced the RED
+  state against HEAD versions and confirmed refusal-set equivalence by
+  boolean analysis. Two Minors, no action: the AST test only inspects
+  `ast.Call` raises (plan-verbatim shape), and `EMLINK` is a documented
+  faithful reading of "O_NOFOLLOW rejection". Reviewer re-flagged the Task 5
+  code-map discrepancy; resolution unchanged (normative class map wins).
+- **Fix rounds:** 0.
+- **Commit:** recorded in the Task 5 entry.
