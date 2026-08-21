@@ -24,7 +24,7 @@ current step. Phase 2 is not authorized.
 | S3 — server-owned destinations | **COMPLETE** | One canonical resolver validates module/sub/flags/lifecycle paths, derives block, and revalidates stored proposals before reads or writes. |
 | S4 — proposal identity and freshness | **COMPLETE** | Collision-safe proposal IDs, exact-byte source SHA-256, no-follow snapshots, and visible stale/missing refusals are merged. |
 | S5 — Git transaction and audit | **COMPLETE** | Classification approval and registry deletion use exact-path alternate-index transactions with ownership-aware rollback; Gate 3 validates action-specific messages, paths, and dirty-state fingerprints. |
-| S6 — Console failures | **IN DESIGN** | Design at `docs/superpowers/specs/2026-08-16-s6-visible-console-failures-design.md`, Review Pending after seven rounds. No application code written. |
+| S6 — Console failures | **IN IMPLEMENTATION** | Design approved after eight review rounds plus a closure pass. Tasks 1-9 of 14 committed, each reviewed clean. Public suite 603 → 725. Progress and per-task review record: `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`. |
 | S7 — bound review tokens | **PROPOSED** | Discovered while designing S6; not designed. See `BUILD.md`. |
 
 Merged S5 baseline: `0f71cd3`. Fresh verification of this reconciled branch
@@ -93,7 +93,15 @@ These were discovered by review of existing code, not introduced by S6. None is
 fixed yet; each is either scheduled inside S6 or recorded as its own step.
 
 - **Approval is not bound to reviewed content.** A proposal id names a mutable
-  file. See S7 in `BUILD.md`. Confirmed real by three independent reviews.
+  file. See S7 in `BUILD.md`. Confirmed real by four independent reviews.
+- **A missing `modules:` key blanked every Console page.** `Vault._archetypes`
+  raised a bare `ValueError` for a hand-edited `archetypes.yaml`, and
+  `bundles()` is called unguarded from every page — so one malformed registry
+  produced a 500 on the whole surface. Found and fixed in S6 Task 8.
+- **A corrupt `books.db` reported "an unexpected error was not handled."**
+  `sqlite3.connect` in read-only URI mode never validates the header, so a
+  corrupt file only fails at the first query, escaping the delete-preview route
+  untyped. Found and fixed in S6 Task 8.
 - **Request rebinding through hand-built `hx-vals`.** Two registry templates
   interpolate a value into hand-written JSON. Jinja escapes the quote, the
   browser decodes it inside the attribute, and duplicate JSON keys resolve
@@ -143,11 +151,18 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-S6 is in design, not implementation. Its design has been through seven review
-rounds and remains **Review Pending**; no application code has been written. The
-implementation plan is superseded and will be rewritten only after the design
-receives fresh whole-document approval, from a base rebased onto current
-`origin/main`.
+S6 is in implementation on `codex/s6-visible-console-failures`. Tasks 1-9 of 14
+are committed and pushed; each was implemented test-first and passed an
+independent review, with fix rounds recorded in the SDD ledger. Remaining:
+Tasks 10-13 (route surfaces), Task 14 (state, disclosure, and totality proofs),
+and Task 15 — whose private gates require the vault and therefore run at the
+trusted local boundary, never in a cloud task.
+
+**The branch must not be merged at a commit between Tasks 7 and 10.** Task 7
+enables HTMX swapping of 4xx/5xx responses and Task 10 supplies the handler that
+replaces framework error bodies; between them, raw framework error text swaps
+into operator targets. If S6 is abandoned mid-flight, that override reverts
+with it.
 
 Do not start Phase 2, deploy, or add deferred UI while S6 or the live exit gates
 remain open. S7 is proposed but must not begin before S6 merges.

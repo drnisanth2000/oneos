@@ -284,6 +284,42 @@ independently confirmed the deferral was honest and that the step could merge
 with the gap open. Recording an unresolved defect prominently is a better
 outcome than a silent scope breach.
 
+### Implementation-phase lessons from S6
+
+The design-phase lessons above concerned enumerations. The implementation phase
+produced a different and sharper one.
+
+**Across four reviewed tasks, every finding but one was a defect in the
+verification, not in the feature.** The implementations were faithful; the tests
+asserting them were not. Three shapes recurred:
+
+- *A test that passes with the code under test deleted.* One monkeypatched a
+  function and then never called it. Another asserted `hasattr` on a frozen
+  dataclass with fixed fields — unconditionally false. A third asserted a count
+  of zero that an absent file also returns.
+- *A test that proves a mechanism using the one input shape the codebase never
+  produces.* An AST guard's `system_path` trigger matched only a chained call;
+  every real site assigns to a local first, so the trigger fired zero times
+  while its test passed. Repairing it immediately exposed a genuinely
+  undeclared reader.
+- *A ledger claiming something is pinned when it is not.* Twice. The written
+  record is what a later reviewer trusts, so a false "pinned by test" is worse
+  than an admitted gap.
+
+The countermeasure that worked is mutation, not inspection: break the
+implementation, confirm the test fails, restore. It caught six unprotected
+behaviours across two tasks that reading had passed. Reviewers on this step also
+stripped each declaration in turn to prove none was decorative. **Treat "the
+suite is green" as evidence only after something has been broken and the suite
+went red.**
+
+**Escalate a design/reality conflict; do not resolve it silently.** One task
+found the design's literal instruction would break a pre-existing test through a
+route it did not own. It kept the test green, left the out-of-scope file
+untouched, and reported the deviation. Review then confirmed the deviation was
+right for a stronger reason than the implementer had — the two functions
+differed in read policy, not merely in one error case.
+
 ## Remaining attention
 
 S5 closes the isolated-transaction and path-aware Gate 3 gaps for classification

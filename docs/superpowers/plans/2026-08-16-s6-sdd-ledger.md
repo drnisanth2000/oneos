@@ -480,3 +480,56 @@ aborts rather than blocking. The Task 12 route reviewer should not be surprised.
 - **Reviewer verdict:** clean after fix round 1.
 - **Mutation evidence:** the three previously-surviving mutants (D2 revert,
   dropped `UnicodeDecodeError` handler, gutted `_render_diff`) each now fail.
+
+---
+
+## Reassessment after Task 9 — Tasks 1-14
+
+Checked the remaining tasks' assumptions against the code that now exists.
+**No blocking gap.** Tasks 10-14 are executable as written.
+
+Verified still true: all eleven routes present in `app/main.py`; every class
+named in Tasks 10-13's catch tuples still exists and still catches its refined
+subtypes (`except CrossScopeError` catches all three, `except DestinationError`
+catches all of `UnsafeDestinationPath`'s and `InvalidSourceLeaf`'s subtypes);
+the projection's public shape matches what Task 12 assumes (`OutboxListing(rows,
+blocked)`, `OutboxRow(proposal, diff, error, can_approve, can_reject)`);
+`app/main.py` is untouched apart from one import line, so Tasks 10-13 start from
+the state they were written against.
+
+### One finding — a live regression window between Tasks 7 and 10
+
+Task 7 shipped the `htmx-config` `responseHandling` override, which makes 4xx
+and 5xx responses swap. Task 10 ships the `StarletteHTTPException` body handler
+that replaces framework error bodies. **Between them, the branch swaps raw
+Starlette error text into operator targets** — an unmatched URL or wrong method
+under `HX-Request` puts `Not Found` / `Method Not Allowed` into `#outbox-list`
+or `#diff-{index}`, where before the override it swapped nothing.
+
+This is the exact condition round-six finding I6 identified, and its fix is
+already assigned to Task 10. The final state is correct. What is new is that the
+intermediate state is worse than the starting state, which matters because every
+task on this branch is committed and pushed.
+
+No action beyond recording it: the branch is not merged, Task 10 is next, and
+splitting Task 7 to carry a partial handler would duplicate work Task 10 does
+properly. **But the branch must not be merged at a commit between Task 7 and
+Task 10.** If S6 is ever abandoned mid-flight, the override must be reverted
+with it.
+
+### Carried items, consolidated
+
+| Item | Owner | Note |
+|---|---|---|
+| Non-canonical `dst` aborts the listing rather than blocking it | Task 12 | Faithful — the strict loader poisons identically and design §3 assigns destination validation to phase 2 — but it is the one poisoning condition producing an abort rather than a blocked listing. |
+| Stopwatch still infers success from transport | Task 11 | `templates/triage.html:123` still listens on `htmx:afterRequest`. The `HX-Trigger` fix is Task 11's, as planned. Until then, refusals returning 200 would be counted — but no route returns a described 200 refusal yet, so it is not yet live. |
+| `outbox_list.html` still renders the old `props` API | Task 12 | Expected; Task 12 converts it to the projection. |
+| `add_workspace` and `_count_front_matter` let `UnicodeDecodeError` escape | S7 | Absorbing it would change an existing fatality, which S6 has no authority to do. |
+| Reader-guard heuristic gaps (tuple-unpack, walrus, alias rebinding, `Path(...)` wrapping, builtin `open` on a tracked name) | S7 | None present in `app/` today; invariant 4 only refuses silence. |
+| The review gate does not bind reviewed content | S7 | Unchanged. Design §12. |
+
+### Plan drift
+
+`_diff_text` is a new internal helper introduced by Task 9's fix round and is
+absent from the plan's File Structure table. Internal to `app/outbox.py`, no
+task depends on it by name. Recorded rather than amended.
