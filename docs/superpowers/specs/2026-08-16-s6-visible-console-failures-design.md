@@ -1129,14 +1129,25 @@ listed individually rather than discovered during implementation:
 |---|---|
 | `tests/test_app.py:477-503` | asserts `role="alert"` is absent for an injected transaction error — S6 makes it present |
 | `tests/test_app.py:588` | asserts the raw string `"registry deletion transaction failed"` renders — the disclosure boundary forbids it |
+| `tests/test_app.py:393` `test_tampered_proposal_form_writes_nothing` | asserts `status_code >= 400` in six parametrized cases. `propose` is `fragment-only`, so once Task 11 gives it a route-level catch every one of the six describes to refusal severity and returns **200**. **Status expectation only** — its three state proofs (`HEAD` unchanged, entity bytes unchanged, no proposal written) stay verbatim, and they are the test's actual subject. Owned by Task 11. |
 
 Rule 5's route-shape-first selection settles what earlier drafts left open:
 `propose`, `outbox_approve`, `outbox_reject`, and the two registry POSTs always
-use the fragment renderer, so refusals on those routes stay at **200**. Every
-existing status assertion therefore holds, and the two additional tests earlier
-drafts predicted would break — the stale-source refusal and the cross-entity
-isolation test — do **not** change. That is the main reason route-shape-first
-was chosen over header-only selection.
+use the fragment renderer, so refusals on those routes stay at **200**. The two
+tests earlier drafts predicted would break — the stale-source refusal and the
+cross-entity isolation test — do **not** change, which is the main reason
+route-shape-first was chosen over header-only selection.
+
+An earlier revision of this section also claimed "every existing status
+assertion therefore holds". **That was false**, and it is why this table
+carried only two rows. It was an inference from the selection rule, never
+checked against the test file. `test_tampered_proposal_form_writes_nothing`
+asserts `>= 400` precisely because `propose` has no route-level catch **today**;
+the moment Task 11 gives it one, all six cases return 200. The third row above
+records it.
+
+The lesson is the one this project keeps relearning: an enumeration justified by
+reasoning rather than by reading is wrong in the direction it cannot see.
 
 The rule this table replaces: **an S1-S5 service or state-safety test whose
 subject is a refusal decision, an isolation guarantee, or a state proof must not

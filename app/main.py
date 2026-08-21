@@ -172,6 +172,22 @@ def shell(request: Request) -> HTMLResponse:
 
 
 @app.get("/blocks/pulse", response_class=HTMLResponse)
+# `catches=()` is the truthful declaration, not an empty gesture: `pulse` reads
+# no registry, resolves no path, and has no domain family to declare.
+#
+# `fragment-only` is its real shape under §5's normative rule — "a route with
+# no full-page template always uses the fragment renderer" — and it renders
+# `blocks/pulse.html` with none. §5's parenthetical list of fragment-only
+# routes omits `pulse`; §7 governs, since every enumeration in the design was
+# "wrong in the direction of omission" at least once.
+#
+# This is NOT behaviour-neutral, despite the route inventory's `pulse |
+# unchanged`: an error escaping `pulse` without `HX-Request` previously
+# rendered the full `error.html` page and now renders the alert fragment. The
+# status is unaffected (the global fallback forces the code's page status
+# either way), and no refusal, validation, or commit decision changes. Pinned
+# by test_pulse_declaration_selects_the_fragment_surface.
+@console_route(catches=(), surface="fragment-only")
 def pulse(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request, "blocks/pulse.html", {"now": datetime.now().strftime("%H:%M:%S")}

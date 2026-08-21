@@ -645,6 +645,12 @@ test_stopwatch_counts_only_persisted_proposals       (HX-Trigger present on
   `triage`; `propose` catches its tuple, renders `alert.html` into
   `#diff-{index}`, and sets the `HX-Trigger` header only after
   `propose_classification` returns.
+- [ ] **Step 3a:** Update `tests/test_app.py:393
+  test_tampered_proposal_form_writes_nothing` — **status expectation only**,
+  `>= 400` becomes `== 200`, across all six parametrized cases. Its three state
+  proofs stay verbatim; they are the test's subject and must keep passing
+  unchanged. This is the third and final permitted pre-existing test change,
+  added to the design's regression table for exactly this reason.
 - [ ] **Step 4:** `uv run python -m pytest -q`.
 - [ ] **Step 5:**
 
