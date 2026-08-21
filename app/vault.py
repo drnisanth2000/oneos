@@ -19,6 +19,7 @@ import re
 
 import yaml
 
+from .console_routing import structured_reader
 from .entities import EntityCatalog, resolve_system_registry
 from .scope import Scope
 
@@ -71,17 +72,31 @@ class Vault:
 
     # --- registry loading ---------------------------------------------------
 
+    @structured_reader(category="registry")
     def _load_yaml(self, *system_parts: str) -> dict:
         path = self.system_path(*system_parts)
         if not path.is_file():
-            raise FileNotFoundError(f"registry not found: {path}")
-        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            # Absence of a required system registry is already fatal on every
+            # caller path; only the type is normalized (S6 design §5).
+            raise DestinationRegistryError("registry not found")
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            raise DestinationRegistryError("registry is invalid YAML") from exc
+        if not isinstance(loaded, dict):
+            raise DestinationRegistryError("registry must be a mapping")
+        return loaded
 
     @cached_property
     def _archetypes(self) -> dict:
         cfg = self._load_yaml("archetypes.yaml")
         if "modules" not in cfg:
-            raise ValueError("archetypes.yaml has no `modules:` — v2 schema required")
+            # Sibling of the _load_yaml conversion: a hand-edited archetypes.yaml
+            # missing `modules:` is a registry-validity condition, and bundles()
+            # is called unguarded from every Console page.
+            raise DestinationRegistryError(
+                "archetypes.yaml has no `modules:` — v2 schema required"
+            )
         return cfg
 
     # --- flag / module resolution (faithful to oneos_wizard) ---------------

@@ -266,3 +266,113 @@ success event header only after `propose_classification` returns.
   the plan — fail-closed extension.
 - **Fix rounds:** 0.
 - **Commit:** recorded in the Task 8 entry.
+
+### Task 8 — Structured readers
+
+- **Task 7 commit (deferred to this entry):** `d8940b5`.
+- **RED evidence:** `test_every_structured_read_site_declares_a_category` failed
+  listing every undeclared structured-read site in `app/`; the six conversion
+  and tolerance tests failed on missing behaviour.
+- **GREEN:** 17 readers declared across the four categories; escaping failures
+  in `registry`-category readers normalized to `DestinationRegistryError`.
+- **Execution note:** the SDD worker terminated on a session limit after
+  implementing this task but before review or commit. The work was recovered
+  from its worktree, verified green, and carried through review here.
+
+**Fix round 1** — reviewer returned *not clean*: 1 Critical, 4 Important.
+
+- **C1 (Critical), invented refusal.** `_count_workspaces` had been narrowed from
+  `(entry or {})` to `if entry is None`, making `false` / `""` / `0` as a list
+  entry fatal `E-CONFIG` where they were previously counted as zero. Reachable
+  from the delete-preview route. Restored to `if not entry`.
+- **I1** guard was cwd-relative: from any other directory it scanned zero files
+  and asserted `[] == []`. Anchored to `__file__`, plus a scanned-file floor.
+- **I2** guard missed aliased imports and the design's third trigger. Added
+  per-file alias resolution and `safe_load`/`load`/`full_load`/`unsafe_load`.
+- **I3** a corrupt `books.db` reached the operator as `E-UNKNOWN` on a live
+  route. Narrow `sqlite3.DatabaseError` conversions in `registry` and `rename`.
+- **I4b** the unguarded mid-approval re-read in `approve()`.
+- **I4a NOT taken:** converting `load_proposals`'s escaping types broke two
+  pre-existing tests — see the ruling below.
+- **I5** coverage gaps for `_remove_scoped_registry_value`, `EntityCatalog.load`,
+  and the unpinned `_count_front_matter` tolerance.
+
+**Fix round 2** — reviewer returned *not clean* again: 4 Important. C1 confirmed
+genuinely fixed by a 100-case differential probe against the pre-change tree
+(zero `OK → RAISE` transitions).
+
+- **The `system_path` trigger fired on nothing.** It matched only the chained
+  form, while every real site assigns first — so the test added to prove the
+  trigger passed while the trigger was dead. Fixed by tracking names bound to a
+  `system_path(...)` result **per function** (module-wide tracking over-matched
+  common names like `path` and produced a false positive on a proposal *write*),
+  plus `self.<attr>` module-wide for the bind-in-`__init__`, read-elsewhere case.
+  The working trigger immediately found a real undeclared reader:
+  `add_workspace`, now declared `registry`.
+- **`_remove_scoped_registry_value` still escaped** on a list of scalars where a
+  list of mappings is expected — the design's own "wrongly shaped but valid"
+  row, four lines below two conversions the same diff added. Converted.
+- **`Vault._archetypes`' schema check was left raw**, so a hand-edited
+  `archetypes.yaml` missing `modules:` produced a 500 blank screen on every
+  Console page. Converted to `DestinationRegistryError`.
+- **I4b was broader than Rule 5 permits** and its comment was factually wrong:
+  a non-mapping is already `OutboxDestinationError` inside `_to_proposal`, so the
+  blanket `AttributeError`/`TypeError` bought only the `contents is None` case
+  while risking destructive advice about a healthy file. Narrowed to mirror
+  `execute_delete`, and pinned by test — it had shipped untested.
+- Also: `test_workspaces_tolerates_every_falsy_entry` could pass vacuously
+  (`0` is also the answer for an absent file); each falsy entry is now paired
+  with a real one asserting `1`.
+
+**Ruling on I4a — the design's regression table is COMPLETE and must NOT be
+amended.** The first analysis here was wrong and is corrected for the record.
+Phase 1 belongs to the **projection**, not the loader: the design says the strict
+loader is untouched and that approval "revalidates from scratch through the
+untouched strict path". The phase-1 table's "Escapes today as" column describes
+what the projection must **translate**, not what `load_proposals` must **raise**.
+
+Task 9's reconciliation, which satisfies both its "behavior identical" and
+"`tests/test_outbox.py` unmodified" steps:
+
+- `_read_record` / `_validate_record` raise `UnreadableProposalRecord`;
+- `load_proposals` catches it and re-narrows to `OutboxDestinationError`, so the
+  strict loader's escaping types are unchanged;
+- `project_outbox` catches the typed error directly, per row.
+
+`tests/test_outbox.py:271-274` (`_assert_destination_error`, 13 call sites) stays
+as-is. Relaxing its exact-type assertion would be a scope breach.
+
+**Carried to S7 (no S6 change):** `_count_front_matter` is declared
+`front-matter` (absorbing), but its `except OSError` does not cover
+`UnicodeDecodeError`, so a latin-1 `.md` file still escapes. Absorbing it would
+change the fatality of something already fatal, which S6 has no authority to do.
+
+**Fix round 3** — reviewer returned *not clean*: 1 Important.
+
+- **The I4b test was vacuous.** It monkeypatched `capture_path_state` and then
+  never called `approve()`; its assertions restated the class map and a
+  `PathState` property, so deleting the entire I4b guard left it green. Strictly
+  worse than the vacuous test round 2 rejected, and it made this ledger's
+  "pinned by test" claim false. Rewritten to drive `approve()` for real, and
+  **non-vacuity proven**: with the guard removed the test fails
+  (`yaml.safe_load(None)` raises `AttributeError`), with it restored it passes.
+  It also asserts `HEAD` is unchanged, since the raise precedes the transaction.
+
+**Carried to Task 9 (recorded by the round-3 reviewer, not a Task 8 issue):**
+`OutboxDestinationError` is on the resolver allowlist and ties resolve innermost,
+so `raise OutboxDestinationError(...) from UnreadableProposalRecord(...)` flips
+the *described* code on the strict path from `E-INVALID` to `E-UNREADABLE`. No
+existing test would catch that. Task 9 must make it a deliberate decision.
+
+**Carried to S7:** residual guard heuristic gaps (tuple-unpack and walrus
+binding, alias rebinding, `Path(...)` wrapping, builtin `open` on a tracked
+name) — none present in `app/` today, none required by invariant 4, which only
+refuses silence. Also `add_workspace` and `_count_front_matter` both still let
+`UnicodeDecodeError` escape; absorbing it would change an existing fatality.
+
+- **Reviewer verdict:** clean after fix round 3 (three rounds: 1 Critical +
+  4 Important, then 4 Important, then 1 Important).
+- **Mutation evidence:** the round-3 reviewer stripped each of the 18
+  `@structured_reader` declarations one at a time; every one is flagged on
+  removal, so no declaration is decorative.
+- **Suite:** 703 passed. `git diff --check` clean.

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import yaml
 
+from .console_routing import structured_reader
 from .scope import RedirectedPathError, Scope
 
 
@@ -22,6 +23,7 @@ class InboxItem:
     fm: dict = field(default_factory=dict)
 
 
+@structured_reader(category="front-matter")
 def split_front_matter(text: str) -> tuple[dict, str]:
     if not text.startswith("---"):
         return {}, text
@@ -58,6 +60,7 @@ def _require_real_receipt(directory: Path, discovered: Path) -> Path:
     return discovered
 
 
+@structured_reader(category="front-matter")
 def read_inbox(scope: Scope) -> list[InboxItem]:
     if _require_real_directory(scope, "00-inbox") is None:
         return []

@@ -16,7 +16,8 @@ from datetime import date
 
 import yaml
 
-from .vault import Vault
+from .console_routing import structured_reader
+from .vault import DestinationRegistryError, Vault
 
 _DEFAULT = {"module": "00-inbox", "sub": "triage"}
 
@@ -36,10 +37,22 @@ class Classifier:
         self._path = vault.system_path("classifier", "rules.yaml")
         self._cfg = self._load()
 
+    @structured_reader(category="registry")
     def _load(self) -> dict:
         if not self._path.is_file():
+            # Absent rules => everything is unclassified — a safe default,
+            # not an error. The tolerance is deliberate and preserved.
             return {"rules": [], "default": dict(_DEFAULT)}
-        cfg = yaml.safe_load(self._path.read_text(encoding="utf-8")) or {}
+        try:
+            cfg = yaml.safe_load(self._path.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            raise DestinationRegistryError(
+                "classifier rules registry is invalid YAML"
+            ) from exc
+        if not isinstance(cfg, dict):
+            raise DestinationRegistryError(
+                "classifier rules registry must be a mapping"
+            )
         cfg.setdefault("rules", [])
         cfg.setdefault("default", dict(_DEFAULT))
         return cfg

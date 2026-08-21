@@ -22,6 +22,7 @@ from pathlib import Path
 
 import yaml
 
+from .console_routing import structured_reader
 from .git_transaction import (
     GitTransactionError,
     PathChange,
@@ -274,6 +275,7 @@ def _to_proposal(path: Path, record: dict) -> Proposal:
     )
 
 
+@structured_reader(category="proposal")
 def load_proposals(scope: Scope) -> list[Proposal]:
     outbox = _require_outbox_path(scope)
     if not outbox.exists():
@@ -370,6 +372,7 @@ def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
     raise OutboxError(f"no pending proposal {proposal_id!r} for {entity}")
 
 
+@structured_reader(category="proposal")
 def approve(scope: Scope, proposal_id: str) -> Proposal:
     """Perform the proposed move and commit it — exactly one revertible commit.
     The proposal is transaction-owned but never enters the approval commit."""
@@ -400,7 +403,23 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
 
     proposal_rel = prop.path.relative_to(vault).as_posix()
     proposal_state = capture_path_state(vault, proposal_rel)
-    persisted = _to_proposal(prop.path, yaml.safe_load(proposal_state.contents))
+    # Mid-approval re-read, mirroring execute_delete: a vanished file makes
+    # safe_load(None) raise AttributeError, and corrupted bytes raise
+    # YAMLError. Both escape as E-UNKNOWN at the highest-stakes moment. A
+    # non-mapping is already OutboxDestinationError inside _to_proposal, and a
+    # blanket AttributeError/TypeError here would mask programmer errors —
+    # Rule 5 forbids it.
+    if proposal_state.contents is None:
+        raise UnreadableProposalRecord(
+            "proposal record could not be re-read before approval"
+        )
+    try:
+        record = yaml.safe_load(proposal_state.contents)
+    except yaml.YAMLError as exc:
+        raise UnreadableProposalRecord(
+            "proposal record could not be re-read before approval"
+        ) from exc
+    persisted = _to_proposal(prop.path, record)
     persisted = _require_destination(scope, persisted)
     if persisted != prop:
         raise OutboxDestinationError("proposal changed since it was loaded")
