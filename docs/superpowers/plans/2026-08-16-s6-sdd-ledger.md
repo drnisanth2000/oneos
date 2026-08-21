@@ -376,3 +376,31 @@ refuses silence. Also `add_workspace` and `_count_front_matter` both still let
   `@structured_reader` declarations one at a time; every one is flagged on
   removal, so no declaration is decorative.
 - **Suite:** 703 passed. `git diff --check` clean.
+
+### Task 9 — decisions recorded before implementation
+
+Both carried items from Task 8 are decided here rather than left to emerge.
+
+**D1 — the strict-loader reconciliation.** `_read_record` and `_validate_record`
+raise `UnreadableProposalRecord`. `load_proposals` catches it and re-narrows to
+`OutboxDestinationError`, so the strict loader's escaping types are unchanged
+and `tests/test_outbox.py` — including `_assert_destination_error`'s exact-type
+assertion at 13 call sites — stays untouched. `project_outbox` catches the typed
+error directly, per row. This is what satisfies the plan's own "behavior
+identical" and "test_outbox.py unmodified" steps simultaneously.
+
+**D2 — the described code on the strict path flips to `E-UNREADABLE`, and that
+is deliberate.** `OutboxDestinationError` is on the resolver allowlist and ties
+resolve innermost, so `raise OutboxDestinationError(...) from
+UnreadableProposalRecord(...)` makes `describe()` return `E-UNREADABLE` where it
+previously returned `E-INVALID`.
+
+Accepted, because it is the more truthful outcome. `E-INVALID` advises "create a
+new proposal", which cannot clear a file that is not parseable as a proposal;
+`E-UNREADABLE` advises repairing or removing it outside the Console. That is the
+same distinction that justified splitting the two codes. The refusal itself is
+unchanged — same input, same refusal, same exception type escaping
+`load_proposals` — only the operator-facing description improves.
+
+Pinned by test, since no existing test covers it and the round-3 reviewer noted
+it would otherwise be a silent change.
