@@ -225,8 +225,8 @@ git commit -m "feat: declare refined exception subtypes"
 ## Task 3: Pin the safe-read contract and convert the CrossScopeError sites
 
 **Files:** modify `app/outbox.py`, `app/inbox.py`, `app/scope.py`,
-`app/registry.py` (its CrossScopeError raises); test `tests/test_outbox.py`
-additions in `tests/test_console_invariants.py`
+`app/registry.py` (its CrossScopeError raises); tests in
+`tests/test_console_invariants.py`
 
 The safe-read contract, stated once and binding on Task 9:
 
@@ -248,7 +248,9 @@ is unchanged and no refusal changes.
 ```text
 test_safe_read_missing_leaf_raises_filenotfound
 test_safe_read_symlink_raises_redirected            (symlink -> RedirectedPathError)
-test_safe_read_nonregular_raises_redirected         (fifo via os.mkfifo)
+test_safe_read_nonregular_raises_redirected         (real file; monkeypatch
+    os.fstat to report a non-regular st_mode — opening a FIFO read-only
+    blocks forever without a writer, so no FIFO fixture)
 test_safe_read_permission_error_raises_unavailable  (chmod 000)
 test_safe_read_replacement_race_raises_redirected   (dir swapped in for file)
 test_safe_read_other_oserror_raises_unavailable     (EACCES on parent)
@@ -303,7 +305,7 @@ def test_no_direct_raise_of_an_ambiguous_base():
   are all in `git_transaction.py` and `destinations.py` after Task 3).
 - [ ] **Step 3: GREEN** — convert each site. `git_transaction.py`: path
   validation before I/O → `InvalidTransactionPath`; `lstat`/read `OSError` →
-  `ReviewedPathUnavailable`; symlink/non-regular/type-swap → 
+  `ReviewedPathUnavailable`; symlink/non-regular/type-swap →
   `ReviewedPathIntegrityError` (the "could not be opened safely" site uses the
   Task-3 discrimination rule); content/index changed → `ReviewedStateChanged`.
   `destinations.py`: symlinked → `RedirectedDestination`/`RedirectedSourceLeaf`;
@@ -397,7 +399,11 @@ git commit -m "feat: resolve outcomes across allowlisted cause chains"
 **Files:** `tests/test_console_invariants.py`
 
 - [ ] **Step 1:** `test_every_application_exception_resolves_to_its_designed_code`
-  — walk modules under `app/` with `pkgutil`, collect exception classes, assert
+  — discover exception classes by walking modules under `app/` **excluding**
+  `app.main`, whose import executes `build_catalog()` at module scope and
+  would read a live vault or fail without `ONEOS_VAULT`; `app.main` defines
+  no exception classes (assert that by AST inside the test). Collect from
+  the safe imports, assert
   `describe(cls("probe"))` returns a non-`E-UNKNOWN` code, exempting exactly
   the four abstract bases; separately assert each mapped class hits its named
   code (import the expected pairs from a dict in the test, transcribed from the
@@ -674,9 +680,10 @@ test_outbox_hx_vals_are_tojson
 - [ ] **Step 2-3:** RED then GREEN: routes render the projection; blocked
   listing withholds all controls with one described notice; approve/reject
   catch their tuple and describe.
-- [ ] **Step 4:** `uv run python -m pytest -q` — the design's two listed
-  regression tests are updated now (`test_app.py:477-503`, `:588`); every other
-  pre-existing test unmodified.
+- [ ] **Step 4:** `uv run python -m pytest -q` — the first listed regression
+  test is updated now (`test_app.py:477-503`, the transaction-error alert
+  assertion); every other pre-existing test unmodified. The second listed
+  test (`:588`) covers the registry route and is updated in Task 13.
 - [ ] **Step 5:**
 
 ```bash
@@ -706,13 +713,15 @@ test_propose_persistence_outcome                     (same, for propose)
 
 - [ ] **Step 2-3:** RED then GREEN: `tojson` `hx-vals` in both registry
   templates; success copy from a pre-execute `get_delete_proposal`; both
-  branches templated.
+  branches templated. Update the second listed regression test here —
+  `test_app.py:588` asserts a raw internal string renders, which the
+  disclosure boundary forbids.
 - [ ] **Step 4:** `uv run python -m pytest -q`.
 - [ ] **Step 5:**
 
 ```bash
 git add app/main.py templates/registry.html templates/blocks/delete_impact.html \
-  tests/test_console_routes.py
+  tests/test_console_routes.py tests/test_app.py
 git commit -m "feat: describe registry failures and close hx-vals binding"
 ```
 
@@ -722,12 +731,23 @@ git commit -m "feat: describe registry failures and close hx-vals binding"
 
 **Files:** `tests/test_console_routes.py`
 
-- [ ] **Step 1:** state proofs keyed to `committed` × persistence
-  (`test_refusals_leave_every_byte_unchanged` parametrized over one refusal per
-  route, using conftest fingerprint helpers with porcelain-v2 status).
+- [ ] **Step 1:** state proofs as an explicit matrix keyed by
+  `(committed, persistence)`:
+  `test_state_proof_matrix[no-none]` — one refusal per non-persisting route,
+  every fingerprint identical;
+  `test_state_proof_matrix[no-proposal-written]` — `propose` and
+  `registry_delete_preview` failing after persistence: HEAD, index, and
+  tracked content identical, exactly one new untracked outbox file;
+  `test_state_proof_matrix[yes]` — committed-cleanup: exactly the reviewed
+  paths at one new HEAD;
+  `test_state_proof_matrix[unknown]` — recovery-blocked: unrelated state
+  identical. Conftest fingerprint helpers with porcelain-v2 status.
 - [ ] **Step 2:** disclosure sweep — `test_alerts_never_contain_paths_slugs_or_echoes`
-  parametrized over every described error on every route; assert no `/`, no
-  fixture slug, no submitted value, markup escaped.
+  parametrized over every described error on every route. Parse the response
+  (html.parser), take the role="alert" element's visible text and dynamic
+  attribute values, and assert those contain no path separator, no fixture
+  slug, and no submitted value. Raw-HTML substring checks are wrong here —
+  every closing tag contains a slash.
 - [ ] **Step 3:** route totality — for each `@console_route` declaration, inject
   each member; assert the global fallback spy is never hit.
 - [ ] **Step 4:** `uv run python -m pytest -q`.
@@ -794,6 +814,22 @@ done
 git add BUILD.md docs/STATUS.md docs/superpowers tests/test_publication_docs.py
 git commit -m "docs: record S6 as complete"
 ```
+
+- [ ] **Step 6: post-documentation verification.** The documentation commit
+  changed tracked files and a test after the gates ran, so the gates run again
+  against the final tree:
+
+```bash
+uv run python -m pytest -q
+git diff --check
+tools/run_gitleaks.sh .
+uv run python -m tools.public_repo_audit --repo . --history
+```
+
+  If any private-gate input changed (it should not — documentation touches no
+  vault reader), re-run the private audit and repeat the fingerprint comparison
+  from Step 3. The branch is complete only when this round passes with the
+  documentation commit as HEAD.
 
 ---
 

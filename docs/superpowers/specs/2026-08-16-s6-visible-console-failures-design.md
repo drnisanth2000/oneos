@@ -121,7 +121,7 @@ is whether anything was committed.
 ### `app/console_errors.py`
 
 ```text
-ConsoleError(code, tier, severity, message, retry, committed)
+ConsoleError(code, tier, severity, message, retry, committed, page_status)
 describe(exc) -> ConsoleError
 ```
 
@@ -134,6 +134,9 @@ Structural invariants, all asserted:
 - `severity = refusal` implies `committed = no`.
 - `tier = committed` implies `committed = yes` and `retry = stop`;
   `tier = recovery` implies `committed = unknown` and `retry = stop`.
+- `page_status` is one of the statuses the codes table uses (404, 409, 422,
+  500), carried on the value itself so no renderer owns a parallel
+  code-to-status map.
 
 The table keys on imported exception classes, not dotted strings: strings are
 not refactor-safe and a renamed class would degrade silently to `E-UNKNOWN`.
