@@ -29,6 +29,22 @@ class ReviewedStateConflict(GitTransactionError):
     pass
 
 
+class ReviewedPathIntegrityError(ReviewedStateConflict):
+    pass
+
+
+class ReviewedStateChanged(ReviewedStateConflict):
+    pass
+
+
+class ReviewedPathUnavailable(ReviewedStateConflict):
+    pass
+
+
+class InvalidTransactionPath(ReviewedStateConflict):
+    pass
+
+
 class GitTransactionFailure(GitTransactionError):
     pass
 

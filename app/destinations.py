@@ -18,6 +18,18 @@ class InvalidSourceLeaf(DestinationError):
     pass
 
 
+class RedirectedSourceLeaf(InvalidSourceLeaf):
+    pass
+
+
+class MissingSourceLeaf(InvalidSourceLeaf):
+    pass
+
+
+class NonCanonicalLeaf(InvalidSourceLeaf):
+    pass
+
+
 class InvalidModule(DestinationError):
     pass
 
@@ -31,6 +43,14 @@ class BlockMismatch(DestinationError):
 
 
 class UnsafeDestinationPath(DestinationError):
+    pass
+
+
+class RedirectedDestination(UnsafeDestinationPath):
+    pass
+
+
+class MissingDestination(UnsafeDestinationPath):
     pass
 
 

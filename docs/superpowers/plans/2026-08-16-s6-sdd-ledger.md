@@ -145,4 +145,23 @@ success event header only after `propose_classification` returns.
   implementation byte-identical to the plan's Step 3 block, tests
   content-identical to the plan, invariants match design §2).
 - **Fix rounds:** 0.
-- **Commit:** `90562ed`.
+- **Commit:** `2185680`. (An earlier line recorded the pre-amend SHA
+  `90562ed`; the amend that folded this ledger entry into the commit changed
+  it. From Task 2 on, each task's SHA is recorded in the next task's ledger
+  edit to avoid the self-reference.)
+
+### Task 2 — Declare every new exception class
+
+- **RED:** `uv run pytest tests/test_console_invariants.py -q` →
+  `ImportError: cannot import name 'OutOfScopeError' from 'app.scope'`
+  (1 failed).
+- **GREEN:** same command → 1 passed.
+- **Full suite:** 609 passed (608 + 1 new; declarations only, 52 insertions,
+  0 deletions, no raise/except touched).
+- **Reviewer verdict:** clean. The reviewer independently flagged the same
+  design-internal discrepancy already recorded in the preflight notes
+  (§2 summary row vs. the normative class map for `InvalidTransactionPath`
+  and `ReviewedPathUnavailable`); resolution unchanged — the normative class
+  map wins in Task 5.
+- **Fix rounds:** 0.
+- **Commit:** recorded in the Task 3 entry.

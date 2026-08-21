@@ -16,6 +16,14 @@ class CrossScopeError(ValueError):
     pass
 
 
+class OutOfScopeError(CrossScopeError):
+    pass
+
+
+class RedirectedPathError(CrossScopeError):
+    pass
+
+
 @dataclass(frozen=True)
 class Scope:
     _root: Path

@@ -44,6 +44,14 @@ class OutboxError(Exception):
     pass
 
 
+class UnreadableProposalRecord(OutboxError):
+    pass
+
+
+class ProposalSourceUnavailable(CrossScopeError):
+    pass
+
+
 class ProposalFreshnessError(OutboxError):
     pass
 
