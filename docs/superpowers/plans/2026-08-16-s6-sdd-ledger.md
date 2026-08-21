@@ -533,3 +533,61 @@ with it.
 `_diff_text` is a new internal helper introduced by Task 9's fix round and is
 absent from the plan's File Structure table. Internal to `app/outbox.py`, no
 task depends on it by name. Recorded rather than amended.
+
+### Task 10 — Routes, framework surface
+
+- **RED:** 5 failed / 3 passed. The three passing were the "leaves the
+  framework's own response untouched" assertions — correct, since that
+  behaviour must not change.
+- **GREEN:** `entity_scope` raises `EntitySelectionError` to a dedicated
+  handler; `RequestValidationError` and `StarletteHTTPException` handlers; a
+  global `Exception` fallback; `@console_route` on all eleven routes.
+- **Suite:** 735 passed. `diff --check` clean.
+
+**Escalation raised and then WITHDRAWN — it rested on a false premise.** Task 10
+initially left the five `fragment-only` handlers undecorated, reporting that
+decorating `propose` flipped `test_tampered_proposal_form_writes_nothing` to
+200 in six cases. The review proved the 200 was **not** caused by the
+decoration. It was a Critical defect in the global fallback that the decoration
+merely made visible. The implementer read the symptom as the cause.
+
+**Critical — the global fallback returned 200.** `_render_console_error` applied
+the fragment severity rule to every caller, so a refusal-severity exception
+escaping a route's declared family returned **200 under `HX-Request`** — and
+both Console routes are only ever called that way. Two live scenarios were
+demonstrated: `OutOfScopeError` escaping `triage` (`E-SCOPE`, 404 → 200) and
+`OutboxError` escaping `outbox_reject` (`E-INVALID`, 422 → 200). Monitoring
+would have seen success for a defect — verbatim what design §5 forbids. The
+handler's own docstring asserted the correct behaviour while the code did the
+opposite.
+
+Fixed with a `force_page_status` flag set only by the fallback: the fragment
+*body* is kept so the swap lands in the operator's target, and the *status* is
+decoupled — the same separation the Rule 4 framework handler already makes.
+With it fixed, **all five handlers decorate cleanly and the suite is green with
+zero test edits.** The plan's Task 10 table was right as written.
+
+**Two vacuous tests found and fixed.**
+- `test_request_validation_..._without_echo` called the handler function
+  directly with a synthetic scope. Unregistering the `@app.exception_handler` —
+  the production wiring — left all eight tests green. Rewritten to drive the app
+  through `TestClient`; verified the mutant now fails.
+- Nothing tested the "never 200" requirement. The existing fallback test was
+  blind twice over: it injected a `RuntimeError` (`E-UNKNOWN`, attention, 500
+  either way) and sent no `HX-Request`. Added a refusal-severity escapee under
+  `HX-Request`; verified the mutant now fails.
+
+Its status expectation also moved from 422 to **200**: every route accepting
+form data is `fragment-only`, so Rule 5's route-shape-first selection applies
+and a refusal returns 200. The plan's `..._422_...` name predated the
+decoration, and no page-surface route accepts a form, so 422 describes no
+reachable case.
+
+**Verified clean by review:** the Rule 4 / Rule 6 distinction end-to-end —
+framework status and `Allow` header preserved, body replaced only under
+`HX-Request`, taxonomy genuinely excluded, `HEAD` bodies respected; the
+Task 7→10 regression window is closed. `RequestValidationError` cannot reach
+`exc.errors()` structurally. No bare `except Exception` in a route body, no
+`Exception` in a `catches=` tuple, no instance-specific values.
+
+- **Reviewer verdict:** 1 Critical, 2 Important — all fixed; escalation withdrawn.

@@ -10,15 +10,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Form, Request
+from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.utils import is_body_allowed_for_status_code
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .classifier import Classifier
 from .config import build_catalog, build_scope
+from .console_errors import describe
+from .console_render import is_fragment, status_for
+from .console_routing import console_route
 from .destinations import DestinationError, resolve_classification_destination
-from .entities import EntitySelectionError
+from .entities import EntityManifestError, EntitySelectionError
 from .inbox import read_inbox
 from .outbox import (
     MissingProposalSource,
@@ -38,7 +45,7 @@ from .registry import (
     propose_delete,
     reference_count,
 )
-from .scope import Scope
+from .scope import CrossScopeError, Scope
 from .vault import DestinationRegistryError, Vault
 
 BASE = Path(__file__).resolve().parent.parent
@@ -51,16 +58,110 @@ catalog = build_catalog()
 
 
 def entity_scope(entity: str) -> Scope:
-    try:
-        return build_scope(entity)
-    except EntitySelectionError as exc:
-        raise HTTPException(status_code=404) from exc
+    # Rule 6: no application code raises HTTPException. EntitySelectionError
+    # propagates to its own dedicated handler below.
+    return build_scope(entity)
 
 
 EntityScope = Annotated[Scope, Depends(entity_scope)]
 
 
+# --- Console error rendering (design §4-6) -----------------------------------
+
+
+def _endpoint_for(request: Request):
+    """The endpoint FastAPI matched for this request, if any. Starlette sets
+    ``scope["endpoint"]`` during route matching, before dependencies (and
+    therefore ``entity_scope``) run, so this is populated even when the
+    handler body never executes."""
+    return request.scope.get("endpoint")
+
+
+def _render_console_error(
+    request: Request, error, *, force_page_status: bool = False
+) -> HTMLResponse:
+    """Shared renderer for every described Console error (design §5): route
+    shape first, then HX-Request, decides fragment vs. page; status follows
+    severity for a fragment and the code's own page status for a page.
+
+    `force_page_status` decouples the two for the global fallback, which must
+    never return 200 even while rendering a fragment body — a refusal-severity
+    escapee is a defect, and laundering it into a success is what §5 forbids.
+    The Rule 4 framework handler decouples them the same way.
+    """
+    endpoint = _endpoint_for(request)
+    fragment = is_fragment(request, endpoint)
+    status = error.page_status if force_page_status else status_for(error, fragment)
+    if fragment:
+        return templates.TemplateResponse(
+            request, "blocks/alert.html", {"error": error}, status_code=status,
+        )
+    # design §6: the error page cannot include the sidebar when the
+    # described error is E-CONFIG, since the sidebar iterates bundles and
+    # Vault.bundles() is exactly what failed.
+    bundles = None if error.code == "E-CONFIG" else Vault(catalog).bundles()
+    return templates.TemplateResponse(
+        request, "error.html", {"error": error, "bundles": bundles}, status_code=status,
+    )
+
+
+#: Rule 4's replacement body for a framework-owned status under HX-Request.
+#: Deliberately not a taxonomy code (Rule 6 excludes HTTPException from the
+#: class map and the allowlist) — this is safe, curated text, not a
+#: described ConsoleError, and the framework's own status is preserved
+#: rather than any code's page_status.
+_FRAMEWORK_SAFE_BODY = (
+    '<div class="alert" role="alert">'
+    '<span class="alert-message">'
+    "This request could not be completed."
+    "</span></div>"
+)
+
+
+@app.exception_handler(EntitySelectionError)
+async def _entity_selection_error_handler(
+    request: Request, exc: EntitySelectionError
+) -> HTMLResponse:
+    return _render_console_error(request, describe(exc))
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> HTMLResponse:
+    # describe() never inspects exc.errors(), so the submitted field name
+    # and value can never reach the rendered message (design §5-6).
+    return _render_console_error(request, describe(exc))
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _framework_http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> Response:
+    """Rule 4: replace only the *body* of a framework-owned status — an
+    unmatched URL, a wrong method, a StaticFiles miss — and only when
+    HX-Request is present. The framework's own status is always preserved,
+    never mapped through the taxonomy (Rule 6), and the plain response is
+    left untouched when HX-Request is absent."""
+    if request.headers.get("HX-Request") != "true":
+        return await _default_http_exception_handler(request, exc)
+    headers = getattr(exc, "headers", None)
+    if not is_body_allowed_for_status_code(exc.status_code):
+        return Response(status_code=exc.status_code, headers=headers)
+    return HTMLResponse(
+        _FRAMEWORK_SAFE_BODY, status_code=exc.status_code, headers=headers,
+    )
+
+
+@app.exception_handler(Exception)
+async def _console_fallback_handler(request: Request, exc: Exception) -> HTMLResponse:
+    """Catches only what escapes a route's own declared family; describes it
+    and returns the code's page status. Never 200 (design §5)."""
+    return _render_console_error(request, describe(exc), force_page_status=True)
+
+
 @app.get("/", response_class=HTMLResponse)
+@console_route(catches=(DestinationRegistryError, EntityManifestError), surface="page")
 def shell(request: Request) -> HTMLResponse:
     bundles = Vault(catalog).bundles()
     return templates.TemplateResponse(
@@ -78,6 +179,7 @@ def pulse(request: Request) -> HTMLResponse:
 
 
 @app.get("/triage", response_class=HTMLResponse)
+@console_route(catches=(DestinationRegistryError, EntityManifestError), surface="page")
 def triage_default(request: Request):
     bundles = Vault(catalog).bundles()
     if not bundles:
@@ -86,6 +188,10 @@ def triage_default(request: Request):
 
 
 @app.get("/triage/{entity}", response_class=HTMLResponse)
+@console_route(
+    catches=(DestinationError, DestinationRegistryError, CrossScopeError),
+    surface="page",
+)
 def triage(request: Request, scope: EntityScope) -> HTMLResponse:
     selected = scope.current_entity()
     vault = Vault(catalog)
@@ -112,6 +218,11 @@ def triage(request: Request, scope: EntityScope) -> HTMLResponse:
 
 
 @app.post("/triage/{entity}/propose", response_class=HTMLResponse)
+@console_route(
+    catches=(OutboxError, DestinationError, CrossScopeError,
+             DestinationRegistryError),
+    surface="fragment-only",
+)
 def propose(
     request: Request,
     scope: EntityScope,
@@ -151,6 +262,10 @@ def _outbox_list(
 
 
 @app.get("/outbox/{entity}", response_class=HTMLResponse)
+@console_route(
+    catches=(OutboxError, CrossScopeError, DestinationRegistryError),
+    surface="page",
+)
 def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
     selected = scope.current_entity()
     vault = Vault(catalog)
@@ -162,6 +277,10 @@ def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
 
 
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
+@console_route(
+    catches=(OutboxError, CrossScopeError, DestinationRegistryError),
+    surface="fragment-only",
+)
 def outbox_approve(
     request: Request, scope: EntityScope, id: str = Form(...)
 ) -> HTMLResponse:
@@ -183,6 +302,10 @@ def outbox_approve(
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
+@console_route(
+    catches=(OutboxError, CrossScopeError, DestinationRegistryError),
+    surface="fragment-only",
+)
 def outbox_reject(
     request: Request, scope: EntityScope, id: str = Form(...)
 ) -> HTMLResponse:
@@ -194,6 +317,7 @@ def outbox_reject(
 
 
 @app.get("/registry/{entity}/products", response_class=HTMLResponse)
+@console_route(catches=(RegistryError, DestinationRegistryError), surface="page")
 def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
     selected = scope.current_entity()
     vault = Vault(catalog)
@@ -204,6 +328,10 @@ def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
 
 
 @app.post("/registry/{entity}/product/delete-preview", response_class=HTMLResponse)
+@console_route(
+    catches=(RegistryError, CrossScopeError, DestinationRegistryError),
+    surface="fragment-only",
+)
 def registry_delete_preview(
     request: Request, scope: EntityScope, slug: str = Form(...)
 ) -> HTMLResponse:
@@ -217,6 +345,10 @@ def registry_delete_preview(
 
 
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
+@console_route(
+    catches=(RegistryError, CrossScopeError, DestinationRegistryError),
+    surface="fragment-only",
+)
 def registry_delete_execute(request: Request, scope: EntityScope,
                             id: str = Form(...), slug: str = Form(...)) -> HTMLResponse:
     try:
