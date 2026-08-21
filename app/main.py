@@ -81,7 +81,7 @@ def pulse(request: Request) -> HTMLResponse:
 def triage_default(request: Request):
     bundles = Vault(catalog).bundles()
     if not bundles:
-        return HTMLResponse("<p>No entity bundles found.</p>")
+        return templates.TemplateResponse(request, "blocks/no_bundles.html", {})
     return RedirectResponse(url=f"/triage/{bundles[0].slug}", status_code=307)
 
 

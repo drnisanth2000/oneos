@@ -1,15 +1,8 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OneOS · Triage</title>
-  <link rel="stylesheet" href="/static/app.css">
-  <script defer src="/static/vendor/htmx.min.js"></script>
-  <script defer src="/static/vendor/alpine-morph.min.js"></script>
-  <script defer src="/static/vendor/alpine-persist.min.js"></script>
-  <script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
-  <script defer src="/static/vendor/alpine.min.js"></script>
+  {% set page_title = "OneOS · Triage" %}
+  {% include "_head.html" %}
 </head>
 <body hx-ext="alpine-morph">
   {% include "_sidebar.html" %}

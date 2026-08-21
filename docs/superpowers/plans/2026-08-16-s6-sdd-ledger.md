@@ -246,4 +246,23 @@ success event header only after `propose_classification` returns.
   both walks — **fixed** with the same AST guard `app.main` carries;
   (2) name-based heuristics in the AST guards — standard trade-off, left.
 - **Fix rounds:** 1 (Minor 1; 11 passed, full suite 679 re-run green).
-- **Commit:** recorded in the Task 7 entry.
+- **Commit:** `3f84b8a`.
+
+### Task 7 — Renderers, route metadata, templates
+
+- **RED:** `uv run pytest tests/test_console_render.py -q` → 7 failed
+  (`ModuleNotFoundError: No module named 'app.console_render'` /
+  `'app.console_routing'`; page templates lacked the htmx-config meta).
+- **GREEN:** same command → 7 passed.
+- **Full suite:** 686 passed (679 + 7; vendored-asset and morph regression
+  tests still green against the shared head).
+- **Reviewer verdict:** clean; reviewer parsed the meta JSON structurally
+  against the design block and confirmed head extraction byte-fidelity.
+  Three Minors, no diff change: (1) the `app.routes`-enumerated form of the
+  meta test belongs to invariant 6's route sweep — **carried forward as an
+  obligation on the Task 10-14 route tests** (design §8 "Every full-page
+  route … contains the htmx-config meta tag"); (2) redundant `page_title`
+  sets — harmless; (3) `console_route` validates surface membership beyond
+  the plan — fail-closed extension.
+- **Fix rounds:** 0.
+- **Commit:** recorded in the Task 8 entry.
