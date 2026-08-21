@@ -506,12 +506,17 @@ The translation is therefore normative, not incidental:
 | Condition | Type | Code |
 |---|---|---|
 | receipt absent | `MissingProposalSource` | `E-MISSING` |
-| receipt redirected or unsafe | `RedirectedSourceLeaf` | `E-TAMPER` |
+| receipt redirected or unsafe | `RedirectedPathError` | `E-TAMPER` |
 | receipt not decodable as UTF-8 | `OutboxDestinationError` | `E-INVALID` |
 | receipt unreadable for any other reason | `ProposalSourceUnavailable` | `E-UNAVAILABLE` |
 
 Row and button then agree by construction: both read through one boundary and
-both describe what that boundary raised.
+both describe what that boundary raised. The boundary's types are
+`CrossScopeError` subtypes, not `InvalidSourceLeaf` subtypes — it is the shared
+safe-read helper that raises here, and keeping its base unchanged is what keeps
+every existing `except` clause catching it. `RedirectedSourceLeaf` remains the
+integrity subtype for the destination-resolution sites, which have a different
+base.
 
 ### Delete proposals are skipped, exactly as today
 
