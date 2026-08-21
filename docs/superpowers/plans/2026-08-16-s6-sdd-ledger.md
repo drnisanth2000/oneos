@@ -383,7 +383,7 @@ Both carried items from Task 8 are decided here rather than left to emerge.
 
 **D1 — the strict-loader reconciliation.** `_read_record` and `_validate_record`
 raise `UnreadableProposalRecord`. `load_proposals` catches it and re-narrows to
-`OutboxDestinationError`, so the strict loader's escaping types are unchanged
+`OutboxDestinationError`, so the strict loader's escaping type is unchanged
 and `tests/test_outbox.py` — including `_assert_destination_error`'s exact-type
 assertion at 13 call sites — stays untouched. `project_outbox` catches the typed
 error directly, per row. This is what satisfies the plan's own "behavior
@@ -404,3 +404,79 @@ unchanged — same input, same refusal, same exception type escaping
 
 Pinned by test, since no existing test covers it and the round-3 reviewer noted
 it would otherwise be a silent change.
+
+### Task 9 — The projection
+
+- **RED:** `ImportError: cannot import name 'project_outbox' from 'app.outbox'`
+  — collection error, all 13 tests unrunnable, matching the plan's prediction.
+- **GREEN:** `OutboxRow`/`OutboxListing`; `_read_record` / `_validate_record` /
+  `_render_diff` extracted; `project_outbox` with the three-phase rule.
+- **Suite:** 725 passed. `tests/test_outbox.py` byte-identical. `diff --check`
+  clean. Only `app/outbox.py` and the new test file touched.
+
+**Escalated deviation — `preview_diff` does not delegate to `_render_diff`, and
+the reviewer accepted it.** The design says "strict reload first, then
+delegate". Delegating is **not** behaviour-neutral: the two differ in read
+policy, not just on the missing-source case.
+
+| | `preview_diff` | `_render_diff` |
+|---|---|---|
+| path | `scope.resolve_stored(src)` | `scope.root / src` (matches `approve`) |
+| read | `read_text` — follows symlinks | `_read_no_follow_bytes` — `O_NOFOLLOW` |
+| absent | `""` empty-old fallback | `MissingProposalSource` |
+| non-UTF-8 | raw `UnicodeDecodeError` | `OutboxDestinationError` |
+
+Delegating would start refusing symlinked and non-UTF-8 receipts on
+`outbox_screen`, `_outbox_list`, and the propose fragment — three live routes
+Task 9 does not own, none listed in the design's regression table. Escalating
+rather than editing `app/main.py` or relaxing a pre-existing test was correct.
+Both functions survive all of S6 (Task 11's propose fragment keeps calling
+`preview_diff`), so this is not deferred to a later task.
+
+The duplication it caused **was** fixed: a pure `_diff_text(proposal, old)`
+formatter now serves both, each keeping its own read policy. Gutting
+`_render_diff` previously passed 13/13; it now fails.
+
+**Fix round 1** — reviewer returned *not clean*: 0 Critical, 4 Important. The
+implementation was faithful to design §3 on every probed point; every finding
+was an **unpinned** behaviour — six design-named behaviours survived mutation
+with all 716 tests green.
+
+- **I1 — D2 was not pinned, and this ledger's "Pinned by test" was false.**
+  Changing `from exc` to `from None` — the minimal plausible revert — kept 716
+  green while the described code silently returned to `E-INVALID`. Now pinned on
+  the **strict** path, which the projection cannot see: the previous assertion
+  was on a projection row. Verified: the mutant now fails.
+- **I2 — four of the seven phase-1 rows were decorative**, including the two the
+  design sets in bold. Dropping the `UnicodeDecodeError` handler left the suite
+  green while one bad byte in a proposal file produced `E-UNKNOWN` at 500 — a
+  blank screen, the exact failure the design names. Now parametrized over all
+  seven, plus the two byte-level rows. Verified: the mutant now fails.
+- **I3 — `_render_diff`'s output was entirely unasserted.** Now pinned as
+  `row.diff == preview_diff(scope, row.proposal)`, which also makes any drift
+  between the two read policies a test failure. Verified: the mutant now fails.
+- **I4 — D1's wording corrected above.** A 99-case differential over
+  `load_proposals` between `HEAD` and this tree shows **zero `OK ↔ RAISE`
+  transitions** — no refusal changed — but two conditions change escaping type:
+  `UnicodeDecodeError` and record-read `OSError` become
+  `OutboxDestinationError`. That is required by `_read_record`'s own
+  `proposal` reader category and is fatality-preserving, but "types are
+  unchanged" (plural) overstated it.
+- **Minors:** the `hasattr(row, "path")` disclosure check was a tautology on a
+  frozen dataclass — replaced with an assertion that the filename reaches
+  neither the exception text nor the described message; a malformed delete
+  record now has the design §8 matrix row it was missing; `_validate_record`'s
+  unused `scope` parameter dropped, since it invited a future edit moving
+  registry work into phase 1.
+
+**Carried to Task 12 (reviewer observation, no change made):**
+`_require_destination` also raises "proposal destination is non-canonical" with
+no cause — a record-local condition that aborts the whole listing with
+`E-INVALID` and zero rows rather than producing the blocked listing. Faithful,
+because the strict loader poisons identically and design §3 assigns destination
+validation to phase 2 by name; but it is the one poisoning condition that
+aborts rather than blocking. The Task 12 route reviewer should not be surprised.
+
+- **Reviewer verdict:** clean after fix round 1.
+- **Mutation evidence:** the three previously-surviving mutants (D2 revert,
+  dropped `UnicodeDecodeError` handler, gutted `_render_diff`) each now fail.
