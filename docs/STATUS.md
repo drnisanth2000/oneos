@@ -152,21 +152,22 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-S6 is in implementation on `codex/s6-visible-console-failures`. Tasks 1-9 of 14
-are committed and pushed; each was implemented test-first and passed an
-independent review, with fix rounds recorded in the SDD ledger. Remaining:
-Tasks 10-13 (route surfaces), Task 14 (state, disclosure, and totality proofs),
-and Task 15 — whose private gates require the vault and therefore run at the
-trusted local boundary, never in a cloud task.
+S6 is complete on `codex/s6-visible-console-failures` — every task was
+implemented test-first and passed an independent review, with fix rounds
+recorded in `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`, and every
+public and private gate passes, including the combined repo+vault history
+audit. Its merge/PR state is never recorded here as a point-in-time fact — it
+changes independently of this file and any such claim goes stale the moment
+it does. Check it live instead (`git log origin/main..codex/s6-visible-console-
+failures`, or the hosting UI's pull-request list).
 
-**The branch must not be merged at a commit between Tasks 7 and 10.** Task 7
-enables HTMX swapping of 4xx/5xx responses and Task 10 supplies the handler that
-replaces framework error bodies; between them, raw framework error text swaps
-into operator targets. If S6 is abandoned mid-flight, that override reverts
-with it.
+S7 — bound review tokens — is next. Do not begin S7 until S6 is merged into
+`origin/main` and a fresh merged-`main` baseline passes (see "Repository and
+task hygiene" in `AGENTS.md`). What S7 inherits from S6 is recorded below in
+"S7 inherits these from S6".
 
-Do not start Phase 2, deploy, or add deferred UI while S6 or the live exit gates
-remain open. S7 is proposed but must not begin before S6 merges.
+Do not start Phase 2, deploy, or add deferred UI while S6 is unmerged or the
+live exit gates remain open.
 
 ---
 

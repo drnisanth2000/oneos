@@ -49,7 +49,7 @@ from .registry import (
     propose_delete,
     reference_count,
 )
-from .scope import CrossScopeError, Scope
+from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
 BASE = Path(__file__).resolve().parent.parent
@@ -466,6 +466,19 @@ def propose(
     try:
         if entity_claim is not None:
             raise OutboxDestinationError("entity is owned by request scope")
+        # Task 8 corrective (residual of PR #15 must-fix 6): classify a
+        # lexical symlink on the inbox lifecycle leaf BEFORE calling
+        # `scope.resolve()`, mirroring `_require_real_directory`'s
+        # established pattern in destinations.py/inbox.py. Unlike those
+        # helpers this function builds no anchor path at all today, so a
+        # symlinked `00-inbox/active` reaches `scope.resolve("00-inbox",
+        # "active")` first, which raises `OutOfScopeError` (-> E-SCOPE) for
+        # what design §2 requires to be a redirection finding (-> E-TAMPER).
+        inbox_active_lexical = (
+            scope.root / scope.current_entity() / "00-inbox" / "active"
+        )
+        if inbox_active_lexical.is_symlink():
+            raise RedirectedPathError("inbox lifecycle directory is redirected")
         item_path = scope.resolve("00-inbox", "active") / filename
         prop = propose_classification(
             scope, item_path,

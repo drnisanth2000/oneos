@@ -124,6 +124,10 @@ class Vault:
             raise DestinationRegistryError("registry not found")
         try:
             loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except UnicodeDecodeError as exc:
+            raise DestinationRegistryError("registry is not valid UTF-8") from exc
+        except OSError as exc:
+            raise DestinationRegistryError("registry could not be read") from exc
         except yaml.YAMLError as exc:
             raise DestinationRegistryError("registry is invalid YAML") from exc
         if not isinstance(loaded, dict):

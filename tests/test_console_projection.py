@@ -325,6 +325,11 @@ def test_undiffable_row_error_matches_approve_outcome(tmp_path, monkeypatch, con
 
         monkeypatch.setattr(outbox.os, "fstat", nonregular_fstat)
     elif condition == "permission":
+        if os.geteuid() == 0:
+            # PR #15 must-fix 9: a process with CAP_DAC_OVERRIDE (root) ignores
+            # permission bits entirely, so this branch would depend on the
+            # environment rather than the code under test.
+            pytest.skip("permission bits have no effect for root (CAP_DAC_OVERRIDE)")
         source.chmod(0)
 
     try:
@@ -440,6 +445,8 @@ def test_unreadable_record_bytes_block_with_e_unreadable(tmp_path):
     scope, _ = _propose(vault)
     path = scope.resolve("outbox") / ("20260816T101012-" + "c" * 32 + ".yaml")
     path.write_text("id: x\naction: classify\n", encoding="utf-8")
+    if os.geteuid() == 0:
+        pytest.skip("permission bits have no effect for root (CAP_DAC_OVERRIDE)")
     path.chmod(0o000)
     try:
         listing = project_outbox(scope)

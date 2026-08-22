@@ -89,8 +89,17 @@ def _require_markdown_leaf(leaf: str) -> None:
 
 def _require_real_directory(scope: Scope, *parts: str) -> Path:
     lexical = scope.root / scope.current_entity() / Path(*parts)
+    # PR #15 must-fix 6: classify a lexical symlink BEFORE calling
+    # `scope.resolve()`. A symlink targeting outside the entity root makes
+    # `scope.resolve()` raise `OutOfScopeError` (-> E-SCOPE), which reports
+    # an ordinary scope refusal for what design §2 requires to be a
+    # redirection finding (-> E-TAMPER). Checking the lexical symlink first
+    # means `scope.resolve()` is only reached for a path that is not itself
+    # a symlink.
+    if lexical.is_symlink():
+        raise RedirectedDestination("destination directory is redirected")
     resolved = scope.resolve(*parts)
-    if lexical.is_symlink() or resolved != lexical:
+    if resolved != lexical:
         raise RedirectedDestination("destination directory is redirected")
     if not lexical.exists():
         # Absence is a routine condition (the standing E4 state) and must
@@ -160,12 +169,18 @@ def resolve_classification_destination(
         raise RedirectedDestination("active lifecycle directory is redirected")
 
     destination_lexical = scope.root / entity / module / "active" / leaf
+    # C2 (S6 review): classify a lexical symlink BEFORE calling
+    # scope.resolve() — the same reasoning as _require_real_directory above.
+    # A symlinked destination leaf targeting outside the entity root makes
+    # scope.resolve() raise OutOfScopeError (-> E-SCOPE) first, reporting an
+    # ordinary scope refusal for what design §2 requires to be a
+    # redirection finding (-> E-TAMPER). Checking the lexical symlink first
+    # means scope.resolve() is only reached for a path that is not itself a
+    # symlink.
+    if destination_lexical.is_symlink():
+        raise RedirectedDestination("destination is not canonical")
     destination = scope.resolve(module, "active", leaf)
-    if (
-        destination.parent != active_dir
-        or destination_lexical.is_symlink()
-        or destination.is_symlink()
-    ):
+    if destination.parent != active_dir or destination.is_symlink():
         raise RedirectedDestination("destination is not canonical")
 
     return ClassificationDestination(

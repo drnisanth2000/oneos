@@ -3,9 +3,19 @@ import os
 import pathlib
 import re
 import stat as stat_module
+import textwrap
 from html.parser import HTMLParser
 
 import pytest
+
+# PR #15 must-fix 7: anchored to this file, never to the process cwd. A bare
+# `pathlib.Path("app")` resolves relative to whatever directory pytest is
+# invoked from, so running from anywhere other than the repo root makes
+# `rglob` yield nothing and every offender-scanning test below pass having
+# scanned zero files — the exact defect already recorded twice in the ledger
+# (Task 8 finding I1, Task 10a's C1) and fixed for `app/main.py`'s own scan,
+# but left standing in the two scans below. Defined before its first use.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 AMBIGUOUS = {"CrossScopeError", "ReviewedStateConflict",
              "UnsafeDestinationPath", "InvalidSourceLeaf"}
@@ -13,7 +23,7 @@ AMBIGUOUS = {"CrossScopeError", "ReviewedStateConflict",
 
 def test_no_direct_raise_of_an_ambiguous_base():
     offenders = []
-    for path in pathlib.Path("app").rglob("*.py"):
+    for path in (_REPO_ROOT / "app").rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
@@ -234,7 +244,7 @@ def test_no_domain_module_imports_the_taxonomy():
     forbidden = {"console_errors", "console_render"}
     offenders = []
     excluded = {"main.py", "console_render.py", "console_routing.py"}
-    for path in pathlib.Path("app").rglob("*.py"):
+    for path in (_REPO_ROOT / "app").rglob("*.py"):
         if path.name in excluded or path.name == "console_errors.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -383,7 +393,6 @@ def test_safe_read_other_oserror_raises_unavailable(tmp_path):
 # future finding is 'the design's list omits X', the correct fix is to delete
 # the list and add the invariant that would have caught X."
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _COMPOSITION_ROOT = _REPO_ROOT / "app" / "main.py"
 
 
@@ -1082,3 +1091,506 @@ def test_no_template_hand_builds_hx_vals(tmp_path):
     scanned = sorted(_TEMPLATES_ROOT.rglob("*.html"))
     assert scanned, "expected at least one template under templates/"
     assert _scan_hx_vals(_TEMPLATES_ROOT) == []
+
+
+# --- C2 (S6 review): scope.resolve() must never precede the lexical -------
+# --- symlink check on the path it resolves --------------------------------
+#
+# Design §2 / §7's closing rule: a redirection finding must classify as
+# `E-TAMPER`, never `E-SCOPE`. `Scope.resolve(*parts)` raises `OutOfScopeError`
+# (-> E-SCOPE) the moment a resolved SUBPATH lands outside the entity root —
+# which is exactly what happens when a symlinked component redirects it —
+# so any site that calls `scope.resolve(<parts>)` before classifying its own
+# lexical (pre-resolution) counterpart's `.is_symlink()` status reports an
+# ordinary scope refusal for what is actually a redirection. Three such
+# sites shipped after must-fix 6 fixed the first two
+# (`destinations.py::_require_real_directory`, `inbox.py::_require_real_directory`):
+# `destinations.py`'s own final destination-leaf check,
+# `outbox.py::_require_outbox_path`, and `registry.py::_delete_proposal_path`.
+#
+# Per §7, the fix is not a fourth hand-found patch on top of three — it is
+# this invariant, so a future site with the same shape is a red test, not a
+# sixth review finding.
+
+
+def _mentions_scope_root(node: ast.AST) -> bool:
+    """True if `node`'s subtree references `scope.root` — the marker for
+    "this expression builds a scope-relative LEXICAL path", the thing this
+    invariant requires be `.is_symlink()`-checked before the corresponding
+    `scope.resolve(...)` call."""
+    return any(
+        isinstance(n, ast.Attribute)
+        and n.attr == "root"
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "scope"
+        for n in ast.walk(node)
+    )
+
+
+def _scope_resolve_call_argcount(node: ast.AST) -> int | None:
+    """Arg count of a `scope.resolve(...)` call, or None if `node` is not
+    one."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "resolve"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "scope"
+    ):
+        return len(node.args)
+    return None
+
+
+def _is_symlink_call_target(node: ast.AST) -> str | None:
+    """The bare variable name of a no-arg `<name>.is_symlink()` call, or
+    None."""
+    if (
+        isinstance(node, ast.Call)
+        and not node.args
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "is_symlink"
+        and isinstance(node.func.value, ast.Name)
+    ):
+        return node.func.value.id
+    return None
+
+
+def _iter_in_source_order(node: ast.AST):
+    """Pre-order DFS over field order, which — unlike `ast.walk`'s BFS —
+    approximates source order for a function's statements closely enough for
+    this structural check (the same "structural, not a full control-flow
+    proof" scope every invariant in design §7 accepts)."""
+    yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _iter_in_source_order(child)
+
+
+def _mentions_any_name(node: ast.AST, names: set[str]) -> bool:
+    return any(
+        isinstance(n, ast.Name) and n.id in names for n in ast.walk(node)
+    )
+
+
+def _resolve_before_lexical_symlink_offenders(
+    tree: ast.AST, label: str, *, require_anchor: bool = True
+) -> list[str]:
+    """Fails a function where a `scope.resolve(<parts>)` call — one that CAN
+    raise `OutOfScopeError` for a redirected SUBPATH, i.e. carries at least
+    one path-part argument — is reached before a `.is_symlink()` check on
+    the "anchor path" this same function already built for it.
+
+    An anchor path is either:
+      - a `scope.root`-derived lexical path (`scope.root / ...`), the shape
+        `_require_real_directory` and the three C2 fixes all use; or
+      - a path built from a name already recognized as an anchor — which
+        includes the RESULT of a zero-arg `scope.resolve()` (`Scope.resolve()`
+        with no parts already raises the TAMPER-appropriate
+        `RedirectedPathError` for a symlinked entity root itself, so its
+        result is as trustworthy as a lexical path — `app/registry.py`'s
+        pre-fix `_delete_proposal_path` built exactly this shape,
+        `bound_outbox = entity_root / "outbox"`, as its OWN intended
+        comparison target and simply never checked it).
+
+    A function that builds no anchor path at all is, by default
+    (`require_anchor=True`), not flagged — there is no "corresponding
+    lexical path" for the invariant to police there (the same exemption
+    style as invariant 3's ambiguous bases: refuse silence on the shape that
+    exists, not a universal claim that every `scope.resolve()` call anywhere
+    is provably safe). A library helper may legitimately rely on a caller,
+    or on a function it calls in turn, to have already validated the path —
+    exactly why this stays the default for the general, file-wide scan.
+
+    `app/main.py`'s pre-fix `propose()` was exactly this shape — it called
+    `scope.resolve("00-inbox", "active")` directly with no anchor path built
+    at all — and was the Task 8 corrective residual: a function with NO
+    anchor at all is invisible to the default scan, which is exactly why the
+    misclassification shipped undetected. The fix is not a `propose()`
+    special case; it is `require_anchor=False`, a second axis this same
+    scanning function now also walks. Passed by the Stage 5 route-level scan
+    below, it makes "no anchor was ever built" itself the offense, because a
+    REGISTERED ROUTE HANDLER is the request boundary — nothing wraps it, so
+    there is no caller left to have done the check instead. `require_anchor`
+    is a parameter of this one function, not a second copy of it, so both
+    scans share every other line of detection logic and cannot drift apart.
+    """
+    offenders = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        anchor_names: set[str] = set()
+        checked_names: set[str] = set()
+        for node in _iter_in_source_order(func):
+            if node is func:
+                continue
+            if isinstance(node, ast.Assign):
+                is_anchor = _mentions_scope_root(node.value) or (
+                    anchor_names and _mentions_any_name(node.value, anchor_names)
+                )
+                zero_arg_resolve = _scope_resolve_call_argcount(node.value) == 0
+                if is_anchor or zero_arg_resolve:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            anchor_names.add(target.id)
+                    continue
+            symlink_target = _is_symlink_call_target(node)
+            if symlink_target is not None:
+                checked_names.add(symlink_target)
+                continue
+            argcount = _scope_resolve_call_argcount(node)
+            if argcount is not None and argcount >= 1:
+                if anchor_names:
+                    if not (anchor_names & checked_names):
+                        offenders.append(f"{label}:{node.lineno} in {func.name}")
+                elif not require_anchor:
+                    # Stage 5: no anchor was ever built, and this scan (a
+                    # route handler — the request boundary) does not exempt
+                    # that. Under the default `require_anchor=True` this
+                    # branch never fires, so every existing library-helper
+                    # assertion above is unchanged.
+                    offenders.append(f"{label}:{node.lineno} in {func.name}")
+    return offenders
+
+
+def test_c2_positive_control_resolve_before_symlink_check_is_flagged():
+    """Stage 1: the guard must fire on the exact defective shape — a lexical
+    path built, then `scope.resolve()` called on it BEFORE `.is_symlink()`
+    is ever checked."""
+    src = textwrap.dedent(
+        """
+        def f(scope, leaf):
+            lexical_outbox = scope.root / scope.current_entity() / "outbox"
+            resolved_outbox = scope.resolve("outbox")
+            if lexical_outbox.is_symlink() or resolved_outbox != lexical_outbox:
+                raise RedirectedPathError("bad")
+            return resolved_outbox
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_positive.py"
+    )
+    assert offenders, "guard failed to flag a resolve-before-symlink-check shape"
+
+
+def test_c2_negative_control_symlink_check_first_is_not_flagged():
+    """Stage 2: the guard must NOT fire on the corrected shape — the same
+    code with the check reordered, proving the guard is not merely
+    "resolve() and is_symlink() both present anywhere in the function"."""
+    src = textwrap.dedent(
+        """
+        def f(scope, leaf):
+            lexical_outbox = scope.root / scope.current_entity() / "outbox"
+            if lexical_outbox.is_symlink():
+                raise RedirectedPathError("bad")
+            resolved_outbox = scope.resolve("outbox")
+            if resolved_outbox != lexical_outbox:
+                raise RedirectedPathError("bad")
+            return resolved_outbox
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_negative.py"
+    )
+    assert offenders == []
+
+
+def test_c2_zero_arg_resolve_result_becomes_its_own_anchor():
+    """Stage 3a: a zero-arg `scope.resolve()` result is itself trustworthy
+    (`Scope.resolve()` with no parts already raises the TAMPER-appropriate
+    `RedirectedPathError` for a symlinked entity root), so a subpath BUILT
+    FROM it is a valid anchor and must be `.is_symlink()`-checked like any
+    other before a later `scope.resolve(<args>)` call trusts it. This is
+    exactly `app/registry.py`'s pre-fix `_delete_proposal_path` shape —
+    `bound_outbox = entity_root / "outbox"` — which had no `scope.root`
+    anywhere in it and would be invisible to a guard that only recognized
+    lexical paths built directly from `scope.root`."""
+    src = textwrap.dedent(
+        """
+        def f(scope):
+            entity_root = scope.resolve()
+            bound_outbox = entity_root / "outbox"
+            resolved_outbox = scope.resolve("outbox")
+            return resolved_outbox
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_zero_arg_anchor.py"
+    )
+    assert offenders, "a subpath derived from scope.resolve() must be a tracked anchor"
+
+
+def test_c2_bare_zero_arg_resolve_alone_is_never_flagged():
+    """Stage 3b: a bare zero-arg `scope.resolve()` call, with no later
+    args-carrying `scope.resolve()` call in the same function to guard, is
+    never itself the offending call — there is nothing after it for the
+    invariant to police, and a zero-arg call can never be the ONE flagged
+    (only calls with `argcount >= 1` are ever appended to `offenders`)."""
+    src = textwrap.dedent(
+        """
+        def f(scope):
+            entity_root = scope.resolve()
+            return entity_root
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_bare_zero_arg.py"
+    )
+    assert offenders == []
+
+
+def test_c2_resolve_with_no_local_lexical_path_is_out_of_scope_for_the_guard():
+    """Stage 4: under the DEFAULT (`require_anchor=True`, general/library)
+    scan, a function with no `scope.root`-derived path at all is not flagged
+    merely for calling `scope.resolve(<parts>)` — there is nothing local for
+    the invariant to compare it against, and a library helper may
+    legitimately rely on its caller (or a function it calls in turn) to have
+    already validated the path.
+
+    This was `app/main.py`'s pre-fix `propose()` shape exactly, and — read
+    only against this default scan — is indistinguishable from a genuinely
+    safe helper. That indistinguishability was the Task 8 corrective
+    residual: `propose()` is a registered ROUTE, not a library helper with a
+    caller left to guard it, and the stage 5 tests below
+    (`require_anchor=False`) prove the guard now DOES flag this exact shape
+    once it is scanned as a route handler. This test's assertion is
+    unchanged and still correct for the general case; it is deliberately not
+    the whole story any more."""
+    src = textwrap.dedent(
+        """
+        def f(scope, filename):
+            item_path = scope.resolve("00-inbox", "active") / filename
+            return item_path
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_no_lexical.py"
+    )
+    assert offenders == []
+
+
+def test_c2_no_app_function_calls_resolve_before_its_lexical_symlink_check():
+    """The real scan, anchored to `_REPO_ROOT` (never the process cwd — see
+    `_REPO_ROOT`'s own comment). Must be zero after the C2 fix at all three
+    sites; the three mutation tests below prove each one individually red."""
+    offenders = []
+    sources = list((_REPO_ROOT / "app").rglob("*.py"))
+    assert len(sources) > 10, f"guard scanned too few files: {len(sources)}"
+    for path in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        offenders.extend(_resolve_before_lexical_symlink_offenders(tree, str(path)))
+    assert offenders == []
+
+
+# Each string below is the EXACT pre-fix shape at the named site (captured
+# from the diff this fix batch applied), reduced to a standalone function so
+# the mutation proof does not depend on rewriting real files on disk. Each
+# is asserted red individually — "each stage individually red under
+# mutation" — rather than only proving the batch of three together.
+
+_C2_MUTATIONS = {
+    "destinations.py:172 (pre-fix)": textwrap.dedent(
+        """
+        def resolve_classification_destination(scope, item_path, *, module, sub):
+            destination_lexical = scope.root / entity / module / "active" / leaf
+            destination = scope.resolve(module, "active", leaf)
+            if (
+                destination.parent != active_dir
+                or destination_lexical.is_symlink()
+                or destination.is_symlink()
+            ):
+                raise RedirectedDestination("destination is not canonical")
+        """
+    ),
+    "outbox.py:127-129 (pre-fix)": textwrap.dedent(
+        """
+        def _require_outbox_path(scope, proposal_path=None, *, create_directory=False):
+            lexical_outbox = scope.root / scope.current_entity() / "outbox"
+            resolved_outbox = scope.resolve("outbox")
+            if lexical_outbox.is_symlink() or resolved_outbox != lexical_outbox:
+                raise RedirectedPathError("outbox directory is redirected")
+        """
+    ),
+    "registry.py:289-295 (pre-fix)": textwrap.dedent(
+        """
+        def _delete_proposal_path(scope, proposal_id):
+            entity_root = scope.resolve()
+            bound_outbox = entity_root / "outbox"
+            resolved_outbox = scope.resolve("outbox")
+            if resolved_outbox != bound_outbox:
+                raise RedirectedPathError("outbox redirects outside the bound outbox")
+        """
+    ),
+}
+
+
+@pytest.mark.parametrize("label, src", list(_C2_MUTATIONS.items()))
+def test_c2_each_original_site_is_individually_red_under_mutation(label, src):
+    offenders = _resolve_before_lexical_symlink_offenders(ast.parse(src), label)
+    assert offenders, f"guard did not catch the pre-fix shape at {label}"
+
+
+def test_c2_guard_would_have_caught_all_five_sites_on_the_axis():
+    """Method step 4: would the axis invariant have caught all five original
+    sites (the two must-fix-6 fixed before this review, plus the three C2
+    fixed here)? The two already-fixed sites are proven NOT flagged in their
+    real, current, fixed form (a regression here would mean the invariant
+    itself broke a working site); the three C2 sites are proven flagged in
+    their pre-fix form by the parametrized test above. Together: yes, all
+    five are on one axis this single invariant covers."""
+    from app import destinations, inbox
+
+    for path in (
+        pathlib.Path(destinations.__file__),
+        pathlib.Path(inbox.__file__),
+    ):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        offenders = [
+            o
+            for o in _resolve_before_lexical_symlink_offenders(tree, str(path))
+            if "_require_real_directory" in o
+        ]
+        assert offenders == [], (
+            f"the already-fixed _require_real_directory in {path} "
+            f"regressed: {offenders}"
+        )
+
+
+# --- Stage 5 (Task 8 corrective): the direct ROUTE-LEVEL pattern -----------
+#
+# The stage 4 test above documents, on purpose, that a function with NO
+# anchor path at all is invisible to the general scan — that was the
+# residual: `app/main.py`'s `propose()` is exactly this shape, and it is a
+# registered ROUTE, not a library helper. A library helper may rely on its
+# caller (or a callee it delegates to) to have already validated the path; a
+# route handler is the request boundary, so there is no caller left to have
+# done it instead. `require_anchor=False` is that missing AXIS on the same
+# scanning function used everywhere else in this file — not a name check for
+# `propose`, which appears nowhere below.
+
+
+def _route_level_resolve_offenders(app) -> list[str]:
+    """Every registered console route handler's OWN source, scanned with
+    `require_anchor=False`: a bare `scope.resolve(<parts>)` with no anchor
+    built and no symlink guard anywhere in the handler is always an
+    offender here, never merely "out of scope for the guard" the way stage
+    4 treats it for an arbitrary helper. Routes are discovered from the live
+    `app.routes` registration (`_registered_console_endpoints`, already used
+    by the route-coverage invariant above) — not by name, not by file path —
+    so a future route with this shape is caught the same way `propose` was,
+    regardless of what it is called."""
+    import inspect
+
+    offenders: list[str] = []
+    for endpoint in _registered_console_endpoints(app):
+        try:
+            source = inspect.getsource(endpoint)
+        except (OSError, TypeError):
+            continue
+        tree = ast.parse(textwrap.dedent(source))
+        label = getattr(endpoint, "__qualname__", None) or repr(endpoint)
+        offenders.extend(
+            _resolve_before_lexical_symlink_offenders(
+                tree, label, require_anchor=False
+            )
+        )
+    return offenders
+
+
+def test_c2_route_level_positive_control_bare_unguarded_resolve_is_flagged():
+    """Stage 5 positive control, driven through the real scanning function:
+    the exact pre-fix `propose()` shape — a bare `scope.resolve(<parts>)`
+    with no anchor built anywhere in the function — IS flagged once scanned
+    with `require_anchor=False`, unlike the stage 4 default."""
+    src = textwrap.dedent(
+        """
+        def propose(scope, filename):
+            item_path = scope.resolve("00-inbox", "active") / filename
+            return item_path
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_route_no_anchor.py", require_anchor=False
+    )
+    assert offenders, "stage 5 failed to flag a bare unguarded route-level resolve()"
+
+
+def test_c2_route_level_negative_control_guarded_resolve_is_not_flagged():
+    """Stage 5 negative control: the corrected shape — the real fix's own
+    pattern, a `scope.root`-derived lexical anchor checked for `.is_symlink()`
+    BEFORE `scope.resolve()` — is not flagged even under the stricter
+    `require_anchor=False` scan. Proves stage 5 does not regress the
+    already-correct pattern; it only removes the stage-4 exemption for a
+    function that never built an anchor in the first place."""
+    src = textwrap.dedent(
+        """
+        def propose(scope, filename):
+            inbox_active_lexical = (
+                scope.root / scope.current_entity() / "00-inbox" / "active"
+            )
+            if inbox_active_lexical.is_symlink():
+                raise RedirectedPathError("bad")
+            item_path = scope.resolve("00-inbox", "active") / filename
+            return item_path
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_route_guarded.py", require_anchor=False
+    )
+    assert offenders == []
+
+
+def test_c2_route_level_negative_control_bare_zero_arg_resolve_still_safe():
+    """Stage 5 negative control: a bare zero-arg `scope.resolve()` — which
+    can never raise `OutOfScopeError` for a redirected SUBPATH, since it has
+    no subpath — must still never be the offending call, mirroring stage 3b
+    under the stricter scan. Only calls with `argcount >= 1` are ever
+    appended to `offenders`, in both scan modes."""
+    src = textwrap.dedent(
+        """
+        def f(scope):
+            entity_root = scope.resolve()
+            return entity_root
+        """
+    )
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), "synthetic_route_bare_zero_arg.py", require_anchor=False
+    )
+    assert offenders == []
+
+
+# The exact pre-fix shape at `app/main.py`'s `propose()` (captured from the
+# Task 8 corrective diff), reduced to a standalone function so the mutation
+# proof does not depend on rewriting the real file on disk — the same style
+# as `_C2_MUTATIONS` above, on the same scanning function, with the one
+# parameter that makes route-level scanning stricter.
+_C2_ROUTE_LEVEL_MUTATIONS = {
+    "main.py:469 (pre-fix, Task 8 corrective)": textwrap.dedent(
+        """
+        def propose(scope, filename):
+            item_path = scope.resolve("00-inbox", "active") / filename
+            return item_path
+        """
+    ),
+}
+
+
+@pytest.mark.parametrize("label, src", list(_C2_ROUTE_LEVEL_MUTATIONS.items()))
+def test_c2_route_level_mutation_is_individually_red(label, src):
+    offenders = _resolve_before_lexical_symlink_offenders(
+        ast.parse(src), label, require_anchor=False
+    )
+    assert offenders, f"stage 5 did not catch the pre-fix shape at {label}"
+
+
+def test_c2_no_registered_route_calls_resolve_without_any_symlink_guard(
+    tmp_path, monkeypatch
+):
+    """The real stage-5 scan: every route FastAPI actually registers, loaded
+    from the live app rather than read off a file list. Must be zero after
+    the Task 8 corrective fixes `propose()` — proven red pre-fix by
+    reintroducing the exact mutation against the real app in the
+    accompanying report, since mutating the real `app/main.py` on disk here
+    would leave the suite in a failing state for every other test in this
+    session."""
+    main = _load_console_app(tmp_path, monkeypatch)
+    offenders = _route_level_resolve_offenders(main.app)
+    assert offenders == [], f"stage 5 found an unguarded route-level resolve(): {offenders}"

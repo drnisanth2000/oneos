@@ -43,8 +43,15 @@ def _require_real_directory(scope: Scope, *parts: str) -> Path | None:
     lexical = scope.root / scope.current_entity() / Path(*parts)
     if not lexical.exists() and not lexical.is_symlink():
         return None
+    # PR #15 must-fix 6: classify a lexical symlink BEFORE calling
+    # `scope.resolve()` — see the identical reasoning in
+    # `app/destinations.py::_require_real_directory`. A symlink pointing
+    # outside the entity root would otherwise let `scope.resolve()` raise
+    # `OutOfScopeError` (-> E-SCOPE) for what is a redirection (-> E-TAMPER).
+    if lexical.is_symlink():
+        raise RedirectedPathError("inbox lifecycle directory is redirected")
     resolved = scope.resolve(*parts)
-    if lexical.is_symlink() or resolved != lexical or not lexical.is_dir():
+    if resolved != lexical or not lexical.is_dir():
         raise RedirectedPathError("inbox lifecycle directory is redirected")
     return lexical
 

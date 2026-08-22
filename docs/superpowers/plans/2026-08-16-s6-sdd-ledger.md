@@ -1768,3 +1768,96 @@ new hash. The old→new mapping is not reproduced here because the old SHAs are
 themselves the thing being retired; the commit subjects are unchanged and remain
 the reliable way to locate a task's commit. Entries before `9caeb3a` are
 unaffected.
+
+---
+
+### PR #15 review cycle — CodeRabbit findings, and what fixing them exposed
+
+CodeRabbit posted 13 findings on the open PR. A human triaged them into nine
+must-fix and four reject-without-evidence. The fix batch was then put through
+one independent review, which returned **2 Critical and 2 load-bearing
+Important** — and both Criticals were defect classes this branch has recorded
+before.
+
+**Suite:** 832 → 888 (fix batch) → 919 (review fixes) → **925** (the residual).
+Zero pre-existing tests changed; four regression rows remain the total.
+
+**Critical 1 — the fix batch invented refusals.** Validating nested
+`rules.yaml` shapes moved **24 shapes from `OK` to `RAISE`**, six of them
+confirmed as a 500 `E-CONFIG` on `GET /triage/{entity}` where HEAD served 200.
+The two likeliest hand-edits in that file — leaving `rules:` with an empty
+value, and writing `any: invoice` without list dashes — blanked the primary
+Console screen. The cause is that `classify()` reads every one of these through
+`x or {}` / `x or []`, tolerating **every** falsy value, while the new validator
+excluded only `None`; and `route:` is read only when a rule actually matches.
+Design §5 is unambiguous: S6 changes the *type* of something already fatal,
+never the *fatality* of something tolerated. This is Task 8's invented refusal a
+second time.
+
+Closed by mirroring the access instead of guessing it — truthiness guards
+matching each `or` default, and the `route:` check moved out of the eager reader
+into the matched branch wrapped in `_boundary`. Differential after the fix: **0
+`OK → RAISE`**, 17 shapes restored to tolerance, the 5 genuinely-fatal shapes
+still fatal.
+
+**Critical 2 — a five-site axis reported as one.** The symlink-before-resolve
+reorder closed two sites; `destinations.py:172` was reported and left, and
+**`outbox.py:128` and `registry.py:291` were never reported at all**. The
+sharpest detail: line 139 of the *same function* in `outbox.py` already had the
+correct order, so the axis was inconsistent inside one function. Operator
+impact is real — a planted external symlink read as a routine scope refusal
+("resolved outside the selected entity") instead of a tampering finding ("do not
+retry, inspect the vault").
+
+Closed at all three, and then **closed as an axis**: an AST invariant that fails
+on any function where `scope.resolve(...)` precedes an `.is_symlink()` check on a
+tracked anchor, with synthetic controls and per-site mutation proofs. Per §7's
+closing rule — delete the list, add the invariant that would have caught X.
+
+**Then the invariant's own boundary leaked, and the human caught it.** The first
+version tracked anchors built from `scope.root` or a zero-arg `scope.resolve()`,
+so `propose()` — which has *no* anchor — was invisible to it and was documented
+as an accepted residual. Graded load-bearing on review: misclassifying an
+outcome meets the threshold regardless of how obscure the path. Fixed at the
+route, and the invariant grew a `require_anchor=False` mode applied to handlers
+discovered from live `app.routes` — **not** a name-based exemption for
+`propose()`, which would have left the next instance just as invisible.
+
+**Two S6-owned tests had pinned the bug as correct.**
+`test_outbox_screen_real_symlinked_outbox_shows_e_scope` and its registry twin
+asserted the buggy `E-SCOPE`/200 outcome for two of the sites above. Rewritten
+to assert `E-TAMPER`/409. Both live in `tests/test_console_routes.py`, created
+by this branch, so no regression row is spent — but a test asserting a defect is
+worse than no test, and it took an independent reviewer to see it.
+
+**Two vacuous controls, found by mutation not by reading.**
+`test_pr15_delete_proposal_types.py`'s id-control never called
+`get_delete_proposal` at all, and its path-control passed even when `path` was
+taken *from the record*: deleting the entire validation guard left the file
+green. Both rewritten to drive the real function.
+
+**Verified clean under attack**, and worth keeping intact: the four reader
+normalizations are a textbook §5 conversion (0 fatality changes across 16
+probes); the SQLite identifier quoting defeated all 16 hostile identifiers the
+reviewer constructed while *fixing a silent undercount nobody had claimed* — a
+table named `""` returned a wrong count of 0 at HEAD; the connection guard is
+correct with a non-vacuous control; and the cwd-relative scan fix is
+demonstrably load-bearing (with the violation planted, HEAD passes green from a
+foreign directory and the fix fails loudly).
+
+**Rejected with evidence, not assertion.** `resolve_flags` has exactly one
+caller in the tree, always `None` — removing archetype support would change
+dormant behaviour outside S6. `app/main.py` never imports `app/ingest/`, and no
+route declares an `IngestError`-compatible family, so `E-INGEST` has no Console
+surface and converting its reader would change nothing observable.
+`add_workspace` into the outbox is outside S6's approved scope.
+
+**Carried (record-only):** six delete shapes retyped `E-REGISTRY` →
+`E-UNREADABLE`; a now-unreachable `except KeyError`; new cwd-relative reads in
+`test_pr15_docs.py` (they fail loudly, the tolerated half of the distinction);
+a `?`/`#` URI mis-parse at both `sqlite3.connect` sites, pre-existing and
+identical at HEAD; the chmod skips never firing on ubuntu-latest CI; and one
+**seventh** site of the symlink axis at `app/ingest/base.py:135` — same shape,
+but unreachable from any Console route, so it would propagate as an uncaught
+`OutOfScopeError` out of the offline adapter rather than misclassify an
+operator-facing code. Different failure mode, left for its own task.

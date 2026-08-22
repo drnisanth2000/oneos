@@ -4018,6 +4018,61 @@ def test_propose_real_symlinked_entity_root_shows_e_scope(tmp_path, monkeypatch)
     assert "outside-alpha-root-marker" not in response.text
 
 
+def test_propose_real_symlinked_inbox_active_shows_e_tamper(tmp_path, monkeypatch):
+    """The residual PR #15 must-fix-6 site (Task 8 corrective ledger entry):
+    `propose`'s very first statement is
+    `item_path = scope.resolve("00-inbox", "active") / filename`, with no
+    local anchor path built at all — unlike `_require_real_directory`'s
+    established pattern. This is a REAL symlink at the inbox LEAF, the
+    `00-inbox/active` directory itself, not the entity root (that condition
+    is `test_propose_real_symlinked_entity_root_shows_e_scope` above, which
+    is already `E-TAMPER` because `Scope.resolve`'s own `base != anchor`
+    check catches a symlinked entity root before ever reaching the subpath
+    join).
+
+    Here the entity root is real; only `00-inbox/active` redirects outside
+    it. `Scope.resolve("00-inbox", "active")` joins-then-resolves the whole
+    candidate and only then checks `is_relative_to(base)`, so a symlinked
+    leaf component surfaces exactly like an ordinary out-of-scope subpath —
+    `OutOfScopeError` (-> E-SCOPE) — even though the cause is a redirection,
+    not a request for a genuinely absent or foreign path. Design §2 requires
+    the redirection finding to be `E-TAMPER`. No application code is
+    monkeypatched; only a real symlink and a real POST.
+    """
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-inbox-active-marker"
+    outside.mkdir()
+    (outside / "note.md").write_text(
+        "---\ntitle: t\nsub: triage\n---\nbody\n", encoding="utf-8",
+    )
+    (tmp_path / "alpha/00-inbox").mkdir(parents=True)
+    (tmp_path / "alpha/00-inbox/active").symlink_to(outside)
+    (tmp_path / "alpha/02-work/active").mkdir(parents=True, exist_ok=True)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = TestClient(main.app).post(
+        "/triage/alpha/propose",
+        data={"filename": "note.md", "module": "02-work", "sub": ""},
+    )
+
+    from app.console_errors import _CODES
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert response.status_code == _CODES["E-TAMPER"].page_status
+    assert 'role="alert"' in response.text
+    assert "E-TAMPER" in response.text
+    assert "E-SCOPE" not in response.text
+    assert "outside-inbox-active-marker" not in response.text
+
+
 def test_outbox_reject_real_corrupt_sibling_shows_e_unreadable(tmp_path, monkeypatch):
     """The real-filesystem condition for `outbox_reject`, mirroring
     `test_outbox_blocked_action_renders_one_alert_not_two` (`outbox_approve`'s
@@ -4058,7 +4113,7 @@ def test_outbox_reject_real_corrupt_sibling_shows_e_unreadable(tmp_path, monkeyp
     assert (tmp_path / "alpha/outbox" / f"{valid_id}.yaml").exists()
 
 
-def test_outbox_screen_real_symlinked_outbox_shows_e_scope(tmp_path, monkeypatch):
+def test_outbox_screen_real_symlinked_outbox_shows_e_tamper(tmp_path, monkeypatch):
     """The real-filesystem condition for `outbox_screen` (I6, review):
     unlike every other route in this file, it had none — a CORRUPT
     individual proposal RECORD reaches `project_outbox`'s phase-1 handling
@@ -4070,6 +4125,17 @@ def test_outbox_screen_real_symlinked_outbox_shows_e_scope(tmp_path, monkeypatch
     resolves the outbox directory itself through the bound scope before it
     can glob anything inside it, and a symlink there raises before any
     per-record handling even starts. No application code is monkeypatched.
+
+    C2 (S6 review, bounded fix pass): this test previously asserted
+    `E-SCOPE` — `app/outbox.py::_require_outbox_path` called
+    `scope.resolve("outbox")` (assigning its result) before classifying
+    `lexical_outbox.is_symlink()`, so a redirected outbox raised
+    `OutOfScopeError` before its own symlink check ever ran. Fixed to check
+    the lexical symlink first, matching the correct order already used a
+    few lines below in that same function; a redirected outbox is now
+    `RedirectedPathError` -> `E-TAMPER`, the tier design §2 requires for a
+    redirection finding. `E-TAMPER` is `attention` severity, so Rule 5
+    gives it its own page status (409) even on this full-page route.
     """
     from app.console_errors import _CODES
 
@@ -4096,13 +4162,13 @@ def test_outbox_screen_real_symlinked_outbox_shows_e_scope(tmp_path, monkeypatch
     )
 
     assert reached == [], f"fallback reached: {reached}"
-    assert response.status_code == _CODES["E-SCOPE"].page_status
+    assert response.status_code == _CODES["E-TAMPER"].page_status
     assert 'role="alert"' in response.text
-    assert "E-SCOPE" in response.text
+    assert "E-TAMPER" in response.text
     assert "outside-outbox-screen-marker" not in response.text
 
 
-def test_registry_delete_preview_real_symlinked_outbox_shows_e_scope(
+def test_registry_delete_preview_real_symlinked_outbox_shows_e_tamper(
     tmp_path, monkeypatch
 ):
     """The real-filesystem condition for `registry_delete_preview`'s
@@ -4114,27 +4180,31 @@ def test_registry_delete_preview_real_symlinked_outbox_shows_e_scope(
     `test_registry_products_real_symlinked_registry_shows_e_tamper` uses has
     NO effect on this route (measured directly: a symlinked `products.yaml`
     against this route still returns 200 with the delete-impact fragment).
-    The real vehicle is `propose_delete`'s own `scope.resolve("outbox")`
-    call (`app/registry.py`), unconditional and before anything is written:
-    it re-resolves the entity's `outbox/` directory and raises when a
-    symlink makes the resolved path disagree with the anchored one. A
-    genuinely symlinked `alpha/outbox` reaches this for real.
+    The real vehicle is `propose_delete`'s own `_delete_proposal_path` call
+    (`app/registry.py`), unconditional and before anything is written: it
+    re-resolves the entity's `outbox/` directory and raises when a symlink
+    makes the resolved path disagree with the anchored one. A genuinely
+    symlinked `alpha/outbox` reaches this for real.
 
-    M7 (review): an earlier revision of this docstring named
-    `_delete_proposal_path` as the vehicle and then said `scope.resolve
-    ("outbox")` raises first — two different claims in one paragraph. The
-    second is the one actually measured: `scope.resolve("outbox")` raises
-    `OutOfScopeError` for a symlink target outside the vault root, and
-    `_delete_proposal_path`'s own `RedirectedPathError` check never runs at
-    all for this shape. `E-SCOPE`, not `E-TAMPER` — still the same
-    `CrossScopeError` family member the route declares, just a different
-    refined subtype.
+    C2 (S6 review, bounded fix pass): this test previously asserted
+    `E-SCOPE` — `_delete_proposal_path` called `scope.resolve("outbox")`
+    with no lexical symlink check at all, so a redirected outbox raised
+    `OutOfScopeError` before any redirection-specific check ran. Fixed to
+    classify the lexical `outbox` symlink first, mirroring
+    `app/outbox.py::_require_outbox_path`; a redirected outbox is now
+    `RedirectedPathError` -> `E-TAMPER`, the tier design §2 requires for a
+    redirection finding, still the same `CrossScopeError` family member the
+    route declares, just a different refined subtype. `E-TAMPER` is
+    `attention` severity, so Rule 5 gives it its own page status (409)
+    rather than 200, even on this fragment-only route.
 
     This condition also fires strictly BEFORE `propose_delete` opens the
     proposal file, so — unlike the injected `no-proposal-written` cell in
     the state-proof matrix — this is a real-filesystem instance of
     `(committed=no, persistence=none)`: nothing is written at all.
     """
+    from app.console_errors import _CODES
+
     main, client, slug = _registry_client(tmp_path, monkeypatch)
     outbox_dir = tmp_path / "alpha/outbox"
     outbox_before = set(outbox_dir.glob("*.yaml"))
@@ -4164,11 +4234,9 @@ def test_registry_delete_preview_real_symlinked_outbox_shows_e_scope(
     )
 
     assert reached == [], f"fallback reached: {reached}"
-    # E-SCOPE is `refusal` severity, and this route is `fragment-only`, so
-    # Rule 5 gives it 200 (the request-outcome status), not its page status.
-    assert response.status_code == 200
+    assert response.status_code == _CODES["E-TAMPER"].page_status
     assert 'role="alert"' in response.text
-    assert "E-SCOPE" in response.text
+    assert "E-TAMPER" in response.text
     assert "outside-outbox-preview-marker" not in response.text
 
     # persistence=none: nothing was written anywhere, including the real

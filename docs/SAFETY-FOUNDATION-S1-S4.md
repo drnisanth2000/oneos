@@ -325,8 +325,10 @@ differed in read policy, not merely in one error case.
 S5 closes the isolated-transaction and path-aware Gate 3 gaps for classification
 approval and approved registry deletion. It intentionally does not migrate
 intake, rename, or direct registry add/edit into the new transaction service.
-S6 owns the remaining safe Console error taxonomy and is in design, not
-implementation. Live Phase 1 timing and session trials still remain after S6.
+S6 owns the safe Console error taxonomy and is complete — see `STATUS.md` for
+the certified public/private gate results. S7 — bound review tokens — is the
+next proposed step and is not yet designed. Live Phase 1 timing and session
+trials still remain after S6.
 
 S6's design review found defects that predate it, listed in `STATUS.md`. The
 most serious is that nothing binds an approval to the bytes the operator

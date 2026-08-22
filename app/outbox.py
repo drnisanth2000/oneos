@@ -125,8 +125,17 @@ def _require_outbox_path(
 ) -> Path:
     """Retain the lexical outbox path and reject every redirected component."""
     lexical_outbox = scope.root / scope.current_entity() / "outbox"
+    # C2 (S6 review): classify a lexical symlink BEFORE calling
+    # scope.resolve() — matching the correct order already used a few lines
+    # below in this same function. Calling scope.resolve() first (as this
+    # site previously did, by assigning its result before the is_symlink()
+    # check) lets a redirected outbox raise OutOfScopeError (-> E-SCOPE)
+    # instead of RedirectedPathError (-> E-TAMPER), the wrong tier for a
+    # redirection finding (design §2).
+    if lexical_outbox.is_symlink():
+        raise RedirectedPathError("outbox directory is redirected")
     resolved_outbox = scope.resolve("outbox")
-    if lexical_outbox.is_symlink() or resolved_outbox != lexical_outbox:
+    if resolved_outbox != lexical_outbox:
         raise RedirectedPathError("outbox directory is redirected")
     if lexical_outbox.exists():
         if not lexical_outbox.is_dir():

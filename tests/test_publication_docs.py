@@ -70,6 +70,14 @@ def test_safety_foundation_status_tracks_merged_s1_through_s5():
     assert "| S7 |" in build
     assert "Merged S5 baseline: `0f71cd3`" in status
 
+    # PR #15 must-fix 8: docs/STATUS.md's own "Next step" section must agree
+    # with its "Phase 1 triage" section above (which already marks S6
+    # COMPLETE) rather than still directing work on unfinished S6 tasks. This
+    # sentinel is authorized to change (human ruling: it tracks documented
+    # lifecycle state, not an S1-S5 behavioural, isolation, or refusal
+    # contract) and spends no regression-table row.
+    assert "S6 is complete" in status
+
     stale_claims = (
         "real ingest currently creates an uncommitted item",
         "Start with commit-on-ingest",
@@ -78,6 +86,9 @@ def test_safety_foundation_status_tracks_merged_s1_through_s5():
         "**and an empty git status**",
         "S5 is the current step",
         "**OPEN — S5**",
+        "S6 is in implementation on",
+        "Tasks 1-9 of 14",
+        "Remaining: Tasks 10-13",
     )
     combined = build + "\n" + status
     assert all(claim not in combined for claim in stale_claims)

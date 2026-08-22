@@ -2,6 +2,7 @@
 become E-CONFIG while absorbed tolerances are pinned (S6 Task 8, design §5
 "Boundary conversions" and §7 invariant 4)."""
 import ast
+import os
 import pathlib
 import textwrap
 
@@ -402,6 +403,8 @@ def test_front_matter_counter_still_skips_an_unreadable_file(tmp_path):
     good.write_text("---\nproduct: p\n---\nbody\n", encoding="utf-8")
     bad = entity_root / "01-core" / "bad.md"
     bad.write_text("---\nproduct: p\n---\nbody\n", encoding="utf-8")
+    if os.geteuid() == 0:
+        pytest.skip("permission bits have no effect for root (CAP_DAC_OVERRIDE)")
     bad.chmod(0o000)
     try:
         assert registry._count_front_matter(entity_root, "product", "p") == 1
