@@ -25,7 +25,11 @@ from .console_errors import ConsoleError, describe
 from .console_render import is_fragment, status_for
 from .console_routing import console_route
 from .destinations import DestinationError, resolve_classification_destination
-from .entities import EntityManifestError, EntitySelectionError
+from .entities import (
+    EntityManifestError,
+    EntitySelectionError,
+    SystemRegistryPathError,
+)
 from .inbox import read_inbox
 from .outbox import (
     OutboxDestinationError,
@@ -77,6 +81,33 @@ def _endpoint_for(request: Request):
     return request.scope.get("endpoint")
 
 
+#: Declared once, ahead of `_render_console_error`, so the decorator, each
+#: route's own `except`, AND the sidebar re-entrancy guard below all read the
+#: same family — the pattern Tasks 11-13 established after the same gap was
+#: found on every other route family in turn.
+#:
+#: C2' (S6 review round 2): an earlier version of this comment claimed "After
+#: Task 8's C2 fix, this is a closed family: `Vault.bundles()` can raise no
+#: other type." That was false, and it was the sole load-bearing premise of
+#: the C1 sidebar guard. `Vault.system_path` calls `resolve_system_registry`
+#: directly, unlike `Scope.system_path`, so `bundles()` can raise
+#: `SystemRegistryPathError` — and it re-resolves `_system` on EVERY call, so
+#: a `_system` directory redirected AFTER startup reaches this on a live
+#: request. That subclasses `EntityManifestError`, so this tuple already
+#: catches it; the three route tuples below did not, and now name it
+#: explicitly.
+#:
+#: **This is NOT a closed family, and the claim is not being retried.** Two
+#: shapes still escape `bundles()` unconverted and blank the page: a module
+#: spec that is a list or a scalar (`AttributeError`) and a non-iterable
+#: `flags:` (`TypeError`). Converting those is reader-boundary work under
+#: design §5 — Task 8's rule, surfacing late — and is split out as a recorded
+#: Task 8 corrective with its own RED/GREEN evidence and review rather than
+#: hidden inside a tests-only task. Until it lands, an unconverted stdlib
+#: shape from a hand-edited registry still reaches the global fallback.
+_SIDEBAR_CATCHES = (DestinationRegistryError, EntityManifestError)
+
+
 def _render_console_error(
     request: Request, error, *, force_page_status: bool = False
 ) -> HTMLResponse:
@@ -96,10 +127,37 @@ def _render_console_error(
         return templates.TemplateResponse(
             request, "blocks/alert.html", {"error": error}, status_code=status,
         )
-    # design §6: the error page cannot include the sidebar when the
-    # described error is E-CONFIG, since the sidebar iterates bundles and
-    # Vault.bundles() is exactly what failed.
-    bundles = None if error.code == "E-CONFIG" else Vault(catalog).bundles()
+    # design §6: the error page cannot include the sidebar when the sidebar
+    # itself is unreadable — `_sidebar.html` iterates bundles and
+    # `Vault.bundles()` is what can fail.
+    #
+    # C1 (S6 review): this used to key on `error.code == "E-CONFIG"` — the
+    # code of the error ALREADY BEING RENDERED — rather than on whether
+    # `Vault(catalog).bundles()` itself succeeds. Any described error whose
+    # code was NOT "E-CONFIG" (including E-UNKNOWN for something wholly
+    # unrelated) still re-entered `bundles()` here to build the sidebar, and
+    # if the vault's registries were ALSO broken in a way that didn't
+    # resolve to "E-CONFIG" for the original error (e.g. a bare exception
+    # from a hand-edited entities.yaml, before the C2 fix converted it), the
+    # second failure propagated out of this handler uncaught — including out
+    # of the GLOBAL FALLBACK itself, past every exception handler, to a
+    # completely empty 500 body. Measured against a real
+    # `flags: [nosuchflag]` vault with no monkeypatching: `/`, `/triage`,
+    # `/triage/alpha`, `/outbox/alpha`, and `/registry/alpha/products` all
+    # returned an empty-bodied 500.
+    #
+    # The fix decides on READABILITY, not on the code: attempt the sidebar
+    # and fall back to `None` on failure, exactly as `_sidebar.html`'s own
+    # E-CONFIG contract already promises. `_SIDEBAR_CATCHES` is a specific,
+    # maintained tuple naming every type `Vault.bundles()` is known to raise
+    # (C2' review: NOT asserted closed by a structural test — see the tuple's
+    # own declaration comment above), so this is not the blanket
+    # `except Exception` invariant 6 forbids for a registered endpoint's own
+    # body — `app/main.py` is one.
+    try:
+        bundles = Vault(catalog).bundles()
+    except _SIDEBAR_CATCHES:
+        bundles = None
     return templates.TemplateResponse(
         request, "error.html", {"error": error, "bundles": bundles}, status_code=status,
     )
@@ -161,9 +219,18 @@ async def _console_fallback_handler(request: Request, exc: Exception) -> HTMLRes
 
 
 @app.get("/", response_class=HTMLResponse)
-@console_route(catches=(DestinationRegistryError, EntityManifestError), surface="page")
+@console_route(catches=_SIDEBAR_CATCHES, surface="page")
 def shell(request: Request) -> HTMLResponse:
-    bundles = Vault(catalog).bundles()
+    """`Vault(catalog).bundles()` raises every declared member, and it runs
+    before any template exists — so the route answers them itself rather than
+    relying on the global fallback, which design §5 calls "a failure rather
+    than a silent default" and which `ServerErrorMiddleware` re-raises as a
+    logged traceback. Task 10 added the declaration; this adds the handler.
+    """
+    try:
+        bundles = Vault(catalog).bundles()
+    except _SIDEBAR_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
         request,
         "shell.html",
@@ -195,9 +262,13 @@ def pulse(request: Request) -> HTMLResponse:
 
 
 @app.get("/triage", response_class=HTMLResponse)
-@console_route(catches=(DestinationRegistryError, EntityManifestError), surface="page")
+@console_route(catches=_SIDEBAR_CATCHES, surface="page")
 def triage_default(request: Request):
-    bundles = Vault(catalog).bundles()
+    """Same boundary as `shell`, and for the same reason."""
+    try:
+        bundles = Vault(catalog).bundles()
+    except _SIDEBAR_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
     if not bundles:
         return templates.TemplateResponse(request, "blocks/no_bundles.html", {})
     return RedirectResponse(url=f"/triage/{bundles[0].slug}", status_code=307)
@@ -215,7 +286,30 @@ _PROPOSAL_PERSISTED_EVENT = "console:proposal-persisted"
 
 
 #: Declared once so the decorator and the route's own `except` cannot drift.
-_TRIAGE_CATCHES = (DestinationError, DestinationRegistryError, CrossScopeError)
+#: `SystemRegistryPathError` is declared explicitly rather than via its
+#: `EntityManifestError` base because it is **narrower**: the base would also
+#: swallow `RecipientConfigurationError` and any future sibling, which these
+#: routes have no business answering.
+#:
+#: An earlier revision of this comment justified it as "so the `E-TAMPER`
+#: mapping is preserved rather than collapsed into `E-CONFIG`". That was
+#: false and review disproved it with one command: `describe()` resolves on
+#: the raised instance's own class, never on the route's declared tuple, so
+#: declaring the base would still render `E-TAMPER`. The decision stands; the
+#: reason did not. `bundles()`
+#: re-resolves `_system` on every request, so an operator who moves the
+#: directory and symlinks it back after startup reaches this on a live
+#: request — measured on three routes, each previously escaping to the global
+#: fallback with a logged traceback.
+#:
+#: Declared here rather than converted in `Vault.system_path`: converting
+#: would change a service exception contract to close a presentation-layer
+#: gap, and would break `tests/test_vault.py`'s standing E4 regression, which
+#: asserts the raw `EntityManifestError`. Human ruling, recorded in the ledger.
+_TRIAGE_CATCHES = (
+    DestinationError, DestinationRegistryError, CrossScopeError,
+    SystemRegistryPathError,
+)
 
 
 @app.get("/triage/{entity}", response_class=HTMLResponse)
@@ -275,12 +369,15 @@ def _triage_page(request: Request, scope: Scope) -> HTMLResponse:
     )
 
 
+#: Declared once so the decorator and each of the route's two `except`
+#: clauses cannot drift (the Task 11 pattern; M5, review: this repeated the
+#: same literal tuple three times before).
+_PROPOSE_CATCHES = (OutboxError, DestinationError, CrossScopeError,
+                     DestinationRegistryError)
+
+
 @app.post("/triage/{entity}/propose", response_class=HTMLResponse)
-@console_route(
-    catches=(OutboxError, DestinationError, CrossScopeError,
-             DestinationRegistryError),
-    surface="fragment-only",
-)
+@console_route(catches=_PROPOSE_CATCHES, surface="fragment-only")
 def propose(
     request: Request,
     scope: EntityScope,
@@ -298,8 +395,7 @@ def propose(
             scope, item_path,
             module=module, sub=sub, claimed_block=block,
         )
-    except (OutboxError, DestinationError, CrossScopeError,
-            DestinationRegistryError) as exc:
+    except _PROPOSE_CATCHES as exc:
         # Refused before propose_classification returned: nothing was
         # written, so no persisted-proposal signal is emitted.
         return _render_console_error(request, describe(exc))
@@ -313,8 +409,7 @@ def propose(
         response = templates.TemplateResponse(
             request, "blocks/diff.html", {"proposal": prop, "diff": diff},
         )
-    except (OutboxError, DestinationError, CrossScopeError,
-            DestinationRegistryError) as exc:
+    except _PROPOSE_CATCHES as exc:
         response = _render_console_error(request, describe(exc))
     response.headers["HX-Trigger"] = _PROPOSAL_PERSISTED_EVENT
     return response
@@ -324,7 +419,10 @@ def propose(
 #: (the Task 11 pattern). `load_proposals` raises bare `CrossScopeError` for a
 #: redirected outbox or proposal leaf, which today escapes `except OutboxError:
 #: pass` entirely — design §5 names this exact gap for the outbox routes.
-_OUTBOX_CATCHES = (OutboxError, CrossScopeError, DestinationRegistryError)
+_OUTBOX_CATCHES = (
+    OutboxError, CrossScopeError, DestinationRegistryError,
+    SystemRegistryPathError,  # see _TRIAGE_CATCHES
+)
 
 
 def _outbox_rows(listing):
@@ -585,7 +683,10 @@ def _outbox_reject_response(request: Request, scope: Scope, id: str) -> HTMLResp
 #: requires exactly that category to raise it for a malformed record, so a
 #: corrupt delete-proposal file on disk reached the global fallback for a
 #: designed, not accidental, failure mode.
-_REGISTRY_PRODUCTS_CATCHES = (RegistryError, CrossScopeError, DestinationRegistryError)
+_REGISTRY_PRODUCTS_CATCHES = (
+    RegistryError, CrossScopeError, DestinationRegistryError,
+    SystemRegistryPathError,  # see _TRIAGE_CATCHES
+)
 _REGISTRY_DELETE_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError, UnreadableProposalRecord,
 )

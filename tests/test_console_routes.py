@@ -26,6 +26,7 @@ import importlib
 import json
 import re
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -1709,14 +1710,19 @@ def test_all_five_s5_outcomes_via_real_execute_delete(tmp_path, monkeypatch):
     assert committed_proposal.path.exists() is False
 
 
-def test_delete_preview_persistence_outcome(tmp_path, monkeypatch):
+def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch):
     """design §8 state proof: `(committed=no, persistence=proposal-written)`.
     `registry_delete_preview` calls `propose_delete`, which writes the
     proposal file, and only then calls `reference_count` while building the
     response. A described failure in that second phase must not roll back
     the write: HEAD, the index, and all tracked content stay identical, and
     exactly one new untracked proposal file appears under the bound entity's
-    `outbox/` — and nothing else changes."""
+    `outbox/` — and nothing else changes.
+
+    Folded into `test_state_proof_matrix`'s `no-proposal-written` cell (was
+    the standalone `test_delete_preview_persistence_outcome`) — the matrix is
+    the deliverable design §8 asks for, not a second copy of the same proof.
+    """
     main, client, slug = _registry_client(tmp_path, monkeypatch)
     vault = tmp_path
     head_before = git_head(vault)
@@ -1758,7 +1764,7 @@ def test_delete_preview_persistence_outcome(tmp_path, monkeypatch):
     _outbox_new_path_in_entity(outbox_before, outbox_after, tmp_path, "alpha")
 
 
-def test_propose_persistence_outcome(tmp_path, monkeypatch):
+def _state_proof_proposal_written_propose(tmp_path, monkeypatch):
     """design §8 state proof: `(committed=no, persistence=proposal-written)`
     for `propose`, the second of the two routes design §8 permits to declare
     it. `propose_classification` writes the proposal file before
@@ -1772,6 +1778,10 @@ def test_propose_persistence_outcome(tmp_path, monkeypatch):
     Task 11's own test, already pins the signal and the write count; this
     adds the full HEAD/index/tracked-content state proof design §8 requires
     for this outcome, over a real Git repository.)
+
+    Folded into `test_state_proof_matrix`'s `no-proposal-written` cell (was
+    the standalone `test_propose_persistence_outcome`) — the matrix is the
+    deliverable design §8 asks for, not a second copy of the same proof.
     """
     main, client = _git_propose_client(tmp_path, monkeypatch)
     vault = tmp_path
@@ -2172,3 +2182,1637 @@ def test_delete_execute_fragment_does_not_reproduce_delete_impact_root(
     assert _CODES["E-REGISTRY"].message in error_response.text
     assert "One commit written" not in error_response.text
     assert "not-a-real-proposal-id" not in error_response.text
+
+
+# --- Task 14: cross-cutting proofs (design §8) ------------------------------
+#
+# Three deliverables: the state-proof matrix (Step 1), the disclosure sweep
+# (Step 2), and route totality (Step 3). Tasks 10-13 already built extensive
+# per-route coverage — the three `..._never_reaches_the_global_fallback`
+# tests, the real-filesystem symlink/corrupt-record tests, and the two
+# persistence-outcome tests folded above — so this section's job is to (a)
+# organize the state proof as the explicit matrix design §8 asks for rather
+# than as scattered individual tests, (b) build the systematic disclosure
+# sweep that did not exist yet, and (c) close the totality gap Task 13 named:
+# `shell`, `pulse`, and `triage_default` had zero S6-era failure-injection
+# coverage, and `propose` had no totality test at all (only its
+# post-persistence branch was covered).
+
+
+class _AlertContent(HTMLParser):
+    """Extracts the plain text and every attribute value of the `role="alert"`
+    element and its descendants — there is exactly one alert subtree per
+    rendered error (`blocks/alert.html`, included directly or nested inside a
+    row/listing template).
+
+    A raw-HTML substring check cannot assert "no path separator": every
+    closing tag in this file (`</div>`, `</span>`, …) contains one, so
+    checking the whole response text would be a test that can never pass.
+    Parsing to plain text — and confining the check to the alert subtree, so
+    legitimate sibling content (a still-pending proposal's real id and
+    destination) is never mistaken for a leak — is what makes the assertion
+    meaningful.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stack: list[bool] = []
+        self.texts: list[str] = []
+        self.attr_values: list[str] = []
+
+    def _enter(self, attrs) -> None:
+        parent_in_alert = self._stack[-1] if self._stack else False
+        is_alert = dict(attrs).get("role") == "alert"
+        in_alert = parent_in_alert or is_alert
+        self._stack.append(in_alert)
+        if in_alert:
+            for _, value in attrs:
+                if value:
+                    self.attr_values.append(value)
+
+    def handle_starttag(self, tag, attrs):
+        self._enter(attrs)
+
+    def handle_startendtag(self, tag, attrs):
+        self._enter(attrs)
+        self._stack.pop()
+
+    def handle_endtag(self, tag):
+        if self._stack:
+            self._stack.pop()
+
+    def handle_data(self, data):
+        if self._stack and self._stack[-1]:
+            self.texts.append(data)
+
+    @property
+    def text(self) -> str:
+        return "".join(self.texts)
+
+
+def test_alert_content_parser_isolates_the_alert_subtree():
+    """Pins `_AlertContent` itself before trusting it as a test oracle: text
+    and attribute values OUTSIDE the alert subtree must never be collected,
+    and a path separator inside legitimate sibling content must not trip a
+    check confined to the alert."""
+    html = (
+        '<div id="outbox-list">'
+        '<span class="prop-route">alpha/02-work/active/marker.md</span>'
+        '<div class="alert" role="alert" data-marker="inside-alert-marker">'
+        "<span>outside text should not leak in</span>"
+        "</div>"
+        "<span>trailing/sibling/path</span>"
+        "</div>"
+    )
+    parser = _AlertContent()
+    parser.feed(html)
+    assert parser.text == "outside text should not leak in"
+    assert parser.attr_values == ["alert", "alert", "inside-alert-marker"]
+    assert "alpha/02-work" not in parser.text
+    assert "trailing/sibling/path" not in parser.text
+
+
+def _alert(html_text: str) -> _AlertContent:
+    parser = _AlertContent()
+    parser.feed(html_text)
+    return parser
+
+
+#: The entity slug every fixture in this sweep uses (`ENTITIES` above).
+#: Checked on EVERY case (C3, review), not only where a caller happened to
+#: pass it as a marker — an earlier revision left this out of the base
+#: check entirely, so "leak the bound entity slug into alert TEXT" passed
+#: green on every one of the sweep's ~20 cases at once, not just one.
+_FIXTURE_ENTITY_SLUG = "alpha"
+
+
+def _assert_alert_discloses_nothing(response, expected_code: str, markers=()) -> None:
+    """The core disclosure assertion (design §6, Rule 9): the alert's own
+    text carries only the curated message for `expected_code`, no path
+    separator, and none of the case's hostile markers or the fixture's own
+    entity slug — in either the text OR a dynamic attribute value on the
+    alert subtree.
+
+    C3 (review): an earlier revision applied the path-separator check to
+    `alert.text` only, leaving `attr_values` checked against per-case
+    synthetic markers alone — so leaking `request.url.path` (which contains
+    both a `/` and the entity slug `alpha`) into an alert ATTRIBUTE passed
+    green, and no assertion anywhere named the fixture slug at all, so
+    leaking it into alert TEXT passed green too. Both gaps are closed here,
+    unconditionally, rather than by asking every call site to remember to
+    pass "alpha" as one more marker.
+    """
+    from app.console_errors import _CODES
+
+    assert expected_code in response.text, response.text
+    alert = _alert(response.text)
+    assert alert.text, "expected an alert subtree, found none"
+    assert _CODES[expected_code].message in alert.text, (expected_code, alert.text)
+    assert "/" not in alert.text, alert.text
+    assert "\\" not in alert.text, alert.text
+    for value in alert.attr_values:
+        assert "/" not in value, value
+        assert "\\" not in value, value
+    for marker in (*markers, _FIXTURE_ENTITY_SLUG):
+        assert marker not in alert.text, (marker, alert.text)
+        for value in alert.attr_values:
+            assert marker not in value, (marker, value)
+
+
+# --- Step 1: the state-proof matrix (design §8 "State proof") --------------
+
+
+def _state_proof_no_none(tmp_path, monkeypatch):
+    """`(committed=no, persistence=none)`: one refusal per non-persisting
+    route, every fingerprint identical. `propose` and
+    `registry_delete_preview` are excluded on purpose — design §8 reserves
+    `proposal-written` for exactly those two. `pulse` is excluded too: it
+    declares `catches=()` (main.py's own comment: "pulse reads no registry,
+    resolves no path, and has no domain family to declare"), so it
+    contributes no refusal case — see `test_pulse_declares_no_family`.
+
+    `shell` and `triage_default` are ALSO excluded, and not for the same
+    reason: their declared family (`DestinationRegistryError`,
+    `EntityManifestError`) is a registry-read failure while COMPOSING the
+    page, not a refused action, so neither route contributes a refusal case
+    to this fingerprint sweep — there is no action to refuse and nothing
+    that could have persisted. Both routes now answer that family
+    themselves (`test_shell_and_triage_default_declared_family_never_
+    reaches_the_global_fallback`), and their described-error behaviour is
+    proved by the three dedicated tests grouped with it.
+    """
+    from app.console_errors import _CODES
+    from app.outbox import OutboxError
+    from app.registry import RegistryError
+    from app.scope import OutOfScopeError
+
+    main, client, proposal_id = _git_outbox_proposal_client(tmp_path, monkeypatch)
+
+    vault = tmp_path
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    cached_before = git_cached_diff(vault)
+    worktree_before = git_worktree_diff(vault)
+    status_before = git_status_bytes(vault)
+    outbox_before = _outbox_snapshot(vault)
+
+    real_project_outbox = main.project_outbox
+
+    def _raise_scope(*args, **kwargs):
+        raise OutOfScopeError("resolved outside the selected entity")
+
+    monkeypatch.setattr(main, "read_inbox", _raise_scope)
+    triage_response = client.get("/triage/alpha")
+
+    def _raise_outbox(*args, **kwargs):
+        raise OutboxError("outbox is otherwise broken")
+
+    monkeypatch.setattr(main, "project_outbox", _raise_outbox)
+    outbox_screen_response = client.get("/outbox/alpha")
+    monkeypatch.setattr(main, "project_outbox", real_project_outbox)
+
+    monkeypatch.setattr(main, "approve", _raise_outbox)
+    outbox_approve_response = client.post(
+        "/outbox/alpha/approve", data={"id": proposal_id}
+    )
+
+    monkeypatch.setattr(main, "reject", _raise_outbox)
+    outbox_reject_response = client.post(
+        "/outbox/alpha/reject", data={"id": proposal_id}
+    )
+
+    def _raise_registry_error(*args, **kwargs):
+        raise RegistryError("registry is otherwise broken")
+
+    monkeypatch.setattr(main, "products_for", _raise_registry_error)
+    registry_products_response = client.get("/registry/alpha/products")
+
+    monkeypatch.setattr(main, "get_delete_proposal", _raise_registry_error)
+    registry_delete_execute_response = client.post(
+        "/registry/alpha/product/delete-execute", data={"id": "irrelevant"}
+    )
+
+    # (response, expected code, expected status)
+    responses = {
+        "triage": (triage_response, "E-SCOPE", _CODES["E-SCOPE"].page_status),
+        "outbox_screen": (
+            outbox_screen_response, "E-INVALID", _CODES["E-INVALID"].page_status,
+        ),
+        "outbox_approve": (outbox_approve_response, "E-INVALID", 200),
+        "outbox_reject": (outbox_reject_response, "E-INVALID", 200),
+        "registry_products": (
+            registry_products_response, "E-REGISTRY", _CODES["E-REGISTRY"].page_status,
+        ),
+        "registry_delete_execute": (
+            registry_delete_execute_response, "E-REGISTRY", 200,
+        ),
+    }
+    for route, (response, code, status) in responses.items():
+        assert response.status_code == status, f"{route}: {response.text}"
+        assert code in response.text, f"{route}: expected {code}, got {response.text}"
+        assert 'role="alert"' in response.text, route
+
+    assert git_head(vault) == head_before
+    assert git_index_entries(vault) == index_before
+    assert git_cached_diff(vault) == cached_before
+    assert git_worktree_diff(vault) == worktree_before
+    assert git_status_bytes(vault) == status_before
+    assert _outbox_snapshot(vault) == outbox_before
+
+
+def _state_proof_committed_outbox_approve(tmp_path, monkeypatch):
+    """`(committed=yes)`: committed-cleanup on `outbox_approve`.
+
+    I2 (review): this used to duplicate `test_approve_committed_cleanup_
+    shows_e_committed` byte-for-byte — same fixture, same injected failure,
+    same state-proof assertions — minus that test's `role="alert"` and
+    message checks, making it a strictly WEAKER copy rather than a second
+    proof. Folded: this cell now simply invokes the pre-existing,
+    Task-12-owned regression, so there is exactly one assertion set for this
+    scenario rather than two that can silently drift apart.
+    """
+    test_approve_committed_cleanup_shows_e_committed(tmp_path, monkeypatch)
+
+
+def _index_entries_by_path(raw: bytes) -> dict[str, bytes]:
+    """Parse `git ls-files --stage -z` output into `{path: "<mode> <hash>
+    <stage>"}`, so a path-keyed comparison can exclude a specific reviewed
+    path rather than requiring the whole blob byte-identical (I1, review)."""
+    entries: dict[str, bytes] = {}
+    for chunk in raw.split(b"\0"):
+        if not chunk:
+            continue
+        meta, _, path = chunk.partition(b"\t")
+        entries[path.decode("utf-8")] = meta
+    return entries
+
+
+def _status_lines_excluding(raw: bytes, *excluded: str) -> list[bytes]:
+    """`git status --porcelain=v1 -z` entries, minus any naming one of
+    `excluded` — for a scenario where a specific OWNED path is expected to
+    show up (or change) in status while everything else must not (I3,
+    review's `_state_proof_unknown_concurrent_writer`)."""
+    excluded_bytes = {p.encode("utf-8") for p in excluded}
+    kept = []
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        path = entry[3:]  # porcelain v1: "XY path"
+        if path in excluded_bytes:
+            continue
+        kept.append(entry)
+    return kept
+
+
+def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
+    """`(committed=yes)`: committed-cleanup on `registry_delete_execute`,
+    the other route design §8 names for this outcome. Same real post-commit
+    cleanup failure as the outbox case above.
+
+    I1 (review): this cell asserted no "unrelated state identical"
+    invariant at all — a stray write anywhere else in the vault during this
+    scenario would have passed green. Five fingerprints, before and after,
+    now prove it: the worktree, cached diff, and status are expected to
+    return to the SAME clean state they started in (the transaction commits
+    everything it touches, leaving nothing pending either side of the
+    request), so those three compare byte-identical; the index is compared
+    path-by-path with the one REVIEWED path excluded, since that blob hash
+    is expected to change — that is the commit. `git_changed_paths` then
+    proves the commit itself touched exactly that one path and nothing else.
+    """
+    import app.git_transaction as git_transaction
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    vault = Path(tmp_path)
+    scope = Scope(vault, "alpha")
+    registry_path = scope.system_path("products.yaml")
+    reviewed_path = "_system/products.yaml"
+    proposal = registry.propose_delete(scope, "product", slug)
+
+    head_before = git_head(vault)
+    commits_before = git_count_commits(vault)
+    index_before = _index_entries_by_path(git_index_entries(vault))
+    cached_before = git_cached_diff(vault)
+    worktree_before = git_worktree_diff(vault)
+    status_before = git_status_bytes(vault)
+
+    def _fail_cleanup(temporary_index):
+        return OSError("injected post-commit temporary index cleanup failure")
+
+    monkeypatch.setattr(git_transaction, "_remove_temporary_index", _fail_cleanup)
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+    )
+
+    from app.console_errors import _CODES
+
+    assert response.status_code == _CODES["E-COMMITTED"].page_status
+    assert "E-COMMITTED" in response.text
+
+    assert git_count_commits(vault) == commits_before + 1
+    new_head = git_head(vault)
+    assert new_head != head_before
+    assert git_changed_paths(vault, new_head) == [reviewed_path]
+
+    assert git_worktree_diff(vault) == worktree_before
+    assert git_cached_diff(vault) == cached_before
+    assert git_status_bytes(vault) == status_before
+    index_after = _index_entries_by_path(git_index_entries(vault))
+    index_before.pop(reviewed_path, None)
+    index_after.pop(reviewed_path, None)
+    assert index_after == index_before
+
+    assert slug.encode("utf-8") not in registry_path.read_bytes()
+    assert proposal.path.exists() is False
+
+
+def _state_proof_unknown(tmp_path, monkeypatch):
+    """`(committed=unknown)`: recovery-blocked. Design §8: "unrelated state
+    identical, and the owned path matches either its pre-request state or
+    the concurrent writer's state and nothing else." The injected
+    `GitTransactionRecoveryError` fires before `execute_transaction` performs
+    any real work, so nothing here simulates a concurrent writer — this
+    proves the first of the two allowed disjuncts, "matches its pre-request
+    state"."""
+    import app.outbox as outbox_module
+    from app.console_errors import _CODES
+    from app.git_transaction import GitTransactionRecoveryError
+
+    main, client, proposal_id = _git_outbox_proposal_client(tmp_path, monkeypatch)
+    vault = Path(tmp_path)
+    source = vault / "alpha/00-inbox/active/marker.md"
+    destination = vault / "alpha/02-work/active/marker.md"
+    proposal_path = vault / "alpha/outbox" / f"{proposal_id}.yaml"
+    source_before = source.read_bytes()
+    proposal_before = proposal_path.read_bytes()
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    cached_before = git_cached_diff(vault)
+    worktree_before = git_worktree_diff(vault)
+    status_before = git_status_bytes(vault)
+
+    blocked_path = "alpha/11-other/active/blocked-path-marker.md"
+    real_execute_transaction = outbox_module.execute_transaction
+
+    def _raise(*args, **kwargs):
+        raise GitTransactionRecoveryError((blocked_path,))
+
+    # M2 (review): `raising=False` only disables monkeypatch's own
+    # check that the symbol already exists — it does, `app/outbox.py`
+    # imports `execute_transaction` directly, so the flag was inert.
+    monkeypatch.setattr(outbox_module, "execute_transaction", _raise)
+
+    try:
+        response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+
+        assert response.status_code == _CODES["E-RECOVER"].page_status
+        assert "E-RECOVER" in response.text
+        assert "blocked-path-marker" not in response.text
+
+        # Unrelated state identical: no commit happened at all.
+        assert git_head(vault) == head_before
+        assert git_index_entries(vault) == index_before
+        assert git_cached_diff(vault) == cached_before
+        assert git_worktree_diff(vault) == worktree_before
+        assert git_status_bytes(vault) == status_before
+
+        # The owned path — the proposal's source — matches its pre-request
+        # state.
+        assert source.read_bytes() == source_before
+        assert destination.exists() is False
+        assert proposal_path.read_bytes() == proposal_before
+    finally:
+        # `monkeypatch` is shared across BOTH scenarios the "unknown" cell
+        # runs in one test invocation — restore explicitly rather than
+        # relying on end-of-test teardown, or the sibling scenario
+        # (`_state_proof_unknown_concurrent_writer`) would drive its POST
+        # through THIS patch instead of a real transaction, and its
+        # `.git/hooks/pre-commit` vehicle would never run at all.
+        monkeypatch.setattr(
+            outbox_module, "execute_transaction", real_execute_transaction
+        )
+
+
+def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
+    """`(committed=unknown)`, the SECOND disjunct design §8 allows — "the
+    owned path matches ... the concurrent writer's state" — which
+    `_state_proof_unknown` above cannot reach: its own docstring concedes
+    "nothing here simulates a concurrent writer", because its injected
+    failure fires before `execute_transaction` performs any real work (I3,
+    review).
+
+    This drives a REAL concurrent writer through `outbox_approve`: a
+    `.git/hooks/pre-commit` hook that overwrites the reviewed destination
+    after the transaction has staged it — the same vehicle
+    `tests/test_git_transaction.py::
+    test_hook_same_path_replacement_after_staging_blocks_success` uses
+    directly against `execute_transaction`. No application code is
+    monkeypatched here; the recovery-blocked outcome and the conflicting
+    bytes on disk are both genuine.
+    """
+    main, client, proposal_id = _git_outbox_proposal_client(tmp_path, monkeypatch)
+    vault = Path(tmp_path)
+    source = vault / "alpha/00-inbox/active/marker.md"
+    destination = vault / "alpha/02-work/active/marker.md"
+    destination_relative = "alpha/02-work/active/marker.md"
+    proposal_path = vault / "alpha/outbox" / f"{proposal_id}.yaml"
+    source_before = source.read_bytes()
+    proposal_before = proposal_path.read_bytes()
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    cached_before = git_cached_diff(vault)
+    status_before = git_status_bytes(vault)
+
+    concurrent_bytes = b"concurrent replacement\n"
+    hook = vault / ".git/hooks/pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"printf '{concurrent_bytes.decode()}' > "
+        "alpha/02-work/active/marker.md\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+
+    from app.console_errors import _CODES
+
+    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+
+    assert response.status_code == _CODES["E-RECOVER"].page_status
+    assert "E-RECOVER" in response.text
+
+    # Unrelated state identical: no commit happened at all (the hook's
+    # write is a working-tree mutation, not a commit).
+    assert git_head(vault) == head_before
+    assert git_index_entries(vault) == index_before
+    assert git_cached_diff(vault) == cached_before
+    # The destination is the OWNED path here (it now holds the concurrent
+    # writer's bytes, per design's second disjunct), so it is EXPECTED to
+    # appear as a new untracked entry in status — excluded from the
+    # comparison rather than asserted byte-identical, the same "excluding
+    # the reviewed/owned path" shape I1's registry fix uses.
+    assert _status_lines_excluding(
+        git_status_bytes(vault), destination_relative
+    ) == _status_lines_excluding(status_before, destination_relative)
+
+    # The owned path — the destination — matches the CONCURRENT WRITER's
+    # bytes. This is the disjunct `_state_proof_unknown` cannot exercise.
+    assert destination.read_bytes() == concurrent_bytes
+    assert source.read_bytes() == source_before
+    assert proposal_path.read_bytes() == proposal_before
+
+
+def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):
+    """M6 (review): `shell` and `triage_default` are the two routes whose
+    app code Task 14 changed (the C1/C2 re-entrancy and boundary-conversion
+    handlers), and neither had a state proof. Both are read-only against a
+    broken registry — there is no domain action to refuse — so the only
+    claim to prove is design §6's own: "describing and rendering an error
+    performs no mutation: no file written, nothing staged, no directory
+    created, no lock acquired."
+    """
+    from app.vault import DestinationRegistryError
+
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    vault = Path(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=vault, check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "test"], cwd=vault, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=vault, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=vault, check=True)
+
+    head_before = git_head(vault)
+    index_before = git_index_entries(vault)
+    cached_before = git_cached_diff(vault)
+    worktree_before = git_worktree_diff(vault)
+    status_before = git_status_bytes(vault)
+
+    def _raise(self):
+        raise DestinationRegistryError("registries unreadable")
+
+    monkeypatch.setattr(main.Vault, "bundles", _raise)
+    client = TestClient(main.app)
+    for path in ("/", "/triage"):
+        response = client.get(path)
+        assert response.status_code == 500
+        assert "E-CONFIG" in response.text
+        assert 'role="alert"' in response.text
+
+    assert git_head(vault) == head_before
+    assert git_index_entries(vault) == index_before
+    assert git_cached_diff(vault) == cached_before
+    assert git_worktree_diff(vault) == worktree_before
+    assert git_status_bytes(vault) == status_before
+
+
+@pytest.mark.parametrize("cell", ["no-none", "no-proposal-written", "yes", "unknown"])
+def test_state_proof_matrix(tmp_path, monkeypatch, cell):
+    """design §8 "State proof": the explicit matrix keyed by
+    `(committed, persistence)`. Each cell drives every route/scenario design
+    §8 assigns to it and proves the matching fingerprint discipline with the
+    conftest git helpers plus `_outbox_snapshot`.
+
+    `no-proposal-written` and `yes` each cover two routes/scenarios under one
+    cell id — both scenarios in a cell get a fresh sub-vault (`tmp_path /
+    <name>`) so neither's monkeypatching or Git state can bleed into the
+    other. `no-none` and `unknown` now do too (M6, I3, review).
+    """
+    if cell == "no-none":
+        _state_proof_no_none(tmp_path / "actions", monkeypatch)
+        _state_proof_shell_and_triage_default(tmp_path / "shell-triage", monkeypatch)
+    elif cell == "no-proposal-written":
+        _state_proof_proposal_written_registry_delete_preview(
+            tmp_path / "delete-preview", monkeypatch
+        )
+        _state_proof_proposal_written_propose(tmp_path / "propose", monkeypatch)
+    elif cell == "yes":
+        _state_proof_committed_outbox_approve(tmp_path / "approve", monkeypatch)
+        _state_proof_committed_registry_delete_execute(
+            tmp_path / "delete-execute", monkeypatch
+        )
+    elif cell == "unknown":
+        _state_proof_unknown(tmp_path / "injected", monkeypatch)
+        _state_proof_unknown_concurrent_writer(tmp_path / "concurrent", monkeypatch)
+    else:  # pragma: no cover - parametrize is closed
+        raise AssertionError(cell)
+
+
+# --- Step 2: the disclosure sweep (design §6, §8) ---------------------------
+
+
+def test_alerts_never_contain_paths_slugs_or_echoes(tmp_path, monkeypatch):
+    """design §8 disclosure sweep: every described error each route's
+    declared family can produce, over every route. This file already checks
+    individual cases with `"marker" not in response.text` (a strictly
+    coarser and strictly weaker check, since it covers the whole page); this
+    sweep is what proves the specific, sharper claim the plan asks for — "no
+    path separator" — which a raw substring check cannot express at all
+    (every closing tag contains one), by parsing to the alert's own plain
+    text with `_AlertContent`.
+
+    One request per (route, declared exception); a distinct hostile marker
+    per case embeds both a fake path segment and a fake slug, so a single
+    assertion covers "no path separator", "no fixture slug", and "no raw
+    exception text" together. Where the route also accepts attacker-controlled
+    form input (a slug, a filename, an id), that field carries its own
+    distinct marker to prove Rule 8 (never reflect a submitted value) inside
+    the same sweep.
+
+    `pulse` contributes nothing (`catches=()`); `EntityManifestError` on
+    `shell`/`triage_default` is excluded — design §11's known limitation:
+    `catalog = build_catalog()` runs at module scope, so that exception can
+    never arise while a client exists to observe a response.
+    """
+    from app.outbox import OutboxError, UnreadableProposalRecord
+    from app.registry import RegistryError
+    from app.scope import OutOfScopeError, RedirectedPathError
+    from app.vault import DestinationRegistryError
+
+    n = 0
+
+    def _marker(label: str) -> str:
+        nonlocal n
+        n += 1
+        return f"hostile/marker-{n}-{label}/leaked-secret.md"
+
+    # -- shell, triage_default: DestinationRegistryError -----------------
+    # Both routes answer this family themselves (see
+    # `test_shell_and_triage_default_declared_family_never_reaches_the_
+    # global_fallback`); this sweep is about the SAFETY of whatever alert is
+    # rendered, not about which handler rendered it, so it stays agnostic.
+    #
+    # `main.Vault` is the SAME class object across every `_load_main` reload
+    # in this sweep (only `app.main`, not `app.vault`, gets reloaded), so the
+    # patch MUST be restored before any later case in this sweep — including
+    # `triage`'s own page-level error branch, which calls `Vault(catalog).
+    # bundles()` again to build the sidebar (`_render_console_error`) and
+    # would otherwise raise a second, unrelated error from a stale patch.
+    for route, path in (("shell", "/"), ("triage_default", "/triage")):
+        main = _load_main(tmp_path / route, monkeypatch, ENTITIES)
+        marker = _marker(route)
+        real_bundles = main.Vault.bundles
+
+        def _raise_bundles(self, __marker=marker):
+            raise DestinationRegistryError(f"registries unreadable: {__marker}")
+
+        monkeypatch.setattr(main.Vault, "bundles", _raise_bundles)
+        response = TestClient(main.app, raise_server_exceptions=False).get(path)
+        monkeypatch.setattr(main.Vault, "bundles", real_bundles)
+        _assert_alert_discloses_nothing(response, "E-CONFIG", [marker])
+
+    # -- triage: DestinationError is per-row and never the page-level
+    #    alert this sweep targets (design §3), so only the two page-level
+    #    members are exercised here: RedirectedPathError and
+    #    DestinationRegistryError. `OutOfScopeError` is E-SCOPE, whose
+    #    message deliberately omits WHERE the request resolved (§6) — no
+    #    marker to embed, covered by presence alone.
+    for exc_factory, code in (
+        (lambda m: RedirectedPathError(f"redirected inbox: {m}"), "E-TAMPER"),
+        (lambda m: DestinationRegistryError(f"registries unreadable: {m}"), "E-CONFIG"),
+    ):
+        subdir = tmp_path / f"triage-{code}"
+        main = _load_main(subdir, monkeypatch, ENTITIES)
+        scaffold_modules(subdir, "alpha", ["00-intake", "01-core", "02-work"])
+        marker = _marker(f"triage-{code}")
+
+        def _raise(*args, __exc=exc_factory(marker), **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "read_inbox", _raise)
+        response = TestClient(main.app).get("/triage/alpha")
+        _assert_alert_discloses_nothing(response, code, [marker])
+
+    scope_subdir = tmp_path / "triage-E-SCOPE"
+    main = _load_main(scope_subdir, monkeypatch, ENTITIES)
+
+    def _raise_scope(*args, **kwargs):
+        raise OutOfScopeError("resolved outside the selected entity")
+
+    monkeypatch.setattr(main, "read_inbox", _raise_scope)
+    response = TestClient(main.app).get("/triage/alpha")
+    _assert_alert_discloses_nothing(response, "E-SCOPE")
+
+    # -- propose: submitted module value carries its own marker (Rule 8) -
+    # I5 (review): `E-DEST` added — `propose`'s own declared `DestinationError`
+    # member and, per review, "a declared member, the most operator-reachable
+    # refusal, reached by a plain form value" — the sweep covered only 6 of
+    # 21 codes before this and omitted it entirely.
+    from app.destinations import MissingDestination
+
+    for exc_factory, code in (
+        (lambda m: OutboxError(f"outbox is otherwise broken: {m}"), "E-INVALID"),
+        (lambda m: RedirectedPathError(f"redirected source: {m}"), "E-TAMPER"),
+        (
+            lambda m: DestinationRegistryError(f"registries unreadable: {m}"),
+            "E-CONFIG",
+        ),
+        (lambda m: MissingDestination(f"destination unresolved: {m}"), "E-DEST"),
+    ):
+        subdir = tmp_path / f"propose-{code}"
+        main, client = _propose_client(subdir, monkeypatch)
+        marker = _marker(f"propose-{code}")
+        submitted_marker = _marker(f"propose-{code}-submitted")
+
+        def _raise(*args, __exc=exc_factory(marker), **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "propose_classification", _raise)
+        response = client.post(
+            "/triage/alpha/propose",
+            data={"filename": "note.md", "module": submitted_marker, "sub": ""},
+        )
+        _assert_alert_discloses_nothing(response, code, [marker, submitted_marker])
+
+    # -- outbox_screen, outbox_approve, outbox_reject ---------------------
+    for exc_factory, code in (
+        (lambda m: OutboxError(f"outbox is otherwise broken: {m}"), "E-INVALID"),
+        (lambda m: RedirectedPathError(f"redirected proposal leaf: {m}"), "E-TAMPER"),
+        (
+            lambda m: DestinationRegistryError(f"registries unreadable: {m}"),
+            "E-CONFIG",
+        ),
+    ):
+        subdir = tmp_path / f"outbox-screen-{code}"
+        main, client, proposal_id = _outbox_proposal_client(subdir, monkeypatch)
+        marker = _marker(f"outbox-screen-{code}")
+
+        def _raise(*args, __exc=exc_factory(marker), **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "project_outbox", _raise)
+        response = client.get("/outbox/alpha")
+        _assert_alert_discloses_nothing(response, code, [marker])
+
+        for action in ("approve", "reject"):
+            subdir = tmp_path / f"outbox-{action}-{code}"
+            main, client, proposal_id = _outbox_proposal_client(subdir, monkeypatch)
+            marker = _marker(f"outbox-{action}-{code}")
+            id_marker = _marker(f"outbox-{action}-{code}-id")
+
+            def _raise_action(*args, __exc=exc_factory(marker), **kwargs):
+                raise __exc
+
+            monkeypatch.setattr(main, action, _raise_action)
+            response = client.post(
+                f"/outbox/alpha/{action}", data={"id": id_marker}
+            )
+            _assert_alert_discloses_nothing(response, code, [marker, id_marker])
+
+    # -- outbox_approve: E-RECOVER, E-COMMITTED (I5, review: these two
+    #    chain-derived outcomes — Rule 1's resolver walking a wrapper's
+    #    `__cause__` — were entirely absent from the sweep, and `E-COMMITTED`
+    #    is "forbidden by name in §6" (the message must never leak a commit
+    #    id). Constructed the same way `app/outbox.py` itself chains a
+    #    transaction failure: an `OutboxTransactionError` wrapper with
+    #    `__cause__` set to the real `git_transaction` type the resolver's
+    #    allowlist walks, so this exercises the actual resolver path a real
+    #    transaction failure takes rather than a shortcut around it.
+    from app.git_transaction import (
+        GitTransactionCommittedError,
+        GitTransactionRecoveryError,
+        TransactionResult,
+    )
+    from app.outbox import OutboxTransactionError
+
+    def _chained(wrapper: BaseException, cause: BaseException) -> BaseException:
+        wrapper.__cause__ = cause
+        return wrapper
+
+    for exc_factory, code in (
+        (
+            lambda m: _chained(
+                OutboxTransactionError("outbox transaction failed"),
+                GitTransactionRecoveryError((f"alpha/blocked/{m}.md",)),
+            ),
+            "E-RECOVER",
+        ),
+        (
+            lambda m: _chained(
+                OutboxTransactionError("outbox transaction failed"),
+                GitTransactionCommittedError(
+                    TransactionResult(
+                        commit_oid=f"deadbeef{m}",
+                        changed_paths=(f"alpha/committed/{m}.md",),
+                    ),
+                    OSError(f"cleanup failed: {m}"),
+                ),
+            ),
+            "E-COMMITTED",
+        ),
+    ):
+        subdir = tmp_path / f"outbox-approve-{code}"
+        main, client, proposal_id = _outbox_proposal_client(subdir, monkeypatch)
+        marker = _marker(f"outbox-approve-{code}")
+
+        def _raise_chained(*args, __exc=exc_factory(marker), **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "approve", _raise_chained)
+        response = client.post(
+            "/outbox/alpha/approve", data={"id": proposal_id}
+        )
+        _assert_alert_discloses_nothing(response, code, [marker])
+
+    # -- registry_products: declared (RegistryError, CrossScopeError,
+    #    DestinationRegistryError) — NOT UnreadableProposalRecord, which is
+    #    the two delete routes' own addition (`_REGISTRY_PRODUCTS_CATCHES` vs
+    #    `_REGISTRY_DELETE_CATCHES`, app/main.py).
+    for exc_factory, code in (
+        (lambda m: RegistryError(f"registry is otherwise broken: {m}"), "E-REGISTRY"),
+        (lambda m: RedirectedPathError(f"redirected registry: {m}"), "E-TAMPER"),
+        (
+            lambda m: DestinationRegistryError(f"registries unreadable: {m}"),
+            "E-CONFIG",
+        ),
+    ):
+        subdir = tmp_path / f"registry-products-{code}"
+        main, client, slug = _registry_client(subdir, monkeypatch)
+        marker = _marker(f"registry-products-{code}")
+
+        def _raise(*args, __exc=exc_factory(marker), **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "products_for", _raise)
+        response = client.get("/registry/alpha/products")
+        # C3 (review): the product slug is a fixture value too, and none of
+        # the sweep's assertions named it before this.
+        _assert_alert_discloses_nothing(response, code, [marker, slug])
+
+    # -- registry_delete_preview, registry_delete_execute: declared family
+    #    additionally includes UnreadableProposalRecord.
+    for exc_factory, code in (
+        (lambda m: RegistryError(f"registry is otherwise broken: {m}"), "E-REGISTRY"),
+        (lambda m: RedirectedPathError(f"redirected registry: {m}"), "E-TAMPER"),
+        (
+            lambda m: DestinationRegistryError(f"registries unreadable: {m}"),
+            "E-CONFIG",
+        ),
+        (
+            lambda m: UnreadableProposalRecord(f"corrupt delete proposal: {m}"),
+            "E-UNREADABLE",
+        ),
+    ):
+        subdir = tmp_path / f"registry-delete-preview-{code}"
+        main, client, slug = _registry_client(subdir, monkeypatch)
+        marker = _marker(f"registry-delete-preview-{code}")
+        slug_marker = _marker(f"registry-delete-preview-{code}-slug")
+
+        def _raise_preview(*args, __exc=exc_factory(marker), **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "propose_delete", _raise_preview)
+        response = client.post(
+            "/registry/alpha/product/delete-preview", data={"slug": slug_marker}
+        )
+        # C3 (review): the fixture's OWN product slug ("widget") too, not
+        # only the hostile submitted one.
+        _assert_alert_discloses_nothing(response, code, [marker, slug_marker, slug])
+
+        subdir = tmp_path / f"registry-delete-execute-{code}"
+        main, client, slug = _registry_client(subdir, monkeypatch)
+        marker = _marker(f"registry-delete-execute-{code}")
+        id_marker = _marker(f"registry-delete-execute-{code}-id")
+
+        def _raise_execute(*args, __exc=exc_factory(marker), **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "get_delete_proposal", _raise_execute)
+        response = client.post(
+            "/registry/alpha/product/delete-execute", data={"id": id_marker}
+        )
+        _assert_alert_discloses_nothing(response, code, [marker, id_marker, slug])
+
+
+# --- Step 3: route totality — closing the gap Task 13 named -----------------
+#
+# Task 13 proved by measurement that a totality test injecting a route's
+# DECLARED family cannot discover that the declaration is incomplete (the
+# symlinked products.yaml and corrupt delete-proposal escapes). The existing
+# `..._never_reaches_the_global_fallback` tests for triage/outbox/registry
+# already carry both halves — declaration-driven injection AND at least one
+# real-filesystem condition apiece — and are kept as-is rather than folded
+# into a single generic sweep: `test_outbox_declared_family_never_reaches_
+# the_global_fallback`'s two-pass structure (I5) exists specifically to
+# distinguish "the action's own except" from "the re-render's except", which
+# a route-declaration-only sweep would collapse and silently stop testing.
+# What follows closes the three routes with NO prior S6 coverage (`shell`,
+# `pulse`, `triage_default`) and the one route whose totality test was
+# entirely missing (`propose` — only the post-persistence branch was ever
+# injected), plus the real-filesystem conditions still missing per route.
+
+
+def _route_totality_plan(main) -> dict:
+    """Every registered console route's request and patch targets, keyed by
+    the endpoint FUNCTION OBJECT itself — the same identity
+    `_registered_console_endpoints` yields (C4/I7, review).
+
+    Every OTHER totality test in this file hand-copies the list of
+    `(exception, expected_code)` pairs it injects. That cannot notice a
+    route's declared `catches` tuple being silently WIDENED to a member
+    NOTHING injects: the review added `EntityManifestError` to
+    `_TRIAGE_CATCHES`, `_OUTBOX_CATCHES`, and `propose`'s tuple — three
+    routes, a member nothing in this file drove — and the full suite stayed
+    green. This plan intentionally carries no exception LISTS: the sweep
+    below reads each route's `catches` straight off its own
+    `__console_route__` at test time, so the injected set tracks the
+    declaration automatically. Only the WHERE-to-inject (a patch target
+    already inside the route's own guarded region) is route-specific and
+    lives here.
+
+    A patch target need not be where a given exception naturally originates
+    in production — the sweep only needs to prove the route's OWN except
+    tuple answers whatever DOES reach it, for every declared member. Which
+    call site is the REALISTIC origin of a specific member is what the
+    route-specific tests elsewhere in this file already prove.
+    """
+    return {
+        main.shell: {
+            "request": lambda c: c.get("/"),
+            "patch_targets": [(main.Vault, "bundles")],
+        },
+        main.triage_default: {
+            "request": lambda c: c.get("/triage"),
+            "patch_targets": [(main.Vault, "bundles")],
+        },
+        main.triage: {
+            "request": lambda c: c.get("/triage/alpha"),
+            "patch_targets": [(main, "read_inbox")],
+        },
+        main.propose: {
+            "request": lambda c: c.post(
+                "/triage/alpha/propose",
+                data={"filename": "note.md", "module": "02-work", "sub": ""},
+            ),
+            "patch_targets": [(main, "propose_classification")],
+        },
+        main.outbox_screen: {
+            "request": lambda c: c.get("/outbox/alpha"),
+            "patch_targets": [(main, "project_outbox")],
+        },
+        main.outbox_approve: {
+            "request": lambda c: c.post(
+                "/outbox/alpha/approve", data={"id": "irrelevant"}
+            ),
+            "patch_targets": [(main, "approve")],
+        },
+        main.outbox_reject: {
+            "request": lambda c: c.post(
+                "/outbox/alpha/reject", data={"id": "irrelevant"}
+            ),
+            "patch_targets": [(main, "reject")],
+        },
+        main.registry_products: {
+            "request": lambda c: c.get("/registry/alpha/products"),
+            "patch_targets": [(main, "products_for")],
+        },
+        main.registry_delete_preview: {
+            "request": lambda c: c.post(
+                "/registry/alpha/product/delete-preview", data={"slug": "widget"}
+            ),
+            "patch_targets": [(main, "propose_delete")],
+        },
+        main.registry_delete_execute: {
+            "request": lambda c: c.post(
+                "/registry/alpha/product/delete-execute", data={"id": "irrelevant"}
+            ),
+            "patch_targets": [(main, "get_delete_proposal")],
+        },
+        main.pulse: {"request": lambda c: c.get("/blocks/pulse"), "patch_targets": []},
+    }
+
+
+def test_route_totality_from_declared_catches(tmp_path, monkeypatch):
+    """design §7 invariant 6 / §8 "Route-level totality", GENERALIZED (C4,
+    I7 — review): enumerates every route `_registered_console_endpoints`
+    finds, reads each one's OWN `__console_route__.catches` at test time,
+    and injects exactly those classes through the per-route patch-target
+    map above — so a route's declared family being widened is exercised the
+    moment it lands, automatically, with no corresponding hand-written test
+    case required.
+
+    This does not replace the route-specific totality tests elsewhere in
+    this file: those additionally prove WHICH of several call sites within
+    one route answers WHICH member (`test_outbox_declared_family_never_
+    reaches_the_global_fallback`'s two-pass split, specifically, which this
+    sweep does not attempt to reproduce) and drive real-filesystem
+    conditions this sweep cannot. Both are kept — this closes the
+    orthogonal, previously-untested claim that declaration and defense
+    never drift apart.
+    """
+    from tests.test_console_invariants import _registered_console_endpoints
+
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    plan = _route_totality_plan(main)
+
+    endpoints = list(_registered_console_endpoints(main.app))
+    assert len(endpoints) >= 11, f"the sweep saw only {endpoints}"
+    missing = [
+        getattr(ep, "__qualname__", repr(ep)) for ep in endpoints if ep not in plan
+    ]
+    assert missing == [], (
+        f"route(s) registered but absent from the totality patch-target map: "
+        f"{missing}"
+    )
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    for endpoint in endpoints:
+        spec = plan[endpoint]
+        catches = endpoint.__console_route__.catches
+        originals = [
+            (owner, attr, getattr(owner, attr)) for owner, attr in spec["patch_targets"]
+        ]
+        try:
+            for exc_class in catches:
+                for owner, attr in spec["patch_targets"]:
+                    def _raise(*args, __exc=exc_class, **kwargs):
+                        raise __exc("injected for route totality")
+
+                    monkeypatch.setattr(owner, attr, _raise)
+                    reached.clear()
+                    spec["request"](client)
+                    assert reached == [], (
+                        f"{endpoint.__qualname__}: {exc_class.__name__} via "
+                        f"{owner!r}.{attr} reached the global fallback"
+                    )
+        finally:
+            # Restore before moving to the next route: several routes share
+            # a patch target (`Vault.bundles`, in particular), and a
+            # leftover patch would make the NEXT route's request fail for a
+            # reason unrelated to what it declares.
+            for owner, attr, original_value in originals:
+                monkeypatch.setattr(owner, attr, original_value)
+
+    # Sanity: the spy fires for something genuinely undeclared, so every
+    # empty `reached` above is proof of routing rather than of a dead spy.
+    def _boom(self):
+        raise RuntimeError("undeclared by any route")
+
+    monkeypatch.setattr(main.Vault, "bundles", _boom)
+    reached.clear()
+    client.get("/")
+    assert reached == ["RuntimeError"]
+
+
+def test_shell_and_triage_default_render_e_config_safely(
+    tmp_path, monkeypatch
+):
+    """Neither route had ANY S6-era failure-injection test before this one.
+    Both declare `_SIDEBAR_CATCHES`, i.e. `(DestinationRegistryError, EntityManifestError)`.
+
+    Whatever answers the request, the OPERATOR must see a correct, safe
+    E-CONFIG response with no raw exception text. That is what this test
+    proves, unconditionally; the separate structural question of WHICH
+    handler answers is `test_shell_and_triage_default_declared_family_
+    never_reaches_the_global_fallback`, below.
+
+    `EntityManifestError` is injected here via the same `Vault.bundles`
+    vehicle used for `DestinationRegistryError`, rather than the function that
+    raises it in production.
+
+    An earlier revision of this docstring claimed design §11 records that no
+    real request can trigger it, "since `catalog = build_catalog()` runs at
+    module scope, before any handler exists". **Both halves are false**, and
+    review measured them: `Scope.__init__` calls `EntityCatalog.load(root)` on
+    every entity-scoped request, and `Vault.bundles()` re-resolves `_system`
+    on every call — module-scope catalog construction is irrelevant to either.
+    Deleting `entities.yaml` after startup yields a real `EntityManifestError`
+    at 500 with `E-CONFIG` on four routes. It raises inside `entity_scope`
+    dependency resolution, so no route-level `except` can answer it; a
+    dedicated handler is the fix, and it is app code owned by the Task 8
+    corrective. See the ledger's open-items entry.
+    """
+    from app.entities import EntityManifestError
+    from app.vault import DestinationRegistryError
+
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    client = TestClient(main.app)
+
+    for exc, expected_code in (
+        (DestinationRegistryError("registries unreadable"), "E-CONFIG"),
+        (EntityManifestError("manifest is invalid"), "E-CONFIG"),
+    ):
+        def _raise(self, __exc=exc):
+            raise __exc
+
+        monkeypatch.setattr(main.Vault, "bundles", _raise)
+        shell_response = client.get("/")
+        assert shell_response.status_code == 500
+        assert expected_code in shell_response.text, shell_response.text
+        assert 'role="alert"' in shell_response.text
+        assert str(exc) not in shell_response.text
+
+        triage_default_response = client.get("/triage")
+        assert triage_default_response.status_code == 500
+        assert expected_code in triage_default_response.text
+        assert 'role="alert"' in triage_default_response.text
+        assert str(exc) not in triage_default_response.text
+
+
+def test_shell_and_triage_default_declared_family_never_reaches_the_global_fallback(
+    tmp_path, monkeypatch
+):
+    """Both routes must answer their own declared family rather than relying
+    on the global fallback (design §5: "relying on it is a failure rather than
+    a silent default").
+
+    Task 14 found this open — Task 10 added the declaration and no handler, so
+    every request to `/` or `/triage` against a broken registry reached the
+    fallback and `ServerErrorMiddleware` re-raised a logged traceback for a
+    first-class described condition. That was the fourth and last occurrence of
+    the gap Tasks 11-13 closed on every other route family in turn. It shipped
+    first as an `xfail(strict=True)` recording the defect; the handler landed in
+    the same task, so this is now a hard assertion.
+    """
+    from app.vault import DestinationRegistryError
+
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    def _raise(self):
+        raise DestinationRegistryError("registries unreadable")
+
+    monkeypatch.setattr(main.Vault, "bundles", _raise)
+    client.get("/")
+    client.get("/triage")
+    assert reached == [], "design §5: the route itself must answer this, not the fallback"
+
+    # M3 (review): a positive control, unlike this test's three siblings
+    # (`test_triage_declared_family_never_reaches_the_global_fallback` etc.),
+    # which each prove the spy itself fires for something genuinely
+    # undeclared. Restore `Vault.bundles` first — an UNDECLARED exception
+    # from it would double-fault through the C1 sidebar re-entrancy guard
+    # (which only catches the declared `_SIDEBAR_CATCHES` family, by
+    # design), so the vehicle here is deliberately something OUTSIDE the
+    # `try` in each route body instead: `shell`'s own `datetime.now()` call
+    # (the same vehicle `test_pulse_declares_no_family` uses) and
+    # `triage_default`'s own `RedirectResponse(...)` call.
+    monkeypatch.undo()
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    class _BoomDatetime:
+        @staticmethod
+        def now(*args, **kwargs):
+            raise RuntimeError("undeclared by shell")
+
+    monkeypatch.setattr(main, "datetime", _BoomDatetime)
+    reached.clear()
+    client.get("/")
+    assert reached == ["RuntimeError"]
+
+    def _boom_redirect(*args, **kwargs):
+        raise RuntimeError("undeclared by triage_default")
+
+    monkeypatch.setattr(main, "RedirectResponse", _boom_redirect)
+    reached.clear()
+    client.get("/triage")
+    assert reached == ["RuntimeError"]
+
+
+def test_shell_and_triage_default_real_broken_archetypes_shows_e_config(
+    tmp_path, monkeypatch
+):
+    """The real-filesystem condition for both routes' `DestinationRegistryError`
+    member — no monkeypatching of application code, a genuinely malformed
+    `archetypes.yaml` on disk. `bundles()` -> `resolve_flags` ->
+    `self._archetypes` (`app/vault.py`) raises `DestinationRegistryError`
+    directly when `modules:` is entirely absent — a hand-editing mistake
+    distinct from the non-canonical `block:` value
+    `test_triage_page_with_broken_registry_shows_e_config_page` drives (that
+    one is invisible to `bundles()` itself; see this test's own investigation
+    in the Task 14 report).
+
+    A default `TestClient` (`raise_server_exceptions=True`) is the point:
+    it would raise in-test if either route let this escape to the global
+    fallback, so the real condition is proved answered by the route itself.
+    """
+    entities_yaml = """
+version: "1.0"
+entities:
+  alpha: { label: Alpha, flags: [] }
+"""
+    # No `modules:` key at all — `Vault._archetypes` raises directly on
+    # this shape, and every caller of `bundles()` reaches it unguarded.
+    archetypes_yaml = 'version: "2.0"\n'
+    write_vault(tmp_path, entities_yaml, archetypes_yaml)
+    monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
+    import app.main as main
+
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    for response in (client.get("/"), client.get("/triage")):
+        assert response.status_code == 500
+        assert "E-CONFIG" in response.text
+        assert 'role="alert"' in response.text
+
+
+def test_render_console_error_sidebar_reentrancy_survives_an_undeclared_failure(
+    tmp_path, monkeypatch
+):
+    """C1, isolated: the re-entrancy guard in `_render_console_error` must
+    protect the sidebar rebuild regardless of what code the ORIGINAL error
+    resolved to — not only when that code happens to be `E-CONFIG`.
+
+    Vehicle: `triage`'s own `read_inbox` call raises a genuinely UNDECLARED
+    `RuntimeError` (not in `_TRIAGE_CATCHES`), which escapes the route to
+    the global fallback and describes to `E-UNKNOWN` — a code that is, by
+    construction, never `"E-CONFIG"`. `Vault.bundles()` is SEPARATELY
+    patched to raise `DestinationRegistryError`, so the fallback's own
+    sidebar rebuild (triggered because the page is `E-UNKNOWN`, not
+    `E-CONFIG`) fails too. Before C1, keying the guard on the ORIGINAL
+    error's code meant this combination reached `Vault.bundles()`
+    unguarded a second time and the second failure propagated out of the
+    global fallback itself — an empty body. After C1, the guard catches on
+    READABILITY, so the page still renders with `bundles=None` and the
+    ORIGINAL `E-UNKNOWN` alert intact.
+    """
+    from app.vault import DestinationRegistryError
+
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+
+    def _raise_undeclared(*args, **kwargs):
+        raise RuntimeError("undeclared by triage")
+
+    def _raise_sidebar(self):
+        raise DestinationRegistryError("registries unreadable")
+
+    monkeypatch.setattr(main, "read_inbox", _raise_undeclared)
+    monkeypatch.setattr(main.Vault, "bundles", _raise_sidebar)
+
+    response = TestClient(main.app, raise_server_exceptions=False).get(
+        "/triage/alpha"
+    )
+
+    assert response.status_code == 500
+    assert response.text != "", "completely empty body"
+    assert 'role="alert"' in response.text
+    assert "E-UNKNOWN" in response.text
+
+
+def test_real_post_startup_system_redirect_never_reaches_the_global_fallback(
+    tmp_path, monkeypatch
+):
+    """C2' (S6 review round 2): `Vault.system_path` (app/vault.py) called
+    `resolve_system_registry` directly, unlike `Scope.system_path`
+    (app/scope.py), which converts `SystemRegistryPathError` (an
+    `EntityManifestError`) to `RedirectedPathError` (a `CrossScopeError`).
+    `Vault._archetypes` -> `_load_yaml` -> `system_path` could therefore
+    raise the raw, unconverted type straight out of `bundles()` — undeclared
+    by `_TRIAGE_CATCHES`, `_OUTBOX_CATCHES`, and `_REGISTRY_PRODUCTS_CATCHES`
+    (none of which name `EntityManifestError`), reachable on every request
+    because `bundles()` re-resolves `_system` every time it runs, not only
+    once at import.
+
+    Real filesystem, no monkeypatching of application code: `archetypes.yaml`
+    is moved out of `_system` and symlinked back in place AFTER the app has
+    already started — a realistic operator action (an editor or sync tool
+    replacing a file with a symlink), not a hostile one. `entities.yaml`
+    stays a real, resolvable file throughout, so `entity_scope`'s own
+    `EntityCatalog.load` (a separate call to `resolve_system_registry`,
+    unconverted, and NOT reachable from inside any route's own `try`/`except`
+    at all since dependency resolution runs before the route body) is not
+    exercised here — a whole-`_system`-directory redirection would ALSO
+    break that unrelated, pre-existing path and is out of scope for this
+    fix; see this test's docstring note below.
+    """
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+
+    real_archetypes = tmp_path / "_system/archetypes.yaml"
+    moved_aside = tmp_path / "archetypes-real.yaml"
+    moved_aside.write_bytes(real_archetypes.read_bytes())
+    real_archetypes.unlink()
+    real_archetypes.symlink_to(moved_aside)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    for url in (
+        "/", "/triage", "/triage/alpha", "/outbox/alpha", "/registry/alpha/products",
+    ):
+        reached.clear()
+        response = client.get(url)
+        assert response.status_code == 409, (url, response.text)
+        assert "E-TAMPER" in response.text, (url, response.text)
+        assert 'role="alert"' in response.text, url
+        assert reached == [], (
+            f"{url}: reached the global fallback via {reached} — "
+            "the route's own declared family must answer this"
+        )
+
+
+def test_pulse_declares_no_family(tmp_path, monkeypatch):
+    """`pulse` is the one route with nothing to inject: `catches=()` — no
+    registry read, no path resolution, no domain family (main.py's own
+    comment on the declaration). This pins that the declaration really is
+    empty (so it correctly contributes nothing to the disclosure sweep or
+    the `no-none` state-proof cell above) and that an undeclared exception
+    still reaches the global fallback rather than being silently absorbed.
+    """
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    assert main.pulse.__console_route__.catches == ()
+
+    # FastAPI captures the endpoint FUNCTION at route registration, so
+    # patching `main.pulse` itself would not change what the router calls.
+    # `datetime.now()` is the only thing the body touches, and `main.py`
+    # binds the class itself (`from datetime import datetime`), so a fake
+    # class with a raising `now()` is the vehicle.
+    class _BoomDatetime:
+        @staticmethod
+        def now(*args, **kwargs):
+            raise RuntimeError("undeclared by pulse")
+
+    monkeypatch.setattr(main, "datetime", _BoomDatetime)
+
+    client = TestClient(main.app, raise_server_exceptions=False)
+    response = client.get("/blocks/pulse")
+    assert response.status_code == 500
+    assert "E-UNKNOWN" in response.text
+
+
+def test_propose_declared_family_never_reaches_the_global_fallback(
+    tmp_path, monkeypatch
+):
+    """`propose` had no totality test before this one — only its
+    post-persistence branch (`preview_diff` raising `OutboxError`) was ever
+    injected. Its declared family is `(OutboxError, DestinationError,
+    CrossScopeError, DestinationRegistryError)`; this covers all four via
+    `propose_classification`, the pre-persistence call.
+    """
+    from app.destinations import MissingDestination
+    from app.outbox import OutboxError
+    from app.scope import RedirectedPathError
+    from app.vault import DestinationRegistryError
+
+    main, client = _propose_client(tmp_path, monkeypatch)
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    for exc, expected_code in (
+        (OutboxError("outbox is otherwise broken"), "E-INVALID"),
+        (MissingDestination("destination is unresolved"), "E-DEST"),
+        (RedirectedPathError("redirected source"), "E-TAMPER"),
+        (DestinationRegistryError("registries unreadable"), "E-CONFIG"),
+    ):
+        def _raise(*args, __exc=exc, **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "propose_classification", _raise)
+        response = client.post(
+            "/triage/alpha/propose",
+            data={"filename": "note.md", "module": "02-work", "sub": ""},
+        )
+        assert expected_code in response.text, response.text
+        assert reached == [], f"propose: fallback reached for {expected_code}"
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("undeclared by propose")
+
+    monkeypatch.setattr(main, "propose_classification", _boom)
+    TestClient(main.app, raise_server_exceptions=False).post(
+        "/triage/alpha/propose",
+        data={"filename": "note.md", "module": "02-work", "sub": ""},
+    )
+    assert reached == ["RuntimeError"]
+
+
+def test_propose_real_symlinked_receipt_shows_e_tamper(tmp_path, monkeypatch):
+    """The real-filesystem condition for `propose`'s `DestinationError`
+    member: an inbox receipt that is genuinely a symlink on disk, reached
+    through a normal POST with no monkeypatching of application code.
+    `propose` never calls `read_inbox` — it resolves the item path directly
+    (`scope.resolve("00-inbox", "active") / filename`) and hands it to
+    `propose_classification`, which is a different call path than `triage`'s
+    own real-symlink test uses (that one bypasses `read_inbox`'s list-time
+    guard deliberately; this one does not need to, because `propose` never
+    goes through `read_inbox` at all).
+
+    I4 (review): an earlier revision of this docstring claimed this drives
+    `propose`'s `CrossScopeError` member. Measured, it does not: the raised
+    type is `destinations.RedirectedSourceLeaf`
+    (`app/destinations.py` — a `DestinationError` subclass, not a
+    `CrossScopeError` one), thrown while `propose_classification` resolves
+    the classification destination for a symlinked source leaf. `E-TAMPER`
+    is correct either way (both subtypes map to it), but the *member*
+    exercised was mislabeled — see
+    `test_propose_real_symlinked_entity_root_shows_e_scope` below for
+    `propose`'s actual real `CrossScopeError` condition, which this file had
+    none of until that test.
+    """
+    main, client = _propose_client(tmp_path, monkeypatch)
+    active = tmp_path / "alpha/00-inbox/active"
+    target = tmp_path / "elsewhere.md"
+    target.write_text("outside the vault's inbox lifecycle\n", encoding="utf-8")
+    receipt = active / "symlinked-receipt.md"
+    receipt.symlink_to(target)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = TestClient(main.app).post(
+        "/triage/alpha/propose",
+        data={"filename": "symlinked-receipt.md", "module": "02-work", "sub": ""},
+    )
+
+    from app.console_errors import _CODES
+
+    assert reached == [], f"fallback reached: {reached}"
+    # E-TAMPER is `attention` severity, so Rule 5 gives it its own page
+    # status (409) rather than 200, even on this fragment-only route.
+    assert response.status_code == _CODES["E-TAMPER"].page_status
+    assert 'role="alert"' in response.text
+    assert "E-TAMPER" in response.text
+    assert "elsewhere.md" not in response.text
+    assert "symlinked-receipt.md" not in response.text
+
+
+def test_propose_real_symlinked_entity_root_shows_e_scope(tmp_path, monkeypatch):
+    """`propose`'s actual real-filesystem `CrossScopeError` condition (I4,
+    review): the test above was mislabeled, and once corrected `propose` had
+    NO real condition proving that declared member at all. `propose`'s own
+    first statement is `scope.resolve("00-inbox", "active") / filename` —
+    `Scope.resolve` raises `RedirectedPathError` (a `CrossScopeError`) when
+    the bound entity's root itself is a symlink (`if base != anchor: raise
+    ...`), reached before `propose_classification` is ever called. No
+    application code is monkeypatched.
+
+    `RedirectedPathError` maps to `E-TAMPER` by `mro` (the class map is
+    exact-vs-mro per class, not per code), the same code the mislabeled test
+    above produces — `Scope.resolve` does not distinguish WHERE along an
+    entity-scoped path the redirection occurred, so both symlink shapes
+    describe identically. What differs is the declared FAMILY member
+    exercised: this is genuinely `CrossScopeError`, not `DestinationError`.
+    """
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-alpha-root-marker"
+    outside.mkdir()
+    (outside / "00-inbox" / "active").mkdir(parents=True)
+    (outside / "00-inbox" / "active" / "note.md").write_text(
+        "---\ntitle: t\nsub: triage\n---\nbody\n", encoding="utf-8",
+    )
+    (outside / "02-work" / "active").mkdir(parents=True)
+    import shutil
+
+    shutil.rmtree(tmp_path / "alpha")
+    (tmp_path / "alpha").symlink_to(outside)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = TestClient(main.app).post(
+        "/triage/alpha/propose",
+        data={"filename": "note.md", "module": "02-work", "sub": ""},
+    )
+
+    from app.console_errors import _CODES
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert response.status_code == _CODES["E-TAMPER"].page_status
+    assert 'role="alert"' in response.text
+    assert "E-TAMPER" in response.text
+    assert "outside-alpha-root-marker" not in response.text
+
+
+def test_outbox_reject_real_corrupt_sibling_shows_e_unreadable(tmp_path, monkeypatch):
+    """The real-filesystem condition for `outbox_reject`, mirroring
+    `test_outbox_blocked_action_renders_one_alert_not_two` (`outbox_approve`'s
+    own real condition). `get_proposal` — which both `approve` and `reject`
+    call first — runs the strict `load_proposals`, so a corrupt sibling
+    record poisons `reject` on a perfectly valid id too, with no
+    monkeypatching of any application code at all.
+    """
+    from app.console_errors import _CODES
+
+    main, client, valid_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox/unreadable-reject-marker.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8",
+    )
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = TestClient(main.app).post(
+        "/outbox/alpha/reject", data={"id": valid_id}
+    )
+
+    assert reached == [], f"fallback reached: {reached}"
+    # E-UNREADABLE is `attention` severity, so the fragment status follows
+    # its own page status (422) rather than 200 (design §5).
+    assert response.status_code == _CODES["E-UNREADABLE"].page_status
+    assert 'role="alert"' in response.text
+    assert "E-UNREADABLE" in response.text
+    assert "unreadable-reject-marker" not in response.text
+    # The still-pending valid proposal was never touched by the refused
+    # reject — it is still on disk.
+    assert (tmp_path / "alpha/outbox" / f"{valid_id}.yaml").exists()
+
+
+def test_outbox_screen_real_symlinked_outbox_shows_e_scope(tmp_path, monkeypatch):
+    """The real-filesystem condition for `outbox_screen` (I6, review):
+    unlike every other route in this file, it had none — a CORRUPT
+    individual proposal RECORD reaches `project_outbox`'s phase-1 handling
+    and yields a `blocked` listing at 200
+    (`test_outbox_screen_renders_projection_blocked_listing`), never the
+    route's own `except`, so that clause had no real proof it ever runs.
+
+    A genuinely symlinked `alpha/outbox` DIRECTORY does: `project_outbox`
+    resolves the outbox directory itself through the bound scope before it
+    can glob anything inside it, and a symlink there raises before any
+    per-record handling even starts. No application code is monkeypatched.
+    """
+    from app.console_errors import _CODES
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    outbox_dir = tmp_path / "alpha/outbox"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-outbox-screen-marker"
+    outside.mkdir()
+    import shutil
+
+    shutil.rmtree(outbox_dir)
+    outbox_dir.symlink_to(outside)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = TestClient(main.app, raise_server_exceptions=False).get(
+        "/outbox/alpha"
+    )
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert response.status_code == _CODES["E-SCOPE"].page_status
+    assert 'role="alert"' in response.text
+    assert "E-SCOPE" in response.text
+    assert "outside-outbox-screen-marker" not in response.text
+
+
+def test_registry_delete_preview_real_symlinked_outbox_shows_e_scope(
+    tmp_path, monkeypatch
+):
+    """The real-filesystem condition for `registry_delete_preview`'s
+    `CrossScopeError` member.
+
+    `reference_count` does NOT read `products.yaml` at all — it counts
+    front-matter, workspace, and `books.db` references (`app/registry.py`),
+    so the symlinked-`products.yaml` vehicle
+    `test_registry_products_real_symlinked_registry_shows_e_tamper` uses has
+    NO effect on this route (measured directly: a symlinked `products.yaml`
+    against this route still returns 200 with the delete-impact fragment).
+    The real vehicle is `propose_delete`'s own `scope.resolve("outbox")`
+    call (`app/registry.py`), unconditional and before anything is written:
+    it re-resolves the entity's `outbox/` directory and raises when a
+    symlink makes the resolved path disagree with the anchored one. A
+    genuinely symlinked `alpha/outbox` reaches this for real.
+
+    M7 (review): an earlier revision of this docstring named
+    `_delete_proposal_path` as the vehicle and then said `scope.resolve
+    ("outbox")` raises first — two different claims in one paragraph. The
+    second is the one actually measured: `scope.resolve("outbox")` raises
+    `OutOfScopeError` for a symlink target outside the vault root, and
+    `_delete_proposal_path`'s own `RedirectedPathError` check never runs at
+    all for this shape. `E-SCOPE`, not `E-TAMPER` — still the same
+    `CrossScopeError` family member the route declares, just a different
+    refined subtype.
+
+    This condition also fires strictly BEFORE `propose_delete` opens the
+    proposal file, so — unlike the injected `no-proposal-written` cell in
+    the state-proof matrix — this is a real-filesystem instance of
+    `(committed=no, persistence=none)`: nothing is written at all.
+    """
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    outbox_dir = tmp_path / "alpha/outbox"
+    outbox_before = set(outbox_dir.glob("*.yaml"))
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-outbox-preview-marker"
+    outside.mkdir()
+    # `alpha/outbox` is not scaffolded by any fixture (design: outbox/ and
+    # staging/ are `system`, absent from archetypes.yaml `modules:`) and
+    # nothing has written to it yet in this test, so it does not exist yet.
+    if outbox_dir.exists():
+        import shutil
+
+        shutil.rmtree(outbox_dir)
+    outbox_dir.symlink_to(outside)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = TestClient(main.app).post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    )
+
+    assert reached == [], f"fallback reached: {reached}"
+    # E-SCOPE is `refusal` severity, and this route is `fragment-only`, so
+    # Rule 5 gives it 200 (the request-outcome status), not its page status.
+    assert response.status_code == 200
+    assert 'role="alert"' in response.text
+    assert "E-SCOPE" in response.text
+    assert "outside-outbox-preview-marker" not in response.text
+
+    # persistence=none: nothing was written anywhere, including the real
+    # (redirected) target directory.
+    assert list(outside.glob("*.yaml")) == []
+    assert outbox_before == set()

@@ -1387,3 +1387,156 @@ disk lookup).
   Critical or Important. Every finding was reproduced by the reviewer before
   acceptance and re-broken afterwards. **No unmeasured claim shipped in fix
   rounds 1 or 2** — the first passes on this branch of which that is true.
+
+---
+
+### The ruling on a fifth regression row — DENIED
+
+Task 14's round-2 fix for C2' converted `SystemRegistryPathError` to
+`RedirectedPathError` inside `Vault.system_path`, mirroring what
+`Scope.system_path` already does. That flipped one assertion in
+`tests/test_vault.py::test_vault_rejects_registry_leaf_redirected_outside_system`
+— a **fifth** pre-existing test change, and in the BUILD.md standing E4
+regression. Escalated. **Denied**, and the reasoning is worth keeping:
+
+> This change differs materially from the first four. Those preserved behavior
+> while correcting presentation expectations or restoring an inert test.
+> Changing `EntityManifestError` to unrelated `RedirectedPathError` alters the
+> service exception contract and can break existing callers. It solves a
+> presentation-layer catch gap by changing domain behavior.
+
+That is the right line, and the branch had drifted across it. The four granted
+rows each changed what a test *expects* about presentation; this would have
+changed what a service *raises*. The normative class map already distinguishes
+`SystemRegistryPathError → E-TAMPER` (exact) from `EntityManifestError →
+E-CONFIG` (mro), so preserving the raised type is what honours the contract —
+converting it would have discarded the distinction the map exists to draw.
+
+**Applied instead:** `Vault.system_path` restored to propagate
+`SystemRegistryPathError`; `tests/test_vault.py` restored unchanged;
+`SystemRegistryPathError` declared explicitly at the three route boundaries
+that lacked it (`_TRIAGE_CATCHES`, `_OUTBOX_CATCHES`,
+`_REGISTRY_PRODUCTS_CATCHES`) — the subclass by name rather than the
+`EntityManifestError` base because it is **narrower**: the base would also
+swallow `RecipientConfigurationError` and any future sibling.
+
+A first draft of this paragraph justified it as "so the `E-TAMPER` mapping is
+preserved rather than collapsed into `E-CONFIG`". **That was false**, and
+review disproved it with one command — `describe()` resolves on the raised
+instance's own class and never reads the route's declared tuple, so declaring
+the base still renders `E-TAMPER`. Recorded because the same paragraph
+elsewhere claims no unmeasured assertion shipped in this task; one did, in
+round 3, in this entry. The operator sees the same described outcome; no
+service contract moved. Four regression rows remain the total, all spent.
+
+**Also split out by the same ruling:** the late `app/vault.py` shape
+normalization (unknown flag → `ValueError`, `modules:` as a list →
+`AttributeError`, and the two shapes one level deeper — a module spec as a list
+or scalar, and a non-iterable `flags:`). That is Task 8 reader-boundary work
+under design §5 *Boundary conversions*, surfacing eleven tasks late. It
+implements an existing design rule, needs its own RED→GREEN evidence and
+review, and **must not be hidden inside a tests-only Task 14 commit**. Reverted
+out of Task 14 and preserved for a recorded Task 8 corrective.
+
+**Known live consequence, accepted deliberately.** Until that corrective lands,
+an unconverted stdlib shape from a hand-edited registry — a module spec that is
+a list or a scalar, or `flags:` as a scalar — still reaches the global fallback
+and renders an **empty-body 500** on all five sidebar routes. The C1 sidebar
+guard fixes the declared-type case and cannot fix this one, because the type is
+undeclared by construction. This is recorded rather than patched, because
+patching it shape-by-shape is what produced the finding twice already; the
+corrective converges `bundles()` onto `_destination_registry`'s existing
+validation instead.
+
+
+**Open item for the Task 8 corrective — the `entity_scope` dependency
+boundary.** Two real conditions raise *before the route body*, inside
+`Scope.__init__` → `EntityCatalog.load` → `resolve_system_registry`, so no
+route-level `except` can ever answer them and the three tuple entries above are
+structurally incapable of closing them. Measured, no monkeypatching:
+
+| Condition | Result |
+|---|---|
+| the whole `_system` directory redirected post-startup | `SystemRegistryPathError` → 409 `E-TAMPER`, fallback reached on `/triage/{e}`, `/outbox/{e}`, `/registry/{e}/products` |
+| `entities.yaml` deleted post-startup | `EntityManifestError` → 500 `E-CONFIG`, fallback reached on those three plus `/triage` |
+
+The operator sees a correct, safe, non-empty page in both, so **this is not a
+second release blocker** — but it is a sixth instance of design §5's "relying
+on it is a failure rather than a silent default", at a boundary no prior task
+touched. The fix is one dedicated `@app.exception_handler(EntityManifestError)`
+beside the existing `_entity_selection_error_handler` — exactly the shape
+Rule 6 prescribes for `entity_scope`. App code, so it belongs with the
+corrective, not with a tests-only task.
+
+Task 14's own real-filesystem test covers the **leaf** vehicle (a symlinked
+`archetypes.yaml` inside `_system`), which the routes *can* answer. An earlier
+summary claimed it covered the directory vehicle on all five routes; it does
+not, and the two are different boundaries.
+---
+
+### Task 14 — Cross-cutting proofs
+
+- **RED, measured**, selection `tests/test_console_routes.py`: **6 failed, 57
+  passed**.
+- **Suite:** 781 → **798** (14 new, 2 folded, 3 moved to the Task 8
+  corrective, 1 added for C2'). Gates: `test_app.py` 28 · outbox+registry+
+  git_transaction 205 · `test_vault.py` 23 (standing E4) · `diff --check`
+  clean.
+- **Zero pre-existing tests touched.** `app/vault.py`, `tests/test_vault.py`,
+  `tests/test_app.py` and `tests/test_console_readers.py` are byte-identical
+  to `HEAD`. Four regression rows remain the total.
+
+**Delivered:** the `(committed, persistence)` state-proof matrix, folding the
+two standalone persistence tests in; a disclosure sweep that parses the
+`role="alert"` subtree with `html.parser` rather than substring-checking raw
+HTML; and route totality — including, at last, the **declaration-driven**
+sweep design §7's closing rule has demanded since Task 11.
+
+**The gap found a fourth and a fifth time.** `shell` and `triage_default`
+declared `(DestinationRegistryError, EntityManifestError)` and had no
+`try`/`except` at all; three more routes omitted `SystemRegistryPathError`
+while calling `bundles()` inside their guarded regions. Both closed.
+
+**And a defect worse than any of them: `/` returned a 500 with a literally
+empty body.** `_render_console_error` keyed the sidebar re-entrancy guard on
+`error.code == "E-CONFIG"` rather than on whether bundles are *readable*, so
+any other `bundles()` failure re-entered `Vault.bundles()` **inside the global
+fallback** and raised again. Measured on a plain hand-editing mistake
+(`flags: [nosuchflag]`), no monkeypatching, on all five sidebar routes. The
+guard now tries and falls back to `None`.
+
+**What the new invariant does and does not do.** The declaration-driven sweep
+reads each endpoint's own `__console_route__.catches` at test time, so
+decorator/body **drift** is now caught — widening a decorator alone reds it.
+It cannot catch declaration **incompleteness**, because it injects only what a
+route already declares. Every gap found in Tasks 13 and 14 was invisible to
+exactly that shape and surfaced only from the real filesystem. **Stated
+plainly so no later reader mistakes the sweep for totality:** the invariant
+that would catch incompleteness — per route, every type reachable from its own
+call graph is declared or deliberately `E-UNKNOWN` — does not exist, and is
+S7's.
+
+**Carried, with the reviewer's agreement** (each re-measured this round): the
+`yes` cell's `outbox_approve` half lacks unrelated-state fingerprints, so a
+stray write during an approve *response render* is uncovered (nothing in S6
+writes there; fold into Task 15's state-proof gate); the totality sweep uses
+one patch target per route, so `propose`'s second `except` is deletable while
+green (real coverage exists elsewhere; add `preview_diff` and `project_outbox`
+targets opportunistically); the disclosure sweep covers **9 of 21** codes —
+residue `E-GIT`, `E-BUSY`, `E-CONFLICT`, `E-STALE`, `E-MISSING`, `E-ENTITY`,
+`E-REQUEST`, `E-UNKNOWN`; `_state_proof_unknown_concurrent_writer` omits
+`git_worktree_diff`; the approve `yes` scenario runs twice per suite; and the
+sweep is one monolithic function, so one of its 31 cases failing aborts the
+rest.
+
+**Three false written claims shipped and were caught in round 3** — the
+E-TAMPER/E-CONFIG rationale (disproved by one command), a `CrossScopeError`
+added to `_SIDEBAR_CATCHES` with no justification, no test and a comment
+contradicting it (deleted; suite unchanged at 798), and a docstring asserting
+design §11 makes `EntityManifestError` unreachable when `Scope.__init__` loads
+the catalog on every entity-scoped request. All corrected. The ninth, tenth and
+eleventh unmeasured claims on this branch; review has caught every one.
+
+- **Reviewer verdict:** clean after round 3 — round 1: 4 Critical, 8 Important,
+  7 Minor; round 2: 2 Critical, 3 Important, 4 Minor; round 3: 4 bounded
+  record/comment fixes, no test churn.
