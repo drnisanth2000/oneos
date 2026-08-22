@@ -179,3 +179,65 @@ service remains gated through an outbox proposal and explicit approval.
 
 Specific parsers and integration targets are instance data and remain in the
 vault's `decisions.md`, not this repository.
+
+## S7 inherits these from S6
+
+S6 is complete and its branch is frozen at a gate-certified tip. Five items pass
+to S7 explicitly, so none is rediscovered by accident. Each is stated as a rule
+or a measured condition; no instance values appear here or anywhere in this
+repository.
+
+**1. Approval bound to reviewed bytes.** A proposal id names a *mutable file*,
+not the bytes an operator reviewed. `approve`, `reject` and `execute_delete`
+each take an id and re-read the record, comparing it only against another read
+made in the same request, so between preview and approval another process may
+rewrite a proposal while preserving its id and filename. Every existing check
+validates the current record's internal consistency, never its correspondence to
+what was reviewed. The fix — hash the validated snapshot, submit
+`id + review_sha256`, compare before the first mutation, refuse visibly on
+mismatch — **adds a refusal condition**, which is precisely why S6 could not
+absorb it. The precedent is exact: S4 bound the source receipt's bytes and
+refused stale approvals; this binds the proposal record's bytes one artifact
+further out. S6 neither introduced nor widened the exposure.
+
+**2. Prose-leakage enforcement.** This repository has structural invariants for
+catch-alls, `hx-vals`, reader categories and route declarations — and **none for
+its own documentation**. AGENTS.md's one rule is enforced solely by the combined
+repo+vault audit, which needs the private vault and therefore cannot run in CI
+or in a cloud task. A private value consequently survived fifty commits and
+several careful readings of the exact line that carried it, and was caught only
+at the final gate. A check over tracked documentation, seeded from the manifest
+at gate time, would have caught it at the first commit.
+
+**3. Declaration-completeness gaps.** The declaration-driven totality sweep
+reads each endpoint's own declared catch tuple at test time, so decorator/body
+**drift** is caught — widening a decorator alone reds it. It cannot catch
+declaration **incompleteness**, because it injects only what a route already
+declares. Every gap found in Tasks 13 and 14 was invisible to exactly that shape
+and surfaced only by driving the real filesystem. The invariant that would close
+this — per route, every type reachable from its own call graph is either
+declared or deliberately routed to `E-UNKNOWN` — does not exist. Related: a
+broad typed handler can silently *retire* a narrower guard's coverage without
+changing behaviour, so whenever one is added above a layer declaring the same
+family, check the lower declaration is still pinned.
+
+**4. Remaining filesystem failure shapes.** Two realistic post-startup operator
+actions still reach the global fallback as `E-UNKNOWN` on four routes: the
+entity manifest with its permissions removed (`PermissionError`), and the vault
+root renamed or unmounted (`RuntimeError` from the root resolver). Both raise
+inside dependency resolution, so no route-level `except` can answer them; both
+are the same design §5 instance — relying on the fallback is a failure, not a
+silent default. The manifest reader is a declared `registry`-category structured
+reader, so the permission escape is invariant-4 adjacent.
+
+**5. Independent reviewer and mutation-tested verification — retained as
+method, not as an option.** Across roughly twenty review rounds on S6, nearly
+every finding was a defect in the *tests or the record* rather than in the
+feature. Twelve false claims shipped in code comments and in this project's own
+ledger; independent review caught all twelve, three of them inside corrections
+of earlier ones. The countermeasure that worked is mutation, not inspection:
+break the implementation, confirm the specific test fails, restore, confirm
+byte-identity. A green suite is evidence only after something was broken and the
+suite went red. Two corollaries earned the hard way — a count is meaningless
+without the pytest selection that produced it, and a control that does not run
+the code under test does not control it.
