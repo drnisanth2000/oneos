@@ -1703,3 +1703,68 @@ whether the lower declaration is still pinned by anything.
 - **Reviewer verdict:** one round, as scoped — 0 Critical, 1 load-bearing
   Important (fixed), 2 record-only Important, 4 Minor. Eight reviewer mutations;
   seven red, one green, and that one green was the finding.
+
+---
+
+### Task 15 gate failure — a private value in this document set, and the history rewrite
+
+The combined `--vault --history` audit **failed** at Task 15 Step 2.
+`docs/superpowers/plans/2026-08-16-s6-handoff.md:17` named **two vault entity
+bundles** while recording that Grey Matter carries two pre-existing uncommitted
+edits. That violates AGENTS.md's one rule — *"No instance-specific value ever
+appears in this repo. This prohibits organization, person, entity, module,
+vault-path, and credential values"* — and the plan lists it as a stop
+condition.
+
+Introduced when the handoff was first written and carried through **every**
+later edit to that table, four of them made during this session by an author
+who read the line each time and did not see it. **Every other gate passed**:
+vault unittest discovery 37, `check_v2` 0 errors / 0 warnings, policy enforcer
+`EXIT GATE: PASSED`, pinned Gitleaks no leaks, public `--history` audit CLEAN,
+public suite 832. Only the audit that reads the vault could see it, which is
+exactly why that audit exists and why it is unconditional.
+
+**The lesson is about the guard, not the slip.** The repo has an AST invariant
+for catch-alls, one for `hx-vals`, one for reader categories, one for route
+declarations — and none for its own prose. The one rule is enforced only by a
+gate that requires the private vault, so it cannot run in CI or in a cloud task,
+and the violation survived fifty commits and several careful readings. A
+`grep`-shaped check over tracked documentation, seeded from the manifest at
+gate time, would have caught it at the first commit. Recorded as S7 work.
+
+**Disposition, by human ruling:** rewrite the branch history rather than squash
+around the failed gate or accept it — *"S6 cannot be marked complete while its
+required `--history` audit is red."*
+
+**Local checkpoint completed; no remote action taken.**
+
+| | |
+|---|---|
+| Old tip | `c7335a2f3f0292560041f8ec1dec34bbd049a6a4` |
+| New tip | `d8200c91eb0e80af1d9f409f8052c2297b901936` |
+| Tree (both) | `1860547fb00e5546eab4d7a8279085d11b337b07` — **byte-identical** |
+| Range rewritten | `9caeb3a^..codex/s6-visible-console-failures`, 18 commits, 17 contaminated |
+| Force-with-lease anchor | `035e335930c4c6701e3bd7aeaee8e9ebcc39be3b` |
+
+The boundary is the **parent** of the introducing commit: `9caeb3a..` would have
+excluded `9caeb3a` itself and left the value in place. `git diff c7335a2 HEAD`
+is empty, so the rewrite altered only the two strings inside historical trees.
+`filter-branch` auto-creates `refs/original/…` pointing at the contaminated
+history; it was deleted immediately, and no tag, backup ref or remote branch was
+created — such a ref would keep the audit red by design. Reflogs were not
+expired and no garbage collection was run.
+
+**Post-rewrite, local branch:** public suite 832, Gitleaks 146 commits no leaks,
+public `--history` audit CLEAN, and no commit reachable from the local branch
+contains the value. The combined audit still reports 17 findings, and every
+cited SHA is reachable **only** from `refs/remotes/origin/codex/…`, which still
+points at the pre-rewrite tip — measured, not assumed. That is expected and is
+what the push resolves; the audit is not red because of anything in the
+rewritten branch.
+
+**SHAs recorded in earlier entries of this ledger are pre-rewrite
+identifiers and no longer resolve.** Every commit from `9caeb3a` onward has a
+new hash. The old→new mapping is not reproduced here because the old SHAs are
+themselves the thing being retired; the commit subjects are unchanged and remain
+the reliable way to locate a task's commit. Entries before `9caeb3a` are
+unaffected.
