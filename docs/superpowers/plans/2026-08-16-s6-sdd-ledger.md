@@ -1620,3 +1620,86 @@ satisfying the invariant's letter. No AST test can close the second class, and
   (blocker not cleared), 2 Important, 6 Minor; round 2: 1 Important
   (comment-only), 4 Minor. 15 mutations run by the reviewer across the two
   rounds; 11 red, 4 green and each of those four disclosed in source.
+
+---
+
+### Dependency-boundary corrective — the typed `EntityManifestError` handler
+
+Closes the Task 14 open item, as a separate commit by human ruling: *"This is
+presentation-boundary work, not reader normalization."*
+
+Two real post-startup operator actions raise inside FastAPI **dependency**
+resolution — `entity_scope` → `build_scope` → `Scope.__init__` →
+`EntityCatalog.load` → `resolve_system_registry` — before any route body, so no
+route `except` can ever answer them. They reached the global fallback and
+`ServerErrorMiddleware` re-raised a logged traceback. Sixth instance of design
+§5's "relying on it is a failure rather than a silent default", at a boundary no
+prior task touched.
+
+**Fix:** one `@app.exception_handler(EntityManifestError)` beside the existing
+`_entity_selection_error_handler` — the shape §5 Rule 6 prescribes.
+`SystemRegistryPathError` subclasses `EntityManifestError`, so one handler
+covers both while `describe()`, resolving on the **raised instance's** class,
+keeps `E-TAMPER` (exact) for the subclass and gives `E-CONFIG` (mro) to the
+base.
+
+**That mechanism was verified, not assumed** — a prior task shipped a false
+claim about exactly it. Mutating the handler to describe the base collapsed
+`E-TAMPER` → `E-CONFIG` and reddened only the subclass case. Registration order
+was also proved irrelevant empirically rather than read out of Starlette:
+`('base','exc')` and `('exc','base')` both give `409 BASE:Sub`.
+
+- **RED**, selection `tests/test_console_routes.py -k "post_startup_system_directory_redirect or post_startup_entities_yaml_missing"`: **2 failed**, each naming the fallback it reached.
+- **Suite:** 829 → **832**. Only `app/main.py` and `tests/test_console_routes.py`
+  modified; `app/entities.py`, `app/scope.py`, `app/vault.py` and every
+  pre-existing test byte-identical. Four regression rows still the total.
+
+**The load-bearing finding, and it is the interesting one.** Adding the handler
+**silently absorbed the whole family**, so deleting `SystemRegistryPathError`
+from the three route tuples the previous ruling ordered added left the entire
+suite **green** — while the same mutation against `HEAD` reds. Operator-visible
+output is identical either way, so this was a test-strength regression rather
+than a runtime defect, but it is precisely the declaration drift the ledger says
+must stay pinned, and the declaration-driven sweep cannot see it either, because
+that sweep injects only what a route already declares.
+
+Closed additively, spending no regression row:
+`test_route_tuples_still_answer_the_leaf_redirect_without_the_dependency_handler`
+removes the app-level handler for its duration and asserts the three routes
+still answer the **leaf** vehicle themselves — the condition they genuinely can
+handle, reached inside the body through `Vault.bundles()`. The
+whole-`_system`-directory vehicle is deliberately not used there: it raises in
+dependency resolution and only the handler can answer it. Verified both ways —
+dropping the tuple entries now reds this test; removing the handler reds three
+others.
+
+**A general lesson worth keeping:** a broad typed handler can *retire* a
+narrower guard's test coverage without changing any behaviour. Whenever a
+handler is added above a layer that already declares the same family, check
+whether the lower declaration is still pinned by anything.
+
+**Carried, record-only** (all measured, none affecting the shipped outcome):
+
+- Two further conditions reach the same boundary uncovered — `entities.yaml`
+  with permissions removed (`PermissionError` → `E-UNKNOWN`) and the vault root
+  renamed or unmounted (`RuntimeError` from `config.vault_root()` →
+  `E-UNKNOWN`), both on four routes with the fallback reached. `EntityCatalog.
+  load` is a declared `@structured_reader(category="registry")`, so the
+  `PermissionError` escape is invariant-4 adjacent. The residue of this open
+  item, not implied closed by it.
+- `/` renders a normal Command Center off the stale import-time catalog for
+  **every** manifest condition — deleted, invalid YAML, wrong shape, symlinked
+  out, chmod 000. The new test pins that as a regression guard; it is pinning a
+  **known gap**, not an approved outcome, and a later fix will red it.
+- The `/triage` row in the entities-missing loop is a 307 to `/triage/alpha`,
+  so it re-tests the same route rather than a fourth one.
+- Conditions the one handler **does** cover, verified with `fallback=[]`:
+  symlinked-out `entities.yaml` → 409 `E-TAMPER`; invalid YAML, `entities:` as a
+  list, `ingest:` not a mapping → 500 `E-CONFIG`; `_system` replaced by a
+  regular file → 500 `E-CONFIG`. The five `fragment-only` POSTs are covered too,
+  and `_endpoint_for` is populated during dependency resolution, so the fragment
+  surface is selected correctly and no whole document swaps into an HTMX target.
+
+- **Reviewer verdict:** one round, as scoped — 0 Critical, 1 load-bearing
+  Important (fixed), 2 record-only Important, 4 Minor. Eight reviewer mutations;
+  seven red, one green, and that one green was the finding.

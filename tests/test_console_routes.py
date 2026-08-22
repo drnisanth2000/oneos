@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
 import re
 import subprocess
 from html.parser import HTMLParser
@@ -3514,6 +3515,71 @@ def test_render_console_error_sidebar_reentrancy_survives_an_undeclared_failure(
     assert "E-UNKNOWN" in response.text
 
 
+def test_route_tuples_still_answer_the_leaf_redirect_without_the_dependency_handler(
+    tmp_path, monkeypatch
+):
+    """The dependency-boundary handler must not become the only thing
+    answering `SystemRegistryPathError`.
+
+    Review found that adding `@app.exception_handler(EntityManifestError)`
+    silently absorbs the whole family, so deleting `SystemRegistryPathError`
+    from `_TRIAGE_CATCHES` / `_OUTBOX_CATCHES` / `_REGISTRY_PRODUCTS_CATCHES`
+    — the three declarations a human ruling ordered added — left the entire
+    suite **green**. Operator-visible output is identical either way, so this
+    is a test-strength regression rather than a runtime defect; but it is
+    exactly the declaration drift the ledger says must stay pinned, and the
+    declaration-driven sweep cannot see it either, since that sweep injects
+    only what a route already declares.
+
+    So this test removes the app-level handler for its duration and asserts
+    the routes still answer the **leaf** vehicle themselves — the condition
+    they genuinely can and must handle, reached inside the body through
+    `Vault.bundles()`. The whole-`_system`-directory vehicle is deliberately
+    NOT used here: that one raises in dependency resolution and only the
+    handler can answer it.
+    """
+    from app.entities import EntityManifestError
+
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+
+    real_archetypes = tmp_path / "_system/archetypes.yaml"
+    moved_aside = tmp_path / "archetypes-real-tuple-pin.yaml"
+    moved_aside.write_bytes(real_archetypes.read_bytes())
+    real_archetypes.unlink()
+    real_archetypes.symlink_to(moved_aside)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    monkeypatch.delitem(main.app.exception_handlers, EntityManifestError)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    for url in ("/triage/alpha", "/outbox/alpha", "/registry/alpha/products"):
+        reached.clear()
+        response = client.get(url)
+        assert response.status_code == 409, url
+        assert "E-TAMPER" in response.text, url
+        assert reached == [], (
+            f"{url}: the route's OWN declared family must answer the leaf "
+            "redirect, not the dependency-boundary handler"
+        )
+
+    # Sanity: the spy fires for something genuinely undeclared, so the empty
+    # lists above are proof of routing rather than of a dead spy.
+    def _boom(scope):
+        raise RuntimeError("undeclared by this route")
+
+    monkeypatch.setattr(main, "read_inbox", _boom)
+    reached.clear()
+    client.get("/triage/alpha")
+    assert reached == ["RuntimeError"]
+
+
 def test_real_post_startup_system_redirect_never_reaches_the_global_fallback(
     tmp_path, monkeypatch
 ):
@@ -3570,6 +3636,196 @@ def test_real_post_startup_system_redirect_never_reaches_the_global_fallback(
             f"{url}: reached the global fallback via {reached} — "
             "the route's own declared family must answer this"
         )
+
+
+def _fs_snapshot(root: Path) -> list[tuple[str, str]]:
+    """`(relative posix path, fingerprint)` for every entry under `root` —
+    `symlink->target` for a symlink, `dir` for a directory, and a content
+    hash for a regular file. Cheap, git-free proof that a read-only failure
+    path writes nothing to disk; these fixtures are plain directories, not
+    Git repositories, so `git status`/`git diff` fingerprints (as the
+    committed-outcome tests elsewhere in this file use) do not apply here."""
+    entries = []
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root).as_posix()
+        if p.is_symlink():
+            entries.append((rel, f"symlink->{os.readlink(p)}"))
+        elif p.is_dir():
+            entries.append((rel, "dir"))
+        else:
+            entries.append((rel, hashlib.sha256(p.read_bytes()).hexdigest()))
+    return entries
+
+
+def test_real_post_startup_system_directory_redirect_shows_e_tamper_everywhere(
+    tmp_path, monkeypatch
+):
+    """Task 14's open item: `test_real_post_startup_system_redirect_never_
+    reaches_the_global_fallback` above symlinks only `archetypes.yaml` back
+    into place, and its own docstring concedes that leaves `entity_scope`'s
+    `EntityCatalog.load` — a SEPARATE call to `resolve_system_registry`,
+    unconverted — unexercised: "a whole-`_system`-directory redirection would
+    ALSO break that unrelated, pre-existing path and is out of scope for this
+    fix."
+
+    This test is that whole-directory redirection. `resolve_system_registry`'s
+    own root-identity check (`resolved_system != lexical_system`) then fires
+    from every caller, including `Scope.__init__` -> `EntityCatalog.load`,
+    which runs inside `entity_scope`'s DEPENDENCY resolution — before any
+    route body executes. No route-level `except` can ever see it (the design
+    §5 gap this task closes); only a dedicated
+    `@app.exception_handler(EntityManifestError)` can, since
+    `SystemRegistryPathError` is a subclass and `describe()` still resolves
+    on the raised instance's own (narrower) class, not the handler's.
+
+    Real filesystem, no monkeypatching of application code: `_system` is
+    moved aside and symlinked back in place AFTER the app has already
+    started — a realistic operator action, not a hostile one.
+
+    `/` and `/triage` are driven too, and must keep answering via their own
+    already-declared `_SIDEBAR_CATCHES` family (acceptance criterion 5: their
+    pre-existing behaviour is unchanged by adding the new handler) rather
+    than falling through to it.
+    """
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+
+    vault = Path(tmp_path)
+    real_system = vault / "_system"
+    moved_aside = vault / "_system-real"
+    real_system.rename(moved_aside)
+    real_system.symlink_to(moved_aside)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    before = _fs_snapshot(vault)
+
+    for url in (
+        "/", "/triage", "/triage/alpha", "/outbox/alpha", "/registry/alpha/products",
+    ):
+        reached.clear()
+        response = client.get(url)
+        assert response.status_code == 409, (url, response.text)
+        assert response.text != "", (url, "completely empty body")
+        # The exact raw message `resolve_system_registry` raises
+        # ("system registry root is redirected") is passed as a marker so a
+        # handler that leaked `str(exc)` into the rendered alert — rather
+        # than only its curated, code-derived description — would be caught
+        # here even though that particular raw message happens to carry no
+        # path separator of its own.
+        _assert_alert_discloses_nothing(
+            response, "E-TAMPER", ["system registry root is redirected"]
+        )
+        assert reached == [], (
+            f"{url}: reached the global fallback via {reached} — "
+            "a dedicated handler (or the route's own declared family) must "
+            "answer this without relying on it (design §5)"
+        )
+
+    assert _fs_snapshot(vault) == before, "a read-only failure must not mutate the vault"
+
+    # Positive control (M3 pattern, as the sibling test above): restore the
+    # real layout and prove the very same spy fires for something genuinely
+    # undeclared, so the all-clear `reached == []` runs above are not simply
+    # a spy that never fires at all.
+    real_system.unlink()
+    moved_aside.rename(real_system)
+
+    def _raise_undeclared(*args, **kwargs):
+        raise RuntimeError("undeclared by triage")
+
+    monkeypatch.setattr(main, "read_inbox", _raise_undeclared)
+    reached.clear()
+    client.get("/triage/alpha")
+    assert reached == ["RuntimeError"]
+
+
+def test_real_post_startup_entities_yaml_missing_shows_e_config_via_entity_scope(
+    tmp_path, monkeypatch
+):
+    """The second half of Task 14's open item: `entities.yaml` itself
+    deleted (rather than `_system` redirected) after startup.
+    `EntityCatalog.load` (`app/entities.py`) raises `EntityManifestError`
+    directly — "entities manifest is missing" — from inside `entity_scope`'s
+    dependency resolution on every entity-scoped route, unreachable by any
+    route's own `except` for the identical reason as the redirect case above.
+
+    `/` is driven too, and is pinned at 200: `shell` builds its sidebar from
+    the module-scope `catalog` global (`build_catalog()`, evaluated once at
+    import time) via `Vault(catalog).bundles()`, which never re-reads
+    `entities.yaml` — so this condition does not reach it at all. That is
+    long-standing, unrelated behaviour, not a target of this fix; asserting
+    it here pins that the fix does not accidentally change it.
+
+    `/triage` is driven through `TestClient`'s default `follow_redirects=True`:
+    `triage_default` still redirects (307) to `/triage/alpha` using that same
+    stale catalog, and the client follows the redirect into the identical
+    `entity_scope` failure `/triage/alpha` shows directly — so `/triage`
+    surfaces the same `E-CONFIG` outcome as the other three entity-scoped
+    routes, unlike `/`.
+    """
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+
+    vault = Path(tmp_path)
+    (vault / "_system/entities.yaml").unlink()
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    before = _fs_snapshot(vault)
+
+    reached.clear()
+    root_response = client.get("/")
+    assert root_response.status_code == 200, root_response.text
+    assert 'role="alert"' not in root_response.text
+    assert reached == []
+
+    for url in ("/triage", "/triage/alpha", "/outbox/alpha", "/registry/alpha/products"):
+        reached.clear()
+        response = client.get(url)
+        assert response.status_code == 500, (url, response.text)
+        assert response.text != "", (url, "completely empty body")
+        # Same rationale as the redirect test's marker above: the exact raw
+        # message `EntityCatalog.load` raises for a missing manifest.
+        _assert_alert_discloses_nothing(
+            response, "E-CONFIG", ["entities manifest is missing"]
+        )
+        assert reached == [], (
+            f"{url}: reached the global fallback via {reached} — "
+            "a dedicated handler must answer this without relying on it "
+            "(design §5)"
+        )
+
+    assert _fs_snapshot(vault) == before, "a read-only failure must not mutate the vault"
+
+    # Positive control: `/` never touches `entity_scope`, so its own
+    # undeclared-failure vehicle (`shell`'s `datetime.now()` call, as
+    # `test_shell_and_triage_default_declared_family_never_reaches_the_
+    # global_fallback` uses) is independent of the deleted manifest and
+    # proves the spy fires for something genuinely undeclared.
+    class _BoomDatetime:
+        @staticmethod
+        def now(*args, **kwargs):
+            raise RuntimeError("undeclared by shell")
+
+    monkeypatch.setattr(main, "datetime", _BoomDatetime)
+    reached.clear()
+    client.get("/")
+    assert reached == ["RuntimeError"]
 
 
 def test_pulse_declares_no_family(tmp_path, monkeypatch):

@@ -221,6 +221,44 @@ async def _entity_selection_error_handler(
     return _render_console_error(request, describe(exc))
 
 
+#: Task 14 corrective (design §5 Rule 6's shape, applied to the ONE other
+#: framework-adjacent site that needed it): `entity_scope` -> `build_scope`
+#: -> `Scope.__init__` -> `EntityCatalog.load` -> `resolve_system_registry`
+#: can raise `EntityManifestError` (a missing/invalid `entities.yaml`) or its
+#: narrower subclass `SystemRegistryPathError` (a redirected `_system`) —
+#: from inside FastAPI's DEPENDENCY resolution, which runs before any route
+#: body. No route-level `except` can ever see either: `shell` and
+#: `triage_default` already answer them via `_SIDEBAR_CATCHES` because they
+#: reach `EntityManifestError` a different way (`Vault(catalog).bundles()`,
+#: not `Scope.__init__`). **Eight** routes take `EntityScope` — `triage`,
+#: `propose`, `outbox_screen`, `outbox_approve`, `outbox_reject`,
+#: `registry_products`, `registry_delete_preview`, `registry_delete_execute`
+#: — and this family reaches all of them **unguarded** only through the
+#: dependency. (It also reaches the three page routes inside their bodies via
+#: `Vault.bundles()`, which is why `SystemRegistryPathError` sits in their
+#: catch tuples; that path is guarded, this one was not.) The five
+#: `fragment-only` POSTs are covered by the same handler: `_endpoint_for` is
+#: populated during dependency resolution, so the fragment surface is
+#: selected correctly and no whole document is swapped into an HTMX target.
+#:
+#: One handler suffices for both classes: Starlette dispatches on the most
+#: specific registered ancestor in the raised instance's MRO, so a raised
+#: `SystemRegistryPathError` is routed here (there is no more specific
+#: handler for it) while `describe()` — verified, not assumed, since a prior
+#: task shipped a false claim about this exact mechanism (see
+#: `_TRIAGE_CATCHES`'s own declaration comment) — resolves on the RAISED
+#: INSTANCE's own class via `_EXACT`/`_MRO`, never on the handler's declared
+#: type. `SystemRegistryPathError` has its own `_EXACT` entry (`E-TAMPER`),
+#: so it keeps that code; `EntityManifestError` itself has no `_EXACT` entry
+#: and falls through to its `_MRO` entry (`E-CONFIG`). Neither ever reaches
+#: `_console_fallback_handler`.
+@app.exception_handler(EntityManifestError)
+async def _entity_manifest_error_handler(
+    request: Request, exc: EntityManifestError
+) -> HTMLResponse:
+    return _render_console_error(request, describe(exc))
+
+
 @app.exception_handler(RequestValidationError)
 async def _request_validation_error_handler(
     request: Request, exc: RequestValidationError
