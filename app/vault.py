@@ -35,6 +35,49 @@ def _is_registry_id(value: object) -> bool:
     return isinstance(value, str) and _REGISTRY_ID.fullmatch(value) is not None
 
 
+def _boundary(read, message: str):
+    """Task 8 corrective (design §5 "Boundary conversions"): perform a
+    registry access whose only failure mode is the wrong SHAPE — an
+    `AttributeError` from calling a mapping method (`.items()`, `.get()`) on
+    something that is not a mapping, or a `TypeError` from an
+    unhashable/non-iterable value reaching `set(...)` or `in` — and convert
+    that escape into `DestinationRegistryError`.
+
+    `_destination_registry` already converts these shapes, but with FULLER,
+    STRICTER semantic validation (canonical ids, `requires_flag` present in
+    a declared `flags:`, `lifecycle_pattern` typing, ...) than
+    `resolve_flags` / `active_modules` / `block_of` have ever enforced —
+    those three serve `bundles()`, called unguarded from every Console page,
+    and S6 has no authority to fatal-ize a shape it currently tolerates (a
+    `flags:` written as a plain list of names, e.g., works today via
+    `set([...])` and must keep working). So this is deliberately NOT an
+    `isinstance` pre-check shared with `_destination_registry` — that was
+    tried (see the task's saved, reverted patch) and it measurably changes
+    which shapes are fatal. Instead, `read` performs the UNMODIFIED original
+    access: any shape that already succeeds keeps succeeding with the
+    identical result, and only a shape that already raises one of these two
+    specific errors is retyped. Never a fatality change, in either
+    direction.
+
+    M6 (S6 corrective review): this is NOT the identical shape as
+    `_destination_registry`'s own precedent, and the claim is corrected
+    here rather than repeated. `_destination_registry` wraps its
+    `self._archetypes` access in a single `try`/`except` around the WHOLE
+    property read, catching six types (`OSError`, `TypeError`,
+    `AttributeError`, `KeyError`, `ValueError`, `yaml.YAMLError`) — a
+    single-statement guard that nonetheless catches six types. `_boundary`
+    is narrower on the type axis only: one
+    access at a time (never a whole function body — Rule 5 forbids that
+    breadth), and only the two types a wrong-shape access can actually
+    raise. What the two share is the destination type and the principle
+    (retype an escape, change nothing else) — not the shape of the guard.
+    """
+    try:
+        return read()
+    except (AttributeError, TypeError) as exc:
+        raise DestinationRegistryError(message) from exc
+
+
 @dataclass(frozen=True)
 class Module:
     name: str
@@ -107,18 +150,38 @@ class Vault:
         for parity with the wizard, never called with an archetype at read time.
         """
         cfg = self._archetypes
-        declared = set(cfg.get("flags") or {})
+        declared = _boundary(
+            lambda: set(cfg.get("flags") or {}),
+            "archetypes.yaml `flags:` must be a mapping",
+        )
         active: set[str] = set()
 
         if archetype:
-            bundle = (cfg.get("archetypes") or {}).get(archetype)
+            # M1 (S6 corrective review): `bundles()` never passes an
+            # `archetype` — this branch is console-unreachable today — but
+            # design §5 binds the READER, not the caller, so the same two
+            # conversions apply here as everywhere else in this function.
+            bundle = _boundary(
+                lambda: (cfg.get("archetypes") or {}).get(archetype),
+                "archetypes.yaml `archetypes:` must be a mapping",
+            )
             if bundle is None:
-                raise ValueError(f"unknown archetype {archetype!r}")
-            active |= {f for f, on in (bundle or {}).items() if on}
+                raise DestinationRegistryError(f"unknown archetype {archetype!r}")
+            active |= _boundary(
+                lambda: {f for f, on in (bundle or {}).items() if on},
+                f"archetypes.yaml archetype {archetype!r} must be a mapping",
+            )
 
         for f in flags or []:
             if f not in declared:
-                raise ValueError(f"unknown flag {f!r}")
+                # C2 (S6 review, Task 8 corrective): an unknown flag in
+                # entities.yaml is a registry-validity condition, not a
+                # programmer error, and this is called unguarded from every
+                # Console page (design §5) — already fatal; only the type
+                # changes, so every route's own DestinationRegistryError
+                # catch answers it instead of the untyped ValueError
+                # reaching the global fallback as E-UNKNOWN.
+                raise DestinationRegistryError(f"unknown flag {f!r}")
             active.add(f)
 
         return active
@@ -126,12 +189,27 @@ class Vault:
     def active_modules(self, active_flags: set[str]) -> list[str]:
         """A module is active unless it declares `requires_flag:` and that flag
         is absent. Sorted, so zero-padded names order 00→15."""
+        modules = self._archetypes["modules"]
+        items = _boundary(
+            lambda: list(modules.items()),
+            "archetypes.yaml `modules:` must be a mapping",
+        )
         out = []
-        for name, spec in self._archetypes["modules"].items():
-            required = (spec or {}).get("requires_flag")
-            if required is None or required in active_flags:
+        for name, spec in items:
+            required = _boundary(
+                lambda: (spec or {}).get("requires_flag"),
+                f"archetypes.yaml module {name!r} spec must be a mapping",
+            )
+            activated = required is None or _boundary(
+                lambda: required in active_flags,
+                f"archetypes.yaml module {name!r} requires_flag must be a string",
+            )
+            if activated:
                 out.append(name)
-        return sorted(out)
+        return _boundary(
+            lambda: sorted(out),
+            "archetypes.yaml `modules:` keys must be comparable strings",
+        )
 
     @cached_property
     def _destination_registry(self) -> tuple[dict, dict, dict]:
@@ -241,8 +319,23 @@ class Vault:
 
     def block_of(self, module: str) -> str:
         """Block for a module, derived from the registry — never hardcoded,
-        never stored per file."""
-        return ((self._archetypes["modules"].get(module) or {}).get("block", ""))
+        never stored per file.
+
+        Task 8 corrective: `Classifier.classify` (app/classifier.py) calls
+        this directly with a module name read from `classifier/rules.yaml`,
+        independently of `bundles()` / `active_modules` — so the identical
+        unguarded access here is reachable on its own, not merely "already
+        validated by the time bundles() gets here" as it is on that path.
+        """
+        modules = self._archetypes["modules"]
+        spec = _boundary(
+            lambda: modules.get(module),
+            "archetypes.yaml `modules:` must be a mapping",
+        )
+        return _boundary(
+            lambda: (spec or {}).get("block", ""),
+            f"archetypes.yaml module {module!r} spec must be a mapping",
+        )
 
     # --- sidebar model ------------------------------------------------------
 
@@ -265,7 +358,10 @@ class Vault:
                     name=name,
                     block=self._block_of(name),
                     # E4 only when the bundle exists but this module does not.
-                    missing=on_disk and not (bundle_dir / name).is_dir(),
+                    missing=on_disk and not _boundary(
+                        lambda: (bundle_dir / name).is_dir(),
+                        "archetypes.yaml module name must be a string",
+                    ),
                 )
                 for name in names
             )

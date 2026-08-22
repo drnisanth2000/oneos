@@ -1540,3 +1540,83 @@ eleventh unmeasured claims on this branch; review has caught every one.
 - **Reviewer verdict:** clean after round 3 — round 1: 4 Critical, 8 Important,
   7 Minor; round 2: 2 Critical, 3 Important, 4 Minor; round 3: 4 bounded
   record/comment fixes, no test churn.
+
+---
+
+### Task 8 corrective — converge `bundles()` on the reader boundary
+
+Ordered by human ruling after Task 14 found the S6 release blocker: a
+hand-edited registry made `/` return a **500 with a literally empty body** on
+all five sidebar routes. Task 14 shipped two narrow guards and review
+immediately found two more shapes one level deeper, so the ruling fixed the
+direction — *converge `bundles()` on `_destination_registry`, preserving
+tolerated inputs and typing already-fatal malformed shapes as `E-CONFIG`* —
+and split it out of the tests-only task.
+
+- **RED, measured**, selection `tests/test_console_readers.py
+  tests/test_console_routes.py` against `HEAD:app/vault.py`: **20 failed, 97
+  passed**.
+- **Suite:** 798 → 821 → **829**. Gates: `test_vault.py` **23** (BUILD.md
+  standing E4, byte-identical to `HEAD`) · `test_app.py` 28 ·
+  outbox+registry+git_transaction 205 · `test_destinations.py` 53 ·
+  `diff --check` clean.
+- **Zero pre-existing tests changed.** Four regression rows remain the total;
+  none spent here.
+
+**The convergence is not the one the ruling literally named, and the deviation
+is measured.** `_destination_registry` is materially stricter — canonical ids,
+flag descriptions, `requires_flag` present in a declared `flags:`. Reusing its
+`isinstance` pre-checks would have **fatal-ized shapes `bundles()` tolerates
+today** (`flags:` as a plain list of names genuinely activates modules), which
+S6 has no authority to do. Instead `_boundary(read, message)` runs the
+**unmodified** access in a lambda and retypes only an already-raised
+`AttributeError`/`TypeError`. That cannot change fatality in either direction
+by construction rather than by testing.
+
+**The blocker is cleared, measured on real files with no monkeypatching.**
+Reviewer's route differential, 67 shapes × 5 routes × {inbox, no-inbox} = 638
+responses: **empty bodies 420 → 0**, zero status regressions, the global
+fallback never reached on a served route. Fatality differential, 170 shapes ×
+5 entry points = 850 probes: **0 `OK → RAISE`**, 0 `RAISE → OK`, 0 value
+changes, **0 residual `E-UNKNOWN`**. Task 8's own history contains an invented
+refusal caught in review; that defect class is absent here.
+
+**Two findings worth carrying forward as method, not just fixes.**
+
+*The axis, not the case.* The first fix guarded three value-shaped accesses and
+review found two **key**-shaped ones: a `modules:` key resolving to a
+non-string — a truncated `00-intake` → `0`, a YAML 1.1 bareword `on:`/`no:` →
+`bool`, a float, mixed key types — still blanked all five routes. The 3×6 grid
+missed them because *its axes varied only the value and never a key*. The fix
+added the **axis**; the reviewer then probed 36 key shapes, 22 never discussed,
+and all convert while every tolerated string key is untouched.
+
+*A tolerance class can pass vacuously.* The sole justification for deviating
+from the ruling — that `flags:` as a plain list must keep working — was pinned
+by four rows that are all **falsy** and short-circuit through `or {}`. Applying
+the `isinstance` mutation left the suite green. The discriminating shape
+existed in no fixture in the repo. Now pinned by
+`test_flags_as_plain_list_activates_a_gated_module`: under that mutation,
+**1 failed, 828 passed** — that one test and nothing else.
+
+**Access points miscounted twice, in the same direction, so they are no longer
+counted.** The comment said three; review measured five; the correction said
+five and review measured **eight** by frame-instrumenting `_boundary` during
+real `bundles()` calls. Each miscount was an enumeration written from reading
+rather than measurement, and the first is what let the key-shaped defect ship.
+Per design §7's closing rule the enumeration is deleted and replaced by the
+shape space it should always have been; the census is left as
+`grep -n '_boundary(' app/vault.py`. Twelfth unmeasured claim on this branch;
+review has caught all twelve.
+
+**Carried (Minor, not fixed):** the M2 AST invariant that pins §5's narrowness
+is defeatable two ways — a blanket `try` relocated into a helper outside the
+four guarded names, and a single mega-lambda that collapses a whole loop into
+one `_boundary` call, violating the *substance* of the narrowness rule while
+satisfying the invariant's letter. No AST test can close the second class, and
+§7 says invariants "only refuse silence"; recorded rather than chased.
+
+- **Reviewer verdict:** clean after one bounded fix pass — round 1: 1 Critical
+  (blocker not cleared), 2 Important, 6 Minor; round 2: 1 Important
+  (comment-only), 4 Minor. 15 mutations run by the reviewer across the two
+  rounds; 11 red, 4 green and each of those four disclosed in source.

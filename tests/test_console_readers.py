@@ -6,6 +6,7 @@ import pathlib
 import textwrap
 
 import pytest
+import yaml
 
 from tests.conftest import write_vault
 
@@ -489,3 +490,318 @@ def test_archetypes_without_modules_is_config_not_unknown(tmp_path):
     with pytest.raises(Exception) as raised:
         Vault(EntityCatalog.load(tmp_path)).bundles()
     assert describe(raised.value).code == "E-CONFIG"
+
+
+def test_archetypes_modules_as_list_is_config_not_unknown(tmp_path):
+    """C2 (S6 review): `archetypes.yaml` with `modules:` written as a LIST
+    rather than a mapping is valid YAML, wrong shape — `Vault.active_modules`
+    called `.items()` on it directly (`app/vault.py`), raising a bare
+    `AttributeError` that reached the operator as `E-UNKNOWN` on every
+    `bundles()` caller, exactly like the unknown-flag shape below but from
+    the OTHER of the two sites review named."""
+    from app.console_errors import describe
+    from app.entities import EntityCatalog
+    from app.vault import DestinationRegistryError, Vault
+
+    write_vault(
+        tmp_path, ENTITIES,
+        archetypes_yaml='version: "2.0"\nflags: {}\nmodules:\n  - 00-intake\n',
+    )
+    with pytest.raises(DestinationRegistryError) as raised:
+        Vault(EntityCatalog.load(tmp_path)).bundles()
+    assert describe(raised.value).code == "E-CONFIG"
+
+
+def test_entities_unknown_flag_is_config_not_unknown(tmp_path):
+    """C2 (S6 review): a hand-edited `entities.yaml` naming a flag that
+    `archetypes.yaml` never declares is valid YAML — the wrong VALUE, not
+    the wrong shape — and `Vault.resolve_flags` raised a bare `ValueError`
+    for it (`app/vault.py`), which reached the operator as `E-UNKNOWN`
+    (and, through the C1 sidebar re-entrancy bug, an EMPTY 500 body) on
+    every one of `bundles()`'s callers: `/`, `/triage`, `/triage/<entity>`,
+    `/outbox/<entity>`, and `/registry/<entity>/products`. This is the
+    SECOND of the two real shapes review measured; the existing test above
+    covers the other (`modules:` entirely absent) — the review's point was
+    that an existing test picking one shape does not prove its neighbour is
+    covered, and here it was not."""
+    from app.console_errors import describe
+    from app.entities import EntityCatalog
+    from app.vault import DestinationRegistryError, Vault
+
+    write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  demo: {label: Demo, flags: [nosuchflag]}\n',
+    )
+    with pytest.raises(DestinationRegistryError) as raised:
+        Vault(EntityCatalog.load(tmp_path)).bundles()
+    assert describe(raised.value).code == "E-CONFIG"
+
+
+# --- Task 8 corrective: bundles() shape-space boundary conversion ----------
+#
+# design §5 "Boundary conversions" requires every registry reader to
+# normalize a failure that ESCAPES it — a list where a mapping is expected,
+# raising `AttributeError` or `TypeError` on access — into
+# `DestinationRegistryError`. `resolve_flags` / `active_modules` / `block_of`
+# (the three functions `bundles()` reads `archetypes.yaml` through — they
+# hold eight guarded accesses between them; see app/main.py on why the
+# count is not written down, independent
+# of `_destination_registry`'s own, stricter, semantic validation) did not.
+#
+# Each row below was measured against the UNCORRECTED `app/vault.py` with a
+# standalone probe (no test framework, no monkeypatching) before this test,
+# or the fix it pins, existed: `tolerated=True` rows already succeed today
+# and MUST keep succeeding with the identical result; `tolerated=False` rows
+# already raise a bare `AttributeError` or `TypeError` (reaching the
+# operator as `E-UNKNOWN`, and — through the C1 sidebar-rebuild re-entrancy
+# path `app/main.py` documents — an EMPTY 500 body on every one of
+# `bundles()`'s five callers) and must become a typed
+# `DestinationRegistryError` / `E-CONFIG` with no other behaviour change.
+#
+# Six representative shapes — `[]`, `{}`, `""`, `5`, `None`, and a nested
+# variant (a list containing a mapping for `flags:`/`modules:`; a spec whose
+# `requires_flag:` is itself a list for "a module spec") — at each of the
+# three VALUE-shaped access points `bundles()` makes, PLUS a fourth axis
+# added by the Task 8 corrective review: the `modules:` mapping KEY. C-A
+# (S6 corrective review) found this axis was missing entirely — the value
+# axes above vary the shape at three levels and never vary a key, and a
+# `modules:` key that resolves to a non-string (a truncated `00-intake` ->
+# `00` read back as int `0`; a YAML 1.1 bareword `on:`/`no:` read back as
+# bool; a bare float; or a mix of string and int keys in the same mapping)
+# is untouched by any value-shape row and reached the operator as an
+# untyped `TypeError` at two DIFFERENT sites: `Vault.active_modules`'s
+# `sorted(out)` (mixed-type keys, since a str and an int don't order) and
+# `bundles()`'s own `(bundle_dir / name).is_dir()` (a non-`str`/`PathLike`
+# key). This is not the 3x6 cross product any more — it is that cross
+# product PLUS a `modules_key` axis with its own tolerated/fatal rows,
+# interleaved the same way, so a test that could not tell the difference
+# would fail somewhere in here rather than passing vacuously.
+_SHAPE_SPACE = (
+    # (level, value in archetypes.yaml, tolerated?, expected (name, block) pairs if tolerated)
+    ("flags", [], True, [("00-intake", "system")]),
+    ("flags", {}, True, [("00-intake", "system")]),
+    ("flags", "", True, [("00-intake", "system")]),
+    ("flags", 5, False, None),
+    ("flags", None, True, [("00-intake", "system")]),
+    ("flags", [{"a": 1}], False, None),
+    ("modules", [], False, None),
+    ("modules", {}, True, []),
+    ("modules", "", False, None),
+    ("modules", 5, False, None),
+    ("modules", None, False, None),
+    ("modules", [{"a": 1}], False, None),
+    ("modules_key", "00-intake", True, [("00-intake", "system")]),
+    ("modules_key", 0, False, None),
+    ("modules_key", True, False, None),
+    ("modules_key", False, False, None),
+    ("modules_key", 1.5, False, None),
+    ("modules_key", "__MIXED_STR_INT__", False, None),
+    ("spec", [], True, [("00-intake", "")]),
+    ("spec", {}, True, [("00-intake", "")]),
+    ("spec", "", True, [("00-intake", "")]),
+    ("spec", 5, False, None),
+    ("spec", None, True, [("00-intake", "")]),
+    ("spec", {"block": "system", "requires_flag": ["x"]}, False, None),
+)
+
+
+@pytest.mark.parametrize(
+    "level, value, tolerated, expected",
+    _SHAPE_SPACE,
+    ids=[
+        f"{level}-{shape!r}"
+        for level, shape, _tolerated, _expected in _SHAPE_SPACE
+    ],
+)
+def test_bundles_shape_space_boundary_conversion(tmp_path, level, value, tolerated, expected):
+    from app.console_errors import describe
+    from app.entities import EntityCatalog
+    from app.vault import DestinationRegistryError, Vault
+
+    archetypes = {
+        "version": "2.0",
+        "flags": {},
+        "modules": {"00-intake": {"block": "system"}},
+    }
+    if level == "flags":
+        archetypes["flags"] = value
+    elif level == "modules":
+        archetypes["modules"] = value
+    elif level == "modules_key":
+        if value == "__MIXED_STR_INT__":
+            # A registry with both string and int keys in `modules:` — the
+            # int key (e.g. a bare `5`) is itself a valid single-module
+            # shape (see the other `modules_key` rows), but MIXING it with
+            # a string key is what makes `sorted(out)` raise: Python cannot
+            # order a `str` against an `int`.
+            archetypes["modules"] = {
+                "00-intake": {"block": "system"},
+                5: {"block": "system"},
+            }
+        else:
+            archetypes["modules"] = {value: {"block": "system"}}
+    else:
+        assert level == "spec"
+        archetypes["modules"] = {"00-intake": value}
+
+    write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: []}\n',
+        yaml.safe_dump(archetypes),
+    )
+    if level == "modules_key":
+        # The four `modules_key` failure rows other than the mixed-keys one
+        # raise only in `bundles()`'s own `(bundle_dir / name).is_dir()`
+        # check, which short-circuits (`on_disk and not ...`) unless the
+        # bundle directory actually exists — so the entity directory must be
+        # real, unlike every other row in this space, whose failures happen
+        # earlier in `active_modules`/`resolve_flags` regardless of disk state.
+        (tmp_path / "alpha").mkdir(parents=True, exist_ok=True)
+    vault = Vault(EntityCatalog.load(tmp_path))
+
+    if tolerated:
+        (bundle,) = vault.bundles()
+        assert [(m.name, m.block) for m in bundle.modules] == expected
+    else:
+        with pytest.raises(DestinationRegistryError) as raised:
+            vault.bundles()
+        assert type(raised.value) is DestinationRegistryError
+        assert describe(raised.value).code == "E-CONFIG"
+
+
+def test_flags_as_plain_list_activates_a_gated_module(tmp_path):
+    """I-A (S6 corrective review): every `tolerated=True` row for the
+    `flags:` level in `_SHAPE_SPACE` above — `[]`, `{}`, `""`, `None` — is
+    FALSY. `declared = set(cfg.get("flags") or {})` short-circuits every one
+    of them to `set()` regardless of shape, and no module in that harness
+    declares `requires_flag:`, so `declared` is never actually consulted by
+    `resolve_flags`/`active_modules`. Those rows pass whether or not the
+    `flags:` value is even read correctly — vacuously — and so cannot be the
+    evidence for `_boundary`'s docstring claim that "a `flags:` written as a
+    plain list of names works today via `set([...])` and must keep working."
+
+    This is the one shape that discriminates: a NON-EMPTY, non-falsy list of
+    flag names, feeding a module that actually requires one of them. If
+    `_boundary` were replaced by the `isinstance(cfg.get("flags"), dict)`
+    pre-check the design ruling considered and rejected, THIS row — not the
+    four falsy ones — is the one that would wrongly go fatal, because a
+    plain list is not a `dict` even though `set(a_list)` works fine on it.
+    """
+    from app.entities import EntityCatalog
+    from app.vault import Vault
+
+    archetypes = {
+        "version": "2.0",
+        "flags": ["beta"],
+        "modules": {
+            "00-intake": {"block": "system"},
+            "zz-extra": {"block": "system", "requires_flag": "beta"},
+        },
+    }
+    write_vault(
+        tmp_path,
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: [beta]}\n',
+        yaml.safe_dump(archetypes),
+    )
+    vault = Vault(EntityCatalog.load(tmp_path))
+
+    (bundle,) = vault.bundles()
+    assert sorted(m.name for m in bundle.modules) == ["00-intake", "zz-extra"]
+
+
+def test_block_of_spec_shape_boundary_conversion_reached_independently_of_bundles(
+    tmp_path,
+):
+    """`block_of()` is called directly by `Classifier.classify()`
+    (app/classifier.py) with a module name read from `classifier/rules.yaml`
+    — independently of `bundles()` / `active_modules()`, which happen to
+    validate the identical shape first on THAT path only because they always
+    run before `block_of` for the same module. Calling `block_of()` directly
+    here, bypassing `active_modules()` entirely, proves the guard on this
+    call path is load-bearing rather than dead code shadowed by the other
+    one."""
+    from app.console_errors import describe
+    from app.entities import EntityCatalog
+    from app.vault import DestinationRegistryError, Vault
+
+    write_vault(
+        tmp_path, ENTITIES,
+        archetypes_yaml='version: "2.0"\nflags: {}\nmodules:\n  00-intake: [block, system]\n',
+    )
+    vault = Vault(EntityCatalog.load(tmp_path))
+    with pytest.raises(DestinationRegistryError) as raised:
+        vault.block_of("00-intake")
+    assert describe(raised.value).code == "E-CONFIG"
+
+
+def test_block_of_modules_shape_boundary_conversion(tmp_path):
+    """Same independence as above, for the `modules:` top-level shape
+    rather than a single module's spec."""
+    from app.console_errors import describe
+    from app.entities import EntityCatalog
+    from app.vault import DestinationRegistryError, Vault
+
+    write_vault(
+        tmp_path, ENTITIES,
+        archetypes_yaml='version: "2.0"\nflags: {}\nmodules: []\n',
+    )
+    vault = Vault(EntityCatalog.load(tmp_path))
+    with pytest.raises(DestinationRegistryError) as raised:
+        vault.block_of("00-intake")
+    assert describe(raised.value).code == "E-CONFIG"
+
+
+def test_boundary_readers_carry_no_blanket_try_of_their_own():
+    """M2 (S6 corrective review): design §5 forbids a blanket
+    `except (AttributeError, TypeError)` wrapping a whole reader function —
+    conversion must narrow to the specific access it guards. Nothing pinned
+    that requirement: hoisting the per-access `_boundary` calls inside
+    `Vault.active_modules` into a single `try`/`except` around the WHOLE
+    function body is invisible to every behavioural test above (every
+    `_SHAPE_SPACE` row still passes, because the same set of escaping
+    shapes still converts to the same typed error) — the only difference is
+    that a blanket form also silently converts an unrelated bug anywhere
+    else in the same function body, which Rule 5 forbids.
+
+    This is therefore a structural check, not a behavioural one: parse
+    `app/vault.py` and assert that none of the methods `bundles()` reads
+    `archetypes.yaml` through contain a `try` statement of their own — every
+    access-level conversion must go through the shared `_boundary` helper,
+    whose own `try` wraps exactly one statement.
+    """
+    import ast
+    import inspect
+
+    import app.vault as vault_module
+
+    tree = ast.parse(inspect.getsource(vault_module))
+
+    (vault_class,) = (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "Vault"
+    )
+    guarded = {"resolve_flags", "active_modules", "block_of", "bundles"}
+    checked = set()
+    for node in vault_class.body:
+        if isinstance(node, ast.FunctionDef) and node.name in guarded:
+            checked.add(node.name)
+            own_try = [n for n in ast.walk(node) if isinstance(n, ast.Try)]
+            assert not own_try, (
+                f"Vault.{node.name} contains its own try/except statement — "
+                "every access-level conversion must go through `_boundary`, "
+                "not a blanket catch wrapping the function body"
+            )
+    assert checked == guarded, f"method(s) not found on Vault: {guarded - checked}"
+
+    (boundary_fn,) = (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_boundary"
+    )
+    (boundary_try,) = (n for n in ast.walk(boundary_fn) if isinstance(n, ast.Try))
+    assert len(boundary_try.body) == 1, (
+        "_boundary's own try body must stay a single statement "
+        "(`return read()`) — widening it defeats the per-access narrowness "
+        "this helper exists to enforce"
+    )

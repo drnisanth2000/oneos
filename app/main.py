@@ -97,14 +97,52 @@ def _endpoint_for(request: Request):
 #: catches it; the three route tuples below did not, and now name it
 #: explicitly.
 #:
-#: **This is NOT a closed family, and the claim is not being retried.** Two
-#: shapes still escape `bundles()` unconverted and blank the page: a module
-#: spec that is a list or a scalar (`AttributeError`) and a non-iterable
-#: `flags:` (`TypeError`). Converting those is reader-boundary work under
-#: design §5 — Task 8's rule, surfacing late — and is split out as a recorded
-#: Task 8 corrective with its own RED/GREEN evidence and review rather than
-#: hidden inside a tests-only task. Until it lands, an unconverted stdlib
-#: shape from a hand-edited registry still reaches the global fallback.
+#: Task 8 corrective: the two shapes named above (a module spec that is a
+#: list or a scalar; a non-iterable `flags:`) — plus two more the reviewer
+#: found one level deeper once those landed (a `modules:` that is itself not
+#: a mapping, and a `requires_flag:` that is itself a list, unhashable
+#: against the active-flags set) — are now converted at the exact access in
+#: `Vault.resolve_flags` / `active_modules` / `block_of` (`app/vault.py`).
+#: An unknown flag in `entities.yaml` (already fatal, previously an untyped
+#: `ValueError`) was folded into the same corrective — same empty-body
+#: mechanism, only the type was wrong. Measured with a real hand-edited
+#: registry and no monkeypatching: none of the four now blanks any of the
+#: five routes `bundles()` serves.
+#:
+#: **This section has now miscounted its own access points twice, in the same
+#: direction, so it no longer counts them.** It first said three; review
+#: measured five; the correction said five and review measured **eight**
+#: (frame-instrumented during real `bundles()` calls). Each miscount was an
+#: enumeration written from reading rather than from measurement, and the
+#: first one is what let the key-shaped defect ship. Per design §7's closing
+#: rule — "delete the list and add the invariant that would have caught X" —
+#: the enumeration is gone.
+#:
+#: What is covered is a **shape space, not an access list**: `_SHAPE_SPACE`
+#: in `tests/test_console_readers.py` crosses four axes — `flags:`,
+#: `modules:`, a `modules:` KEY, and a module `spec` — against `[]`, `{}`,
+#: `""`, a scalar, `None` and a nested variant, and every row is classified
+#: tolerated-or-fatal by measurement against `HEAD`. The key axis exists
+#: because a value-only enumeration structurally could not see a `modules:`
+#: key resolving to a non-string (a truncated `00-intake` -> `0`, a YAML 1.1
+#: bareword `on:`/`no:` -> `bool`, a bare float, mixed key types), which
+#: blanked all five routes.
+#:
+#: The census, if ever needed, is mechanical rather than written down:
+#: `grep -n '_boundary(' app/vault.py`.
+#:
+#: **Still NOT asserted a closed family by a structural test** — the C2'
+#: caution above stands on its own terms, not superseded by this fix: a
+#: *different* unconverted shape could exist that nobody has hand-edited a
+#: registry to find yet, on an access point nobody has enumerated yet
+#: either, exactly as this section's own history just demonstrated. What
+#: changed is that every shape actually measured — value-shape at three
+#: access points across `[]` / `{}` / `""` / a scalar / `None` / a nested
+#: variant, AND key-shape at the two access points that read the `modules:`
+#: mapping's keys — is now either already-tolerated (unchanged) or typed
+#: `DestinationRegistryError`. Coverage is these five access points and no
+#: others; see `tests/test_console_readers.py::test_bundles_shape_space_boundary_conversion`
+#: for the enumeration.
 _SIDEBAR_CATCHES = (DestinationRegistryError, EntityManifestError)
 
 

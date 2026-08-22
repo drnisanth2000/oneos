@@ -678,6 +678,109 @@ def test_triage_declared_family_never_reaches_the_global_fallback(
     assert reached == ["RuntimeError"]
 
 
+def test_bundles_shape_failures_never_blank_any_sidebar_route(tmp_path, monkeypatch):
+    """Task 8 corrective, the exact reproduction the human ruling names: a
+    hand-edited registry driven through all five of `bundles()`'s callers —
+    `/`, `/triage`, `/triage/<entity>`, `/outbox/<entity>`, and
+    `/registry/<entity>/products` — with NO monkeypatching of application
+    code, only real files on a real (throwaway) vault.
+
+    Before this fix, every one of these scenarios returned a COMPLETELY
+    EMPTY 500 body on every route: `resolve_flags`/`active_modules` raised a
+    bare `AttributeError`, `TypeError`, or untyped `ValueError` instead of
+    `DestinationRegistryError`, which is the one type every route's own
+    catch family (`_SIDEBAR_CATCHES` / `_TRIAGE_CATCHES` / `_OUTBOX_CATCHES`
+    / `_REGISTRY_PRODUCTS_CATCHES`) already declares — so the raw exception
+    escaped the route, and (via `app/main.py`'s C1 sidebar-rebuild
+    re-entrancy, which raises the identical unconverted error a second time
+    while trying to render the very error page) escaped the GLOBAL fallback
+    too, straight to Starlette's `ServerErrorMiddleware`.
+
+    Once the type is converted, every route's own handler answers it, so the
+    global fallback in particular must never be reached — proved with the
+    same exception-handler spy `test_triage_declared_family_never_reaches_
+    the_global_fallback` uses, but on real files, not an injected raise.
+    """
+    scenarios = {
+        "unknown_flag_in_entities_yaml": (
+            'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: [nosuchflag]}\n',
+            None,
+        ),
+        "archetypes_module_spec_as_list": (
+            ENTITIES,
+            'version: "2.0"\nflags: {}\nmodules:\n  00-intake: [block, system]\n',
+        ),
+        "archetypes_module_spec_as_scalar": (
+            ENTITIES,
+            'version: "2.0"\nflags: {}\nmodules:\n  00-intake: system\n',
+        ),
+        "archetypes_flags_as_scalar": (
+            ENTITIES,
+            'version: "2.0"\nflags: 5\nmodules:\n  00-intake: {block: system}\n',
+        ),
+        # M5 (S6 corrective review): the comment above named "`modules:`
+        # not-a-mapping" and "`requires_flag:`-as-list" as measured route
+        # categories, but neither had a route-level test — only the unit
+        # shape-space test in tests/test_console_readers.py covered them.
+        "archetypes_modules_not_a_mapping": (
+            ENTITIES,
+            'version: "2.0"\nflags: {}\nmodules:\n  - 00-intake\n',
+        ),
+        "archetypes_requires_flag_as_list": (
+            ENTITIES,
+            'version: "2.0"\nflags: {}\nmodules:\n  00-intake: {block: system, requires_flag: [x]}\n',
+        ),
+        # C-A (S6 corrective review): the module KEY, not just the module
+        # VALUE, is a fifth unguarded access point — a truncated
+        # `00-intake` -> `00`, read back by YAML as int `0`, raises
+        # `TypeError` at `(bundle_dir / name).is_dir()` (app/vault.py).
+        "archetypes_modules_key_truncated_to_int": (
+            ENTITIES,
+            'version: "2.0"\nflags: {}\nmodules:\n  00: {block: system}\n',
+        ),
+        # A `modules:` mapping with both string and int keys raises at the
+        # OTHER key-shaped site, `sorted(out)` in `Vault.active_modules`
+        # (app/vault.py) — `str` and `int` do not order.
+        "archetypes_modules_mixed_key_types": (
+            ENTITIES,
+            'version: "2.0"\nflags: {}\nmodules:\n  "00-intake": {block: system}\n  5: {block: system}\n',
+        ),
+    }
+
+    for name, (entities_yaml, archetypes_yaml) in scenarios.items():
+        if archetypes_yaml is None:
+            write_vault(tmp_path, entities_yaml)
+        else:
+            write_vault(tmp_path, entities_yaml, archetypes_yaml)
+        scaffold_modules(tmp_path, "alpha", ["00-intake", "01-core", "02-work"])
+        monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
+        import app.main as main
+
+        importlib.reload(main)
+
+        reached = []
+        original = main.app.exception_handlers[Exception]
+
+        async def _spy(request, exc):
+            reached.append(type(exc).__name__)
+            return await original(request, exc)
+
+        monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+        client = TestClient(main.app, raise_server_exceptions=False)
+
+        for url in (
+            "/", "/triage", "/triage/alpha", "/outbox/alpha",
+            "/registry/alpha/products",
+        ):
+            response = client.get(url)
+            assert response.status_code == 500, f"{name} {url}: {response.status_code}"
+            assert response.text != "", f"{name} {url}: completely empty body"
+            assert 'role="alert"' in response.text, f"{name} {url}: {response.text}"
+            assert "E-CONFIG" in response.text, f"{name} {url}: {response.text}"
+
+        assert reached == [], f"{name}: global fallback reached: {reached}"
+
+
 # --- Task 12: routes, outbox (design §3 "Rule 3", §5 route inventory,
 # §8 test matrix) -----------------------------------------------------------
 #
