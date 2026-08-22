@@ -626,8 +626,18 @@ def test_registry_transaction_error_is_a_registry_error(client, monkeypatch):
         data={"id": proposal.id, "slug": "alpha-only"},
     )
 
+    # design §6 regression table, second row: this asserted the raw internal
+    # string "registry deletion transaction failed" rendered. The disclosure
+    # boundary forbids raw exception text reaching HTML, so it must now be
+    # described instead — the code and curated message from the taxonomy —
+    # and the raw string must be absent. Status expectation and all three
+    # state proofs below are unchanged — they are the test's actual subject.
+    from app.console_errors import _CODES
+
     assert response.status_code == 200
-    assert "registry deletion transaction failed" in response.text
+    assert "E-GIT" in response.text
+    assert _CODES["E-GIT"].message in response.text
+    assert "registry deletion transaction failed" not in response.text
     assert registry_path.read_bytes() == registry_before
     assert proposal.path.read_bytes() == proposal_before
     assert git_head(client.vault) == head_before

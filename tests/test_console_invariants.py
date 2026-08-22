@@ -1,7 +1,9 @@
 import ast
 import os
 import pathlib
+import re
 import stat as stat_module
+from html.parser import HTMLParser
 
 import pytest
 
@@ -741,3 +743,342 @@ def test_pulse_declaration_selects_the_fragment_surface(tmp_path, monkeypatch):
     # what distinguishes the two surfaces.
     assert "<!doctype" not in response.text.lower()
     assert "synthetic pulse failure" not in response.text
+
+
+# --- Task 13a: design §7 invariant 5 -----------------------------------------
+#
+# "A test scans templates/ for hx-vals attributes and fails on any whose
+# value is not a single {{ ... | tojson }} expression." Before this task the
+# check existed only as a triage-specific assertion
+# (tests/test_app.py::test_triage_serializes_canonical_destination_as_one_hx_vals_mapping),
+# which is the shape invariant 6 was in before Task 10a — carried in the
+# ledger as "Design §7 invariant 5's general hx-vals scan over templates/
+# exists in no test file and no task's step list... Close it the same way: a
+# scan, not a list." Task 13's own list of offenders names only the two known
+# templates (registry.html, blocks/delete_impact.html), which is exactly the
+# two-row list design §6 says is not enforcement.
+#
+# C2 (round 1 review): the first version of this scan matched `hx-vals='...'`
+# as a byte sequence, not an attribute — `re.compile(r"hx-vals='([^']*)'")`.
+# Five spellings defeated it: double-quoted, whitespace around `=`, a
+# newline before the value, an unquoted value, and `HX-VALS` in upper case.
+# Two are live exploits — rewriting `registry.html` to the double-quoted or
+# the whitespace-around-`=` form let a hand-built, injectable mapping ship
+# while the scan stayed green. The shape check was separately porous: `\S+`
+# for the expression half absorbed a leading `x|safe` in `{{ x|safe|tojson
+# }}`, so a filter chain longer than a bare `tojson` still matched —
+# fail-open in the direction that matters. And the collection stage was
+# uncontrolled, the same defect Task 10a's C2/MN2 closed for
+# `_endpoint_source_files`: swapping `rglob` for a non-recursive `glob`
+# silently dropped every file under `templates/blocks/` — including
+# `delete_impact.html` itself — and the scan still passed. Fixed then by
+# parsing real start tags with `html.parser`.
+#
+# Round 2 review found the round-1 fix still incomplete:
+#
+# R2-C1 — `data-hx-vals` was invisible. htmx honours it as a fallback for
+# every `hx-*` attribute (`ee(e,t)||ee(e,"data-"+t)` in
+# `static/vendor/htmx.min.js`), so `data-hx-vals='...'` is exploitable
+# exactly like `hx-vals='...'` and the exact `name == "hx-vals"` check let it
+# straight through. Now both names are recognized.
+#
+# R2-C2 — the collection control asserted only descent (`rglob` vs `glob`),
+# never root coverage: `rglob("*/*.html")` (skips every top-level template)
+# and `rglob("blocks/*.html")` (the control directory was itself named
+# `blocks`) both passed the old single-file, single-directory control. The
+# control tree now carries a hostile file at its root AND nested in a
+# subdirectory not named `blocks`, with both paths in one assertion, so a
+# mutation dropping either coverage is individually red.
+#
+# R2-I1 — the parser only sees `hx-vals` lexically inside a well-formed
+# start tag. Three shapes defeat it, each rendering to a working hand-built
+# `hx-vals`: an attribute wrapped in `{% if %}` or `{% for %}` (HTMLParser
+# still opens the tag but tokenizes a mangled attribute name like
+# `%}hx-vals`, so the exact-name check correctly does not match it — and
+# nothing else does either), and one emitted by a `{% macro %}` (the literal
+# text sits outside any tag HTMLParser opens at all). A raw-text backstop
+# below finds every `(?:data-)?hx-vals\s*=` occurrence in the source and
+# fails closed on any the parser did not explain via a genuine,
+# whitespace-bounded attribute token inside a tag it actually opened — this
+# is also what catches a tag left unterminated at EOF (R2-M2): HTMLParser
+# never emits an event for one, even after `close()`, so it can never be
+# "explained" either.
+#
+# R2-M1 — the shape check's own comment says its job is "so a second filter
+# has nowhere to hide", which is what requiring exactly one `|` achieves.
+# The regex it shipped with instead restricted the LEFT side to a bare
+# dotted identifier, rejecting legitimate, equally safe markup: a
+# server-built dict literal, a subscript (the natural per-row form), a
+# function call, and `tojson` with its own filter arguments. Replaced with a
+# check that enforces what the comment claims and nothing more.
+
+_TEMPLATES_ROOT = _REPO_ROOT / "templates"
+
+# Raw-text backstop (R2-I1): every literal occurrence of the attribute name,
+# regardless of surrounding syntax, quote, or case.
+_RAW_HX_VALS_RE = re.compile(r"(?:data-)?hx-vals\s*=", re.IGNORECASE)
+# A genuine attribute token is preceded by whitespace or starts the tag
+# text — never glued to other syntax. This is what excludes the
+# Jinja-mangled "%}hx-vals=" HTMLParser produces from a `{% if %}` / `{% for
+# %}` guard: the parser DID open a tag there, but never tokenized "hx-vals"
+# as its own attribute name, so it must not count as explained.
+_ATTR_TOKEN_RE = re.compile(r"(?:^|(?<=\s))(?:data-)?hx-vals\s*=", re.IGNORECASE)
+
+
+def _hx_vals_value_is_clean(value: str) -> bool:
+    """True when `value` is a single `{{ EXPR | tojson[(...)] }}` expression
+    with EXACTLY one `|` (R2-M1) — the rule this guard's own comment states.
+    Any second `|` (a hidden filter chain), any text outside one outer
+    `{{ }}` pair (a second expression, or a missing/extra brace), or a
+    filter other than `tojson` fails it. The left-hand EXPR is otherwise
+    unconstrained — a dict literal, a subscript, and a call are all equally
+    safe, since `tojson` still runs last and exactly once.
+
+    One exception, and it is a real fail-open otherwise: Jinja binds a filter
+    TIGHTER than `if`/`else`/`and`/`or`, so `{{ raw if y else v | tojson }}`
+    parses as `raw if y else (v | tojson)`. When `y` is truthy the output is
+    `raw`, autoescaped as HTML rather than JSON — a `"` becomes `&#34;`, which
+    the browser decodes back to a delimiter inside the attribute. A textual
+    split cannot model Jinja precedence, so a bare conditional or boolean
+    operator in EXPR is rejected outright rather than reasoned about."""
+    value = value.strip()
+    if len(value) < 4 or not (value.startswith("{{") and value.endswith("}}")):
+        return False
+    inner = value[2:-2]
+    parts = inner.split("|")
+    if len(parts) != 2:
+        return False
+    expr, filt = parts[0].strip(), parts[1].strip()
+    if not expr or "{{" in expr or "}}" in expr:
+        return False
+    if re.search(r"(?:^|\s)(?:if|else|and|or)(?:\s|$)", expr):
+        return False
+    return re.fullmatch(r"tojson(?:\([^{}]*\))?", filt) is not None
+
+
+class _HxValsAttrParser(HTMLParser):
+    """Collects every `hx-vals` / `data-hx-vals` (R2-C1) attribute value
+    from real start tags, regardless of quote style, whitespace around `=`,
+    a newline between the attribute name and its value, or the name's case —
+    the five spellings a `hx-vals='...'` regex over raw bytes cannot see
+    (review C2). Also records every start tag's own position and raw text,
+    which the raw-text backstop below (R2-I1) uses to decide which literal
+    `hx-vals=` occurrences it has already explained."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.found: list[tuple[int, str]] = []
+        self.tags: list[tuple[int, int, str]] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        self._record_tag()
+        self._collect(attrs)
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        self._record_tag()
+        self._collect(attrs)
+
+    def _record_tag(self) -> None:
+        line, col = self.getpos()
+        self.tags.append((line, col, self.get_starttag_text() or ""))
+
+    def _collect(self, attrs) -> None:
+        for name, value in attrs:
+            if name in ("hx-vals", "data-hx-vals") and value is not None:
+                self.found.append((self.getpos()[0], value))
+
+
+def _line_start_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for line in text.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    return offsets
+
+
+def _explained_offsets(text: str, tags: list[tuple[int, int, str]]) -> set[int]:
+    """Absolute offsets of every hx-vals-like attribute token the parser
+    actually recognized inside a start tag it opened — searched within each
+    tag's own verbatim text, never the whole document, so a boundary match
+    can never cross into text no tag covers (R2-I1)."""
+    line_starts = _line_start_offsets(text)
+    explained = set()
+    for lineno, col, tag_text in tags:
+        base = line_starts[lineno - 1] + col
+        for match in _ATTR_TOKEN_RE.finditer(tag_text):
+            explained.add(base + match.start())
+    return explained
+
+
+def _hx_vals_offenders(
+    source: pathlib.Path, root: pathlib.Path | None = None
+) -> list[str]:
+    """Every `hx-vals` / `data-hx-vals` attribute in `source` whose value is
+    not a single `{{ EXPR | tojson[(...)] }}` expression, labelled
+    `file:line`, UNIONED with every raw `(?:data-)?hx-vals\\s*=` occurrence
+    the HTML parse could not explain (R2-I1) — a conditional attribute
+    wrapped in Jinja `{% if %}` / `{% for %}`, one emitted by a `{% macro
+    %}`, or a tag left unterminated at EOF (R2-M2), none of which the parser
+    alone can see.
+
+    `root`, when given, labels offenders relative to it instead of the repo
+    root — used by `_scan_hx_vals` so a collection-stage control rooted
+    outside the repo (R2-C2) still distinguishes a nested file from a
+    top-level one, rather than both collapsing to a bare basename."""
+    text = source.read_text(encoding="utf-8")
+    label = source.relative_to(root) if root is not None else _label(source)
+
+    parser = _HxValsAttrParser()
+    parser.feed(text)
+    # R2-M2: flush any tag left buffered at EOF. HTMLParser never emits an
+    # event for a genuinely unterminated tag even after close() — this call
+    # is about leaving the parser in a settled state before the backstop
+    # below reads its `tags`/`found` collections, not about surfacing the
+    # unterminated tag itself. The backstop is what actually catches it:
+    # with no start-tag event, it is never in `explained`.
+    parser.close()
+
+    offenders = set()
+    for line, value in parser.found:
+        if not _hx_vals_value_is_clean(value):
+            offenders.add(f"{label}:{line}")
+
+    explained = _explained_offsets(text, parser.tags)
+    for match in _RAW_HX_VALS_RE.finditer(text):
+        if match.start() in explained:
+            continue
+        line = text.count("\n", 0, match.start()) + 1
+        offenders.add(f"{label}:{line}")
+
+    return sorted(offenders)
+
+
+def _scan_hx_vals(root: pathlib.Path) -> list[str]:
+    """Walks `root` recursively for offenders. A thin wrapper so the
+    *collection* stage (`rglob`, not `glob`) is itself something a control
+    can exercise — the same shape as `_endpoint_source_files` (Task 10a),
+    and for the same reason: a scanner that finds every offender in a file
+    it never opens still passes.
+
+    R2-M4 (recorded, not fixed — a stated limit rather than a hand-maintained
+    list, per design §7's closing rule): this only walks `*.html`, so a
+    `.jinja`/`.j2` extension is invisible, and `rglob` does not follow
+    symlinked subdirectories by default, so a symlinked template directory
+    would be invisible too. Nothing under `templates/` is either today."""
+    offenders = []
+    for path in sorted(root.rglob("*.html")):
+        offenders += _hx_vals_offenders(path, root)
+    return offenders
+
+
+def test_no_template_hand_builds_hx_vals(tmp_path):
+    """Rule 8 / invariant 5, closed as a scan over the real `templates/`
+    tree rather than as a list of known offenders.
+
+    Controls, driven through `_hx_vals_offenders` and `_scan_hx_vals`
+    themselves rather than re-implementing the shape, the parser backstop,
+    or the collection stage inline — the branch's signature defect (ledger,
+    Task 8 round 2 and Task 10a's C1/C2): a control that does not exercise
+    the real function proves nothing about it. Written to `tmp_path`, not
+    the repo's own `templates/`, so the positive control's deliberately
+    broken markup never touches a real template.
+    """
+    controls = tmp_path / "_controls"
+    controls.mkdir(exist_ok=True)
+
+    positive = controls / "hostile.html"
+    positive.write_text(
+        "<button hx-vals='{\"slug\": \"{{ slug }}\"}'>hand-built, single-quoted</button>\n"  # 1
+        "<button hx-vals=\"{'slug': '{{ slug }}'}\">hand-built, double-quoted</button>\n"    # 2
+        "<button hx-vals ='{\"slug\": \"{{ slug }}\"}'>hand-built, space before =</button>\n"  # 3
+        "<button hx-vals={{slug}}>hand-built, unquoted, no filter at all</button>\n"          # 4
+        "<button hx-vals='{{ a }}{{ b | tojson }}'>not a single expression</button>\n"        # 5
+        "<button hx-vals='{{ x|safe|tojson }}'>filter chain, not tojson alone</button>\n"     # 6
+        "<button data-hx-vals='{\"slug\": \"{{ slug }}\"}'>data-hx-vals hand-built (R2-C1)</button>\n"  # 7
+        "<button {% if s %}hx-vals='{\"slug\": \"{{ s }}\"}'{% endif %}>conditional if (R2-I1)</button>\n"  # 8
+        "<button {% for a in b %}hx-vals='{\"slug\": \"{{ s }}\"}'{% endfor %}>conditional for (R2-I1)</button>\n"  # 9
+        "{% macro vals(s) %}hx-vals='{\"slug\": \"{{ s }}\"}'{% endmacro %}<button {{ vals(s) }}>macro-emitted (R2-I1)</button>\n"  # 10
+        "<button hx-vals='{{ values | tojson }}'>clean, must NOT be reported</button>\n"      # 11, clean
+        "<button hx-vals=\"{{ values | tojson }}\">clean, double-quoted</button>\n"           # 12, clean
+        "<button hx-vals={{values|tojson}}>clean, unquoted, no spaces</button>\n"             # 13, clean
+        "<button\n  hx-vals\n  =\n  '{{ values | tojson }}'>clean, newline before value</button>\n"  # 14-17, clean
+        "<button HX-VALS='{{ values | tojson }}'>clean, uppercase attribute name</button>\n"  # 18, clean
+        "<button data-hx-vals='{{ values | tojson }}'>clean, data-hx-vals (R2-C1)</button>\n"  # 19, clean
+        "<button hx-vals='{{ {\"id\": prop.id} | tojson }}'>clean, dict literal (R2-M1)</button>\n"  # 20, clean
+        "<button hx-vals='{{ vals[loop.index0] | tojson }}'>clean, subscript (R2-M1)</button>\n"  # 21, clean
+        "<button hx-vals='{{ make_vals(prop) | tojson }}'>clean, function call (R2-M1)</button>\n"  # 22, clean
+        "<button hx-vals='{{ values | tojson(indent=0) }}'>clean, filter args (R2-M1)</button>\n"  # 23, clean
+        "<button hx-vals='{{ x|tojson|replace(\"a\",\"b\") }}'>two filters, tojson first</button>\n"  # 24
+        "<button hx-vals='{{ v | tojson if y else z }}'>cond-expr around the filter</button>\n"  # 25
+        "<button hx-vals='{{ raw if y else v | tojson }}'>cond-expr BEFORE the filter</button>\n"  # 26
+        "<button hx-vals='unterminated, no closing angle bracket (R2-M2)",  # 27 — MUST stay last: EOF, no ">"
+        encoding="utf-8",
+    )
+    # Every hostile spelling review found across both rounds — hand-built
+    # JSON in single quotes, double quotes, extra whitespace around `=`,
+    # unquoted with no filter at all, `data-hx-vals`, a value carrying more
+    # than one `{{ }}` expression, a filter chain longer than a bare
+    # `tojson`, the same attribute wrapped in a Jinja `{% if %}` / `{% for
+    # %}`, one emitted through a `{% macro %}`, and a tag left unterminated
+    # at EOF — must all be reported. A set, not a sorted list: line 24 pushes
+    # numbering into two digits, and a plain string sort would place
+    # "...:10" before "...:2", which is not the property this test is
+    # checking.
+    assert set(_hx_vals_offenders(positive)) == {
+        "hostile.html:1",
+        "hostile.html:2",
+        "hostile.html:3",
+        "hostile.html:4",
+        "hostile.html:5",
+        "hostile.html:6",
+        "hostile.html:7",
+        "hostile.html:8",
+        "hostile.html:9",
+        "hostile.html:10",
+        # 24 pins the "exactly one `|`" count rule and 25/26 pin the
+        # tojson-identity rule; without them `len(parts) != 2` -> `< 2` and
+        # `fullmatch(...)` -> `"tojson" in filt` both passed green. 26 is the
+        # Jinja-precedence fail-open: it renders HTML-autoescaped, not JSON.
+        "hostile.html:24",
+        "hostile.html:25",
+        "hostile.html:26",
+        "hostile.html:27",
+    }
+
+    negative = controls / "clean.html"
+    negative.write_text(
+        "<button hx-vals='{{ values | tojson }}'>ok</button>\n"
+        "<button hx-vals='{{ proposal_values | tojson }}'>ok too</button>\n",
+        encoding="utf-8",
+    )
+    assert _hx_vals_offenders(negative) == []
+
+    # Control for the *collection* stage (R2-C2), which the two checks above
+    # cannot reach: a hostile file at the control tree's ROOT, and one
+    # nested under a subdirectory NOT named `blocks` — both in one
+    # assertion. A root-only fixture cannot red `rglob("*/*.html")` (which
+    # skips every top-level template but would still find the nested file);
+    # a `blocks`-named subdirectory cannot red `rglob("blocks/*.html")`
+    # (which would still find a file nested exactly there). Together they
+    # force `glob("*.html")`, `rglob("*/*.html")`, and `rglob("blocks/*.html")`
+    # to each be individually red, rather than only the `rglob` vs `glob`
+    # descent the round-1 control checked.
+    nested_root = tmp_path / "_nested_templates"
+    (nested_root / "deep").mkdir(parents=True)
+    (nested_root / "top.html").write_text(
+        "<button hx-vals='{\"slug\": \"{{ slug }}\"}'>root-level hand-built</button>\n",
+        encoding="utf-8",
+    )
+    (nested_root / "deep" / "nested.html").write_text(
+        "<button hx-vals='{\"slug\": \"{{ slug }}\"}'>nested hand-built</button>\n",
+        encoding="utf-8",
+    )
+    assert _scan_hx_vals(nested_root) == ["deep/nested.html:1", "top.html:1"]
+
+    # Every real template in this repo, scanned by walking the tree rather
+    # than by naming files — the same shape as invariant 6's guard, and for
+    # the same reason: a hand-maintained list is wrong in the direction of
+    # omission (design §7).
+    assert _TEMPLATES_ROOT.is_dir()
+    scanned = sorted(_TEMPLATES_ROOT.rglob("*.html"))
+    assert scanned, "expected at least one template under templates/"
+    assert _scan_hx_vals(_TEMPLATES_ROOT) == []

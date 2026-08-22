@@ -1243,3 +1243,143 @@ unmeasured claim about one's own edits — the same failure this entry is largel
 about, one level up. Every replacement in the final pass asserts its anchor is
 present and unique, and the result is grepped afterwards. **Do not use an
 unasserted `replace()` on a file whose correctness is the point.**
+
+---
+
+### Task 13 + Task 13a — Routes, registry; and invariant 5's template scan
+
+- **RED, measured** against a `git archive HEAD` tree given the final test
+  files, selection stated per line: `tests/test_console_routes.py` → **7
+  failed, 39 passed** (seven of the eight new route tests red at HEAD);
+  `tests/test_console_invariants.py::test_no_template_hand_builds_hx_vals` →
+  red, naming both real offenders `['templates/blocks/delete_impact.html:14',
+  'templates/registry.html:24']`; `tests/test_app.py` → **1 failed, 27
+  passed**. The eighth route test, `test_propose_persistence_outcome`, is green
+  at HEAD by construction and pinned by mutation instead — rolling the
+  persisted proposal back reds it.
+- **Suite:** 766 → 775 (implementation) → 780 (fix round 1) → **781**.
+  `app/registry.py` **byte-identical to HEAD throughout**, so `execute_delete`'s
+  signature and behaviour are untouched as the constraint requires.
+
+**Rule 8 is closed, and closure was proven by exploitation rather than by
+reading.** Fifteen hostile slugs — raw `"` and `'`, `&quot;`/`&#34;`/`&#x22;`,
+backslash, `"`, a nested `{"id": …}`, newline, `</script>`,
+`  ` — driven through the real products and preview routes, parsed
+with `html.parser` then `json.loads`: each round-trips to exactly one key
+carrying the original value. Jinja's `tojson` emits `<>&'` as
+`< > & '`, defeating both attribute breakout and browser
+entity re-decoding. Against the pre-fix template the same probe yields
+`{'slug': 'a', 'id': 'INJECTED'}` — **the vulnerability was real**, and it was a
+preview/approve mismatch, not a display bug.
+
+**The Task 11/12 trap, third occurrence, quantified.** A 30-cell sweep (6
+exception types × 2 patch targets × 3 routes) with a global-fallback spy and a
+positive control returning `['RuntimeError']`: **22 escapes at HEAD, 0 after
+Task 13.** At HEAD `registry_products` and `registry_delete_preview` had no
+`try` at all and leaked *every* injected type including their own declared
+`RegistryError`; `registry_delete_execute` leaked all four non-`RegistryError`
+types.
+
+**Two escapes injection-only totality can never see.** Both were found by
+driving the real filesystem, and both are the reason the first fix looked
+complete and was not:
+
+- A **real symlinked** `_system/products.yaml` → `FALLBACK REACHED:
+  ['RedirectedPathError']` at 409, and under a default `TestClient`
+  `RE-RAISED: RedirectedPathError` — `ServerErrorMiddleware` logging a traceback
+  for a first-class described condition, the raw server fault the Objective
+  forbids. Cause: `_REGISTRY_PRODUCTS_CATCHES` omitted `CrossScopeError` while
+  the sibling constant three lines below included it.
+- A **real corrupt** delete-proposal record → `FALLBACK REACHED:
+  ['UnreadableProposalRecord']` at 422.
+
+The route's own totality test was green throughout, because it injects the
+**declared** members — which is exactly what invariant 6 and Task 14 Step 3 do.
+**A totality test built from a route's own declaration cannot discover that the
+declaration is incomplete.** Only the real condition can.
+
+**`UnreadableProposalRecord` — adjudicated as Task 13's, no human ruling
+sought.** It pre-dates Task 13 (`execute_delete`'s first statement is already
+`get_delete_proposal`, `app/registry.py:375`, so the new pre-execute call
+widened the window by nothing), but "pre-existing" is not the test this branch
+applies. Both functions are `@structured_reader(category="proposal")` and
+invariant 4 *requires* that category to raise it — it is the designed failure
+mode of the calls the route makes, not a foreign type. Design §5 performs the
+identical widening for `triage` and the outbox routes and calls it "required,
+not optional". Nothing in the design pins a route's catch tuple the way it pins
+the regression table, so widening one is ordinary implementation. And deferring
+would have made it permanently invisible: Task 14 injects only declared
+members, invariant 6 checks a route declares *something* rather than enough.
+
+**Task 13a — invariant 5's scan, broken twice in review before it held.** Each
+rewrite closed the spelling it had been shown and left the adjacent one open:
+
+| Round | Guard | Defeated by |
+|---|---|---|
+| 1 | `re.compile(r"hx-vals='([^']*)'")` over raw bytes | double-quoted, whitespace around `=`, newline before value, unquoted, uppercase — two of them live exploits |
+| 2 | `html.parser`, `name == "hx-vals"` | **`data-hx-vals`** — a *regression*, since the byte-sequence regex had caught it, and htmx honours it (`ee(e,t)||ee(e,"data-"+t)` in the vendored bundle) |
+| 2 | collection control | `rglob("*/*.html")` and `rglob("blocks/*.html")` — the control directory was itself named `blocks`, so the walk was pinned in one direction only |
+| 3 | — | held |
+
+Round 3 replaced pattern-widening with a **fail-closed backstop**: a raw-text
+pass over the whole source flags any `(?:data-)?hx-vals\s*=` occurrence the
+parser's per-tag token search cannot explain. That inverts the failure mode —
+anything unexplained is an offender by default — and it catches the three Jinja
+shapes (`{% if %}`, `{% for %}`, `{% macro %}`) the parser structurally cannot
+see, since it only observes well-formed start tags. Nineteen of twenty hostile
+shapes are flagged; the one miss is a computed attribute name
+(`<button {{ 'hx-vals' }}='…'>`), where no contiguous `hx-vals=` exists.
+
+**One genuine fail-open, closed in the final pass.** Jinja binds a filter
+tighter than `if`/`else`/`and`/`or`, so `{{ raw if y else v | tojson }}` parses
+as `raw if y else (v | tojson)`: when `y` is truthy the output is `raw`,
+autoescaped as **HTML** rather than JSON, and the browser decodes `&#34;` back
+to a delimiter inside the attribute. A textual split cannot model Jinja
+precedence, so a bare conditional or boolean operator in the left-hand
+expression is now rejected outright.
+
+**Four rules that were correct but unpinned, found by the round-3 reviewer and
+now red under mutation:** the "exactly one `|`" count (`!= 2` → `< 2` passed
+green), the `tojson` filter identity (`fullmatch` → substring passed green),
+the Jinja-precedence rejection, and `_outbox_new_path_in_entity`'s
+path-versus-name comparison — that last one left the whole of
+`tests/test_console_routes.py` green at 51 passed when reverted.
+
+**The isolation helper compared names, not paths.** `_outbox_new_path_in_entity`
+accepted `<vault>/beta/alpha/outbox/x.yaml` — a write that escaped the bound
+entity while having an ancestor *named* `alpha`. The persistence tests caught it
+only through `git_status_bytes`, and only because `.gitignore`'s
+`*/outbox/*.yaml` is single-level. Luck, not a guarantee. Now a resolved-path
+comparison with its own `pytest.raises` control.
+
+**Regression row 2 — the last of the four.** Exactly one deleted line in
+`tests/test_app.py`, the raw-string assertion in
+`test_registry_transaction_error_is_a_registry_error`; `status_code == 200` and
+all three state proofs byte-identical to `HEAD`. Zero deletions in either
+console test file. The design's citation of `tests/test_app.py:588` is stale —
+that line is now `test_registry_products_route_reads_only_bound_namespace`.
+
+**Stated limits, recorded rather than fixed:** the scan collects `.html` only
+and does not follow symlinked subdirectories (`rglob` defaults
+`recurse_symlinks=False`); nothing under `templates/` is either today. A
+computed attribute name is not detected. `<script>`/`<style>` CDATA and
+`hx-vals=` inside another attribute's quoted value are deliberately suppressed —
+in those positions no real attribute exists for htmx to read. The `.gitignore`
+that makes `git_status_bytes` byte-identical is written by the fixtures
+themselves (4 call sites, all `*/outbox/*.yaml`); nothing in this repo
+establishes the real vault's ignore rules, and the docstring now says so rather
+than claiming otherwise.
+
+**Also corrected:** a docstring quoting a design sentence that does not exist
+(paraphrased with a real citation); a stale line reference — the design says
+`app/git_transaction.py:466` fires the post-commit cleanup, but
+`_remove_temporary_index` is called at **:476** and defined at 762, so the
+design is ten lines stale; and a docstring naming the wrong route to the error
+branch (the id fails the *grammar* check in `_delete_proposal_path` before any
+disk lookup).
+
+- **Reviewer verdict:** clean after fix round 2 — round 1: 2 Critical, 4
+  Important, 8 Minor; round 2: 2 Critical, 2 Important, 7 Minor; round 3: none
+  Critical or Important. Every finding was reproduced by the reviewer before
+  acceptance and re-broken afterwards. **No unmeasured claim shipped in fix
+  rounds 1 or 2** — the first passes on this branch of which that is true.

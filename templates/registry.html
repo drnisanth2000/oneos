@@ -18,10 +18,11 @@
       {% for slug in products %}
       <li class="triage-item">
         <div class="ti-head"><span class="ti-title">{{ slug }}</span></div>
+        {% set delete_preview_values = {"slug": slug} %}
         <div class="prop-actions">
           <button class="reject"
                   hx-post="/registry/{{ entity }}/product/delete-preview"
-                  hx-vals='{"slug": "{{ slug }}"}'
+                  hx-vals='{{ delete_preview_values | tojson }}'
                   hx-target="#impact-{{ loop.index0 }}" hx-swap="innerHTML">Delete…</button>
         </div>
         <div id="impact-{{ loop.index0 }}"></div>

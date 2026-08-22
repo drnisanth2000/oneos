@@ -742,9 +742,17 @@ test_propose_persistence_outcome                     (same, for propose)
 
 ```bash
 git add app/main.py templates/registry.html templates/blocks/delete_impact.html \
-  tests/test_console_routes.py tests/test_app.py
+  templates/blocks/delete_success.html \
+  tests/test_console_routes.py tests/test_app.py tests/test_console_invariants.py
 git commit -m "feat: describe registry failures and close hx-vals binding"
 ```
+
+I4 (review): the original list omitted `templates/blocks/delete_success.html`
+(the untracked new template `registry_delete_execute`'s success branch
+renders) and `tests/test_console_invariants.py` (Task 13a's `hx-vals` scan,
+carried into this same task's working tree). Executed literally, the
+original list would have committed a tree where a live route raises
+`TemplateNotFound` the first time it succeeds.
 
 ---
 

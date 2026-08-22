@@ -30,6 +30,7 @@ from .inbox import read_inbox
 from .outbox import (
     OutboxDestinationError,
     OutboxError,
+    UnreadableProposalRecord,
     approve,
     preview_diff,
     project_outbox,
@@ -39,6 +40,7 @@ from .outbox import (
 from .registry import (
     RegistryError,
     execute_delete,
+    get_delete_proposal,
     products_for,
     propose_delete,
     reference_count,
@@ -563,44 +565,97 @@ def _outbox_reject_response(request: Request, scope: Scope, id: str) -> HTMLResp
         return _outbox_list_error(request, scope, exc, action_error=approval_error)
 
 
+#: Declared once so the decorator and every route's own `except` cannot
+#: drift (the Task 11/12 pattern). Before this task `registry_products` and
+#: `registry_delete_preview` had no `try`/`except` at all, so literally
+#: everything escaped them to the global fallback — including their own
+#: declared `RegistryError` — and `registry_delete_execute` caught only
+#: `RegistryError`, so everything else escaped it too.
+#:
+#: C1/I1 (review, first fix round): the initial tuples repeated the same
+#: hole one level down. `_REGISTRY_PRODUCTS_CATCHES` omitted
+#: `CrossScopeError` even though `products_for` → `scope.system_path(...)`
+#: can raise `RedirectedPathError` (a `CrossScopeError`) for a real
+#: symlinked `_system/products.yaml` — proven against the filesystem, not
+#: an injected exception, since a totality test that only injects the
+#: declared family cannot see a member the family itself omits. And
+#: `_REGISTRY_DELETE_CATCHES` omitted `UnreadableProposalRecord`, even
+#: though `get_delete_proposal` and `execute_delete` are both
+#: `@structured_reader(category="proposal")` — design §7 invariant 4
+#: requires exactly that category to raise it for a malformed record, so a
+#: corrupt delete-proposal file on disk reached the global fallback for a
+#: designed, not accidental, failure mode.
+_REGISTRY_PRODUCTS_CATCHES = (RegistryError, CrossScopeError, DestinationRegistryError)
+_REGISTRY_DELETE_CATCHES = (
+    RegistryError, CrossScopeError, DestinationRegistryError, UnreadableProposalRecord,
+)
+
+
 @app.get("/registry/{entity}/products", response_class=HTMLResponse)
-@console_route(catches=(RegistryError, DestinationRegistryError), surface="page")
+@console_route(catches=_REGISTRY_PRODUCTS_CATCHES, surface="page")
 def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
-    selected = scope.current_entity()
-    vault = Vault(catalog)
-    return templates.TemplateResponse(
-        request, "registry.html",
-        {"bundles": vault.bundles(), "entity": selected, "products": products_for(scope)},
-    )
+    # M7 (review): unlike the two delete routes below, the `TemplateResponse`
+    # call sits inside this `try`. Intentional, not drift: `vault.bundles()`
+    # and `products_for(scope)` are both evaluated as part of building the
+    # context dict passed to `TemplateResponse`, so a failure from either
+    # must already be inside the guarded region for this route to describe
+    # it at all. The delete routes build their context only from values
+    # already validated by the point the `try` exits, so nothing left to
+    # raise the declared family sits outside it either — the shapes differ
+    # because what each route's context construction can raise differs, not
+    # because one route is guarded more carefully than the other.
+    try:
+        selected = scope.current_entity()
+        vault = Vault(catalog)
+        return templates.TemplateResponse(
+            request, "registry.html",
+            {"bundles": vault.bundles(), "entity": selected,
+             "products": products_for(scope)},
+        )
+    except _REGISTRY_PRODUCTS_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
 
 
 @app.post("/registry/{entity}/product/delete-preview", response_class=HTMLResponse)
-@console_route(
-    catches=(RegistryError, CrossScopeError, DestinationRegistryError),
-    surface="fragment-only",
-)
+@console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
 def registry_delete_preview(
     request: Request, scope: EntityScope, slug: str = Form(...)
 ) -> HTMLResponse:
-    selected = scope.current_entity()
-    prop = propose_delete(scope, "product", slug)
+    try:
+        selected = scope.current_entity()
+        prop = propose_delete(scope, "product", slug)
+        # propose_delete has already written the proposal file by this
+        # point (design §8: "the domain action succeeded, and S6 must not
+        # roll back a successful write merely because rendering failed"), so
+        # a failure from here on is `(committed=no, persistence=
+        # proposal-written)`, not `persistence=none`.
+        report = reference_count(scope, "product", slug)
+    except _REGISTRY_DELETE_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
-        {"entity": selected, "slug": slug, "prop": prop,
-         "report": reference_count(scope, "product", slug)},
+        {"entity": selected, "slug": slug, "prop": prop, "report": report},
     )
 
 
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
-@console_route(
-    catches=(RegistryError, CrossScopeError, DestinationRegistryError),
-    surface="fragment-only",
-)
-def registry_delete_execute(request: Request, scope: EntityScope,
-                            id: str = Form(...), slug: str = Form(...)) -> HTMLResponse:
+@console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
+def registry_delete_execute(
+    request: Request, scope: EntityScope, id: str = Form(...)
+) -> HTMLResponse:
+    # Rule 8 (design §6): the success copy must name the SERVER-derived
+    # slug, never the submitted one. `execute_delete` returns `None` and
+    # removes the proposal file as an owned change (app/registry.py:292,
+    # :346), so the record cannot be read afterwards — the validated slug is
+    # therefore held from a `get_delete_proposal` call made BEFORE
+    # `execute_delete`, and the route no longer even declares a `slug` form
+    # field (item D: it is unused for display and must not be submitted).
     try:
+        prop = get_delete_proposal(scope, id)
         execute_delete(scope, id)
-        msg = f"Deleted product '{slug}'. One commit written."
-    except RegistryError as e:
-        msg = str(e).replace("\n", "<br>")
-    return HTMLResponse(f'<div class="diff-head">{msg}</div>')
+    except _REGISTRY_DELETE_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+    return templates.TemplateResponse(
+        request, "blocks/delete_success.html",
+        {"kind": prop.kind, "slug": prop.slug},
+    )
