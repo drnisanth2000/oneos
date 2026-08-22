@@ -426,11 +426,24 @@ def preview_diff(scope: Scope, proposal: Proposal) -> str:
 
     Deliberately does **not** delegate to `_render_diff`: `_render_diff`
     raises a described error for a missing/redirected/undecodable receipt
-    (the projection's phase-3 contract), while `preview_diff` is relied on by
-    `app/main.py`'s outbox routes — outside S6 Task 9's scope — to render an
-    empty-old diff for a missing source without raising
-    (`tests/test_app.py::test_approval_route_visibly_refuses_unfresh_source`).
-    Changing that is a route-layer concern for a later task, not this one."""
+    (the projection's phase-3 contract), while `preview_diff` renders an
+    empty-old diff for a missing source without raising.
+
+    Task 12 moved every outbox *route* — `outbox_screen`, `outbox_approve`,
+    `outbox_reject` — onto `project_outbox`/`_render_diff`, leaving `propose`
+    as the sole remaining caller. The empty-old fallback is kept because
+    changing it would alter `propose`'s behaviour, which Task 12 does not own
+    — **not** because the source is expected to be absent there:
+    `propose_classification` refuses a missing receipt before persisting, so
+    on that path the source provably existed moments earlier and only a TOCTOU
+    deletion can race it.
+
+    `test_approval_route_visibly_refuses_unfresh_source` now observes
+    `approve`'s own refusal rendered through the projection's listing. Its
+    missing-source case additionally produces a row-level `E-MISSING`; there
+    is no row-level `E-STALE`, because staleness is a revalidation concern
+    rather than a read-boundary one, so a stale row keeps `can_approve` and
+    renders a normal diff."""
     _require_outbox_path(scope, proposal.path, require_leaf=True)
     reloaded = get_proposal(scope, proposal.id)
     if reloaded.id != proposal.id or reloaded.path != proposal.path:

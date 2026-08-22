@@ -21,7 +21,11 @@ Synthetic vaults only; the real vault is never touched.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
+import json
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -29,7 +33,13 @@ from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from app.console_routing import console_route
-from tests.conftest import scaffold_modules, write_vault
+from tests.conftest import (
+    git_changed_paths,
+    git_count_commits,
+    git_head,
+    scaffold_modules,
+    write_vault,
+)
 
 ENTITIES = """
 version: "1.0"
@@ -660,4 +670,659 @@ def test_triage_declared_family_never_reaches_the_global_fallback(
 
     monkeypatch.setattr(main, "read_inbox", _boom)
     client.get("/triage/alpha")
+    assert reached == ["RuntimeError"]
+
+
+# --- Task 12: routes, outbox (design §3 "Rule 3", §5 route inventory,
+# §8 test matrix) -----------------------------------------------------------
+#
+# `outbox_screen` had no try/except at all, and `outbox_approve`/
+# `outbox_reject` caught only `OutboxError` — the exact Task 11 trap, unfixed
+# here until now: all three declare `(OutboxError, CrossScopeError,
+# DestinationRegistryError)`, so `CrossScopeError` and `DestinationRegistryError`
+# escaped to the global fallback (and, per Starlette's `ServerErrorMiddleware`,
+# logged a raw traceback) for every one of the three routes.
+
+
+def _outbox_proposal_client(tmp_path, monkeypatch, *, proposal_id=None):
+    """A vault with one active module and one valid, loadable outbox
+    proposal — no Git repo. Sufficient for every test that monkeypatches
+    `app.outbox.execute_transaction` (or `main.approve`/`main.reject`
+    directly) rather than driving a real transaction.
+    """
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    active = tmp_path / "alpha/00-inbox/active"
+    active.mkdir(parents=True)
+    source = active / "marker.md"
+    source.write_text(
+        "---\ntitle: outbox-route-marker\nsub: triage\n---\nbody\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "alpha/02-work/active").mkdir(parents=True, exist_ok=True)
+    outbox_dir = tmp_path / "alpha/outbox"
+    outbox_dir.mkdir(parents=True, exist_ok=True)
+    proposal_id = proposal_id or "20260815T090703-" + "aa" * 16
+    (outbox_dir / f"{proposal_id}.yaml").write_text(
+        "\n".join(
+            (
+                f"id: {proposal_id}",
+                "action: classify",
+                "entity: alpha",
+                "src: alpha/00-inbox/active/marker.md",
+                f"source_sha256: {hashlib.sha256(source.read_bytes()).hexdigest()}",
+                "dst: alpha/02-work/active/marker.md",
+                "module: 02-work",
+                "sub:",
+                "block: build",
+                "status: pending",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    return main, TestClient(main.app), proposal_id
+
+
+def _git_outbox_proposal_client(tmp_path, monkeypatch):
+    """Same fixture, but a real Git repository — required to drive an actual
+    `execute_transaction` commit (design §8 state-proof matrix: the committed
+    case must be a genuine post-commit cleanup failure, not a monkeypatched
+    `execute_transaction`, which produces no commit at all)."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / ".gitignore").write_text("*/outbox/*.yaml\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"],
+        cwd=tmp_path, check=True,
+    )
+    subprocess.run(["git", "config", "user.name", "test"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=tmp_path, check=True)
+    return main, client, proposal_id
+
+
+def test_outbox_screen_renders_projection_blocked_listing(tmp_path, monkeypatch):
+    """design §3 "The blocked listing": one unreadable record blocks the
+    whole entity's actions, but valid rows keep rendering (id, destination,
+    diff) — no classification control anywhere — with one E-UNREADABLE
+    notice. The unreadable file's own name is never echoed (Rule 9).
+
+    I4: also pins two more template branches the review found deletable at
+    758 green — the unreadable row's own generic markup (distinct from the
+    listing-level alert above it) and the `prop-route` span that carries a
+    valid row's destination alongside its diff while blocked. Both verified
+    non-vacuous by mutation: stripping either leaves this test red.
+    """
+    main, client, valid_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    outbox_dir = tmp_path / "alpha/outbox"
+    (outbox_dir / "unreadable-filename-marker.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8",
+    )
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "E-UNREADABLE" in body
+    from app.console_errors import _CODES
+
+    assert _CODES["E-UNREADABLE"].message in body
+    assert valid_id in body
+    assert "unreadable-filename-marker" not in body
+    assert 'class="approve"' not in body
+    assert 'class="reject"' not in body
+    assert "/outbox/alpha/approve" not in body
+    assert "/outbox/alpha/reject" not in body
+    # The unreadable row's own generic markup (design §3: "the unreadable
+    # row is generic and echoes no filename") — distinct from the one
+    # listing-level notice already asserted above. `E-UNREADABLE`'s own
+    # message text also contains "could not be read as a proposal", so the
+    # row's own CSS class is what actually distinguishes its markup from the
+    # notice's.
+    assert 'class="proposal proposal-unreadable"' in body
+    # The still-blocked valid row keeps its destination AND its diff (design
+    # §3: "valid rows render read-only — id, destination, and diff").
+    assert 'class="prop-route">02-work' in body
+    assert 'class="block-tag">build</span>' in body
+    assert "a/alpha/00-inbox/active/marker.md" in body
+    assert "b/alpha/02-work/active/marker.md" in body
+    assert "-sub: triage" in body
+
+
+def test_outbox_screen_unblocked_listing_keeps_controls(tmp_path, monkeypatch):
+    """Sanity counterpart: with no unreadable record, the same valid proposal
+    keeps its approve/reject controls — proving the blocked test above is
+    exercising the blocking condition, not a template that never renders
+    controls at all."""
+    main, client, valid_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    assert valid_id in response.text
+    assert 'class="approve"' in response.text
+    assert 'class="reject"' in response.text
+
+
+def test_approve_busy_shows_e_busy_at_200(tmp_path, monkeypatch):
+    from app.console_errors import _CODES
+    from app.git_transaction import VaultBusyError
+    import app.outbox as outbox_module
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    raw_message = "another approval is already running"
+
+    def _raise(*args, **kwargs):
+        raise VaultBusyError(raw_message)
+
+    monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
+
+    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+
+    assert response.status_code == 200
+    assert 'role="alert"' in response.text
+    assert "E-BUSY" in response.text
+    assert _CODES["E-BUSY"].message in response.text
+    # Raw exception text never reaches HTML (design §6).
+    assert raw_message not in response.text
+
+
+def test_approve_conflict_shows_e_conflict(tmp_path, monkeypatch):
+    from app.console_errors import _CODES
+    from app.git_transaction import ReviewedStateChanged
+    import app.outbox as outbox_module
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    raw_message = "reviewed path has an unexpected staged change"
+
+    def _raise(*args, **kwargs):
+        raise ReviewedStateChanged(raw_message)
+
+    monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
+
+    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+
+    assert response.status_code == 200
+    assert 'role="alert"' in response.text
+    assert "E-CONFLICT" in response.text
+    assert _CODES["E-CONFLICT"].message in response.text
+    assert raw_message not in response.text
+
+
+def test_approve_rolled_back_shows_e_git(tmp_path, monkeypatch):
+    """N3: this test cannot detect a broken cause chain on its own —
+    `GitTransactionFailure` is itself `exact`-mapped to `E-GIT` (design §2's
+    class map), so even a raise that dropped `from exc` entirely would still
+    describe to `E-GIT` here. It pins the route's own catch and rendering,
+    not the resolver's chain-walking, which `tests/test_console_errors.py`
+    covers separately."""
+    from app.console_errors import _CODES
+    from app.git_transaction import GitTransactionFailure
+    import app.outbox as outbox_module
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    raw_message = "approval transaction failed and was rolled back"
+
+    def _raise(*args, **kwargs):
+        raise GitTransactionFailure(raw_message)
+
+    monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
+
+    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+
+    assert response.status_code == 200
+    assert 'role="alert"' in response.text
+    assert "E-GIT" in response.text
+    assert _CODES["E-GIT"].message in response.text
+    assert raw_message not in response.text
+
+
+def test_approve_recovery_blocked_shows_e_recover(tmp_path, monkeypatch):
+    """Recovery blocked is `attention` severity, unlike the three refusal
+    outcomes above — the fragment status follows the code's own page status
+    (500), not 200 (design §5)."""
+    from app.git_transaction import GitTransactionRecoveryError
+    import app.outbox as outbox_module
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    # A path distinct from the proposal's own src/dst — the still-pending
+    # proposal legitimately shows its own "marker.md" in the listing's diff,
+    # so the disclosure check below must target a path that would only ever
+    # appear if the *error's* own blocked-path argument leaked.
+    blocked_path = "alpha/11-other/active/blocked-path-marker.md"
+
+    def _raise(*args, **kwargs):
+        raise GitTransactionRecoveryError((blocked_path,))
+
+    monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
+
+    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+
+    from app.console_errors import _CODES
+
+    assert response.status_code == 500
+    assert 'role="alert"' in response.text
+    assert "E-RECOVER" in response.text
+    assert _CODES["E-RECOVER"].message in response.text
+    # Rule 9 / §6 disclosure: the blocked path is never echoed.
+    assert "blocked-path-marker" not in response.text
+
+
+def test_approve_committed_cleanup_shows_e_committed(tmp_path, monkeypatch):
+    """The one S5 outcome that must NOT be produced by monkeypatching
+    `execute_transaction` — that would produce no commit at all, and the
+    design's state-proof matrix requires "exactly the reviewed paths
+    committed at one new HEAD". Instead this injects a real post-commit
+    cleanup `OSError` (`app/git_transaction.py`'s `_remove_temporary_index`,
+    called unconditionally after a successful commit), so the transaction
+    genuinely commits and then converts to `GitTransactionCommittedError`.
+    """
+    import app.git_transaction as git_transaction
+
+    main, client, proposal_id = _git_outbox_proposal_client(tmp_path, monkeypatch)
+    vault = Path(tmp_path)
+    source = vault / "alpha/00-inbox/active/marker.md"
+    destination = vault / "alpha/02-work/active/marker.md"
+    proposal_path = vault / "alpha/outbox" / f"{proposal_id}.yaml"
+    head_before = git_head(vault)
+    commits_before = git_count_commits(vault)
+
+    def _fail_cleanup(temporary_index):
+        return OSError("injected post-commit temporary index cleanup failure")
+
+    monkeypatch.setattr(git_transaction, "_remove_temporary_index", _fail_cleanup)
+
+    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+
+    assert response.status_code == 500
+    assert 'role="alert"' in response.text
+    assert "E-COMMITTED" in response.text
+    from app.console_errors import _CODES
+
+    assert _CODES["E-COMMITTED"].message in response.text
+
+    # State proof: exactly the reviewed paths committed at one new HEAD.
+    assert git_count_commits(vault) == commits_before + 1
+    new_head = git_head(vault)
+    assert new_head != head_before
+    assert git_changed_paths(vault, new_head) == sorted(
+        ["alpha/00-inbox/active/marker.md", "alpha/02-work/active/marker.md"]
+    )
+    assert source.exists() is False
+    assert destination.exists() is True
+    assert proposal_path.exists() is False
+
+
+def test_reject_failure_is_visible_not_silent(tmp_path, monkeypatch):
+    """`outbox_reject` used to swallow every `OutboxError` silently
+    (`except OutboxError: pass`). A reject of an id with no matching pending
+    proposal must now render a described, visible refusal."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/outbox/alpha/reject",
+        data={"id": "20260101T000000-" + "00" * 16},
+    )
+
+    assert response.status_code == 200
+    assert 'role="alert"' in response.text
+    assert "E-INVALID" in response.text
+    # The real, still-pending proposal is untouched and still listed.
+    assert proposal_id in response.text
+
+
+def test_outbox_fragments_reproduce_outbox_list_root(tmp_path, monkeypatch):
+    """design §8: approve/reject target `#outbox-list` with `outerHTML`, so
+    every fragment they return — refusal or success — must reproduce that
+    root exactly once (never zero, never nested).
+
+    N1: extended past the two already-correct shapes (green at HEAD) to the
+    blocked and double-failure shapes C2 found untested — `_outbox_list_error`
+    exists specifically to keep this root on the double-failure path, and
+    nothing pinned that it actually does.
+    """
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    refusal = client.post(
+        "/outbox/alpha/reject", data={"id": "hostile-nonexistent-id"}
+    )
+    assert refusal.text.count('id="outbox-list"') == 1
+
+    success = client.post("/outbox/alpha/reject", data={"id": proposal_id})
+    assert success.text.count('id="outbox-list"') == 1
+
+    # Blocked shape: a genuinely unreadable record blocks the whole listing.
+    (tmp_path / "alpha/outbox/unreadable-shape-marker.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8",
+    )
+    blocked = client.get("/outbox/alpha")
+    assert blocked.text.count('id="outbox-list"') == 1
+    (tmp_path / "alpha/outbox/unreadable-shape-marker.yaml").unlink()
+
+    # Double-failure shape (C2): the action's own re-render also fails, for
+    # BOTH approve and reject — `_outbox_list_error`'s whole purpose is to
+    # keep this root as the swap target rather than stranding the operator
+    # with nothing left for a future approve/reject to swap into.
+    def _fail_listing(*args, **kwargs):
+        raise DestinationRegistryError("registries unreadable during re-render")
+
+    monkeypatch.setattr(main, "project_outbox", _fail_listing)
+    approve_double_failure = client.post(
+        "/outbox/alpha/approve", data={"id": proposal_id}
+    )
+    assert approve_double_failure.text.count('id="outbox-list"') == 1
+    reject_double_failure = client.post(
+        "/outbox/alpha/reject", data={"id": proposal_id}
+    )
+    assert reject_double_failure.text.count('id="outbox-list"') == 1
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_double_failure_renders_both_the_action_refusal_and_the_listing_failure(
+    tmp_path, monkeypatch, action
+):
+    """I1: the double-failure path (the action's own refusal, followed by the
+    re-render itself failing) must not discard the outcome of the request the
+    operator actually made. Design §5: "the status is the refusal's, because
+    that is the outcome of the request being answered."
+
+    Uses two DISTINCT exceptions on purpose — the pre-fix totality test
+    patched both sides with the *same* exception, so `expected_code in text`
+    could pass regardless of which one actually drove the response.
+    """
+    from app.console_errors import _CODES
+    from app.outbox import OutboxError
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    def _refuse_action(*args, **kwargs):
+        raise OutboxError("the action itself refuses this exact proposal")
+
+    def _fail_listing(*args, **kwargs):
+        raise DestinationRegistryError("registries unreadable during re-render")
+
+    monkeypatch.setattr(main, action, _refuse_action)
+    monkeypatch.setattr(main, "project_outbox", _fail_listing)
+
+    response = client.post(f"/outbox/alpha/{action}", data={"id": proposal_id})
+    body = response.text
+
+    # The action's own refusal (E-INVALID, a refusal) drives the status —
+    # not the listing failure (E-CONFIG, attention/500) that happened to be
+    # the exception which actually escaped `_outbox_list`.
+    assert response.status_code == 200
+    assert "E-INVALID" in body
+    assert _CODES["E-INVALID"].message in body
+    # The listing's own failure must still be visible, not silently dropped.
+    assert "E-CONFIG" in body
+    assert _CODES["E-CONFIG"].message in body
+    assert body.count('role="alert"') == 2
+    assert body.count('id="outbox-list"') == 1
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_same_code_double_failure_renders_one_alert(
+    tmp_path, monkeypatch, action
+):
+    """The scenario `_outbox_list_error`'s own docstring names — "the same
+    vault-wide condition as the just-attempted action, e.g. a broken registry
+    that refuses both" — described identically on both sides.
+
+    The distinct-exception test above cannot see this: choosing two different
+    exceptions is what makes it able to prove the status keying, and is
+    exactly what blinds it to the duplicate. Design §3 allows the listing ONE
+    notice, and the same sentence twice is not two pieces of information.
+    """
+    from app.console_errors import _CODES
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    def _one_condition_refuses_both(*args, **kwargs):
+        raise DestinationRegistryError("one broken registry refuses both")
+
+    monkeypatch.setattr(main, action, _one_condition_refuses_both)
+    monkeypatch.setattr(main, "project_outbox", _one_condition_refuses_both)
+
+    response = client.post(f"/outbox/alpha/{action}", data={"id": proposal_id})
+    body = response.text
+
+    assert body.count('role="alert"') == 1
+    assert body.count(_CODES["E-CONFIG"].message) == 1
+    assert body.count('id="outbox-list"') == 1
+
+
+def test_outbox_blocked_action_renders_one_alert_not_two(tmp_path, monkeypatch):
+    """I2: design §3 promises "one listing-level notice". In the blocked
+    state, approve's own refusal — the strict loader's E-UNREADABLE (ledger
+    D2) — and the projection's `blocked_notice` (also E-UNREADABLE, since any
+    unreadable row's own description carries it) describe the identical
+    condition. Rendering both would be two byte-identical alerts."""
+    from app.console_errors import _CODES
+
+    main, client, valid_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox/unreadable-blocked-action-marker.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8",
+    )
+
+    response = client.post("/outbox/alpha/approve", data={"id": valid_id})
+
+    # E-UNREADABLE is `attention` severity, so the fragment status follows
+    # its own page status (422) rather than 200 (design §5).
+    assert response.status_code == 422
+    body = response.text
+    assert body.count('role="alert"') == 1
+    assert "E-UNREADABLE" in body
+    # No output assertion can say WHICH of the two survived, and this one
+    # does not pretend to: `describe()` only selects from the `_CODES` table,
+    # so equal codes mean the identical `ConsoleError` — the two candidate
+    # renders are byte-identical. Keeping the action's refusal is therefore a
+    # preference, not an observable requirement. What is asserted is the thing
+    # design §3 actually promises: one notice, not two.
+    assert body.count(_CODES["E-UNREADABLE"].message) == 1
+
+
+def test_outbox_double_failure_does_not_claim_no_pending_proposals(
+    tmp_path, monkeypatch
+):
+    """I3: `_outbox_list_error` cannot build the listing at all, so `rows` is
+    empty for a reason unrelated to whether anything is actually pending. It
+    must not tell the operator there is nothing pending while a proposal
+    genuinely sits on disk — the S6 Objective forbids "a screen that hides
+    the condition it is protecting against"."""
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    def _fail_listing(*args, **kwargs):
+        raise DestinationRegistryError("registries unreadable during re-render")
+
+    monkeypatch.setattr(main, "project_outbox", _fail_listing)
+
+    response = client.post(
+        "/outbox/alpha/reject", data={"id": "hostile-nonexistent-id"}
+    )
+
+    assert "No pending proposals" not in response.text
+
+
+def test_outbox_row_with_non_utf8_receipt_keeps_reject_loses_approve_no_diff(
+    tmp_path, monkeypatch
+):
+    """I4: pins the per-row `{% elif error %}{% include "blocks/alert.html" %}`
+    branch (design §3 phase 3: an undiffable row "renders with a described
+    error in place of the diff"), and the row's capability shape — keeps
+    `can_reject`, loses `can_approve`, no diff. Deleting the per-row include
+    leaves the suite green at 758; verified by mutation."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    source = tmp_path / "alpha/00-inbox/active/marker.md"
+    source.write_bytes(b"---\ntitle: x\nsub: triage\n---\n\xff\xfe not valid utf-8\n")
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert proposal_id in body
+    assert "E-INVALID" in body
+    assert 'class="reject"' in body
+    assert 'class="approve"' not in body
+    assert 'class="diff-body"' not in body
+
+
+def test_outbox_row_with_missing_receipt_keeps_reject_loses_approve_no_diff(
+    tmp_path, monkeypatch
+):
+    """I4, second condition of the same shape: a missing receipt describes to
+    `E-MISSING` rather than `E-INVALID`, and the row still keeps `can_reject`
+    while losing `can_approve` and its diff."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/00-inbox/active/marker.md").unlink()
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert proposal_id in body
+    assert "E-MISSING" in body
+    assert 'class="reject"' in body
+    assert 'class="approve"' not in body
+    assert 'class="diff-body"' not in body
+
+
+def test_outbox_hx_vals_are_tojson(tmp_path, monkeypatch):
+    """design Rule 8 / §7 invariant 5: no template hand-builds an `hx-vals`
+    mapping. `templates/blocks/outbox_list.html` previously had two —
+    `hx-vals='{"id": "{{ p.id }}"}'` for both approve and reject."""
+    from tests.test_app import HxValsParser
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    response = client.get("/outbox/alpha")
+
+    parser = HxValsParser()
+    parser.feed(response.text)
+    assert len(parser.values) == 2  # one approve button, one reject button
+    for raw in parser.values:
+        assert json.loads(raw) == {"id": proposal_id}
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "templates/blocks/outbox_list.html"
+    ).read_text(encoding="utf-8")
+    hx_vals_attrs = re.findall(r"hx-vals='([^']*)'", source)
+    assert hx_vals_attrs, "expected at least one hx-vals attribute"
+    for value in hx_vals_attrs:
+        assert re.fullmatch(r"\{\{\s*\S+\s*\|\s*tojson\s*\}\}", value.strip()), value
+
+
+def test_outbox_declared_family_never_reaches_the_global_fallback(
+    tmp_path, monkeypatch
+):
+    """design §5: "the global handler catches only what escapes a route",
+    and "relying on it is a failure rather than a silent default" — pinned
+    here for all three outbox routes, the Task 11 pattern
+    (`test_triage_declared_family_never_reaches_the_global_fallback`).
+
+    I5: two separate passes, never the same exception object patched onto
+    both sides. The single-pass version left `project_outbox` patched for
+    the whole iteration, so approve/reject always exited through the OUTER
+    guard (`_outbox_list_error`) and the inline `except` around `approve`/
+    `reject` itself was never actually carried to completion; and patching
+    both sides with one shared exception let `expected_code in text` pass
+    regardless of which path answered, since both would describe the
+    identical object to the identical code.
+    """
+    from app.scope import RedirectedPathError
+    from app.vault import DestinationRegistryError
+    from app.outbox import OutboxError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    real_approve = main.approve
+    real_reject = main.reject
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    main.app.exception_handlers[Exception] = _spy
+
+    # Pass 1 — the action alone. `project_outbox` is left untouched, so a
+    # successful re-render (the still-pending proposal surviving in the
+    # response) proves the inline `except` around `approve`/`reject` ran to
+    # completion, rather than being masked by an identical listing failure.
+    for raiser, expected_code in (
+        (RedirectedPathError("redirected proposal leaf"), "E-TAMPER"),
+        (DestinationRegistryError("registries unreadable"), "E-CONFIG"),
+        (OutboxError("outbox is otherwise broken"), "E-INVALID"),
+    ):
+        def _raise(*args, __exc=raiser, **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "approve", _raise)
+        approve_response = client.post(
+            "/outbox/alpha/approve", data={"id": proposal_id}
+        )
+        assert expected_code in approve_response.text, approve_response.text
+        assert proposal_id in approve_response.text, (
+            "the still-pending proposal must survive the listing re-render"
+        )
+        assert reached == [], f"outbox_approve: fallback reached for {expected_code}"
+
+        monkeypatch.setattr(main, "reject", _raise)
+        reject_response = client.post(
+            "/outbox/alpha/reject", data={"id": proposal_id}
+        )
+        assert expected_code in reject_response.text, reject_response.text
+        assert proposal_id in reject_response.text, (
+            "the still-pending proposal must survive the listing re-render"
+        )
+        assert reached == [], f"outbox_reject: fallback reached for {expected_code}"
+
+    monkeypatch.setattr(main, "approve", real_approve)
+    monkeypatch.setattr(main, "reject", real_reject)
+
+    # Pass 2 — the projection alone: `approve`/`reject` are restored to the
+    # real functions, so any code observed here is driven entirely by
+    # `project_outbox` failing, for all three routes that call it.
+    for raiser, expected_code in (
+        (RedirectedPathError("redirected outbox"), "E-TAMPER"),
+        (DestinationRegistryError("registries unreadable"), "E-CONFIG"),
+        (OutboxError("outbox is otherwise broken"), "E-INVALID"),
+    ):
+        def _raise(*args, __exc=raiser, **kwargs):
+            raise __exc
+
+        monkeypatch.setattr(main, "project_outbox", _raise)
+        screen_response = client.get("/outbox/alpha")
+        assert expected_code in screen_response.text, screen_response.text
+        assert reached == [], f"outbox_screen: fallback reached for {expected_code}"
+
+        approve_response = client.post(
+            "/outbox/alpha/approve", data={"id": proposal_id}
+        )
+        assert expected_code in approve_response.text, approve_response.text
+        assert reached == [], f"outbox_approve: fallback reached for {expected_code}"
+
+        reject_response = client.post(
+            "/outbox/alpha/reject", data={"id": proposal_id}
+        )
+        assert expected_code in reject_response.text, reject_response.text
+        assert reached == [], f"outbox_reject: fallback reached for {expected_code}"
+
+    # Sanity: the spy fires for something genuinely undeclared, so the empty
+    # lists above are proof of routing rather than of a spy that never runs.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("undeclared by any outbox route")
+
+    monkeypatch.setattr(main, "project_outbox", _boom)
+    TestClient(main.app, raise_server_exceptions=False).get("/outbox/alpha")
     assert reached == ["RuntimeError"]

@@ -521,9 +521,10 @@ with it.
 
 | Item | Owner | Note |
 |---|---|---|
-| Non-canonical `dst` aborts the listing rather than blocking it | Task 12 | Faithful — the strict loader poisons identically and design §3 assigns destination validation to phase 2 — but it is the one poisoning condition producing an abort rather than a blocked listing. |
+| ~~Non-canonical `dst` aborts the listing rather than blocking it~~ | Task 12 | **DONE** — Task 12's outer handler describes it as `E-INVALID` at 422 instead of letting it escape to the global fallback, an improvement on the state this row recorded. Original note: faithful — the strict loader poisons identically and design §3 assigns destination validation to phase 2 — but it is the one poisoning condition producing an abort rather than a blocked listing. |
 | ~~Stopwatch still infers success from transport~~ | Task 11 | **DONE** at `d8d0dbe`. The listener and the literal `htmx:afterRequest` string survive (so the unlisted gate-1 test is untouched); what it keys on moved to the `HX-Trigger` header. |
-| `outbox_list.html` still renders the old `props` API | Task 12 | Expected; Task 12 converts it to the projection. |
+| ~~`outbox_list.html` still renders the old `props` API~~ | Task 12 | **DONE** — converted to the projection. |
+| Design §7 invariant 5's general `hx-vals` scan over `templates/` exists in no test file and no task's step list | Task 13a | Exactly the shape invariant 6 was in before Task 10a. Task 13's list names only the two known offenders (`registry.html`, `blocks/delete_impact.html`), which is the two-row list design §6 says is not enforcement. Close it the same way: a scan, not a list. |
 | `add_workspace` and `_count_front_matter` let `UnicodeDecodeError` escape | S7 | Absorbing it would change an existing fatality, which S6 has no authority to do. |
 | Reader-guard heuristic gaps (tuple-unpack, walrus, alias rebinding, `Path(...)` wrapping, builtin `open` on a tracked name) | S7 | None present in `app/` today; invariant 4 only refuses silence. |
 | The review gate does not bind reviewed content | S7 | Unchanged. Design §12. |
@@ -1030,3 +1031,215 @@ recording is correct for both):
 - The header comparison assumes the plain-string `HX-Trigger` form. Correct
   against the vendored bundle, which treats a value not starting with `{` as a
   comma-separated name list; nothing in this repo emits the object form.
+
+---
+
+### The ruling on `test_concurrent_outbox_requests_keep_entity_diffs_isolated`
+
+Escalated to the human during Task 12 and **granted**. Recorded here at the time
+of the ruling — the previous ruling was recorded only after the fact, and the
+Task 12 reviewer, seeing the design amended mid-review with no ledger entry,
+correctly read it as a session self-amending the normative document to
+authorise its own change. The amendment's content was right; its provenance was
+invisible. **A ruling is not authority until it is written down.**
+
+**The finding.** The test forces two requests to overlap by monkeypatching
+`main.load_proposals` onto a `threading.Barrier(2)`. Task 12 moves the outbox
+routes onto `project_outbox`, which by design §3 and Task 9's own tested
+invariant **never** calls `load_proposals`. Measured, not argued:
+
+| Tree | Barrier calls |
+|---|---|
+| Task 12 working tree | **0** |
+| `HEAD`, same instrumented test | **2** |
+
+Deleting the monkeypatch line outright still leaves the test green. The barrier,
+the `threading` import, `real_load` and the whole closure are inert. What
+remains is two GETs that may run strictly serially, asserting a property another
+test already covers without concurrency.
+
+`app/main.py` also carried a dead `load_proposals` import with a seven-line
+`# noqa` explaining that it existed only so `monkeypatch.setattr` would not
+`AttributeError`. That import is what hid the defect: without it the branch goes
+red the instant Task 12 lands, pointing straight at the hollowing.
+
+**Why this is worse than a test that changes.** A changed test is reviewable —
+`git diff`, `--numstat`, the deletion count and the suite total all show it. A
+hollowed test is invisible to every gate this branch relies on: nothing in the
+diff, no deletion, suite still 758. It is design §7's own diagnosis — "wrong in
+the direction of omission, which is the one direction a written list cannot
+detect" — turned on the regression table itself.
+
+**The ruling.** The regression table is an **explicit allowlist, not a numerical
+cap**; the count is an outcome, never the constraint. Keeping an inert isolation
+test would violate the stronger S1-S5 preservation constraint, so preserving the
+proof wins. In order: add the fourth design row, update the plan, re-point the
+monkeypatch from `load_proposals` to `project_outbox`, preserve the isolation
+assertions verbatim, add an explicit `hits == 2` assertion so the barrier can
+never silently stop firing again, delete the dead import, record the ruling.
+
+This **restores** the original proof rather than weakening or redefining it —
+the first regression row where that is true. The `hits == 2` assertion is the
+general countermeasure: any future refactor that moves the patched symbol off
+the request path now fails loudly instead of passing empty.
+
+---
+
+### Task 12 — Routes, outbox
+
+- **RED, re-measured after the fix rounds changed the file.** `uv run pytest
+  tests/test_console_routes.py -q` against a `git archive HEAD` tree given the
+  **final** test file: **18 failed, 20 passed**. Exactly **one** of the
+  seventeen new cases passes at HEAD — `test_outbox_screen_unblocked_listing_
+  keeps_controls`, a declared sanity control — and it is pinned by mutation
+  rather than by a RED phase.
+
+  An earlier draft of this entry said "9 failed, 21 passed … two of the eleven
+  new tests pass at HEAD". That was the round-1 measurement, taken when the
+  file carried eleven tests, and it went stale the moment fix rounds took it to
+  seventeen — while the sentence pinned it to "the final test file", which is
+  what made it false. The shape test it named as green-at-HEAD now has a
+  genuine RED phase, because the N1 fix extended it onto `main.project_outbox`,
+  a symbol HEAD does not have. **This is the same defect the Task 11 entry
+  documents about itself, one task later in the same document: a number
+  asserted rather than re-measured after the thing it describes changed.**
+- **GREEN.** `outbox_screen`, `outbox_approve`, `outbox_reject` render
+  `project_outbox`; `_outbox_rows` is the single place `describe()` is called
+  on `OutboxRow.error`, keeping the taxonomy out of `app/outbox.py`.
+- **Suite:** 747 → 766. `diff --check` clean. `app/outbox.py` changed only by
+  docstring.
+
+**The Task 11 trap was present here and was closed proactively.** All three
+routes declared `(OutboxError, CrossScopeError, DestinationRegistryError)`
+while `outbox_screen` had **no** `try/except` at all and the POSTs caught only
+`OutboxError`, so two declared members escaped to the global fallback. A
+`_OUTBOX_CATCHES` constant now feeds both the decorator and every `except`
+that answers it — `outbox_screen`'s own, and the two clauses inside each POST
+route's response helper. The POST routes themselves carry no `except`: round 4
+deleted the outer guards, recorded three paragraphs below. The reviewer swept **90 combinations** (10 exception types × 3 patch
+targets × 3 routes) with a fallback spy: zero hits, with a positive control
+proving the spy fires.
+
+The implementer also found a **third** escape shape beyond the brief: after a
+route handles its own action error, `_outbox_list`'s `project_outbox` re-read
+can independently raise the same family. `_outbox_list_error` answers that
+while still reproducing `#outbox-list`, because degrading to `blocks/alert.html`
+would strand the `outerHTML` swap target.
+
+**Review round 1 — 2 Critical, 7 Important.**
+
+- **C1 — an S1-S5 isolation proof was hollowed out.** See the recorded ruling
+  above. Measured 0 barrier calls against 2 at HEAD.
+- **C2 — `_outbox_list_error`'s entire purpose was pinned by nothing.**
+  Replacing its body with a plain `alert.html` render — the exact failure its
+  docstring names — left the **full suite green**. A guard whose distinguishing
+  property is untested is a comment, not a guard. This is Task 10a's C2 shape a
+  third time.
+- **I1** the double-failure path discarded the action's own refusal, rendering
+  only the listing's error and taking its status — inverting design §5's "the
+  status is the refusal's". **I2** blocked-state POSTs rendered two
+  byte-identical `E-UNREADABLE` notices where §3 promises one. **I3** the
+  double-failure fragment rendered "No pending proposals" while a proposal sat
+  on disk — the Objective forbids a screen that hides the condition it protects
+  against. **I4** three template branches (per-row error include, unreadable-row
+  markup, the destination span) were each deletable at 758 green. **I5** the
+  totality test patched both sides with the same exception and so could not
+  tell which handler answered. **I6** `preview_diff`'s docstring asserted
+  removed behaviour as contract — Task 11's fix-round-2 finding repeated.
+- **I7 — design §7 invariant 5's general `hx-vals` scan over `templates/`
+  exists nowhere and is owned by no task**, exactly as invariant 6 was before
+  Task 10a. Task 13's list names only the two known offenders, which is the
+  two-row list §6 says is not enforcement. Carried to a Task 13a.
+
+**Review round 2 — 3 Important, no Critical.** All one shape: a correct fix
+whose *sibling path*, *now-dead branch*, or *replacement comment* was not held
+to the standard of the thing it fixed.
+
+- **The I2 fix was applied in `_outbox_list` and re-created in
+  `_outbox_list_error`** — on the single scenario that helper's own docstring
+  names ("a broken registry that refuses both"). The distinct-exception test
+  written for I1 is structurally blind to it, since choosing two different
+  codes is what lets it prove the status keying. The reviewer's 90-combination
+  sweep found it without contrivance. Suppression now applied in both
+  renderers, keeping the action's refusal; a same-code parametrized test pins
+  it.
+- **The outer route guards became unreachable, and their docstrings claimed
+  otherwise — so they were removed.** After I1 wrapped every statement of the response helpers, the
+  only member that can reach the outer `except` is one raised by
+  `_outbox_list_error` itself — which the handler then calls a second time with
+  the same failing inputs. Deleting either outer guard was red in round 1 and
+  **green** in round 2.
+
+  Round 2 kept them and rewrote the docstrings; round 3 showed that
+  justification was itself false in both halves — invariant 6's guards check
+  that a route *declares* a family and contains no catch-all, **not** that its
+  body catches what it declares; design §7 assigns that to injection, i.e.
+  Task 14 Step 3, a runtime test. Documenting had required inventing a reason,
+  which is the same defect one level up. They are now **deleted**. Verified: a
+  54-request sweep (6 declared-family types × 3 patch targets × 3 routes) with
+  a fallback spy returns **0 global-fallback hits** without them, and both
+  remaining inner guards are load-bearing. Against the **full suite**
+  (`uv run python -m pytest -q`), deleting the re-render guard from both routes
+  reds **7**; deleting the action guard from both reds **19**.
+
+  An earlier draft gave "4" and "10" — `tests/test_console_routes.py`-only
+  figures for a *single* route, in a sentence whose subject was both guards on
+  both routes. Two numbers, two different selections, neither stated. The
+  substantive claim was true and confirmed six ways; the numbers attached to it
+  were not. **A count is meaningless without the selection that produced it.**
+- **The I6 fix replaced one false claim with two.** It asserted `propose`
+  previews "a proposal whose source may not exist yet (e.g. a reclassification
+  proposed before the receipt lands)" — impossible, since
+  `propose_classification` refuses a missing receipt before persisting, so only
+  a TOCTOU deletion can race it. And it claimed the unfresh-source test now
+  exercises "row-level `E-MISSING`/`E-STALE`" — there is **no** row-level
+  `E-STALE`: a stale row carries no error, keeps `can_approve`, and renders a
+  normal diff, because staleness is a revalidation concern rather than a
+  read-boundary one. Both corrected to what was measured. At least the **sixth**
+  unmeasured claim shipped in a comment or ledger on this branch — the Task 11
+  entry had already reached five, and I6 was two false claims in one docstring.
+  Review caught it again.
+
+**A self-caught vacuity worth recording.** The fix round's first
+unreadable-row assertion used `"could not be read as a proposal" in body` —
+which `E-UNREADABLE`'s own message also contains, so the mutation passed green.
+Replaced with the row's CSS class. The reviewer then swept for that shape by
+stripping `error.code` and `error.message` from `alert.html` in turn and
+diffing which tests survived: every code and message assertion goes red, and the
+three tests that ignore both sweeps assert no codes at all. That was the only
+instance.
+
+**Mutation evidence.** Every round-1 mutation that was green is now red:
+`_outbox_list_error` → `alert.html`; delete the per-row error include; delete
+the unreadable-row markup; blank `prop-route`; delete the concurrency
+monkeypatch; re-point the barrier at a symbol nothing calls. Plus the fixes'
+own: remove the I2 duplicate suppression (both renderers), remove
+`listing_unavailable`, drop `action_error`, key `status_for` on the listing
+instead of the refusal, flip `can_approve` in `project_outbox`'s phase-3 error branch (red, but five of the seven it reds are pre-existing Task 9 projection tests, so it is only partly Task 12's evidence).
+
+**Regression rows used:** row 1 (`test_approval_route_transaction_error_...`,
+the alert-absent assertion) and row 4 (the concurrency monkeypatch target).
+`tests/test_app.py` carries exactly three deleted lines — row 1's assertion and
+row 4's two, since retargeting a monkeypatch necessarily touches the capture
+line as well as the `setattr`. The four state proofs and the isolation
+assertions are byte-identical to `HEAD`.
+
+**Recovered from a self-inflicted loss.** While probing whether the barrier
+still fired, the coordinator ran `git checkout -- tests/test_app.py` and
+destroyed Task 12's uncommitted row-1 edit; no backup existed. It was
+reconstructed by hand and the reviewer verified the reconstruction is faithful —
+one deletion, four state proofs byte-identical, nothing else shifted. This is
+the **second** recorded instance of `git checkout` destroying uncommitted work
+on this branch; the first is in the Task 11 mutation-evidence note. An earlier
+draft said "third", and the correction of it was reported as applied while the
+edit had silently failed — see the process note at the end of this entry.
+**Back up with `cp`, restore with `cp`.**
+
+
+**A process note this task earned twice.** Two ledger corrections were written
+with `str.replace()` and no assertion, so both silently matched nothing, left
+the original text in place, and were then *reported* as applied. That is an
+unmeasured claim about one's own edits — the same failure this entry is largely
+about, one level up. Every replacement in the final pass asserts its anchor is
+present and unique, and the result is grepped afterwards. **Do not use an
+unasserted `replace()` on a file whose correctness is the point.**

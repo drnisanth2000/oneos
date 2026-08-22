@@ -1130,6 +1130,7 @@ listed individually rather than discovered during implementation:
 | `tests/test_app.py:477-503` | asserts `role="alert"` is absent for an injected transaction error — S6 makes it present |
 | `tests/test_app.py:588` | asserts the raw string `"registry deletion transaction failed"` renders — the disclosure boundary forbids it |
 | `tests/test_app.py:393` `test_tampered_proposal_form_writes_nothing` | asserts `status_code >= 400` in six parametrized cases. `propose` is `fragment-only`, so once Task 11 gives it a route-level catch every one of the six describes to refusal severity and returns **200**. **Status expectation only** — its three state proofs (`HEAD` unchanged, entity bytes unchanged, no proposal written) stay verbatim, and they are the test's actual subject. It additionally **gains** an observable-refusal assertion: the response must carry `role="alert"` and the described code and message for the condition, and must not echo the submitted value. Swapping `>= 400` for `== 200` alone would weaken the test, since a 200 carrying no alert would pass; the added assertion is what keeps the refusal proven now that the status no longer proves it. The six parameters are six cases of this one declared presentation regression, not six new exceptions. Owned by Task 11. |
+| `tests/test_app.py` `test_concurrent_outbox_requests_keep_entity_diffs_isolated` | forces two requests to overlap by monkeypatching `main.load_proposals` onto a `threading.Barrier(2)`. Task 12 moves the outbox routes onto `project_outbox`, which by design §3 **never** calls `load_proposals`, so the barrier stops firing and the test passes while proving nothing — measured at 0 barrier hits against an expected 2. **Monkeypatch target only** (`load_proposals` → `project_outbox`): the test's subject, its isolation assertions, and its concurrency mechanism are preserved verbatim, and it **gains** an explicit `hits == 2` assertion so it can never silently go inert again. This row exists to *restore* an S1-S5 isolation proof that S6 would otherwise hollow out, not to relax one. Owned by Task 12. |
 
 Rule 5's route-shape-first selection settles what earlier drafts left open:
 `propose`, `outbox_approve`, `outbox_reject`, and the two registry POSTs always
@@ -1148,6 +1149,15 @@ records it.
 
 The lesson is the one this project keeps relearning: an enumeration justified by
 reasoning rather than by reading is wrong in the direction it cannot see.
+
+This table is an **explicit allowlist, not a numerical cap.** A row is added
+when S6 provably changes what a test observes; the count is an outcome, never
+the constraint. The binding rule is the one below, and where the two appear to
+conflict — as with the concurrency row above, where leaving the test untouched
+would have silently destroyed an isolation proof — **preserving the proof
+wins.** A test that still passes while no longer exercising its subject has not
+been preserved; it has been hollowed out, which is worse than a visible failure
+because nothing reports it.
 
 The rule this table replaces: **an S1-S5 service or state-safety test whose
 subject is a refusal decision, an isolation guarantee, or a state proof must not

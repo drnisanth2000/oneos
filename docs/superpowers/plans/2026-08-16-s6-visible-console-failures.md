@@ -693,6 +693,14 @@ test_outbox_hx_vals_are_tojson
 - [ ] **Step 2-3:** RED then GREEN: routes render the projection; blocked
   listing withholds all controls with one described notice; approve/reject
   catch their tuple and describe.
+- [ ] **Step 4a:** Re-point
+  `test_concurrent_outbox_requests_keep_entity_diffs_isolated`'s monkeypatch
+  from `main.load_proposals` to `main.project_outbox`. **Target only** — its
+  isolation assertions and concurrency mechanism stay verbatim. Add an explicit
+  `hits == 2` assertion so the barrier can never silently stop firing again,
+  and delete the now-dead `load_proposals` import from `app/main.py`. Fourth
+  row of the design's regression table; added because leaving it untouched
+  would ship an isolation proof measured at 0 barrier hits.
 - [ ] **Step 4:** `uv run python -m pytest -q` — the first listed regression
   test is updated now (`test_app.py:477-503`, the transaction-error alert
   assertion); every other pre-existing test unmodified. The second listed

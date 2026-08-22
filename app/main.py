@@ -21,20 +21,18 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .classifier import Classifier
 from .config import build_catalog, build_scope
-from .console_errors import describe
+from .console_errors import ConsoleError, describe
 from .console_render import is_fragment, status_for
 from .console_routing import console_route
 from .destinations import DestinationError, resolve_classification_destination
 from .entities import EntityManifestError, EntitySelectionError
 from .inbox import read_inbox
 from .outbox import (
-    MissingProposalSource,
     OutboxDestinationError,
     OutboxError,
-    StaleProposalSource,
     approve,
-    load_proposals,
     preview_diff,
+    project_outbox,
     propose_classification,
     reject,
 )
@@ -320,74 +318,249 @@ def propose(
     return response
 
 
+#: Declared once so the decorator and each route's own `except` cannot drift
+#: (the Task 11 pattern). `load_proposals` raises bare `CrossScopeError` for a
+#: redirected outbox or proposal leaf, which today escapes `except OutboxError:
+#: pass` entirely — design §5 names this exact gap for the outbox routes.
+_OUTBOX_CATCHES = (OutboxError, CrossScopeError, DestinationRegistryError)
+
+
+def _outbox_rows(listing):
+    """Describe every row's carried exception once, in the composition root
+    (design §3: "the taxonomy stays out of the service" — `OutboxRow.error`
+    carries the raw exception, never a code, and only `app/main.py` calls
+    `describe()` on it).
+
+    Returns `(rows, blocked_notice)`: `rows` pairs each `OutboxRow` with its
+    described error (`None` when the row has none); `blocked_notice` is the
+    single listing-level `ConsoleError` for a blocked listing — every
+    unreadable row describes to the same `E-UNREADABLE` code (mro), so any one
+    of them carries the notice.
+    """
+    rows = [
+        (row, describe(row.error) if row.error is not None else None)
+        for row in listing.rows
+    ]
+    blocked_notice = None
+    if listing.blocked:
+        blocked_notice = next(
+            (error for row, error in rows if row.proposal is None and error is not None),
+            None,
+        )
+    return rows, blocked_notice
+
+
 def _outbox_list(
     request: Request,
     scope: Scope,
     *,
-    approval_error: str | None = None,
+    approval_error: ConsoleError | None = None,
 ) -> HTMLResponse:
-    selected = scope.current_entity()
-    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope)]
+    """Fragment renderer shared by approve and reject (design §8: both swap
+    `#outbox-list` `outerHTML`, so the fragment reproduces that root).
+
+    `approval_error` is the just-attempted action's own described failure, if
+    any — never the blocked listing's notice. Design §5: "When one response
+    carries several codes … the status is the refusal's" — the listing's own
+    condition is already visible in its own notice, so the status here follows
+    only `approval_error`, via the same severity rule every fragment uses.
+    """
+    endpoint = _endpoint_for(request)
+    fragment = is_fragment(request, endpoint)
+    listing = project_outbox(scope)
+    rows, blocked_notice = _outbox_rows(listing)
+    if (
+        blocked_notice is not None
+        and approval_error is not None
+        and blocked_notice.code == approval_error.code
+    ):
+        # design §3: "one listing-level notice". In the blocked state a POST
+        # is refused by the strict loader with the identical E-UNREADABLE
+        # code the projection's own blocked notice already carries (ledger
+        # D2) — rendering both would be two byte-identical alerts saying the
+        # same sentence twice. The action's own alert is kept; the listing's
+        # redundant one is suppressed.
+        blocked_notice = None
+    status = status_for(approval_error, fragment) if approval_error is not None else 200
     return templates.TemplateResponse(
         request,
         "blocks/outbox_list.html",
-        {"entity": selected, "props": props, "approval_error": approval_error},
+        {
+            "entity": scope.current_entity(),
+            "rows": rows,
+            "blocked": listing.blocked,
+            "blocked_notice": blocked_notice,
+            "approval_error": approval_error,
+            "listing_unavailable": False,
+            "listing_error": None,
+        },
+        status_code=status,
     )
 
 
 @app.get("/outbox/{entity}", response_class=HTMLResponse)
-@console_route(
-    catches=(OutboxError, CrossScopeError, DestinationRegistryError),
-    surface="page",
-)
+@console_route(catches=_OUTBOX_CATCHES, surface="page")
 def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
-    selected = scope.current_entity()
+    """Every member of the declared family is answered by the route itself
+    (the Task 11 `triage` pattern). `project_outbox`'s phase 2 (destination and
+    registry validation) deliberately propagates — design §3 — so a broken
+    registry or a redirected outbox aborts the projection entirely; that abort
+    must land in *this* handler, not escape the route to the global fallback.
+    """
+    try:
+        return _outbox_page(request, scope)
+    except _OUTBOX_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+
+
+def _outbox_page(request: Request, scope: Scope) -> HTMLResponse:
     vault = Vault(catalog)
-    props = [(p, preview_diff(scope, p)) for p in load_proposals(scope)]
+    listing = project_outbox(scope)
+    rows, blocked_notice = _outbox_rows(listing)
     return templates.TemplateResponse(
         request, "outbox.html",
-        {"bundles": vault.bundles(), "entity": selected, "props": props},
+        {
+            "bundles": vault.bundles(),
+            "entity": scope.current_entity(),
+            "rows": rows,
+            "blocked": listing.blocked,
+            "blocked_notice": blocked_notice,
+            "approval_error": None,
+            "listing_unavailable": False,
+            "listing_error": None,
+        },
+    )
+
+
+def _outbox_list_error(
+    request: Request,
+    scope: Scope,
+    exc: BaseException,
+    *,
+    action_error: ConsoleError | None = None,
+) -> HTMLResponse:
+    """Fallback fragment for the rare double-failure where even the
+    re-rendered listing itself fails to build (`project_outbox`, called from
+    `_outbox_list`, escapes for a reason unrelated to — or the same vault-wide
+    condition as — the just-attempted action, e.g. a broken registry that
+    refuses both).
+
+    Keeps the `#outbox-list` `outerHTML` swap target (design §8's swap-shape
+    rule): rendering the route-agnostic `blocks/alert.html` here instead would
+    remove `#outbox-list` from the DOM entirely, stranding the operator with
+    no element left for a future approve/reject to swap into, AND would
+    discard the listing's own state (design §3: a screen must not hide the
+    condition it is protecting against — here, that a proposal is genuinely
+    still pending). Renders the same fragment `_outbox_list` would, with no
+    rows, `listing_unavailable=True` so the template does not lie and claim
+    the outbox is empty, and the listing failure carried as its own alert.
+
+    `action_error` is the just-attempted action's own described refusal, if
+    the caller already has one (i.e. `approve`/`reject` itself refused before
+    the re-render also failed). Design §5: "the status is the refusal's,
+    because that is the outcome of the request being answered" — so when
+    present it drives the response status, and BOTH conditions are rendered:
+    dropping the action's own refusal here would silently discard the answer
+    to the request the operator actually made.
+    """
+    listing_error = describe(exc)
+    # Same suppression `_outbox_list` applies (I2): when one vault-wide
+    # condition refuses both the action and the re-read — the case this
+    # docstring names — the two describe identically, and rendering the same
+    # sentence twice is not two pieces of information. The action's refusal
+    # is the one kept: design §5, it is "the outcome of the request being
+    # answered".
+    if action_error is not None and action_error.code == listing_error.code:
+        listing_error = None
+    endpoint = _endpoint_for(request)
+    fragment = is_fragment(request, endpoint)
+    status_source = action_error if action_error is not None else listing_error
+    return templates.TemplateResponse(
+        request,
+        "blocks/outbox_list.html",
+        {
+            "entity": scope.current_entity(),
+            "rows": (),
+            "blocked": False,
+            "blocked_notice": None,
+            "approval_error": action_error,
+            "listing_error": listing_error,
+            "listing_unavailable": True,
+        },
+        status_code=status_for(status_source, fragment),
     )
 
 
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
-@console_route(
-    catches=(OutboxError, CrossScopeError, DestinationRegistryError),
-    surface="fragment-only",
-)
+@console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
 def outbox_approve(
     request: Request, scope: EntityScope, id: str = Form(...)
 ) -> HTMLResponse:
+    """The route's declared family is answered inside
+    `_outbox_approve_response`, which catches `approve` itself refusing and,
+    separately, the `_outbox_list` re-render failing on top of it —
+    carrying both into `_outbox_list_error` rather than losing the action's
+    own refusal (design §5: the status is the refusal's).
+
+    There is deliberately no second `except` wrapping this call. Every
+    statement of the response helper is already inside a `try`, so the only
+    thing an outer clause could catch is a failure raised by
+    `_outbox_list_error` itself — which it could only answer by calling that
+    same function again with the same failing inputs. Deleting it changes no
+    structural check and no measured outcome; an earlier revision kept one
+    and had to invent a reason, which is why it is gone.
+    """
+    return _outbox_approve_response(request, scope, id)
+
+
+def _outbox_approve_response(request: Request, scope: Scope, id: str) -> HTMLResponse:
     approval_error = None
     try:
         approve(scope, id)
-    except MissingProposalSource:
-        approval_error = (
-            "Approval refused: source is missing. Restore it or reject the proposal."
-        )
-    except StaleProposalSource:
-        approval_error = (
-            "Approval refused: source changed since this proposal was created. "
-            "Create a fresh proposal."
-        )
-    except OutboxError:
-        pass
-    return _outbox_list(request, scope, approval_error=approval_error)
+    except _OUTBOX_CATCHES as exc:
+        approval_error = describe(exc)
+    try:
+        return _outbox_list(request, scope, approval_error=approval_error)
+    except _OUTBOX_CATCHES as exc:
+        # I1: the re-render's own failure must not discard approve()'s own
+        # refusal — both are carried into the fallback fragment.
+        return _outbox_list_error(request, scope, exc, action_error=approval_error)
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
-@console_route(
-    catches=(OutboxError, CrossScopeError, DestinationRegistryError),
-    surface="fragment-only",
-)
+@console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
 def outbox_reject(
     request: Request, scope: EntityScope, id: str = Form(...)
 ) -> HTMLResponse:
+    """The route's declared family is answered inside
+    `_outbox_reject_response`, which catches `reject` itself refusing and,
+    separately, the `_outbox_list` re-render failing on top of it —
+    carrying both into `_outbox_list_error` rather than losing the action's
+    own refusal (design §5: the status is the refusal's).
+
+    There is deliberately no second `except` wrapping this call. Every
+    statement of the response helper is already inside a `try`, so the only
+    thing an outer clause could catch is a failure raised by
+    `_outbox_list_error` itself — which it could only answer by calling that
+    same function again with the same failing inputs. Deleting it changes no
+    structural check and no measured outcome; an earlier revision kept one
+    and had to invent a reason, which is why it is gone.
+    """
+    return _outbox_reject_response(request, scope, id)
+
+
+def _outbox_reject_response(request: Request, scope: Scope, id: str) -> HTMLResponse:
+    approval_error = None
     try:
         reject(scope, id)
-    except OutboxError:
-        pass
-    return _outbox_list(request, scope)
+    except _OUTBOX_CATCHES as exc:
+        approval_error = describe(exc)
+    try:
+        return _outbox_list(request, scope, approval_error=approval_error)
+    except _OUTBOX_CATCHES as exc:
+        # I1: same as approve — the re-render's own failure must not discard
+        # reject()'s own refusal.
+        return _outbox_list_error(request, scope, exc, action_error=approval_error)
 
 
 @app.get("/registry/{entity}/products", response_class=HTMLResponse)
