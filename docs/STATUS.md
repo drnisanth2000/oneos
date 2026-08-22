@@ -14,8 +14,9 @@ Last reconciled: 2026-08-16, after Safety Foundation S5 merged into `main`.
 
 ## Phase 1 triage
 
-Original steps 1-10 and Safety Foundation S1-S5 are complete. S6 is the
-current step. Phase 2 is not authorized.
+Original steps 1-10 and Safety Foundation S1-S6 are complete. S7 — bound
+review tokens — is the next step and is not yet designed. Phase 2 is not
+authorized.
 
 | Safety step | State | Merged outcome |
 |---|---|---|
@@ -24,7 +25,7 @@ current step. Phase 2 is not authorized.
 | S3 — server-owned destinations | **COMPLETE** | One canonical resolver validates module/sub/flags/lifecycle paths, derives block, and revalidates stored proposals before reads or writes. |
 | S4 — proposal identity and freshness | **COMPLETE** | Collision-safe proposal IDs, exact-byte source SHA-256, no-follow snapshots, and visible stale/missing refusals are merged. |
 | S5 — Git transaction and audit | **COMPLETE** | Classification approval and registry deletion use exact-path alternate-index transactions with ownership-aware rollback; Gate 3 validates action-specific messages, paths, and dirty-state fingerprints. |
-| S6 — Console failures | **IN IMPLEMENTATION** | Design approved after eight review rounds plus a closure pass. Tasks 1-9 of 14 committed, each reviewed clean. Public suite 603 → 725. Progress and per-task review record: `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`. |
+| S6 — Console failures | **COMPLETE** | Every typed Command Center refusal reaches the operator as a specific, safe, actionable message; no route swallows a failure or returns a raw server fault. Public suite 603 → 832. All public and private gates pass, including the combined repo+vault history audit; Grey Matter fingerprints identical before and after. Per-task review record: `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`. |
 | S7 — bound review tokens | **PROPOSED** | Discovered while designing S6; not designed. See `BUILD.md`. |
 
 Merged S5 baseline: `0f71cd3`. Fresh verification of this reconciled branch

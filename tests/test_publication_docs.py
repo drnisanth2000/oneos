@@ -61,9 +61,13 @@ def test_safety_foundation_status_tracks_merged_s1_through_s5():
     build = Path("BUILD.md").read_text(encoding="utf-8")
     status = Path("docs/STATUS.md").read_text(encoding="utf-8")
 
-    for step in ("S1", "S2", "S3", "S4", "S5"):
+    for step in ("S1", "S2", "S3", "S4", "S5", "S6"):
         assert f"| {step} | **COMPLETE** |" in build
-    assert "| S6 | **NEXT** |" in build
+    # S6 advanced NEXT -> COMPLETE in the Task 15 documentation commit. This
+    # sentinel tracks documented lifecycle state, not an S1-S5 behavioural,
+    # isolation or refusal contract, so advancing it spends no regression-table
+    # row (human ruling, recorded in the ledger).
+    assert "| S7 |" in build
     assert "Merged S5 baseline: `0f71cd3`" in status
 
     stale_claims = (

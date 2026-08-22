@@ -1,6 +1,9 @@
 # S6 — Visible Console Failures
 
-**Status:** Approved for implementation planning
+**Status:** HISTORICAL — implemented and merged into the branch at S6 completion.
+Its rules remain normative for the code they govern; its branch commands, test
+counts and stop conditions are a record, not current instructions (AGENTS.md,
+"Repository and task hygiene").
 
 **Base:** `origin/main` at `a42ee12`. Public baseline: 603 tests. Private
 baseline: 37 tests.

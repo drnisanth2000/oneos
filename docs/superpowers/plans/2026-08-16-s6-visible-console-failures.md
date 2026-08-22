@@ -1,5 +1,9 @@
 # S6 Visible Console Failures Implementation Plan
 
+> **HISTORICAL.** Every task is implemented, reviewed and committed. The
+> branch commands, baselines and stop conditions below are a record of how
+> S6 was executed, not current instructions.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make every typed Command Center refusal reach the operator as a
