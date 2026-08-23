@@ -8,9 +8,14 @@ still hash to the fingerprint the operator was shown.
 
 The digest is a change detector, not a secret. It is not a password, a
 capability, or proof of attention, so there is no signing, storage, session,
-or dependency here — and there must never be. Keeping this module free of
-route, storage, and presentation knowledge is what makes "parse and hash the
-same single read" checkable in one place.
+or dependency here — and there must never be.
+
+What this module guarantees is narrow: that a snapshot's digest is the digest
+of the bytes the snapshot carries, and that a submitted fingerprint is
+well-formed before it is ever compared. It cannot see where `value` came
+from, so it cannot prove `value` was parsed from `contents`. That proof is a
+property of the single-read sequence in the readers (spec §Architecture-1,
+step 2-3) and belongs to Task 2 and Task 4, not here.
 """
 from __future__ import annotations
 
@@ -57,10 +62,13 @@ class ReviewedProposalChanged(ReviewTokenError):
 
 @dataclass(frozen=True)
 class ReviewSnapshot(Generic[T]):
-    """One validated value, the exact bytes it was parsed from, their digest.
+    """One validated value, the bytes it is claimed to come from, their digest.
 
-    The three fields travel together so no caller can pair a value parsed
-    from one read with a digest taken from another.
+    The three fields travel together so a reader can hand all of them
+    onward as one thing. Only the bytes-to-digest half of that pairing is
+    enforced here: `value` is opaque, so a caller that parses one read and
+    snapshots another is not detectable at this boundary. The readers'
+    capture-parse-hash sequence is what makes `value` provenance true.
     """
 
     value: T
@@ -68,10 +76,10 @@ class ReviewSnapshot(Generic[T]):
     sha256: str
 
     def __post_init__(self) -> None:
-        # Tasks 2-4 build these inside the outbox and registry readers, which
-        # is where "parse one read, hash another" can be reintroduced. Making
-        # the inconsistent value unconstructible keeps spec §Architecture-1
-        # checkable here rather than at every call site.
+        # Narrow on purpose: this rejects a snapshot whose digest is not of
+        # its own bytes, which is the one inconsistency visible from here.
+        # It does not — and cannot — check that `value` was parsed from
+        # those bytes.
         if type(self.contents) is not bytes:
             raise ReviewContractViolation("snapshot contents must be immutable bytes")
         if hashlib.sha256(self.contents).hexdigest() != self.sha256:

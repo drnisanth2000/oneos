@@ -202,12 +202,12 @@ def test_the_module_knows_nothing_about_routes_storage_or_presentation():
 
 
 def test_a_snapshot_cannot_exist_whose_digest_is_not_of_its_own_bytes():
-    """S1. The type — not just the factory — carries the pairing.
+    """S1. The bytes-to-digest pairing holds for the type, not just the
+    factory — so a direct construction cannot smuggle in a mismatch.
 
-    Tasks 2 and 3 construct these inside the outbox and registry readers,
-    which is exactly where "parse one read, hash another" can be
-    reintroduced by a plausible refactor. Making the inconsistent value
-    unconstructible is what keeps that checkable in one place.
+    This is the whole of what Task 1 proves. See
+    `test_a_snapshot_cannot_prove_where_its_value_came_from` for the half
+    that is deliberately out of reach here.
     """
     contents = b"id: same-id\nvalue: first\n"
     other = hashlib.sha256(b"different bytes entirely").hexdigest()
@@ -251,6 +251,30 @@ def test_a_contract_violation_is_neither_a_changed_review_nor_a_bad_request():
     assert not isinstance(raised.value, ReviewedProposalChanged)
     assert not isinstance(raised.value, InvalidReviewToken)
     assert isinstance(raised.value, ReviewTokenError)
+
+
+def test_a_snapshot_cannot_prove_where_its_value_came_from():
+    """The boundary of Task 1's guarantee, pinned so it is not overclaimed.
+
+    `value` is opaque to this module, so a value parsed from one read can
+    legally be carried alongside bytes and a digest from another. Nothing
+    here can detect it. Proving `value` was parsed from `contents` is a
+    property of the readers' capture-parse-hash sequence (spec
+    §Architecture-1) and is established in Task 2 and Task 4.
+    """
+    bytes_a = b"id: same-id\nvalue: first\n"
+    bytes_b = b"id: same-id\nvalue: second\n"
+    value_from_a = make_review_snapshot("parsed-from-A", bytes_a).value
+
+    mismatched = ReviewSnapshot(
+        value_from_a, bytes_b, hashlib.sha256(bytes_b).hexdigest()
+    )
+
+    # Self-consistent bytes and digest; the value's lineage is simply not
+    # visible from here. If this ever raises, the guarantee has grown and
+    # the module and its docstrings must say so.
+    assert mismatched.value == "parsed-from-A"
+    assert mismatched.contents == bytes_b
 
 
 def test_a_snapshot_verifies_against_its_own_fingerprint():
