@@ -375,6 +375,124 @@ git commit -m "feat: bind approve and reject to reviewed proposal bytes"
 
 ---
 
+## Task 3c: Consume Proposals by Quarantine, Never by Deletion
+
+> Added by **Amendment 1** to the approved spec, after independent review
+> established that no deletion-based construction can satisfy acceptance
+> criterion 4. Do not start until the amendment is approved.
+
+**Files:** modify `app/git_transaction.py`, `app/outbox.py`,
+`tests/test_git_transaction.py`, `tests/test_outbox.py`
+
+- [ ] **RED:** Add tests proving that **no reviewed action unlinks a proposal**:
+
+  - after a successful approve and a successful reject, the proposal is gone
+    from the outbox listing *and* present in quarantine with its exact
+    reviewed bytes;
+  - an AST test that neither `approve`, `reject`, nor the proposal-consumption
+    primitive reaches `os.unlink`/`Path.unlink` on a proposal path;
+  - a replacement swapped in at every injectable seam — after the fingerprint
+    comparison, after the internal capture, and after the final descriptor
+    gate — leaves **both** files intact and refuses;
+  - a quarantine destination that is already occupied is refused, never
+    overwritten, with the occupant's bytes intact; and
+  - with the atomic no-overwrite move made to report itself unavailable, every
+    reviewed action refuses and changes nothing — no fallback path exists.
+
+- [ ] **GREEN — the atomic move.** Add the one primitive everything else
+rests on. It must be a **single kernel operation** that moves the file and
+fails if the destination exists:
+
+```python
+def _move_no_replace(from_fd: int, from_name: str, to_fd: int, to_name: str) -> None:
+    """Atomically move a leaf, refusing if the destination exists.
+
+    Linux: renameat2(RENAME_NOREPLACE). macOS: renameatx_np(RENAME_EXCL).
+    Both via ctypes, so no dependency is added. Ordinary `rename` is NEVER
+    an acceptable fallback: it silently overwrites.
+    """
+```
+
+Reserving a name with `O_EXCL` and renaming onto it later is **two**
+operations and does not compose into one guarantee — another writer can take
+the reservation in between, and the rename destroys what took it. Do not
+reintroduce that shape.
+
+Availability depends on the kernel *and* the filesystem, so probe by
+attempting the operation and translating `ENOSYS`/`EINVAL`/`EOPNOTSUPP` into
+the unsupported outcome. **Fail closed**: refuse the action, change nothing,
+never degrade to a destructive path.
+
+- [ ] **GREEN — the consumption primitive.** Add one narrow public API beside
+`remove_path_if_unchanged`, which it replaces for proposal consumption:
+
+```python
+def quarantine_path_if_unchanged(
+    vault: Path, relative_path: str, expected: PathState, quarantine: str
+) -> str:
+    """Move one reviewed regular leaf into quarantine while it matches."""
+```
+
+Its sequence is: atomic no-overwrite move of the leaf into quarantine; open
+the moved file `O_NOFOLLOW` and verify identity and contents through the
+**descriptor**; on mismatch, atomic no-overwrite move back under its own name
+and refuse. No step may unlink a proposal record.
+
+- [ ] **Quarantine location:** a `.consumed/` directory inside the entity's
+existing `outbox/`. Same filesystem, so the rename is atomic; inside the area
+already excluded from block-mapping validation, so convention impact is
+minimal; and outside the `*.yaml` top-level glob, so quarantined records are
+invisible to every listing and can never be acted on again.
+
+- [ ] **Scope the change precisely.** Quarantine replaces *proposal
+consumption* only. `_apply_state`'s removal branch still serves approve's
+source→destination move, whose removal is the intended, committed, Git-revertible
+effect. Do not quarantine the source receipt.
+
+- [ ] Approve's `owned_changes` proposal consumption and reject both route
+through the new primitive. Preserve one approval commit, exact revertibility,
+identity, scope confinement, and safe visible errors.
+
+- [ ] **Replace `E-DISCARDED`.** It says the proposal "is already gone",
+which quarantine makes false. Retire it and its `ConditionalRemovalCleanupError`
+and add three truthful outcomes, each with its own regression:
+
+| Condition | Must say | Shape |
+|---|---|---|
+| consumed, then cleanup failed | the action took effect; the record is quarantined and recoverable; do not retry | committed tier, `committed=yes`, `retry=stop` |
+| mismatch, restoration blocked | both files preserved, original name occupied, state indeterminate — never "nothing was changed" | recovery tier, `committed=unknown`, `retry=stop` |
+| atomic move unavailable here | nothing was changed and no action is possible on this vault until resolved | refusal, `committed=no` |
+
+- [ ] Add a regression for the restoration-blocked path specifically: occupy
+the original name while the record is in quarantine, and assert that **both**
+files survive, that nothing is deleted to tidy up, and that the outcome is the
+indeterminate one rather than a refusal claiming no change.
+
+- [ ] Retire `remove_path_if_unchanged` if nothing else uses it, rather than
+leaving a destructive primitive available to a future caller.
+
+- [ ] Run focused and full tests, repeat the Task 3 mutation set against the
+new construction, then commit:
+
+```bash
+uv run pytest tests/test_git_transaction.py tests/test_outbox.py tests/test_console_routes.py -q
+uv run python -m pytest -q
+git add app/git_transaction.py app/outbox.py tests/test_git_transaction.py tests/test_outbox.py
+git commit -m "feat: consume reviewed proposals by quarantine"
+```
+
+**Known consequences, deliberately accepted:**
+
+1. Quarantined records accumulate until the separately sequenced reclaim
+   exists. S7 stops destroying; it does not own the lifecycle.
+2. On a kernel or filesystem without an atomic no-overwrite move, approve,
+   reject and registry delete refuse outright. That is the intended trade:
+   refusing to act is strictly better than acting destructively. Verify the
+   Linux `renameat2(RENAME_NOREPLACE)` path on the target platform before
+   live gates — it is unverified in the current session, which is macOS.
+
+---
+
 ## Task 4: Bind Registry Delete and Keep the Live Reference Gate
 
 **Files:** modify `app/registry.py`, `tests/test_registry.py`,
@@ -406,8 +524,12 @@ uv run pytest tests/test_registry.py tests/test_console_errors.py -q
 `execute_delete(scope: Scope, proposal_id: str, review_sha256: object) ->
 DeleteProposal`. Capture the delete-proposal state once; compare, parse, and
 validate its bytes; repeat the live reference count; build the existing
-transaction with that same state as proposal-removal authority; execute; then
-return the bound `DeleteProposal`.
+transaction with that same state as proposal-consumption authority; execute;
+then return the bound `DeleteProposal`.
+
+Registry delete adopts Task 3c's quarantine from the start: the delete
+proposal is consumed by the same non-destructive move, never unlinked. The
+registry *value* removal remains a normal committed change.
 
 The hash does not authorize deletion by itself. Scope, kind/value existence,
 current registry state, fresh references, and transaction-owned state remain

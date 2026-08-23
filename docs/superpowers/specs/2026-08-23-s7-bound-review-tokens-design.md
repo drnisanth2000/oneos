@@ -2,6 +2,11 @@
 
 **Status:** APPROVED — conversational and written design approved
 
+**Amendment 1 (proposed, pending approval):** consumed proposals are
+quarantined rather than deleted. Amended clauses are marked
+*(Amendment 1)*. Rationale in “Why deletion cannot satisfy criterion 4”
+below.
+
 **Base:** merged `origin/main` at
 `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f`. Fresh public baseline:
 `uv run python -m pytest -q` → 926 passed.
@@ -55,6 +60,14 @@ the same rule one artifact later, to the proposal record itself.
 9. **Independent review and mutation testing are mandatory.** A green test is
    evidence only after the relevant protection has been deliberately broken,
    the test has gone red, and the exact implementation has been restored.
+10. **A reviewed action never deletes a proposal file.** *(Amendment 1)*
+    Approve, reject, and registry delete consume a *proposal record* by moving
+    it into a recoverable quarantine, never by unlinking it. Losing a race
+    must not be able to destroy a proposal. This rule is about proposal
+    records only: approve's source-to-destination move of the curated file is
+    an intended, committed, Git-revertible effect and is unchanged.
+    Reclaiming quarantined records is a separate, later operation and is
+    never part of a reviewed action.
 
 ## Scope boundaries
 
@@ -69,12 +82,18 @@ the same rule one artifact later, to the proposal record itself.
   fresh current controls;
 - a read-only `Check again` path and guidance back to existing triage when a
   missing proposal can be recreated safely;
-- truthful integration with S6's existing visible Console outcomes; and
+- truthful integration with S6's existing visible Console outcomes;
+- a quarantine area for consumed proposal records, and the replacement of
+  every destructive removal *of a proposal record* in a reviewed action with
+  an atomic no-overwrite move into it *(Amendment 1)*; and
 - synthetic public tests plus the existing private read-only integration gates.
 
 ### Explicitly excluded
 
 - a review gate for direct registry add/edit;
+- quarantine retention, expiry, reclaim, or any operator surface over it
+  *(Amendment 1)* — S7 only stops destroying, and the lifecycle is sequenced
+  separately;
 - automatic repair, reconstruction, or relocation of damaged proposals;
 - email/PDF intake, archive, summary, and mailbox-deletion workflows;
 - dashboards, cards, or general workflow screens unrelated to S7;
@@ -186,11 +205,91 @@ Approve and registry delete already use S5 transaction-owned proposal state.
 Their plans must use the same proposal state whose bytes passed the fingerprint
 comparison. A reread may not replace it as authority.
 
-Reject remains an uncommitted removal of an untracked proposal, but it must be
-conditional on the reviewed state. It captures, compares, and removes only the
-same regular non-symlink leaf. A rewrite, identity change, type swap, redirect,
-or disappearance before removal is a refusal, not permission to unlink the
-replacement.
+Reject remains an uncommitted consumption of an untracked proposal, but it must
+be conditional on the reviewed state. It captures, compares, and consumes only
+the same regular non-symlink leaf. A rewrite, identity change, type swap,
+redirect, or disappearance before consumption is a refusal, not permission to
+consume the replacement.
+
+#### Why deletion cannot satisfy criterion 4 *(Amendment 1)*
+
+Criterion 4 requires the compared state to be the exact state consumed. A
+deletion cannot provide that. POSIX offers no way to unlink an inode: `unlink`
+resolves a name at the instant it runs, so between the last verification and
+the removal the name can be rebound, and the removal destroys whatever now
+holds it. Every mitigation — capturing under a directory descriptor, reserving
+a private name with `O_EXCL`, re-verifying identity and contents through the
+open descriptor — narrows that window without closing it, because no primitive
+fuses the check to the removal.
+
+So S7 stops relying on winning the race and changes what losing it costs.
+Consumption becomes an atomic rename into a quarantine area, which is
+**non-destructive**: if the wrong file is moved, it can be moved back, and
+nothing is gone. The guarantee stops being a property of timing and becomes a
+property of the construction.
+
+The rule: **no reviewed action may unlink a proposal record.** Approve, reject
+and registry delete each
+
+1. capture, compare and validate the reviewed state as above;
+2. move that leaf into the quarantine area with a **single atomic
+   no-overwrite move**;
+3. verify the quarantined file through an `O_NOFOLLOW` descriptor — identity
+   and contents, never a fresh name lookup; and
+4. on any mismatch, move it back under its own name — again with the atomic
+   no-overwrite move — and refuse.
+
+#### The move must be one syscall *(Amendment 1)*
+
+Reserving a destination name and then renaming onto it is **two** operations,
+not one guarantee: `O_EXCL` proves the reservation was unoccupied when it was
+made, and nothing holds it until the rename. Another writer can take the name
+in between, and an ordinary `rename` then destroys what took it. A two-step
+construction reintroduces exactly the destructive race this amendment exists
+to remove.
+
+So step 2 and step 4 must each be a single kernel operation that moves the
+file *and* fails if the destination exists:
+
+- Linux: `renameat2(..., RENAME_NOREPLACE)`
+- macOS: `renameatx_np(..., RENAME_EXCL)`
+
+Both are reachable through the standard library's `ctypes`, so this adds no
+dependency. **Ordinary `rename` is never an acceptable fallback**, because it
+silently overwrites.
+
+Availability is a property of the running kernel *and* of the filesystem, so
+it is established by attempting the operation, not by inspecting versions.
+When the primitive is unavailable — unimplemented, or refused by this
+filesystem — the reviewed action **fails closed**: it changes nothing and
+reports that this vault cannot be operated on safely. OneOS refuses the action
+rather than falling back to a destructive one.
+
+#### What each outcome must truthfully say *(Amendment 1)*
+
+Quarantine changes what is true after a consumption, so the outcomes must
+change with it. `E-DISCARDED` — "the proposal is already gone" — becomes
+false the moment consumption is recoverable, and must be replaced. Three
+distinct outcomes are required:
+
+- **consumed** — the reviewed record was quarantined and the action
+  completed. If only the cleanup afterwards failed, the operator is told the
+  action took effect, that the record is retained and recoverable, and not to
+  retry.
+- **restoration blocked** — a mismatch was found, but the record could not be
+  put back because its own name is now occupied. Both files are preserved:
+  the record stays in quarantine and whatever holds the original name is left
+  untouched. This is an indeterminate recovery state and must be reported as
+  one. It must never be described as "nothing was changed", and nothing is
+  ever deleted to tidy it up.
+- **unsupported** — the atomic no-overwrite move is unavailable here. Nothing
+  was changed, and no action is possible on this vault until it is resolved.
+
+A refusal that completes restoration leaves the outbox exactly as it found
+it. A refusal that cannot complete restoration does not, and says so.
+
+Quarantined records are invisible to every listing and can never be acted on
+again: they are evidence, not pending work.
 
 ### 4. Registry-delete freshness
 
@@ -338,8 +437,12 @@ S7 is complete only when all of the following are true:
 2. The operator sees the previously reviewed and current meaningful values on
    the same screen and must act again on the current version.
 3. Every action service and transport requires the reviewed SHA-256.
-4. The final comparison owns the same exact proposal state the mutation removes
-   or consumes.
+4. The final comparison owns the same exact proposal state the mutation
+   consumes, and no reviewed action can destroy a proposal record at all
+   *(Amendment 1)*: every consumption is a single atomic no-overwrite move,
+   so a lost race leaves recoverable state rather than none, and an
+   unavailable primitive fails closed instead of degrading to a destructive
+   one.
 5. Registry delete still refuses newly introduced references.
 6. `Check again` is read-only and no recovery path reuses a stale id.
 7. Existing S4 source freshness, S5 isolated transaction/audit, and S6 visible
