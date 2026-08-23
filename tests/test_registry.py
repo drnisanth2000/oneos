@@ -1185,3 +1185,51 @@ def test_a_path_integrity_race_stays_in_the_registry_family(tmp_path):
         reg.capture_path_state = real_capture
 
     assert describe(raised.value).code == "E-TAMPER"
+
+
+@pytest.mark.parametrize(
+    ("total", "sources"),
+    [
+        (0, {"front-matter": 1, "workspaces": 2}),
+        (5, {"front-matter": 1}),
+        (1, {}),
+        (0, {"front-matter": 0, "workspaces": 1}),
+    ],
+)
+def test_a_saved_impact_that_contradicts_its_own_total_is_refused(
+    tmp_path, total, sources
+):
+    """P1 (review): type-checking the fields is not enough. A record whose
+    total disagrees with its own breakdown describes an impact that was
+    never measured — and since the total now gates the deletion, a zero
+    beside a non-empty breakdown is precisely how an unsafe deletion would
+    be waved through."""
+    from app.outbox import UnreadableProposalRecord
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record["total_references"] = total
+    record["impact"] = sources
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(UnreadableProposalRecord):
+        registry.get_delete_review(scope, prop.id)
+
+
+def test_a_consistent_saved_impact_is_accepted(tmp_path):
+    """The control: a total that matches its breakdown still reads."""
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record["total_references"] = 3
+    record["impact"] = {"front-matter": 1, "workspaces": 2}
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    review = registry.get_delete_review(scope, prop.id)
+    assert review.value.total == 3
+    assert sum(review.value.sources.values()) == 3

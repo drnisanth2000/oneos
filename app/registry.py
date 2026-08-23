@@ -420,6 +420,13 @@ def _validate_delete_record(
         raise UnreadableProposalRecord(
             "delete proposal record field 'impact' must map names to counts"
         )
+    # The total gates the deletion, so it may not disagree with the breakdown
+    # it claims to summarise. A zero beside a non-empty breakdown is exactly
+    # how an unsafe deletion would otherwise be waved through.
+    if total != sum(sources.values()):
+        raise UnreadableProposalRecord(
+            "delete proposal record impact does not sum to its total"
+        )
     try:
         return DeleteProposal(
             rec["id"], path, rec["entity"], rec["kind"], rec["slug"],

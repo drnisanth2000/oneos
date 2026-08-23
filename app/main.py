@@ -854,7 +854,10 @@ def registry_delete_preview(
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
-        {"entity": selected, "slug": slug, "prop": review.value,
+        # No submitted value reaches the fragment: the slug on screen is the
+        # one inside the fingerprint, so the screen cannot describe one
+        # product while the button is bound to a proposal naming another.
+        {"entity": selected, "prop": review.value,
          "review_sha256": review.sha256},
     )
 

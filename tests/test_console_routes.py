@@ -1661,7 +1661,21 @@ def test_delete_preview_hx_vals_survive_hostile_slug(tmp_path, monkeypatch):
             (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").read_bytes()
         ).hexdigest(),
     }
-    assert "hostile-injected-id-marker" not in response.text
+    # S7 (blocker: displayed slug outside the snapshot) now renders the
+    # *fingerprinted* slug, which for this request is the hostile string the
+    # proposal actually stores. That is the correct thing to show — the
+    # operator must see what they are approving — so the guarantee is no
+    # longer "the marker never appears" but the two that actually matter:
+    #
+    # 1. it can never reach an `hx-vals` mapping, and
+    for raw in parser.values:
+        assert "hostile-injected-id-marker" not in raw
+    # 2. it is never rendered unescaped, so it cannot close the attribute or
+    #    inject a second key once the browser decodes the page.
+    assert 'shown", "id": "hostile-injected-id-marker' not in response.text
+    assert "hostile-injected-id-marker" in response.text, (
+        "the stored slug must be shown to the operator, escaped"
+    )
 
     # M1 (review): `prop.id` is server-generated
     # (`^[0-9]{8}T[0-9]{6}-[0-9a-f]{32}$`, `app/proposal_identity.py`) and can
@@ -4760,3 +4774,51 @@ def test_the_delete_route_takes_no_second_live_count_at_render_time(tmp_path,
 
     source = _inspect.getsource(main.registry_delete_preview)
     assert "reference_count(" not in source
+
+
+def test_delete_preview_displays_the_fingerprinted_slug_not_the_submitted_one(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the value on screen must come from inside the
+    fingerprint. Rendering the submitted slug lets the screen describe one
+    product while the button is bound to a proposal naming another."""
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+
+    import app.registry as registry
+
+    # The stored proposal is replaced between its creation and its review, so
+    # the fingerprinted record names a different value than the form did.
+    real_propose = registry.propose_delete
+
+    def propose_then_rewrite(scope_arg, kind, value):
+        written = real_propose(scope_arg, kind, value)
+        record = yaml.safe_load(written.path.read_text(encoding="utf-8"))
+        record["slug"] = "fingerprinted-slug-marker"
+        written.path.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+        return written
+
+    monkeypatch.setattr(main, "propose_delete", propose_then_rewrite)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "fingerprinted-slug-marker" in body, body
+    assert slug not in body, body
+
+
+def test_the_preview_route_never_renders_the_submitted_slug(tmp_path, monkeypatch):
+    """Structural: the fragment's context carries no submitted value."""
+    import inspect as _inspect
+
+    import app.main as main
+
+    source = _inspect.getsource(main.registry_delete_preview)
+    rendered = source.split("TemplateResponse", 1)[1]
+    assert '"slug": slug' not in rendered
+    template = (
+        Path(__file__).resolve().parents[1] / "templates/blocks/delete_impact.html"
+    ).read_text(encoding="utf-8")
+    assert "{{ slug }}" not in template
