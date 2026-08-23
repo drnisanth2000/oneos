@@ -1073,3 +1073,115 @@ def test_delete_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
     assert git_head(vault) == head_before
     assert (vault / "_system/products.yaml").read_bytes() == registry_before
     assert prop.path.read_bytes() == replaced[0]
+
+
+# --- Task 4 review: the review must be a currently valid deletion -----------
+
+
+def test_a_review_taken_while_referenced_is_never_actionable(tmp_path):
+    """P1 (review): clearing the references does not make an old review
+    valid. The approved design requires reviewing a currently valid
+    deletion again — both the recorded impact and the live count must
+    permit it."""
+    vault = _products_vault(tmp_path, referenced=True)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    assert review.value.total > 0, "the fixture must start with references"
+
+    # Every reference is now gone, but the operator never reviewed again.
+    cleared = registry.ReferenceReport("product", "widgetx", {})
+    real_count = registry.reference_count
+    registry.reference_count = lambda *args, **kwargs: cleared
+    registry_before = (vault / "_system/products.yaml").read_bytes()
+    try:
+        assert registry.reference_count(scope, "product", "widgetx").total == 0
+        with pytest.raises(registry.RegistryError):
+            registry.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        registry.reference_count = real_count
+
+    assert (vault / "_system/products.yaml").read_bytes() == registry_before
+    assert prop.path.exists()
+
+
+def test_a_fresh_review_after_clearing_references_does_delete(tmp_path):
+    """The other half: reviewing again is what makes it actionable."""
+    vault = _products_vault(tmp_path, referenced=True)
+    scope = Scope(vault, "demo")
+    stale = propose_delete(scope, "product", "widgetx")
+    assert registry.get_delete_review(scope, stale.id).value.total > 0
+
+    cleared = registry.ReferenceReport("product", "widgetx", {})
+    real_count = registry.reference_count
+    registry.reference_count = lambda *args, **kwargs: cleared
+    try:
+        fresh = propose_delete(scope, "product", "widgetx")
+        review = registry.get_delete_review(scope, fresh.id)
+        assert review.value.total == 0
+        registry.execute_delete(scope, fresh.id, review.sha256)
+    finally:
+        registry.reference_count = real_count
+
+    assert "widgetx:" not in (vault / "_system/products.yaml").read_text()
+    # The stale proposal is untouched and still not actionable.
+    assert stale.path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("total_references", "not-a-number"),
+        ("total_references", None),
+        ("total_references", [1]),
+        ("total_references", -1),
+        ("total_references", True),
+        ("impact", ["not", "a", "mapping"]),
+        ("impact", "text"),
+        ("impact", {"source": "not-a-count"}),
+        ("impact", {1: 2}),
+    ],
+)
+def test_a_malformed_saved_impact_is_refused(tmp_path, field, value):
+    """P1 (review): the recorded impact is displayed to the operator and now
+    gates the deletion, so it is validated like every other stored field
+    rather than trusted as whatever YAML happened to hold."""
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record[field] = value
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    from app.outbox import UnreadableProposalRecord
+
+    with pytest.raises(UnreadableProposalRecord):
+        registry.get_delete_review(scope, prop.id)
+
+
+def test_a_path_integrity_race_stays_in_the_registry_family(tmp_path):
+    """P1 (review): a leaf swapped between the lexical check and the capture
+    must reach the route as its declared redirection outcome, not as a raw
+    transaction-layer type escaping to the global fallback."""
+    import app.registry as reg
+    from app.console_errors import describe
+    from app.scope import CrossScopeError
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    real_capture = reg.capture_path_state
+
+    def integrity_race(*args, **kwargs):
+        raise git_transaction.ReviewedPathIntegrityError("leaf is redirected")
+
+    reg.capture_path_state = integrity_race
+    try:
+        with pytest.raises(CrossScopeError) as raised:
+            reg.get_delete_review(scope, prop.id)
+    finally:
+        reg.capture_path_state = real_capture
+
+    assert describe(raised.value).code == "E-TAMPER"

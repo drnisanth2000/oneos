@@ -29,6 +29,8 @@ import json
 import os
 import re
 import subprocess
+
+import yaml
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -1903,7 +1905,10 @@ def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch)
             "registries unreadable after proposal write"
         )
 
-    monkeypatch.setattr(main, "reference_count", _fail_after_persisting)
+    # S7: the route's post-persist step is now the review read, not a live
+    # reference count — the failure must be injected where it still reads, or
+    # this cell proves nothing about "persisted, then failed".
+    monkeypatch.setattr(main, "get_delete_review", _fail_after_persisting)
 
     response = client.post(
         "/registry/alpha/product/delete-preview", data={"slug": slug}
@@ -4703,3 +4708,55 @@ def test_delete_success_copy_comes_from_the_bound_execution(tmp_path, monkeypatc
     assert slug in response.text
     source = _inspect.getsource(main.registry_delete_execute)
     assert "get_delete_proposal(" not in source
+
+
+def test_delete_preview_renders_only_the_fingerprinted_impact(tmp_path, monkeypatch):
+    """P1 (review): the impact on screen must be the impact inside the
+    fingerprint. A second live count rendered beside it describes state the
+    button is not bound to, so the operator reviews one thing and acts on
+    another."""
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+
+    # The proposal is written with a saved impact of zero; every count taken
+    # *after* that says one. Only the saved, fingerprinted value may reach
+    # the screen — a second live count would render "would orphan 1" beside
+    # a button bound to bytes that record none.
+    calls = []
+    real_count = registry.reference_count
+
+    def zero_then_one(scope_arg, kind, value):
+        calls.append(1)
+        if len(calls) == 1:                       # the write's own count
+            return registry.ReferenceReport(kind, value, {})
+        return registry.ReferenceReport(kind, value, {"front-matter": 1})
+
+    monkeypatch.setattr(registry, "reference_count", zero_then_one)
+
+    response = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    )
+
+    body = response.text
+    proposal = next((tmp_path / "alpha/outbox").glob("*.yaml"))
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    assert record["total_references"] == 0, "the fixture must save a zero impact"
+    assert "would orphan" not in body, body
+    assert "No references" in body
+    assert registry.reference_count is zero_then_one
+    monkeypatch.setattr(registry, "reference_count", real_count)
+
+
+def test_the_delete_route_takes_no_second_live_count_at_render_time(tmp_path,
+                                                                   monkeypatch):
+    """Structural: the preview route reads the impact from its review
+    snapshot and never calls the live counter for display."""
+    import inspect as _inspect
+
+    import app.main as main
+
+    source = _inspect.getsource(main.registry_delete_preview)
+    assert "reference_count(" not in source

@@ -844,17 +844,18 @@ def registry_delete_preview(
         # a failure from here on is `(committed=no, persistence=
         # proposal-written)`, not `persistence=none`.
         #
-        # S7: the displayed proposal and its fingerprint come from one review
-        # snapshot of the just-written record, so the button is bound to the
-        # exact bytes this fragment was rendered from.
+        # S7: everything on this screen comes from one review snapshot of
+        # the just-written record — the displayed kind and value, the impact,
+        # and the fingerprint the button carries. A second live count taken
+        # here would describe state the button is not bound to, so the
+        # operator would review one thing and act on another.
         review = get_delete_review(scope, written.id)
-        report = reference_count(scope, "product", slug)
     except _REGISTRY_DELETE_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
         {"entity": selected, "slug": slug, "prop": review.value,
-         "review_sha256": review.sha256, "report": report},
+         "review_sha256": review.sha256},
     )
 
 

@@ -20,6 +20,7 @@ from .git_transaction import (
     GitTransactionError,
     PathChange,
     PathState,
+    ReviewedPathIntegrityError,
     ReviewedPathUnavailable,
     TransactionPlan,
     capture_path_state,
@@ -398,10 +399,31 @@ def _validate_delete_record(
             )
     if rec.get("entity") != scope.current_entity():
         raise RegistryError("delete proposal belongs to another entity")
+    # The recorded impact is shown to the operator *and* gates the deletion
+    # (see `execute_delete`), so it is validated rather than trusted as
+    # whatever YAML happened to hold. `bool` is excluded deliberately: it is
+    # an `int` subclass, and `total_references: true` is not a count.
+    total = rec.get("total_references", 0)
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise UnreadableProposalRecord(
+            "delete proposal record field 'total_references' must be a "
+            "non-negative integer"
+        )
+    sources = rec.get("impact", {})
+    if not isinstance(sources, dict) or not all(
+        isinstance(name, str)
+        and not isinstance(count, bool)
+        and isinstance(count, int)
+        and count >= 0
+        for name, count in sources.items()
+    ):
+        raise UnreadableProposalRecord(
+            "delete proposal record field 'impact' must map names to counts"
+        )
     try:
         return DeleteProposal(
             rec["id"], path, rec["entity"], rec["kind"], rec["slug"],
-            rec.get("total_references", 0), rec.get("impact", {}),
+            total, sources,
         )
     except KeyError as exc:
         raise UnreadableProposalRecord(
@@ -418,6 +440,12 @@ def _capture_delete_proposal_state(
     relative = path.relative_to(scope.root).as_posix()
     try:
         state = capture_path_state(scope.root, relative)
+    except ReviewedPathIntegrityError as exc:
+        # The leaf became a symlink or a non-regular file between its lexical
+        # check and this capture. Re-narrowed to the redirection type the
+        # registry routes already declare, so it reaches the operator as a
+        # tamper finding instead of escaping to the global fallback.
+        raise RedirectedPathError("delete proposal leaf is redirected") from exc
     except ReviewedPathUnavailable as exc:
         raise UnreadableProposalRecord(
             "delete proposal record could not be read"
@@ -524,9 +552,22 @@ def execute_delete(
             scope, path, _parse_delete_record(proposal_state.contents)
         )
 
-        # Independent of the fingerprint: the proposal binds its own bytes,
-        # not the registries. References that appeared since the review still
-        # refuse the deletion.
+        # Two independent gates, and both must permit the deletion.
+        #
+        # The reviewed impact: an operator who was shown "this would orphan
+        # N references" reviewed a deletion that was refused at the time.
+        # Clearing the references afterwards does not retroactively make that
+        # review a review of a valid deletion — the approved design requires
+        # clearing them and reviewing a currently valid deletion again.
+        if prop.total:
+            raise RegistryError(
+                "refusing to delete — this proposal was reviewed while "
+                "references remained. Review the deletion again."
+            )
+
+        # The live count: the fingerprint binds the proposal's bytes, not the
+        # registries, so references that appeared since the review refuse it
+        # even when the fingerprint still matches.
         report = reference_count(scope, prop.kind, prop.slug)
         if report.total:
             raise RegistryError(

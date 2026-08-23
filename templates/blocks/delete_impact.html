@@ -1,8 +1,11 @@
 <div class="delete-impact">
-  {% if report.total %}
-  <div class="diff-head"><span class="unsure">Deleting '{{ slug }}' would orphan {{ report.total }} reference(s):</span></div>
+  {# S7: the impact shown is the impact inside the fingerprint — the values
+     recorded on the reviewed proposal, not a live count taken while
+     rendering. The button is bound to these exact bytes. #}
+  {% if prop.total %}
+  <div class="diff-head"><span class="unsure">Deleting '{{ slug }}' would orphan {{ prop.total }} reference(s):</span></div>
   <ul class="impact-list">
-    {% for k, v in report.sources.items() %}{% if v %}<li>{{ k }}: {{ v }}</li>{% endif %}{% endfor %}
+    {% for k, v in prop.sources.items() %}{% if v %}<li>{{ k }}: {{ v }}</li>{% endif %}{% endfor %}
   </ul>
   <p class="muted">Delete is refused until these are cleared.</p>
   {% else %}
