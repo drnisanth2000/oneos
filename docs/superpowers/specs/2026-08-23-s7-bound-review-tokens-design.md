@@ -292,8 +292,15 @@ distinct outcomes are required:
 - **unsupported** — the atomic no-overwrite move is unavailable here. Nothing
   was changed, and no action is possible on this vault until it is resolved.
 
-A refusal that completes restoration leaves the outbox exactly as it found
-it. A refusal that cannot complete restoration does not, and says so.
+A refusal that completes restoration leaves every proposal record exactly as
+it found it. A refusal that cannot complete restoration does not, and says so.
+
+The quarantine directory itself is the one exception, and deliberately so:
+it is durable infrastructure, created on first use and never removed. A
+refusal may therefore leave an empty `.consumed/` behind. Removing it again
+would add a cleanup step whose failure the operator could not see — the
+refusal they are shown is about the proposal, not about a directory — and a
+silently failing cleanup is a worse thing to own than an empty directory.
 
 #### What quarantine costs the working tree *(Amendment 1)*
 

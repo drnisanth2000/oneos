@@ -1742,7 +1742,7 @@ def test_quarantine_refuses_a_swap_landing_before_verification(tmp_path):
     # and the outbox is exactly as the refusal found it — including no empty
     # quarantine directory left behind.
     assert leaf.read_bytes() == b"REWRITTEN-IN-QUARANTINE\n"
-    assert not (vault / gt.QUARANTINE_DIRECTORY).exists()
+    assert not list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
 
 
 def test_a_post_verification_rewrite_cannot_destroy_anything(tmp_path):
@@ -1937,7 +1937,8 @@ def test_a_consumption_fails_closed_end_to_end_on_an_unsupported_errno(tmp_path)
         gt._MOVE_NO_REPLACE = real
 
     assert leaf.read_bytes() == reviewed
-    assert not (vault / gt.QUARANTINE_DIRECTORY).exists()
+    quarantine = vault / gt.QUARANTINE_DIRECTORY
+    assert not quarantine.exists() or not list(quarantine.iterdir())
     assert describe(raised.value).code == "E-UNSUPPORTED"
     assert describe(raised.value).committed == "no"
 
@@ -2077,29 +2078,23 @@ def test_a_directory_swapped_between_validation_and_open_is_refused(
 
     gt.os.lstat = lstat_then_swap
     try:
-        if replacement == "symlink":
-            # A redirection can carry the record outside the entity, so it
-            # must be refused outright.
-            with pytest.raises(gt.ReviewedStateConflict):
-                quarantine_path_if_unchanged(vault, "outbox/record.yaml", expected)
-        else:
-            # A real directory substituted at the *same* lexical path cannot
-            # carry anything anywhere: it is still `<entity>/outbox/...`,
-            # reached through the parent's own descriptor. No POSIX check can
-            # distinguish it from the directory that was validated, and there
-            # is nothing to distinguish — the guarantee that matters is
-            # confinement, asserted below, not refusal.
-            try:
-                quarantine_path_if_unchanged(vault, "outbox/record.yaml", expected)
-            except gt.GitTransactionError:
-                pass
+        # Every swap is refused, symlink or not. The descriptor is verified
+        # against the stat taken *before* the swap, so a substituted real
+        # directory has a different inode and is just as detectable as a
+        # redirection — sameness of path is not sameness of file.
+        with pytest.raises(gt.ReviewedPathIntegrityError) as raised:
+            quarantine_path_if_unchanged(vault, "outbox/record.yaml", expected)
     finally:
         gt.os.lstat = real_lstat
+
+    from app.console_errors import describe
+
+    assert describe(raised.value).code == "E-TAMPER"
 
     assert swapped, "the probe never swapped the directory"
     assert not list(outside.iterdir()), "a record was moved outside the entity"
     substitute = outbox / gt.QUARANTINE_DIRECTORY if target == "quarantine" else outbox
-    if replacement == "real-directory" and substitute.is_dir():
+    if substitute.is_dir() and not substitute.is_symlink():
         assert not [
             entry for entry in substitute.iterdir() if entry.name.endswith(".yaml")
         ], "a record was moved into the substituted directory"
@@ -2108,10 +2103,15 @@ def test_a_directory_swapped_between_validation_and_open_is_refused(
         assert stashed.read_bytes() == reviewed
 
 
-def test_a_failed_quarantine_cleanup_is_reported_not_swallowed(tmp_path):
-    """P1 (review): if the empty quarantine cannot be removed after a
-    refusal, "the outbox exactly as it found it" no longer holds, and the
-    operator must be able to see that it did not."""
+def test_a_refusal_leaves_the_quarantine_directory_but_no_record(tmp_path):
+    """There is no cleanup step left to fail invisibly.
+
+    The quarantine directory is durable infrastructure — created on first
+    use and never removed. Removing it again after a refusal would add a
+    step whose failure the operator could not see, since the refusal they
+    are shown is about the proposal. An empty directory is not vault
+    content; a silently failing cleanup is a lie about state.
+    """
     import app.git_transaction as gt
     from app.git_transaction import (
         ReviewedStateChanged,
@@ -2121,23 +2121,246 @@ def test_a_failed_quarantine_cleanup_is_reported_not_swallowed(tmp_path):
 
     vault, leaf = _conditional_vault(tmp_path)
     expected = capture_path_state(vault, "outbox-record.yaml")
-    leaf.write_bytes(b"id: probe\nvalue: changed\n")
+    changed = b"id: probe\nvalue: changed\n"
+    leaf.write_bytes(changed)
 
-    real_rmdir = gt.os.rmdir
+    with pytest.raises(ReviewedStateChanged):
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
 
-    def failing_rmdir(path, *args, **kwargs):
-        if path == gt.QUARANTINE_DIRECTORY:
-            raise OSError(13, "Permission denied", path)
-        return real_rmdir(path, *args, **kwargs)
+    # Every proposal record is exactly as the refusal found it ...
+    assert leaf.read_bytes() == changed
+    # ... and the directory, if it was created, holds nothing.
+    quarantine = vault / gt.QUARANTINE_DIRECTORY
+    assert not quarantine.exists() or not list(quarantine.iterdir())
 
-    gt.os.rmdir = failing_rmdir
+
+@pytest.mark.parametrize("code", ["ENOSYS", "EINVAL", "ENOTSUP", "EOPNOTSUPP"])
+def test_an_unsupported_errno_fails_closed_and_never_falls_back(tmp_path, code):
+    """The errno path itself, not a patched-out `_move_no_replace`.
+
+    A kernel or filesystem that cannot do the atomic move reports it through
+    errno. That must become a refusal — never a plain `rename`, which would
+    silently overwrite the destination and reintroduce the exact destructive
+    behaviour Amendment 1 removes.
+    """
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    occupied = vault / "occupied"
+    occupied.write_bytes(b"MUST SURVIVE\n")
+
+    real = gt._MOVE_NO_REPLACE
+
+    def unsupported(_ffd, _f, _tfd, _t):
+        ctypes.set_errno(getattr(_errno, code))
+        return -1
+
+    gt._MOVE_NO_REPLACE = unsupported
+    descriptor = os.open(vault, os.O_RDONLY)
     try:
-        with pytest.raises(ReviewedStateChanged) as raised:
+        with pytest.raises(gt.AtomicMoveUnavailable):
+            gt._move_no_replace(descriptor, "outbox-record.yaml", descriptor, "occupied")
+    finally:
+        os.close(descriptor)
+        gt._MOVE_NO_REPLACE = real
+
+    # No fallback ran: neither file moved, and the occupant is intact.
+    assert leaf.read_bytes() == reviewed
+    assert occupied.read_bytes() == b"MUST SURVIVE\n"
+
+
+def test_a_consumption_fails_closed_end_to_end_on_an_unsupported_errno(tmp_path):
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    real = gt._MOVE_NO_REPLACE
+
+    def unsupported(_ffd, _f, _tfd, _t):
+        ctypes.set_errno(_errno.ENOTSUP)
+        return -1
+
+    gt._MOVE_NO_REPLACE = unsupported
+    try:
+        with pytest.raises(gt.AtomicMoveUnavailable) as raised:
             quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
     finally:
-        gt.os.rmdir = real_rmdir
+        gt._MOVE_NO_REPLACE = real
 
-    notes = getattr(raised.value, "__notes__", [])
-    assert any("quarantine" in note for note in notes), (
-        f"the cleanup failure was swallowed: {notes}"
-    )
+    assert leaf.read_bytes() == reviewed
+    quarantine = vault / gt.QUARANTINE_DIRECTORY
+    assert not quarantine.exists() or not list(quarantine.iterdir())
+    assert describe(raised.value).code == "E-UNSUPPORTED"
+    assert describe(raised.value).committed == "no"
+
+
+# --- Task 3c review: restoration failure, creation race, directory swaps ----
+
+
+@pytest.mark.parametrize("failure", ["unsupported", "occupied", "oserror"])
+def test_any_failed_restoration_is_reported_as_stranded(tmp_path, failure):
+    """P1 (review): whatever stops the record returning to its own name, the
+    outcome is the same fact — it is still in quarantine. Reporting
+    `committed=no` / "Nothing was changed" while a record sits in `.consumed`
+    is a false statement to the operator."""
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    real_move = gt._MOVE_NO_REPLACE
+    calls = []
+
+    def forward_then_fail(from_fd, from_name, to_fd, to_name):
+        calls.append(1)
+        if len(calls) == 1:
+            return real_move(from_fd, from_name, to_fd, to_name)
+        if failure == "unsupported":
+            ctypes.set_errno(_errno.ENOTSUP)
+        elif failure == "occupied":
+            ctypes.set_errno(_errno.EEXIST)
+        else:
+            ctypes.set_errno(_errno.EIO)
+        return -1
+
+    real_held = gt._held_state
+    gt._MOVE_NO_REPLACE = forward_then_fail
+    gt._held_state = lambda descriptor: PathState.regular(b"MISMATCH\n", 0o644)
+    try:
+        with pytest.raises(gt.QuarantineRestorationBlocked) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+        gt._held_state = real_held
+
+    outcome = describe(raised.value)
+    assert outcome.code == "E-STRANDED"
+    assert outcome.committed == "unknown"
+    assert "Nothing was changed" not in outcome.message
+    # And the record really is where the outcome says it is.
+    assert len(list((vault / gt.QUARANTINE_DIRECTORY).iterdir())) == 1
+
+
+def test_a_quarantine_creation_race_refuses_rather_than_accepting_it(tmp_path):
+    """P1 (review): `FileExistsError` from `mkdir` means something appeared
+    between the check and the creation. Whatever appeared was not
+    established by this call, so it is refused, not adopted."""
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    real_mkdir = gt.os.mkdir
+
+    def raced(path, mode=0o777, *, dir_fd=None):
+        if path == gt.QUARANTINE_DIRECTORY:
+            raise FileExistsError(17, "File exists", path)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    gt.os.mkdir = raced
+    try:
+        with pytest.raises(gt.ReviewedPathIntegrityError) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt.os.mkdir = real_mkdir
+
+    # An integrity finding about the directory that appeared — not merely
+    # "unavailable", which is what adopting it and then failing to open it
+    # would produce.
+    from app.console_errors import describe
+
+    assert describe(raised.value).code == "E-TAMPER"
+    assert leaf.read_bytes() == reviewed
+
+
+@pytest.mark.parametrize("target", ["quarantine", "outbox"])
+@pytest.mark.parametrize("replacement", ["symlink", "real-directory"])
+def test_a_directory_swapped_between_validation_and_open_is_refused(
+    tmp_path, target, replacement
+):
+    """P1 (review): the required live swap, not a pre-configured symlink.
+
+    The directory is validated, and only then replaced with a symlink
+    pointing outside the entity. Nothing may be written or moved through it.
+    """
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    from tests.conftest import git_vault
+
+    vault = git_vault(tmp_path, {"tracked.md": "tracked\n"})
+    outbox = vault / "outbox"
+    outbox.mkdir()
+    leaf = outbox / "record.yaml"
+    leaf.write_bytes(b"id: probe\nvalue: first\n")
+    reviewed = leaf.read_bytes()
+    (outbox / gt.QUARANTINE_DIRECTORY).mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    expected = capture_path_state(vault, "outbox/record.yaml")
+    watched = gt.QUARANTINE_DIRECTORY if target == "quarantine" else "outbox"
+    real_lstat = gt.os.lstat
+    swapped = []
+
+    def lstat_then_swap(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if path == watched and not swapped:
+            swapped.append(True)
+            victim = outbox / gt.QUARANTINE_DIRECTORY if target == "quarantine" else outbox
+            for entry in victim.iterdir():
+                entry.rename(tmp_path / f"stash-{entry.name}")
+            victim.rmdir()
+            if replacement == "symlink":
+                victim.symlink_to(outside, target_is_directory=True)
+            else:
+                # A real directory, so `O_NOFOLLOW` opens it happily. Only
+                # re-verifying the descriptor's identity against what was
+                # validated can catch this one.
+                victim.mkdir()
+        return result
+
+    gt.os.lstat = lstat_then_swap
+    try:
+        # Every swap is refused, symlink or not. The descriptor is verified
+        # against the stat taken *before* the swap, so a substituted real
+        # directory has a different inode and is just as detectable as a
+        # redirection — sameness of path is not sameness of file.
+        with pytest.raises(gt.ReviewedPathIntegrityError) as raised:
+            quarantine_path_if_unchanged(vault, "outbox/record.yaml", expected)
+    finally:
+        gt.os.lstat = real_lstat
+
+    from app.console_errors import describe
+
+    assert describe(raised.value).code == "E-TAMPER"
+
+    assert swapped, "the probe never swapped the directory"
+    assert not list(outside.iterdir()), "a record was moved outside the entity"
+    substitute = outbox / gt.QUARANTINE_DIRECTORY if target == "quarantine" else outbox
+    if substitute.is_dir() and not substitute.is_symlink():
+        assert not [
+            entry for entry in substitute.iterdir() if entry.name.endswith(".yaml")
+        ], "a record was moved into the substituted directory"
+    stashed = tmp_path / "stash-record.yaml"
+    if stashed.exists():
+        assert stashed.read_bytes() == reviewed
+
+

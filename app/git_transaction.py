@@ -302,6 +302,15 @@ def _open_checked_directory(
     try:
         descriptor = os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EMLINK, errno.ENOTDIR, errno.ENOENT}:
+            # `lstat` just said this was a real directory, so it has changed
+            # between then and now — swapped for a symlink, for a
+            # non-directory, or removed. That is a redirection finding, not
+            # an "unavailable" one, and the tier matters: the operator must
+            # be told to inspect the vault, not to try again.
+            raise ReviewedPathIntegrityError(
+                f"{description} changed while being opened"
+            ) from exc
         raise _unsafe_open_failure(
             exc, f"{description} could not be opened safely"
         ) from exc
@@ -1342,26 +1351,18 @@ def quarantine_path_if_unchanged(
 
     parent_descriptor, leaf = _walk_to_parent(vault, relative_path)
     try:
-        quarantine_descriptor, created = _open_quarantine(parent_descriptor)
+        # The quarantine directory is durable infrastructure: created on
+        # first use and never removed. Removing it again after a refusal
+        # would add a cleanup step that can fail — and a failure there is
+        # invisible to the operator, since the refusal they see is about the
+        # proposal, not about a directory. An empty `.consumed/` is not vault
+        # content and costs nothing; a silently failing cleanup does.
+        quarantine_descriptor, _created = _open_quarantine(parent_descriptor)
         try:
             return _quarantine_reviewed_leaf(
                 parent_descriptor, leaf, expected,
                 quarantine_descriptor, relative_path,
             )
-        except BaseException as refusal:
-            # "A refusal that completes restoration leaves the outbox exactly
-            # as it found it" — including not leaving behind a directory that
-            # was not there before. If that cleanup fails the claim no longer
-            # holds, so it is recorded on the refusal rather than swallowed.
-            if created:
-                try:
-                    os.rmdir(QUARANTINE_DIRECTORY, dir_fd=parent_descriptor)
-                except OSError as cleanup_error:
-                    refusal.add_note(
-                        f"quarantine directory could not be removed after this "
-                        f"refusal, so it remains: {cleanup_error}"
-                    )
-            raise
         finally:
             os.close(quarantine_descriptor)
     finally:

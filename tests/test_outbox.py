@@ -2337,10 +2337,19 @@ def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
     assert (vault / prop.src).read_bytes() == source_before
     assert not (vault / prop.dst).exists()
 
-    # And no orphan was stranded in the outbox.
-    assert sorted(p.name for p in prop.path.parent.iterdir()) == [
-        prop.path.name
-    ], f"unexpected leftovers in {proposal_rel}'s directory"
+    # No orphan was stranded in the outbox. The quarantine directory itself
+    # is durable infrastructure and may exist; what matters is that it holds
+    # no record and that nothing else was left behind.
+    import app.git_transaction as _gt
+
+    leftovers = sorted(
+        entry.name
+        for entry in prop.path.parent.iterdir()
+        if entry.name != _gt.QUARANTINE_DIRECTORY
+    )
+    assert leftovers == [prop.path.name], (
+        f"unexpected leftovers in {proposal_rel}'s directory: {leftovers}"
+    )
 
 
 def test_reject_reports_truthfully_when_cleanup_fails_after_the_removal(tmp_path):
