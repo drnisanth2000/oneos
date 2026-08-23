@@ -1371,7 +1371,7 @@ def test_outbox_hx_vals_are_tojson(tmp_path, monkeypatch):
         assert json.loads(raw) == {
             "id": proposal_id,
             "review_sha256": fingerprint,
-        }
+        }, "an action control does not transport exactly id + review_sha256"
 
     # S7 Task 5 moved the card — and with it the `hx-vals` — into
     # `blocks/outbox_card.html`, which the list includes. Follow it there:
@@ -1665,7 +1665,7 @@ def test_delete_preview_hx_vals_survive_hostile_slug(tmp_path, monkeypatch):
         "review_sha256": hashlib.sha256(
             (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").read_bytes()
         ).hexdigest(),
-    }
+    }, "the delete control does not transport exactly id + review_sha256"
     # S7 (blocker: displayed slug outside the snapshot) now renders the
     # *fingerprinted* slug, which for this request is the hostile string the
     # proposal actually stores. That is the correct thing to show — the
@@ -4395,7 +4395,7 @@ def test_outbox_action_buttons_carry_id_and_fingerprint_through_tojson(
         assert json.loads(raw) == {
             "id": proposal_id,
             "review_sha256": fingerprint,
-        }
+        }, "an action control does not transport exactly id + review_sha256"
     # The fingerprint is the one this row was actually rendered from.
     assert fingerprint == hashlib.sha256(
         (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").read_bytes()

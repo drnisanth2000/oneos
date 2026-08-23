@@ -41,15 +41,21 @@ For each mutation the script:
    discards them;
 2. asserts the `OLD` text appears **exactly once**, so a stale edit cannot
    silently mutate nothing and be recorded as evidence;
-3. runs the selection and **distinguishes a test failure (pytest exit 1)
-   from infrastructure failure** (any other exit, or zero tests collected) —
-   the latter is scored as neither detected nor survived, because it
-   measured nothing;
-4. requires the **named** test to be among the failures, not merely that
-   something failed;
-5. restores from an in-memory pre-image, verifies byte-identity, and
+3. applies **phase-specific** rules, because the two phases prove different
+   things and a shared rule is wrong for both:
+
+   - a **mutated** run must exit `1`, carry **no collection ERRORs**, fail
+     the **exact node**, and carry that failure's **intended diagnostic**.
+     An exit of 1 with only `ERROR` lines produces no `FAILED` lines at all
+     and would otherwise read as success; and a node name alone would accept
+     that test failing for an unrelated reason.
+   - a **restored** or **full** run must exit `0`. Nothing else counts as
+     green — scanning output for `FAILED` lines is not sufficient, for the
+     same reason.
+
+4. restores from an in-memory pre-image, verifies byte-identity, and
    **re-runs the same selection to confirm it is green again**; and
-6. runs the **full public suite** after the whole restored group.
+5. runs the **full public suite** after the whole restored group.
 
 Read-only Git (`status --porcelain`) provides the cleanliness check. No
 *destructive* Git command appears anywhere in it: a `git checkout` or
@@ -81,6 +87,11 @@ is not evidence either:
 |---|---|---|
 | dirty target refused | append a line to `app/registry.py`, run | refused, naming the file |
 | infrastructure ≠ survival | pytest exits 4 / 127, or collects nothing | refused as infrastructure failure, scored as neither |
+| **exit 1 with only ERRORs** | `_require_clean_run(1, "ERROR …")` | **refused** — previously reported green |
+| mutated run must exit 1 | exit 0, exit 2 | refused as infrastructure failure |
+| mutated run must have no ERRORs | exit 1, errors only | refused as infrastructure failure |
+| the *exact node* must fail | a different node fails | scored ALIVE |
+| with its *intended diagnostic* | right node, wrong reason | scored ALIVE |
 | required field pinned | `Form(...)` → `Form(None)` on all three routes | RED — "outbox_approve does not REQUIRE review_sha256" |
 | `.git` exclusion is exact | a directory literally named `ordinary.git/` | its `marker.bin` and bytes are captured |
 

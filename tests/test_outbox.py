@@ -1650,8 +1650,12 @@ def test_review_value_and_hash_come_from_one_capture_not_a_second_read(tmp_path)
     assert replacement_holder["bytes"] != original, "the probe did not replace anything"
 
     # Every part of the review describes the captured bytes, not the file.
-    assert review.contents == original
-    assert review.sha256 == hashlib.sha256(original).hexdigest()
+    assert review.contents == original, (
+        "the review carries bytes other than the ones it captured"
+    )
+    assert review.sha256 == hashlib.sha256(original).hexdigest(), (
+        "the digest is not of the captured bytes"
+    )
     assert review.value.module == prop.module
     assert review.value.sub == prop.sub
     assert review.value.dst == prop.dst

@@ -1786,6 +1786,13 @@ def test_delete_success_copy_comes_from_the_bound_execution(tmp_path, monkeypatc
     source = _executable_source(main.registry_delete_execute)
     assert "execute_delete(scope, id, review_sha256)" in source
     assert "get_delete_proposal" not in source
+    # Nor any *other* read for display: the route acts and renders what the
+    # action returned. A pre-read here would describe bytes the deletion
+    # never consumed, whichever reader produced them.
+    assert "get_delete_review" not in source, (
+        "the execute route reads a review for display instead of using the "
+        "proposal its own execution returned"
+    )
     # The returned proposal is what the success fragment renders.
     success = source.split("delete_success.html", 1)[1]
     assert "prop.kind" in success and "prop.slug" in success
