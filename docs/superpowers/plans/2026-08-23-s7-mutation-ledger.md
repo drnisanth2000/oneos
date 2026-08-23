@@ -44,11 +44,16 @@ For each mutation the script:
 3. applies **phase-specific** rules, because the two phases prove different
    things and a shared rule is wrong for both:
 
-   - a **mutated** run must exit `1`, carry **no collection ERRORs**, fail
-     the **exact node**, and carry that failure's **intended diagnostic**.
-     An exit of 1 with only `ERROR` lines produces no `FAILED` lines at all
-     and would otherwise read as success; and a node name alone would accept
-     that test failing for an unrelated reason.
+   - a **mutated** run is performed **one expected node at a time**, by full
+     node id. That node must be the *only* failure, and its failure must
+     carry the intended diagnostic. Running the whole selection and checking
+     "the node is in some FAILED line" and "the diagnostic is somewhere in
+     the output" as separate conditions accepts a crossed result — the
+     expected node failing for an unrelated reason while a *different* test
+     emits the diagnostic. Running the node alone makes the binding
+     structural rather than a matter of parsing. The run must also exit `1`
+     and carry no collection `ERROR`s, since an exit of 1 with only `ERROR`
+     lines produces no `FAILED` lines at all.
    - a **restored** or **full** run must exit `0`. Nothing else counts as
      green — scanning output for `FAILED` lines is not sufficient, for the
      same reason.
@@ -90,8 +95,10 @@ is not evidence either:
 | **exit 1 with only ERRORs** | `_require_clean_run(1, "ERROR …")` | **refused** — previously reported green |
 | mutated run must exit 1 | exit 0, exit 2 | refused as infrastructure failure |
 | mutated run must have no ERRORs | exit 1, errors only | refused as infrastructure failure |
-| the *exact node* must fail | a different node fails | scored ALIVE |
+| the *exact node* must fail | a different node fails | refused |
 | with its *intended diagnostic* | right node, wrong reason | scored ALIVE |
+| **diagnostic bound to the node** | expected node fails for another reason while a different test emits the diagnostic | **refused** — previously accepted |
+| the node id must still select something | a renamed node | refused |
 | required field pinned | `Form(...)` → `Form(None)` on all three routes | RED — "outbox_approve does not REQUIRE review_sha256" |
 | `.git` exclusion is exact | a directory literally named `ordinary.git/` | its `marker.bin` and bytes are captured |
 
@@ -110,6 +117,13 @@ above; the script asserts that before substituting.
 -    require_review_match(proposal_state.contents, review_sha256)
 +    pass  # MUTANT M1
 ```
+
+### M1 requires both nodes
+
+M1 breaks the comparison in `_own_reviewed_proposal`, which approve and
+reject share, so the ledger requires **both** `[None-approve]` and
+`[None-reject]` to go red. Requiring only one would leave half the shared
+protection unproven.
 
 ### M2 — reject's bypass is M1
 

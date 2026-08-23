@@ -38,105 +38,114 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
-#: (id, file, OLD, NEW, pytest selection, the exact node that must go
-#: red, and the diagnostic that failure must carry — a node name alone
-#: would accept that test failing for an unrelated reason)
+#: (id, file, OLD, NEW, selection, [(exact node id, its intended diagnostic)])
+#:
+#: Each expected node is a FULL node id and is run **on its own**. Checking
+#: "the node appears in some FAILED line" and "the diagnostic appears
+#: somewhere in the output" independently would accept a run where the
+#: expected node failed for an unrelated reason while a *different* test
+#: emitted the diagnostic. Running one node at a time makes the binding
+#: structural: the only failure the output can contain is that node's.
 MUTATIONS = [
     (
         "M1", "app/outbox.py",
         "    require_review_match(proposal_state.contents, review_sha256)",
         "    pass  # MUTANT M1",
         ["tests/test_outbox.py"],
-        "test_actions_refuse_a_malformed_fingerprint_without_mutation[None-approve]",
-        "DID NOT RAISE InvalidReviewToken",
+        [
+            ("tests/test_outbox.py::test_actions_refuse_a_malformed_fingerprint_without_mutation[None-approve]",
+             "DID NOT RAISE InvalidReviewToken"),
+            ("tests/test_outbox.py::test_actions_refuse_a_malformed_fingerprint_without_mutation[None-reject]",
+             "DID NOT RAISE InvalidReviewToken"),
+        ],
     ),
     (
         "M3", "app/registry.py",
         "        require_review_match(proposal_state.contents, review_sha256)",
         "        pass  # MUTANT M3",
         ["tests/test_registry.py"],
-        "test_execute_delete_refuses_a_malformed_fingerprint[None]",
-        "DID NOT RAISE InvalidReviewToken",
+        [("tests/test_registry.py::test_execute_delete_refuses_a_malformed_fingerprint[None]",
+          "DID NOT RAISE InvalidReviewToken")],
     ),
     (
         "M4", "app/outbox.py",
         "            make_review_snapshot(_require_destination(scope, proposal), contents)",
         "            make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4",
         ["tests/test_outbox.py", "tests/test_console_projection.py"],
-        "test_review_value_and_hash_come_from_one_capture_not_a_second_read",
-        "the review carries bytes other than the ones it captured",
+        [("tests/test_outbox.py::test_review_value_and_hash_come_from_one_capture_not_a_second_read",
+          "the review carries bytes other than the ones it captured")],
     ),
     (
         "M5", "app/outbox.py",
         "            PathChange(proposal_rel, proposal_state, PathState.absent()),",
         "            PathChange(proposal_rel, capture_path_state(vault, proposal_rel), PathState.absent()),  # MUTANT M5",
         ["tests/test_outbox.py"],
-        "test_approve_owns_the_reviewed_state_not_whatever_arrives_later",
-        "DID NOT RAISE Exception",
+        [("tests/test_outbox.py::test_approve_owns_the_reviewed_state_not_whatever_arrives_later",
+          "DID NOT RAISE Exception")],
     ),
     (
         "M5b", "app/registry.py",
         "                PathChange(proposal_rel, proposal_state, PathState.absent()),",
         "                PathChange(proposal_rel, capture_path_state(vault, proposal_rel), PathState.absent()),  # MUTANT M5b",
         ["tests/test_registry.py"],
-        "test_delete_owns_the_reviewed_state_not_whatever_arrives_later",
-        "DID NOT RAISE Exception",
+        [("tests/test_registry.py::test_delete_owns_the_reviewed_state_not_whatever_arrives_later",
+          "DID NOT RAISE Exception")],
     ),
     (
         "M6", "app/outbox.py",
         "        consume_reviewed_proposal(scope.root, proposal_rel, proposal_state)",
         "        consume_reviewed_proposal(scope.root, proposal_rel, capture_path_state(scope.root, proposal_rel))  # MUTANT M6",
         ["tests/test_outbox.py"],
-        "test_reject_owns_the_reviewed_state_not_whatever_arrives_later",
-        "DID NOT RAISE Exception",
+        [("tests/test_outbox.py::test_reject_owns_the_reviewed_state_not_whatever_arrives_later",
+          "DID NOT RAISE Exception")],
     ),
     (
         "M7", "templates/blocks/outbox_card.html",
         '  {% set outbox_values = {"id": row.proposal.id,\n                          "review_sha256": row.review_sha256} %}',
         '  {% set outbox_values = {"id": row.proposal.id} %}  {# MUTANT M7 #}',
         ["tests/test_console_routes.py", "tests/test_console_invariants.py"],
-        "test_outbox_hx_vals_are_tojson",
-        "does not transport exactly id + review_sha256",
+        [("tests/test_console_routes.py::test_outbox_hx_vals_are_tojson",
+          "does not transport exactly id + review_sha256")],
     ),
     (
         "M7b", "templates/blocks/delete_impact.html",
         '  {% set delete_execute_values = {"id": prop.id,\n                                  "review_sha256": review_sha256} %}',
         '  {% set delete_execute_values = {"id": prop.id} %}  {# MUTANT M7b #}',
         ["tests/test_console_routes.py", "tests/test_console_invariants.py"],
-        "test_delete_preview_hx_vals_survive_hostile_slug",
-        "does not transport exactly id + review_sha256",
+        [("tests/test_console_routes.py::test_delete_preview_hx_vals_survive_hostile_slug",
+          "does not transport exactly id + review_sha256")],
     ),
     (
         "M8", "app/main.py",
         "        prop = execute_delete(scope, id, review_sha256)",
         '        prop = get_delete_review(scope, id).value\n        execute_delete(scope, id, review_sha256)  # MUTANT M8',
         ["tests/test_console_routes.py", "tests/test_console_invariants.py"],
-        "test_delete_success_copy_comes_from_the_bound_execution",
-        "reads a review for display instead of using the",
+        [("tests/test_console_invariants.py::test_delete_success_copy_comes_from_the_bound_execution",
+          "reads a review for display instead of using the")],
     ),
     (
         "M9", "app/outbox.py",
         '    if candidate.is_symlink():\n        raise RedirectedPathError("proposal leaf is redirected")',
         '    try:\n        _p = open(candidate, "rb")\n    except OSError:\n        pass\n    else:\n        _p.close()\n    if candidate.is_symlink():\n        raise RedirectedPathError("proposal leaf is redirected")  # MUTANT M9',
         ["tests/test_console_routes.py"],
-        "test_check_again_never_reads_through_a_redirected_leaf[outbox]",
-        "the redirected target was opened",
+        [("tests/test_console_routes.py::test_check_again_never_reads_through_a_redirected_leaf[outbox]",
+          "the redirected target was opened")],
     ),
     (
         "M10", "app/registry.py",
         "        report = reference_count(scope, prop.kind, prop.slug)\n        if report.total:",
         '        path.write_bytes(path.read_bytes() + b"# MUTANT\\n")\n        report = reference_count(scope, prop.kind, prop.slug)\n        if report.total:',
         ["tests/test_registry.py"],
-        "test_the_delete_no_mutation_matrix[new-live-reference]",
-        "new-live-reference",
+        [("tests/test_registry.py::test_the_delete_no_mutation_matrix[new-live-reference]",
+          "new-live-reference")],
     ),
     (
         "M11", "app/main.py",
         "        prop = execute_delete(scope, id, review_sha256)",
         '        _unused = review_sha256  # MUTANT M11\n        prop = execute_delete(scope, id, "0" * 64)',
         ["tests/test_console_invariants.py"],
-        "test_every_reviewed_route_requires_and_passes_the_fingerprint",
-        "never passes review_sha256 to execute_delete",
+        [("tests/test_console_invariants.py::test_every_reviewed_route_requires_and_passes_the_fingerprint",
+          "never passes review_sha256 to execute_delete")],
     ),
 ]
 
@@ -157,45 +166,48 @@ def _pytest(selection: list[str]) -> tuple[int, str, str]:
     return completed.returncode, completed.stdout, completed.stderr
 
 
-def _require_mutated_run(code: int, out: str, err: str, node: str, diagnostic: str,
-                         context: str) -> None:
-    """A mutated run is evidence only if it failed for the intended reason.
+def _require_node_failed_for_its_reason(
+    code: int, out: str, err: str, node: str, diagnostic: str, context: str
+) -> None:
+    """One node, run alone, must fail carrying its intended diagnostic.
 
-    Three separate things must hold, and none implies the others:
-
-    * pytest exited **1** — tests ran and some failed. Any other code means
-      the run measured nothing (missing interpreter, collection error, usage
-      mistake), and scoring it as "detected" would be a false ledger entry.
-    * there are no collection ERRORs — an exit of 1 with only `ERROR` lines
-      is a broken run, not a detected mutation, and parsing for `FAILED`
-      alone would read it as success.
-    * the **exact node** failed, carrying its **intended diagnostic**. A node
-      name alone would accept that test failing for an unrelated reason,
-      which is precisely the thing a mutation ledger must not do.
+    The node is run **by itself**, so the only failure the output can hold is
+    that node's — which is what binds the diagnostic to it. Checking "the
+    node appears in some FAILED line" and "the diagnostic appears somewhere
+    in the output" as separate conditions over a multi-test run would accept
+    the expected node failing for an unrelated reason while a *different*
+    test emitted the diagnostic.
     """
     if code != 1:
         raise InfrastructureFailure(
-            f"{context}: pytest exited {code}, expected 1 (tests failed)\n"
+            f"{context}: pytest exited {code}, expected 1 (this test failed)\n"
             f"--- stdout ---\n{out[-2000:]}\n--- stderr ---\n{err[-2000:]}"
         )
     errors = [line for line in out.splitlines() if line.startswith("ERROR")]
     if errors:
         raise InfrastructureFailure(
-            f"{context}: the run had collection errors, so it measured "
-            f"nothing:\n" + "\n".join(errors[:5])
+            f"{context}: collection errors, so the run measured nothing:\n"
+            + "\n".join(errors[:5])
         )
     if "no tests ran" in out or "collected 0 items" in out:
-        raise InfrastructureFailure(f"{context}: no tests were collected\n{out[-2000:]}")
-
+        raise InfrastructureFailure(
+            f"{context}: the node id selected nothing — it may have been "
+            f"renamed:\n{out[-2000:]}"
+        )
     failed = [line for line in out.splitlines() if line.startswith("FAILED")]
-    if not any(node in line for line in failed):
-        raise MutantSurvived(
-            f"{context}: {node} did not fail. Other failures: {failed[:5] or 'none'}"
+    if len(failed) != 1:
+        raise InfrastructureFailure(
+            f"{context}: expected exactly one failing test, saw {len(failed)}:\n"
+            + "\n".join(failed[:5])
+        )
+    if node.split("::", 1)[1] not in failed[0]:
+        raise InfrastructureFailure(
+            f"{context}: the failure is not this node: {failed[0]}"
         )
     if diagnostic not in out:
         raise MutantSurvived(
-            f"{context}: {node} failed, but not with its intended diagnostic\n"
-            f"  expected to contain: {diagnostic!r}\n"
+            f"{context}: {node} failed, but not for its intended reason\n"
+            f"  expected the failure to contain: {diagnostic!r}\n"
             f"--- output ---\n{out[-2000:]}"
         )
 
@@ -241,8 +253,10 @@ def main() -> int:
         print(f"no mutation named {arguments.only!r}")
         return 1
     if arguments.list:
-        for identifier, target, old, _new, selection, node, _diagnostic in selected:
-            print(f"{identifier:4} {target:38} {node}  [{' '.join(selection)}]")
+        for identifier, target, old, _new, selection, expectations in selected:
+            for node, diagnostic in expectations:
+                print(f"{identifier:4} {target:38} {node}")
+                print(f"{'':4} {'':38}   └─ {diagnostic}")
         return 0
 
     targets = sorted({target for _i, target, *_rest in selected})
@@ -255,7 +269,7 @@ def main() -> int:
         return 1
 
     failures = []
-    for identifier, target, old, new, selection, node, diagnostic in selected:
+    for identifier, target, old, new, selection, expectations in selected:
         path = ROOT / target
         pristine = path.read_bytes()
         source = pristine.decode("utf-8")
@@ -265,20 +279,29 @@ def main() -> int:
             continue
 
         path.write_text(source.replace(old, new), encoding="utf-8")
+        problems = []
         try:
-            code, out, err = _pytest(selection)
-            _require_mutated_run(code, out, err, node, diagnostic, f"{identifier} mutated")
-        except (InfrastructureFailure, MutantSurvived) as problem:
-            path.write_bytes(pristine)
-            label = "ALIVE" if isinstance(problem, MutantSurvived) else "NOT EVIDENCE"
-            print(f"{identifier:4} {label}\n{problem}")
-            failures.append(identifier)
-            continue
+            for node, diagnostic in expectations:
+                code, out, err = _pytest([node])
+                try:
+                    _require_node_failed_for_its_reason(
+                        code, out, err, node, diagnostic, f"{identifier} mutated"
+                    )
+                except (InfrastructureFailure, MutantSurvived) as problem:
+                    problems.append(problem)
         finally:
             path.write_bytes(pristine)
 
         if path.read_bytes() != pristine:
             raise SystemExit(f"{identifier}: restore failed — STOPPING")
+
+        if problems:
+            alive = any(isinstance(p, MutantSurvived) for p in problems)
+            print(f"{identifier:4} {'ALIVE' if alive else 'NOT EVIDENCE'}")
+            for problem in problems:
+                print(f"       {problem}")
+            failures.append(identifier)
+            continue
 
         try:
             code, out, err = _pytest(selection)
@@ -288,8 +311,10 @@ def main() -> int:
             failures.append(identifier)
             continue
 
-        print(f"{identifier:4} RED then GREEN  {node}")
-        print(f"       diagnostic: {diagnostic}")
+        print(f"{identifier:4} RED then GREEN")
+        for node, diagnostic in expectations:
+            print(f"       {node.split('::', 1)[1]}")
+            print(f"         └─ {diagnostic}")
 
     print()
     if failures:
