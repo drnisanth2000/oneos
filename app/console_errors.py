@@ -57,6 +57,18 @@ _CODES: dict[str, ConsoleError] = {
             "stop", "yes", 500,
         ),
         ConsoleError(
+            # S7. Reject makes no Git commit, so E-COMMITTED's "the commit
+            # succeeded" would be untrue — but the discard itself is done and
+            # durable, which is the fact the operator has to act on. That is
+            # what the `committed` tier encodes here: the effect took hold,
+            # so do not retry.
+            "E-DISCARDED", "committed", "attention",
+            "The proposal was discarded, but the cleanup afterwards failed. "
+            "Do not retry — the proposal is already gone. Inspect vault "
+            "state with git status.",
+            "stop", "yes", 500,
+        ),
+        ConsoleError(
             "E-RECOVER", "recovery", "attention",
             "Rollback was blocked by a change made at the same time. "
             "Do not retry. Inspect vault state with git status and resolve "
@@ -232,6 +244,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.GitTransactionFailure: _CODES["E-GIT"],
     _git_transaction.GitTransactionError: _CODES["E-GIT"],
     _git_transaction._ApprovalLockCleanupFailure: _CODES["E-GIT"],
+    _git_transaction.ConditionalRemovalCleanupError: _CODES["E-DISCARDED"],
     _git_transaction._ReviewedIndexOwnershipConflict: _CODES["E-CONFLICT"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.StaleProposalSource: _CODES["E-STALE"],
@@ -285,6 +298,7 @@ ALLOWLIST: frozenset[type[BaseException]] = frozenset(
         _outbox.OutboxDestinationError,
         _git_transaction.GitTransactionFailure,
         _git_transaction._ApprovalLockCleanupFailure,
+        _git_transaction.ConditionalRemovalCleanupError,
         _git_transaction._ReviewedIndexOwnershipConflict,
     }
 )

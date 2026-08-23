@@ -4422,3 +4422,137 @@ def test_no_outbox_action_row_renders_a_button_without_a_fingerprint(
     assert "hx-post=\"/outbox/alpha/approve\"" not in body
     assert "hx-post=\"/outbox/alpha/reject\"" not in body
     assert "review_sha256" not in body
+
+
+# --- S7 Task 3 review: the routes answer the review outcomes ----------------
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_with_a_stale_fingerprint_shows_the_approved_refusal(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): a stale fingerprint is a declared outcome of these
+    routes, not something that escapes to the global fallback."""
+    from app.console_errors import _CODES
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    # The record is rewritten under the same id after the review was issued.
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# rewritten\n")
+    proposal_before = proposal_path.read_bytes()
+    source_before = (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes()
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert 'role="alert"' in response.text
+    assert "E-REVIEW" in response.text
+    assert _CODES["E-REVIEW"].message in response.text
+    # Nothing changed, and the current record is preserved for comparison.
+    assert proposal_path.read_bytes() == proposal_before
+    assert (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes() == source_before
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize("bad", ["not-a-hash", "", "A" * 64, "0" * 63])
+def test_outbox_action_with_a_malformed_fingerprint_is_an_invalid_request(
+    tmp_path, monkeypatch, action, bad
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal_before = proposal_path.read_bytes()
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = client.post(
+        f"/outbox/alpha/{action}", data={"id": proposal_id, "review_sha256": bad}
+    )
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert "E-REQUEST" in response.text
+    assert proposal_path.read_bytes() == proposal_before
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_stale_refusal_re_renders_the_current_review_with_a_fresh_fingerprint(
+    tmp_path, monkeypatch, action
+):
+    """The operator is left able to act again on what is actually stored.
+
+    Task 5 owns the side-by-side comparison of the old and current values;
+    what must already hold is that the refusal does not strand the operator
+    with a fingerprint that can never match again.
+    """
+    from tests.test_app import HxValsParser
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+    assert current != stale["review_sha256"]
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+
+    parser = HxValsParser()
+    parser.feed(response.text)
+    assert parser.values, "the refusal left no actionable review on screen"
+    for raw in parser.values:
+        values = json.loads(raw)
+        assert values["id"] == proposal_id
+        # Only the current fingerprint is live; the stale one is never
+        # re-offered as though it could still act.
+        assert values["review_sha256"] == current
+        assert values["review_sha256"] != stale["review_sha256"]
+
+
+def test_a_second_rewrite_invalidates_the_fingerprint_the_refusal_just_issued(
+    tmp_path, monkeypatch
+):
+    """Approved decision 4: every subsequent rewrite invalidates the
+    controls issued for the previous version."""
+    from tests.test_app import HxValsParser
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# first rewrite\n")
+    first_refusal = client.post("/outbox/alpha/approve", data=stale)
+    parser = HxValsParser()
+    parser.feed(first_refusal.text)
+    reissued = json.loads(parser.values[0])["review_sha256"]
+
+    # A second rewrite lands before the operator reconfirms.
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# second rewrite\n")
+    second_refusal = client.post(
+        "/outbox/alpha/approve",
+        data={"id": proposal_id, "review_sha256": reissued},
+    )
+
+    assert "E-REVIEW" in second_refusal.text
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+    parser = HxValsParser()
+    parser.feed(second_refusal.text)
+    assert json.loads(parser.values[0])["review_sha256"] != reissued

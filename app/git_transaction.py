@@ -63,6 +63,19 @@ class _ApprovalLockCleanupFailure(GitTransactionFailure):
         super().__init__("approval lock cleanup failed")
 
 
+class ConditionalRemovalCleanupError(GitTransactionFailure):
+    """The reviewed file was removed; only the cleanup afterwards failed.
+
+    Distinct from `_ApprovalLockCleanupFailure`, which reaches the operator
+    as "nothing was changed and it was rolled back". After a completed
+    removal that sentence is simply false.
+    """
+
+    def __init__(self, cleanup_error: OSError) -> None:
+        self.cleanup_error = cleanup_error
+        super().__init__("reviewed file was removed but cleanup failed")
+
+
 class _ReviewedIndexOwnershipConflict(GitTransactionFailure):
     def __init__(self, paths: tuple[str, ...]) -> None:
         self.paths = tuple(sorted(paths))
@@ -365,8 +378,22 @@ def remove_path_if_unchanged(
         raise ValueError("conditional removal requires a regular expected state")
     root = Path(os.path.abspath(os.fspath(vault)))
     change = PathChange(relative_path, expected, PathState.absent())
-    with _approval_lock(root):
-        _apply_state(root, change)
+    removed = False
+
+    def _mark_removed(_state: PathState) -> None:
+        nonlocal removed
+        removed = True
+
+    try:
+        with _approval_lock(root):
+            _apply_state(root, change, on_applied=_mark_removed)
+    except _ApprovalLockCleanupFailure as exc:
+        # Mirrors `execute_transaction`'s own distinction: once the work has
+        # happened, a cleanup failure may not be reported as "nothing was
+        # changed and it was rolled back".
+        if not removed:
+            raise
+        raise ConditionalRemovalCleanupError(exc.cleanup_error) from exc.cleanup_error
 
 
 def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult:
@@ -1081,6 +1108,82 @@ def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
             os.close(descriptor)
 
 
+def _restore_claimed_leaf(
+    directory_descriptor: int, claim: str, leaf: str, path: str
+) -> None:
+    """Put a claimed file back under its own name, or refuse to guess.
+
+    Renaming back would silently overwrite anything that took the name in
+    the meantime, so the name must still be free. When it is not, the file
+    stays under its private name and the caller learns the state is
+    indeterminate — never a comfortable lie about it.
+    """
+    try:
+        os.lstat(leaf, dir_fd=directory_descriptor)
+    except FileNotFoundError:
+        try:
+            os.rename(
+                claim,
+                leaf,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+            )
+        except OSError as exc:
+            raise GitTransactionRecoveryError((path,)) from exc
+        return
+    except OSError as exc:
+        raise GitTransactionRecoveryError((path,)) from exc
+    raise GitTransactionRecoveryError((path,))
+
+
+def _remove_reviewed_leaf(
+    directory_descriptor: int, leaf: str, expected: PathState, path: str
+) -> None:
+    """Unlink the reviewed file itself, never whatever answers to its name.
+
+    `os.unlink(name)` destroys whatever holds that name at the instant it
+    runs, which need not be what was compared a moment earlier: checking a
+    parcel's label and then looking away before destroying it lets someone
+    swap the parcel in the gap.
+
+    So claim the name first. Renaming the leaf to a private temporary that
+    only this call knows takes it out of anyone else's reach; the file is
+    then verified under that private name, and unlinked only once it has
+    matched. A mismatch is put back and refused, so a replacement is
+    returned intact rather than destroyed.
+    """
+    claim = f".oneos-remove-{secrets.token_hex(12)}"
+    try:
+        os.rename(
+            leaf,
+            claim,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError as exc:
+        raise ReviewedStateChanged(
+            f"reviewed path changed before mutation: {path}"
+        ) from exc
+    except OSError as exc:
+        raise GitTransactionFailure("could not claim the reviewed file") from exc
+
+    try:
+        claimed = _capture_leaf_state(directory_descriptor, claim)
+    except BaseException:
+        _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+        raise
+    if claimed != expected:
+        _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+        raise ReviewedStateChanged(
+            f"reviewed path changed before mutation: {path}"
+        )
+    try:
+        os.unlink(claim, dir_fd=directory_descriptor)
+    except OSError as exc:
+        _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+        raise GitTransactionFailure("could not remove reviewed file") from exc
+
+
 def _apply_state(
     vault: Path,
     change: PathChange,
@@ -1104,10 +1207,9 @@ def _apply_state(
             )
         if change.after.contents is None:
             if change.before.contents is not None:
-                try:
-                    os.unlink(leaf, dir_fd=directory_descriptor)
-                except OSError as exc:
-                    raise GitTransactionFailure("could not remove reviewed file") from exc
+                _remove_reviewed_leaf(
+                    directory_descriptor, leaf, change.before, change.path
+                )
                 if on_applied is not None:
                     on_applied(change.after)
                     _checkpoint("filesystem-path-applied")

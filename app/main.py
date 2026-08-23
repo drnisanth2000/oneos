@@ -41,6 +41,7 @@ from .outbox import (
     propose_classification,
     reject,
 )
+from .review_tokens import ReviewTokenError
 from .registry import (
     RegistryError,
     execute_delete,
@@ -508,9 +509,14 @@ def propose(
 #: (the Task 11 pattern). `load_proposals` raises bare `CrossScopeError` for a
 #: redirected outbox or proposal leaf, which today escapes `except OutboxError:
 #: pass` entirely — design §5 names this exact gap for the outbox routes.
+#: `ReviewTokenError` (S7): a stale or malformed review fingerprint is a
+#: declared outcome of these routes, not an escape. Without it a rewritten
+#: proposal reaches the global fallback as an unhandled error instead of the
+#: approved refusal, and the operator is never offered the current review.
 _OUTBOX_CATCHES = (
     OutboxError, CrossScopeError, DestinationRegistryError,
     SystemRegistryPathError,  # see _TRIAGE_CATCHES
+    ReviewTokenError,
 )
 
 

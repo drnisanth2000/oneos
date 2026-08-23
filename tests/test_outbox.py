@@ -2249,3 +2249,127 @@ def test_approve_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
     assert (vault / prop.src).exists()
     assert not (vault / prop.dst).exists()
     assert prop.path.read_bytes() == replaced[0]
+
+
+# --- S7 Task 3 review: the swap inside the mutation primitive ----------------
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
+    tmp_path, action
+):
+    """The last gap: the swap lands inside the mutation primitive itself,
+    after it captured the leaf and before it acts on it.
+
+    Neither the fingerprint comparison nor the plan's own state comparison
+    can see this one — only acting on the reviewed file rather than on its
+    name can. The replacement must survive untouched, and approve must
+    neither move the receipt nor create a commit.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+    leaf_name = prop.path.name
+    commits_before = git_count_commits(vault)
+    head_before = git_head(vault)
+    source_before = (vault / prop.src).read_bytes()
+
+    replacement = b"id: swapped\nvalue: REPLACEMENT-NOBODY-REVIEWED\n"
+    real_capture = gt._capture_leaf_state
+    swapped = []
+
+    def capture_then_swap(dir_fd, name):
+        state = real_capture(dir_fd, name)
+        if not swapped and name == leaf_name:
+            swapped.append(True)
+            prop.path.write_bytes(replacement)
+        return state
+
+    gt._capture_leaf_state = capture_then_swap
+    try:
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        gt._capture_leaf_state = real_capture
+
+    assert swapped, "the probe never swapped the proposal"
+    assert describe(raised.value).code in {"E-CONFLICT", "E-TAMPER"}
+
+    # The replacement survives, byte for byte.
+    assert prop.path.exists(), "the unreviewed replacement was destroyed"
+    assert prop.path.read_bytes() == replacement
+
+    # Approve moved nothing and committed nothing.
+    assert git_count_commits(vault) == commits_before
+    assert git_head(vault) == head_before
+    assert (vault / prop.src).read_bytes() == source_before
+    assert not (vault / prop.dst).exists()
+
+    # And no orphan was stranded in the outbox.
+    assert sorted(p.name for p in prop.path.parent.iterdir()) == [
+        prop.path.name
+    ], f"unexpected leftovers in {proposal_rel}'s directory"
+
+
+def test_reject_reports_truthfully_when_cleanup_fails_after_the_removal(tmp_path):
+    """A completed reject followed by a lock-cleanup failure must not tell
+    the operator that nothing was changed — the proposal is gone."""
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    real_flock = gt.fcntl.flock
+
+    def failing_unlock(descriptor, operation):
+        if operation == gt.fcntl.LOCK_UN:
+            raise OSError(5, "simulated unlock failure")
+        return real_flock(descriptor, operation)
+
+    gt.fcntl.flock = failing_unlock
+    try:
+        with pytest.raises(Exception) as raised:
+            reject(scope, prop.id, review.sha256)
+    finally:
+        gt.fcntl.flock = real_flock
+
+    assert not prop.path.exists(), "the reject did complete"
+    outcome = describe(raised.value)
+    assert "Nothing was changed" not in outcome.message
+    assert outcome.retry == "stop"
+    assert outcome.committed != "no"
+
+
+def test_reject_transaction_failures_stay_inside_the_outbox_family(tmp_path):
+    """Reject now takes the approval lock, so lock outcomes are reachable
+    through it. They must arrive as outbox errors, the family the routes
+    declare, with their described outcome preserved through the cause."""
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    real_flock = gt.fcntl.flock
+
+    def busy(descriptor, operation):
+        if operation == gt.fcntl.LOCK_EX | gt.fcntl.LOCK_NB:
+            raise OSError(35, "simulated busy lock")
+        return real_flock(descriptor, operation)
+
+    gt.fcntl.flock = busy
+    try:
+        with pytest.raises(outbox.OutboxError) as raised:
+            reject(scope, prop.id, review.sha256)
+    finally:
+        gt.fcntl.flock = real_flock
+
+    assert describe(raised.value).code == "E-BUSY"
+    assert prop.path.exists()

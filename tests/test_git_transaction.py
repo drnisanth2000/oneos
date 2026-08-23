@@ -1641,3 +1641,160 @@ def test_conditional_removal_leaves_unrelated_git_state_untouched(tmp_path):
     assert git_worktree_diff(vault) == worktree_before
     assert git_cached_diff(vault) == cached_before
     assert b"outbox-record.yaml" not in git_status_bytes(vault)
+
+
+# --- S7 Task 3 review: the compare-to-unlink gap -----------------------------
+
+
+def test_conditional_removal_never_destroys_a_replacement_swapped_after_comparison(
+    tmp_path,
+):
+    """P1 (review): comparing a name and then unlinking that name are two
+    operations, and `os.unlink` destroys whatever holds the name when it
+    runs — not what was compared.
+
+    Checking the parcel's label and then looking away before destroying it
+    lets someone swap the parcel in the gap. The removal must act on the
+    reviewed file itself, never on whatever currently answers to its name.
+    """
+    import app.git_transaction as gt
+    from app.git_transaction import (
+        ReviewedStateConflict,
+        capture_path_state,
+        remove_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = b"id: probe\nvalue: first\n"
+    assert leaf.read_bytes() == reviewed
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    replacement = b"id: probe\nvalue: REPLACEMENT-NOBODY-REVIEWED\n"
+    real_capture = gt._capture_leaf_state
+    swapped = []
+
+    def capture_then_swap(dir_fd, name):
+        state = real_capture(dir_fd, name)
+        if not swapped and name == "outbox-record.yaml":
+            swapped.append(True)
+            leaf.write_bytes(replacement)
+        return state
+
+    gt._capture_leaf_state = capture_then_swap
+    try:
+        with pytest.raises(ReviewedStateConflict):
+            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._capture_leaf_state = real_capture
+
+    assert swapped, "the probe never swapped the file"
+    assert leaf.exists(), "the unreviewed replacement was destroyed"
+    assert leaf.read_bytes() == replacement
+
+
+def test_conditional_removal_leaves_no_orphan_after_refusing_a_replacement(tmp_path):
+    """Whatever mechanism refuses the swap must not strand the file under
+    some other name: the outbox is globbed, and an orphan there is a record
+    nobody can see, review or clear."""
+    import app.git_transaction as gt
+    from app.git_transaction import (
+        ReviewedStateConflict,
+        capture_path_state,
+        remove_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    before = {p.name for p in vault.iterdir()}
+
+    real_capture = gt._capture_leaf_state
+    swapped = []
+
+    def capture_then_swap(dir_fd, name):
+        state = real_capture(dir_fd, name)
+        if not swapped and name == "outbox-record.yaml":
+            swapped.append(True)
+            leaf.write_bytes(b"id: probe\nvalue: replacement\n")
+        return state
+
+    gt._capture_leaf_state = capture_then_swap
+    try:
+        with pytest.raises(ReviewedStateConflict):
+            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._capture_leaf_state = real_capture
+
+    assert {p.name for p in vault.iterdir()} == before
+
+
+def test_conditional_removal_reports_a_completed_removal_when_cleanup_fails(tmp_path):
+    """P1 (review): the removal succeeded, so the operator must not be told
+    that nothing was changed. `execute_transaction` already makes this
+    distinction for a commit; a completed reject deserves the same honesty."""
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, remove_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    real_flock = gt.fcntl.flock
+
+    def failing_unlock(descriptor, operation):
+        if operation == gt.fcntl.LOCK_UN:
+            raise OSError(5, "simulated unlock failure")
+        return real_flock(descriptor, operation)
+
+    gt.fcntl.flock = failing_unlock
+    try:
+        with pytest.raises(gt.GitTransactionError) as raised:
+            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt.fcntl.flock = real_flock
+
+    assert not leaf.exists(), "the removal did happen"
+    outcome = describe(raised.value)
+    # It must not claim nothing changed, must not invite a retry of an
+    # action that already took effect, and must not shrug: this is a known,
+    # handled condition, so "an unexpected error was not handled" would be
+    # its own kind of untruth.
+    assert "Nothing was changed" not in outcome.message
+    assert "rolled back" not in outcome.message
+    assert outcome.retry == "stop"
+    assert outcome.committed != "no"
+    assert outcome.code != "E-UNKNOWN"
+    assert "unexpected" not in outcome.message.lower()
+    # The operator is told plainly that the discard did happen.
+    assert "discarded" in outcome.message.lower()
+
+
+def test_conditional_removal_cleanup_failure_before_removal_still_reports_no_change(
+    tmp_path,
+):
+    """The mirror case: if the removal never happened, the operator must
+    still be told nothing changed."""
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import PathState, capture_path_state, remove_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    leaf.write_bytes(b"id: probe\nvalue: changed before the call\n")
+    survived = leaf.read_bytes()
+
+    real_flock = gt.fcntl.flock
+
+    def failing_unlock(descriptor, operation):
+        if operation == gt.fcntl.LOCK_UN:
+            raise OSError(5, "simulated unlock failure")
+        return real_flock(descriptor, operation)
+
+    gt.fcntl.flock = failing_unlock
+    try:
+        with pytest.raises(gt.GitTransactionError) as raised:
+            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt.fcntl.flock = real_flock
+
+    assert leaf.read_bytes() == survived
+    assert describe(raised.value).committed == "no"

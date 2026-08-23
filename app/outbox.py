@@ -838,5 +838,14 @@ def reject(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
         scope, proposal_id, review_sha256
     )
     _require_outbox_path(scope, prop.path, require_leaf=True)
-    remove_path_if_unchanged(scope.root, proposal_rel, proposal_state)
+    try:
+        remove_path_if_unchanged(scope.root, proposal_rel, proposal_state)
+    except GitTransactionError as exc:
+        # Reject takes the approval lock now, so lock outcomes are reachable
+        # through it. Wrapped the way approve wraps its transaction, so the
+        # routes' declared family still holds and the described outcome
+        # survives through the cause chain.
+        raise OutboxTransactionError(
+            "proposal rejection could not complete"
+        ) from exc
     return prop
