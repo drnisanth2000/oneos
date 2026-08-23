@@ -1678,9 +1678,14 @@ def test_review_refuses_a_non_canonical_proposal_id(tmp_path, bad_id):
     scope, _prop = _propose(_vault(tmp_path))
     before = _vault_tree(scope.root)
 
-    with pytest.raises(Exception) as raised:
+    from app.console_errors import describe
+
+    # P2 (review): assert the promised family and outcome, not merely that
+    # *something* was raised — a TypeError or an unrelated scope error would
+    # otherwise pass as if the contract held.
+    with pytest.raises(outbox.OutboxError) as raised:
         get_proposal_review(scope, bad_id)
-    assert not isinstance(raised.value, AssertionError)
+    assert describe(raised.value).code == "E-INVALID"
 
     assert _vault_tree(scope.root) == before
 
@@ -1742,3 +1747,163 @@ def test_get_proposal_delegates_to_the_review_reader(tmp_path):
     source = inspect.getsource(outbox.get_proposal)
     assert "get_proposal_review" in source
     assert "load_proposals" not in source.split("get_proposal_review")[-1]
+
+
+# --- S7 Task 2 review findings: the strict scan ------------------------------
+
+
+def _two_note_review_vault(tmp_path):
+    files = {
+        "demo/00-inbox/active/note.md": textwrap.dedent(
+            """\
+            ---
+            type: inbox-item
+            title: Clinical study protocol
+            entity: demo
+            product: null
+            status: active
+            created: 2026-01-01
+            updated: 2026-01-01
+            sub: triage
+            source: folder
+            ---
+            Randomised trial protocol body.
+            """
+        ),
+        "demo/00-inbox/active/other.md": textwrap.dedent(
+            """\
+            ---
+            type: inbox-item
+            title: Second protocol
+            entity: demo
+            product: null
+            status: active
+            created: 2026-01-01
+            updated: 2026-01-01
+            sub: triage
+            source: folder
+            ---
+            Second protocol body.
+            """
+        ),
+        "demo/11-knowledge/active/.gitkeep": "",
+        "demo/11-library/active/.gitkeep": "",
+    }
+    vault = _outbox_vault(tmp_path, ("demo",), files)
+    scope = Scope(vault, "demo")
+    target = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "note.md"),
+        module="11-knowledge", sub="kb", claimed_block="govern",
+    )
+    sibling = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "other.md"),
+        module="11-knowledge", sub="kb", claimed_block="govern",
+    )
+    return vault, scope, target, sibling
+
+
+def test_review_refuses_when_a_sibling_destination_is_non_canonical(tmp_path):
+    """P1 (review): the strict loader's refusal is listing-wide, and it is
+    not only about unreadable records.
+
+    A well-formed sibling whose destination no longer canonicalises makes
+    `load_proposals` refuse everything in the entity. A review reader that
+    checked only phase-1 readability would hand out a fingerprint — and
+    therefore an action — that the strict loader would refuse.
+    """
+    _vault_root, scope, target, sibling = _two_note_review_vault(tmp_path)
+
+    record = yaml.safe_load(sibling.path.read_text(encoding="utf-8"))
+    record["dst"] = "demo/11-library/active/other.md"   # module says knowledge
+    sibling.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    # The strict loader refuses ...
+    with pytest.raises(outbox.OutboxDestinationError):
+        load_proposals(scope)
+    # ... so the review of a perfectly valid target must refuse identically.
+    with pytest.raises(outbox.OutboxDestinationError):
+        outbox.get_proposal_review(scope, target.id)
+
+
+def test_the_strict_scan_never_follows_a_leaf_swapped_after_its_lexical_check(
+    tmp_path,
+):
+    """P1 (review): the lexical `is_symlink()` check and the record read are
+    two separate operations. Between them the leaf can become a symlink to a
+    file outside the outbox; a following read would parse that outside file
+    and, because the symlink keeps the filename, its identity check would
+    pass. The read itself must be no-follow."""
+    _vault_root, scope, target, _sibling = _two_note_review_vault(tmp_path)
+    vault = scope.root
+
+    # An outside file that is a perfectly valid proposal under the SAME id,
+    # naming a different destination. If it is ever read, it is returned.
+    outside = tmp_path / "outside-proposal.yaml"
+    planted = yaml.safe_load(target.path.read_text(encoding="utf-8"))
+    planted["module"] = "11-library"
+    planted["sub"] = "reference"
+    planted["dst"] = "demo/11-library/active/note.md"
+    outside.write_text(yaml.safe_dump(planted, sort_keys=False), encoding="utf-8")
+
+    original_bytes = target.path.read_bytes()
+
+    # Record what each read actually resolves to. Watching the *argument*
+    # path is not enough: a following read is called on the leaf and only
+    # its realpath reveals that the outside file was consumed.
+    import os as _os
+
+    reads: list[str] = []
+    real_read_bytes = Path.read_bytes
+    real_read_text = Path.read_text
+
+    def spy_read_bytes(self):
+        reads.append(_os.path.realpath(self))
+        return real_read_bytes(self)
+
+    def spy_read_text(self, *args, **kwargs):
+        reads.append(_os.path.realpath(self))
+        return real_read_text(self, *args, **kwargs)
+
+    real_require = outbox._require_outbox_path
+    swapped = []
+
+    def swap_after_check(scope_arg, proposal_path=None, **kwargs):
+        result = real_require(scope_arg, proposal_path, **kwargs)
+        if (
+            proposal_path is not None
+            and Path(proposal_path).name == f"{target.id}.yaml"
+            and not swapped
+        ):
+            swapped.append(True)
+            Path(proposal_path).unlink()
+            Path(proposal_path).symlink_to(outside)
+        return result
+
+    outbox._require_outbox_path = swap_after_check
+    Path.read_bytes = spy_read_bytes
+    Path.read_text = spy_read_text
+    try:
+        with pytest.raises(CrossScopeError):
+            outbox.get_proposal_review(scope, target.id)
+    finally:
+        Path.read_bytes = real_read_bytes
+        Path.read_text = real_read_text
+        outbox._require_outbox_path = real_require
+
+    assert swapped, "the probe never swapped the leaf"
+    # The decisive assertion: no read anywhere in the scan resolved to the
+    # planted outside file.
+    assert _os.path.realpath(outside) not in reads, (
+        f"the redirected outside file was read: {reads}"
+    )
+    # It is also untouched, and its distinctive destination never became a
+    # review.
+    assert outside.read_text(encoding="utf-8") == yaml.safe_dump(
+        planted, sort_keys=False
+    )
+
+    # Restoring the real leaf reviews the real record, proving the refusal
+    # above was about the redirection and not about the id.
+    Path(target.path).unlink()
+    Path(target.path).write_bytes(original_bytes)
+    assert outbox.get_proposal_review(scope, target.id).value.module == "11-knowledge"

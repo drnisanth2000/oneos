@@ -27,6 +27,7 @@ from .git_transaction import (
     GitTransactionError,
     PathChange,
     PathState,
+    ReviewedPathIntegrityError,
     ReviewedPathUnavailable,
     TransactionPlan,
     capture_path_state,
@@ -37,7 +38,6 @@ from .destinations import DestinationError, resolve_classification_destination
 from .proposal_identity import (
     ProposalIdentityError,
     proposal_id_candidates,
-    require_proposal_id,
     require_proposal_identity,
 )
 from .review_tokens import ReviewSnapshot, make_review_snapshot
@@ -110,14 +110,18 @@ class OutboxRow:
     can_reject: bool
     #: S7. The SHA-256 of the exact stored bytes this row was built from —
     #: the fingerprint its controls must carry and the action boundary will
-    #: compare. `None` means no action is offered.
+    #: compare. It is a change detector, not a secret or a capability: it
+    #: authorises nothing on its own (threat model, design §Threat model).
+    #: `None` means no action is offered.
     review_sha256: str | None = None
 
     def __post_init__(self) -> None:
         # Controls and fingerprint are issued together or not at all. A
         # button without a fingerprint could not be bound to what was
-        # reviewed; a fingerprint without buttons is a live token for an
-        # action this listing has already decided must not be offered.
+        # reviewed; a fingerprint on a row with no buttons is an
+        # action-binding value for an action this listing has already
+        # decided must not be offered — meaningless at best, misleading at
+        # worst.
         actionable = self.can_approve or self.can_reject
         if actionable and self.review_sha256 is None:
             raise ValueError("an actionable row must carry its review fingerprint")
@@ -386,16 +390,29 @@ def _validate_record(path: Path, record: object) -> Proposal | None:
         ) from exc
 
 
-def load_proposals(scope: Scope) -> list[Proposal]:
+def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
+    """The strict loader, as review snapshots — one safe scan, one read each.
+
+    Every record is captured through the same no-follow boundary the actions
+    use, then parsed, validated and destination-checked *from those captured
+    bytes*. So a record is never read twice, a leaf swapped for a symlink
+    after its lexical check is refused rather than followed, and the value a
+    caller receives is paired with the fingerprint of the bytes it came from.
+
+    The loader's all-or-nothing refusal is unchanged and deliberately
+    complete: an unreadable record and a record whose destination no longer
+    canonicalises both refuse every proposal in the entity, because both are
+    conditions under which no action here can be trusted.
+    """
     outbox = _require_outbox_path(scope)
     if not outbox.exists():
         return []
-    props = []
+    reviews: list[ReviewSnapshot[Proposal]] = []
     for discovered in sorted(outbox.glob("*.yaml")):
-        p = _require_outbox_path(scope, discovered, require_leaf=True)
+        leaf = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
-            record = _read_record(p)
-            proposal = _validate_record(p, record)
+            contents = _capture_proposal_contents(scope, leaf)
+            proposal = _validate_record(leaf, _parse_record_bytes(contents))
         except UnreadableProposalRecord as exc:
             # D1 (ledger): re-narrow to the strict loader's existing escaping
             # type, so every `except OutboxDestinationError` clause and every
@@ -405,8 +422,14 @@ def load_proposals(scope: Scope) -> list[Proposal]:
             ) from exc
         if proposal is None:
             continue
-        props.append(_require_destination(scope, proposal))
-    return props
+        reviews.append(
+            make_review_snapshot(_require_destination(scope, proposal), contents)
+        )
+    return reviews
+
+
+def load_proposals(scope: Scope) -> list[Proposal]:
+    return [review.value for review in _load_proposal_reviews(scope)]
 
 
 def _apply_sub(text: str, sub: str | None) -> str:
@@ -587,9 +610,11 @@ def project_outbox(scope: Scope) -> OutboxListing:
             OutboxRow(
                 row.proposal, row.diff, row.error,
                 can_approve=False, can_reject=False,
-                # The fingerprint goes with the controls. Leaving one on a
-                # row whose buttons are withheld would ship a live token for
-                # an action the listing has already refused to offer.
+                # The fingerprint goes with the controls. It grants nothing
+                # by itself, but it is the value that binds an action to
+                # reviewed bytes, and shipping one for an action this
+                # listing has refused to offer would describe a review that
+                # is not on offer.
                 review_sha256=None,
             )
             for row in rows
@@ -624,49 +649,6 @@ def _require_destination(scope: Scope, proposal: Proposal) -> Proposal:
     return proposal
 
 
-def _require_proposal_leaf(scope: Scope, proposal_id: str) -> Path:
-    """Resolve one proposal id to its safe lexical leaf.
-
-    The id is validated as canonical *before* it is ever joined to a path,
-    so a caller-supplied id can never become a path fragment. The outbox
-    checks then reject a redirected directory or leaf as they always have.
-    """
-    try:
-        pid = require_proposal_id(proposal_id)
-    except ProposalIdentityError as exc:
-        # Re-narrow to the outbox's own escaping type, the same way
-        # `load_proposals` re-narrows an unreadable record: from the outbox's
-        # point of view a non-canonical id simply names no proposal, and
-        # every existing `except OutboxError` route clause stays correct.
-        raise OutboxError("proposal id is not canonical") from exc
-    outbox = _require_outbox_path(scope)
-    return _require_outbox_path(scope, outbox / f"{pid}.yaml", require_leaf=True)
-
-
-def _require_readable_outbox(scope: Scope) -> None:
-    """Refuse every action in an entity that holds an unreadable record.
-
-    This is the S6 poisoning coupling, stated directly instead of inherited
-    as a side effect of routing single-proposal lookups through
-    `load_proposals`. It is deliberately phase-1 only: `UnreadableProposalRecord`
-    is the family that actually poisons the strict loader and sets the
-    projection's `blocked`, so it is the family that must withhold actions
-    listing-wide. Destination canonicalisation is a property of one record
-    and is checked against the reviewed bytes, not here.
-    """
-    outbox = _require_outbox_path(scope)
-    if not outbox.exists():
-        return
-    for discovered in sorted(outbox.glob("*.yaml")):
-        leaf = _require_outbox_path(scope, discovered, require_leaf=True)
-        try:
-            _validate_record(leaf, _read_record(leaf))
-        except UnreadableProposalRecord as exc:
-            raise OutboxDestinationError(
-                "proposal record could not be read"
-            ) from exc
-
-
 def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
     """One no-follow byte snapshot of a proposal leaf.
 
@@ -679,6 +661,13 @@ def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
     relative = path.relative_to(scope.root).as_posix()
     try:
         state = capture_path_state(scope.root, relative)
+    except ReviewedPathIntegrityError as exc:
+        # The leaf became a symlink or a non-regular file between its
+        # lexical check and this capture. Re-narrowed to the outbox's own
+        # redirection type so route declarations stay truthful; the operator
+        # outcome (E-TAMPER) is identical either way, and the redirected
+        # target is never read.
+        raise RedirectedPathError("proposal leaf is redirected") from exc
     except ReviewedPathUnavailable as exc:
         raise UnreadableProposalRecord(
             "proposal record could not be read"
@@ -686,18 +675,6 @@ def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
     if state.contents is None:
         raise UnreadableProposalRecord("proposal record no longer exists")
     return state.contents
-
-
-def _validate_proposal_bytes(scope: Scope, path: Path, contents: bytes) -> Proposal:
-    """Parse and fully validate a classification from bytes already captured."""
-    record = _parse_record_bytes(contents)
-    proposal = _validate_record(path, record)
-    if proposal is None:
-        # A well-formed `action: delete` record. Unreachable through
-        # `get_proposal_review`, whose loader gate skips deletes exactly as
-        # `load_proposals` does; kept so this helper is total.
-        raise OutboxError("proposal is not a classification")
-    return _require_destination(scope, proposal)
 
 
 def get_proposal_review(scope: Scope, proposal_id: str) -> ReviewSnapshot[Proposal]:
@@ -708,16 +685,17 @@ def get_proposal_review(scope: Scope, proposal_id: str) -> ReviewSnapshot[Propos
     fingerprint the same bytes. A second read may never supply either the
     value or the digest, so a replacement landing immediately after the
     capture cannot make the two disagree.
-    """
-    # The S6 coupling is unchanged: an entity holding an unreadable record
-    # still refuses every action in that entity. This gate authorises
-    # nothing — the review below is built entirely from its own capture.
-    _require_readable_outbox(scope)
 
-    path = _require_proposal_leaf(scope, proposal_id)
-    contents = _capture_proposal_contents(scope, path)
-    proposal = _validate_proposal_bytes(scope, path, contents)
-    return make_review_snapshot(proposal, contents)
+    The id is matched against what the strict scan found rather than joined
+    to a path, so a caller-supplied id can never become a path fragment, and
+    the scan's listing-wide refusals apply here exactly as they do to
+    `load_proposals`.
+    """
+    entity = scope.current_entity()
+    for review in _load_proposal_reviews(scope):
+        if review.value.id == proposal_id:
+            return review
+    raise OutboxError(f"no pending proposal {proposal_id!r} for {entity}")
 
 
 def get_proposal(scope: Scope, proposal_id: str) -> Proposal:

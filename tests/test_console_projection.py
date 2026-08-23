@@ -595,9 +595,10 @@ def test_an_unreadable_record_exposes_no_token_and_no_controls(tmp_path):
 
 
 def test_a_blocked_listing_withholds_every_token_not_just_every_control(tmp_path):
-    """Controls and tokens are withheld together. A token left behind on a
-    row whose controls are gone is a live fingerprint for an action the
-    listing has already decided must not be offered."""
+    """Controls and fingerprints are withheld together. The fingerprint
+    grants nothing on its own, but it is the value that binds an action to
+    reviewed bytes — leaving one on a row whose controls are gone describes
+    a review the listing has already decided not to offer."""
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
     _write_record(scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n")

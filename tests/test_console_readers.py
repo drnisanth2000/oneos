@@ -449,6 +449,8 @@ def test_mid_approval_reread_of_a_vanished_record_is_unreadable(tmp_path, monkey
     then asserted only on a constructed exception, so it passed with the guard
     deleted — the defect it exists to prevent.
     """
+    import sys
+
     from tests.test_outbox import _propose, _vault
     from tests.conftest import git_head
     from app import outbox
@@ -461,8 +463,17 @@ def test_mid_approval_reread_of_a_vanished_record_is_unreadable(tmp_path, monkey
     real = outbox.capture_path_state
 
     def _vanished(root, rel):
+        # S7: fire only for `approve`'s OWN mid-approval re-read, which is
+        # the guard this test names. The strict scan behind `get_proposal`
+        # now captures through this same primitive, and an indiscriminate
+        # lie would vanish the record at that earlier boundary instead —
+        # a different, already-covered refusal, leaving approve's re-read
+        # guard unexercised.
         state = real(root, rel)
-        return PathState.absent() if rel.endswith(".yaml") else state
+        caller = sys._getframe(1).f_code.co_name
+        if rel.endswith(".yaml") and caller == "approve":
+            return PathState.absent()
+        return state
 
     monkeypatch.setattr(outbox, "capture_path_state", _vanished)
     with pytest.raises(outbox.UnreadableProposalRecord) as raised:
