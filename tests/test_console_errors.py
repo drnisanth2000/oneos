@@ -590,3 +590,74 @@ def test_no_attention_message_invites_a_retry():
         if error.severity == "attention":
             assert error.retry in {"stop", "none"}
             assert "Try again" not in error.message
+
+
+# --- S7 Task 1: the bound-review outcomes ------------------------------------
+
+
+def test_map_ReviewedProposalChanged():
+    from app.review_tokens import ReviewedProposalChanged
+
+    assert _code_of(ReviewedProposalChanged("probe")) == "E-REVIEW"
+
+
+def test_map_InvalidReviewToken():
+    from app.review_tokens import InvalidReviewToken
+
+    assert _code_of(InvalidReviewToken("probe")) == "E-REQUEST"
+
+
+def test_map_ReviewTokenError_base_is_an_internal_defect():
+    # The base is never raised deliberately; if it ever surfaces it is a
+    # defect in OneOS, not a problem with the operator's data.
+    from app.review_tokens import ReviewTokenError
+
+    assert _code_of(ReviewTokenError("probe")) == "E-INTERNAL"
+
+
+def test_review_outcomes_do_not_inherit_each_others_codes():
+    from app.review_tokens import InvalidReviewToken, ReviewedProposalChanged
+
+    class SyntheticChanged(ReviewedProposalChanged):
+        pass
+
+    class SyntheticInvalid(InvalidReviewToken):
+        pass
+
+    # Exact entries never pass through MRO; both fall back to the base's
+    # internal-defect code rather than silently claiming a changed review.
+    assert _code_of(SyntheticChanged("probe")) == "E-INTERNAL"
+    assert _code_of(SyntheticInvalid("probe")) == "E-INTERNAL"
+
+
+def test_changed_review_message_is_the_approved_wording_verbatim():
+    from app.console_errors import _CODES
+
+    error = _CODES["E-REVIEW"]
+    assert error.message == (
+        "Proposal changed since your review. Nothing was changed."
+    )
+    assert error.severity == "refusal"
+    assert error.committed == "no"
+    assert error.page_status == 409
+    assert error.retry == "reload"
+
+
+def test_changed_review_is_a_distinct_outcome_from_reviewed_state_changed():
+    # S5's E-CONFLICT describes reviewed *files* changing under a
+    # transaction. S7's E-REVIEW describes the proposal record itself
+    # changing since the operator reviewed it. Collapsing them would make
+    # the Console tell the operator the wrong thing to do.
+    from app.console_errors import _CODES
+
+    assert _CODES["E-REVIEW"].message != _CODES["E-CONFLICT"].message
+    assert _CODES["E-REVIEW"].code != _CODES["E-CONFLICT"].code
+
+
+def test_changed_review_message_names_no_bytes_and_promises_no_change():
+    from app.console_errors import _CODES
+
+    message = _CODES["E-REVIEW"].message
+    assert "Nothing was changed." in message
+    assert "sha" not in message.lower()
+    assert "/" not in message

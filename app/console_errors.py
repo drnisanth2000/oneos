@@ -138,6 +138,16 @@ _CODES: dict[str, ConsoleError] = {
             "reload", "no", 409,
         ),
         ConsoleError(
+            # S7. Distinct from E-CONFLICT: that one describes reviewed
+            # *files* moving under a transaction, this one describes the
+            # proposal record itself being rewritten since the operator
+            # reviewed it. The wording is normative — the approved design
+            # fixes this sentence verbatim.
+            "E-REVIEW", "refusal", "refusal",
+            "Proposal changed since your review. Nothing was changed.",
+            "reload", "no", 409,
+        ),
+        ConsoleError(
             "E-GIT", "refusal", "refusal",
             "The commit failed and was rolled back. Nothing was changed.",
             "retry", "no", 500,
@@ -199,6 +209,7 @@ from . import git_transaction as _git_transaction  # noqa: E402
 from . import outbox as _outbox  # noqa: E402
 from . import proposal_identity as _proposal_identity  # noqa: E402
 from . import registry as _registry  # noqa: E402
+from . import review_tokens as _review_tokens  # noqa: E402
 from . import rename as _rename  # noqa: E402
 from . import scope as _scope  # noqa: E402
 from . import vault as _vault  # noqa: E402
@@ -235,6 +246,8 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _entities.SystemRegistryPathError: _CODES["E-TAMPER"],
     _entities.RecipientConfigurationError: _CODES["E-CONFIG"],
     _registry.RegistryTransactionError: _CODES["E-GIT"],
+    _review_tokens.ReviewedProposalChanged: _CODES["E-REVIEW"],
+    _review_tokens.InvalidReviewToken: _CODES["E-REQUEST"],
     RequestValidationError: _CODES["E-REQUEST"],
 }
 
@@ -252,6 +265,10 @@ _MRO: dict[type[BaseException], ConsoleError] = {
     _entities.EntityManifestError: _CODES["E-CONFIG"],
     _entities.EntitySelectionError: _CODES["E-ENTITY"],
     _registry.RegistryError: _CODES["E-REGISTRY"],
+    # The S7 base is never raised deliberately. If it surfaces — or if a
+    # future subclass forgets its own exact entry — that is a defect in
+    # OneOS, not a problem with the operator's data.
+    _review_tokens.ReviewTokenError: _CODES["E-INTERNAL"],
     _ingest_base.IngestError: _CODES["E-INGEST"],
     _rename.RenameError: _CODES["E-ADMIN"],
 }
