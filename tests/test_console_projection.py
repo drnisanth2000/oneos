@@ -316,9 +316,18 @@ def test_undiffable_row_error_matches_approve_outcome(tmp_path, monkeypatch, con
         # only inspects `Path.is_symlink()`) still passes and this failure
         # is genuinely row-local (phase 3), not phase 2.
         real_fstat = outbox.os.fstat
+        # S7: narrowed to the source receipt's own inode. `outbox.os` is the
+        # one `os` module, so an unconditional lie here also reaches the
+        # proposal-record capture in phase 1 and aborts the whole projection
+        # with a tamper finding — the opposite of what this test asserts.
+        # Lying only about the receipt keeps the failure genuinely row-local,
+        # which is this test's stated point.
+        source_inode = source.stat().st_ino
 
         def nonregular_fstat(descriptor):
             result = real_fstat(descriptor)
+            if result.st_ino != source_inode:
+                return result
             return os.stat_result(
                 (stat.S_IFIFO | stat.S_IMODE(result.st_mode),) + tuple(result)[1:]
             )
@@ -488,3 +497,198 @@ def test_strict_loader_describes_an_unreadable_record_as_e_unreadable(tmp_path):
     # D2: the cause carries the truthful description through the resolver.
     assert isinstance(raised.value.__cause__, outbox.UnreadableProposalRecord)
     assert describe(raised.value).code == "E-UNREADABLE"
+
+
+# --- S7 Task 2: every actionable row carries its own review fingerprint -----
+
+
+def _sha256(raw: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()
+
+
+def test_every_actionable_row_carries_the_hash_of_its_own_stored_bytes(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    listing = project_outbox(scope)
+    row = next(row for row in listing.rows if row.proposal is not None)
+
+    assert row.can_approve and row.can_reject
+    assert row.review_sha256 == _sha256(prop.path.read_bytes())
+
+
+def test_the_row_token_is_what_the_action_boundary_will_compare(tmp_path):
+    from app.review_tokens import require_review_match
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+
+    assert require_review_match(prop.path.read_bytes(), row.review_sha256) == (
+        row.review_sha256
+    )
+
+
+def test_two_proposals_get_distinct_tokens(tmp_path):
+    vault = _projection_vault(
+        tmp_path,
+        ("demo",),
+        {
+            "demo/00-inbox/active/note-a.md": _note("Alpha receipt body.\n"),
+            "demo/00-inbox/active/note-b.md": _note("Beta receipt body.\n"),
+            "demo/11-knowledge/active/.gitkeep": "",
+            "demo/11-library/active/.gitkeep": "",
+        },
+    )
+    scope = Scope(vault, "demo")
+    for name in ("note-a.md", "note-b.md"):
+        propose_classification(
+            scope,
+            scope.resolve("00-inbox", "active", name),
+            module="11-knowledge",
+            sub="kb",
+            claimed_block="govern",
+        )
+
+    rows = [r for r in project_outbox(scope).rows if r.proposal is not None]
+    tokens = [r.review_sha256 for r in rows]
+
+    assert len(rows) == 2
+    assert all(token is not None for token in tokens)
+    assert len(set(tokens)) == 2
+    for row in rows:
+        assert row.review_sha256 == _sha256(row.proposal.path.read_bytes())
+
+
+def test_an_unavailable_source_keeps_reject_and_its_proposal_token(tmp_path):
+    """Design §Architecture-1: source-diff failure must not erase the
+    proposal's own review hash — the proposal is still well-formed, and
+    rejecting it is still a safe, reviewed action."""
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    (vault / "demo/00-inbox/active/note.md").unlink()
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+
+    assert row.can_approve is False
+    assert row.can_reject is True
+    assert row.error is not None
+    assert row.review_sha256 == _sha256(prop.path.read_bytes())
+
+
+def test_an_unreadable_record_exposes_no_token_and_no_controls(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    _write_record(scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is True
+    assert len(listing.rows) == 1
+    assert listing.rows[0].proposal is None
+    assert listing.rows[0].review_sha256 is None
+    assert listing.rows[0].can_approve is False
+    assert listing.rows[0].can_reject is False
+
+
+def test_a_blocked_listing_withholds_every_token_not_just_every_control(tmp_path):
+    """Controls and tokens are withheld together. A token left behind on a
+    row whose controls are gone is a live fingerprint for an action the
+    listing has already decided must not be offered."""
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    _write_record(scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is True
+    assert any(row.proposal is not None for row in listing.rows)
+    for row in listing.rows:
+        assert row.can_approve is False
+        assert row.can_reject is False
+        assert row.review_sha256 is None
+
+
+@pytest.mark.parametrize(
+    ("label", "prepare"),
+    [
+        ("clean", lambda vault, scope, prop: None),
+        (
+            "missing-source",
+            lambda vault, scope, prop: (vault / "demo/00-inbox/active/note.md").unlink(),
+        ),
+        (
+            "blocked-sibling",
+            lambda vault, scope, prop: _write_record(
+                scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n"
+            ),
+        ),
+        (
+            "delete-record",
+            lambda vault, scope, prop: _write_record(
+                scope,
+                f"20260815T090703-{'33' * 16}.yaml",
+                _delete_record("20260815T090703-" + "33" * 16),
+            ),
+        ),
+    ],
+)
+def test_a_token_exists_on_a_row_if_and_only_if_some_action_is_offered(
+    tmp_path, label, prepare
+):
+    """The structural rule the templates depend on in Task 5: no row ever
+    renders an action button without a fingerprint, and no row without
+    buttons ships a fingerprint nobody can use."""
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    prepare(vault, scope, prop)
+
+    for row in project_outbox(scope).rows:
+        actionable = row.can_approve or row.can_reject
+        assert (row.review_sha256 is not None) is actionable, label
+        if row.review_sha256 is not None:
+            assert row.review_sha256 == _sha256(row.proposal.path.read_bytes())
+
+
+def test_a_row_cannot_be_constructed_with_controls_but_no_token(tmp_path):
+    from app.outbox import OutboxRow
+
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=True, can_reject=False,
+                  review_sha256=None)
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=False, can_reject=True,
+                  review_sha256=None)
+
+
+def test_a_row_cannot_be_constructed_with_a_token_but_no_controls(tmp_path):
+    from app.outbox import OutboxRow
+
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=False, can_reject=False,
+                  review_sha256="a" * 64)
+
+
+def test_the_projected_token_survives_a_replacement_only_as_a_mismatch(tmp_path):
+    from app.review_tokens import ReviewedProposalChanged, require_review_match
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    # A byte-only rewrite: re-serialised with sorted keys, so every
+    # action-relevant value is identical and only the stored bytes differ.
+    # S7 refuses on bytes, so this must still invalidate the fingerprint.
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ReviewedProposalChanged):
+        require_review_match(prop.path.read_bytes(), row.review_sha256)
+
+    # A fresh projection is a fresh review with a fresh fingerprint.
+    fresh = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    assert fresh.review_sha256 != row.review_sha256
+    assert fresh.review_sha256 == _sha256(prop.path.read_bytes())

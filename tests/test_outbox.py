@@ -1532,3 +1532,213 @@ def test_concurrent_proposals_are_written_only_to_the_bound_entity(two_entity_va
     assert list((two_entity_vault / "beta/outbox").glob("*.yaml"))
     assert not list((two_entity_vault / "alpha/outbox").glob("*beta*.yaml"))
     assert not list((two_entity_vault / "beta/outbox").glob("*alpha*.yaml"))
+
+
+# --- S7 Task 2: one byte snapshot behind every classification review --------
+
+
+def _review_imports():
+    from app.outbox import get_proposal_review
+
+    return get_proposal_review
+
+
+def _proposal_bytes(prop: Proposal) -> bytes:
+    return prop.path.read_bytes()
+
+
+def _rewrite_record(path: Path, **changes) -> bytes:
+    """Rewrite a stored proposal in place, preserving id and filename."""
+    record = yaml.safe_load(path.read_text(encoding="utf-8"))
+    record.update(changes)
+    raw = yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+    path.write_bytes(raw)
+    return raw
+
+
+def test_get_proposal_review_returns_the_value_its_bytes_and_their_hash(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    review = get_proposal_review(scope, prop.id)
+
+    stored = _proposal_bytes(prop)
+    assert review.value.id == prop.id
+    assert review.value == prop
+    assert review.contents == stored
+    assert review.sha256 == hashlib.sha256(stored).hexdigest()
+
+
+def test_review_value_and_hash_come_from_one_capture_not_a_second_read(tmp_path):
+    """The core Task 2 proof.
+
+    The stored file is replaced *between* the byte capture and everything
+    that follows. If the reader parses the path again — instead of the bytes
+    it captured — the returned value describes the replacement while the
+    digest describes the capture, and the two no longer agree about
+    anything. The operator would then review one proposal and act on
+    another, which is precisely the S7 defect.
+    """
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    original = _proposal_bytes(prop)
+    replacement_holder = {}
+
+    real_capture = outbox.capture_path_state
+
+    def capture_then_replace(vault, relative_path, *args, **kwargs):
+        state = real_capture(vault, relative_path, *args, **kwargs)
+        if relative_path.endswith(f"{prop.id}.yaml") and not replacement_holder:
+            # The instant after the bytes are in hand, the file becomes a
+            # different proposal under the same id and filename.
+            # A fully canonical replacement: module, sub AND dst all agree,
+            # so it would validate cleanly. Nothing but a value/digest
+            # disagreement can make this test fail.
+            replacement_holder["bytes"] = _rewrite_record(
+                prop.path,
+                module="11-library",
+                sub="reference",
+                dst="demo/11-library/active/note.md",
+            )
+        return state
+
+    import app.outbox as outbox_module
+
+    original_attr = outbox_module.capture_path_state
+    outbox_module.capture_path_state = capture_then_replace
+    try:
+        review = get_proposal_review(scope, prop.id)
+    finally:
+        outbox_module.capture_path_state = original_attr
+
+    assert replacement_holder["bytes"] != original, "the probe did not replace anything"
+
+    # Every part of the review describes the captured bytes, not the file.
+    assert review.contents == original
+    assert review.sha256 == hashlib.sha256(original).hexdigest()
+    assert review.value.module == prop.module
+    assert review.value.sub == prop.sub
+    assert review.value.dst == prop.dst
+    # And the value is genuinely the one those bytes describe.
+    assert review.value == _to_proposal_from_bytes(prop.path, original)
+
+
+def _to_proposal_from_bytes(path: Path, raw: bytes) -> Proposal:
+    return outbox._to_proposal(path, yaml.safe_load(raw.decode("utf-8")))
+
+
+def test_a_replacement_after_the_review_does_not_change_the_review(tmp_path):
+    from app.review_tokens import ReviewedProposalChanged, require_review_match
+
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    review = get_proposal_review(scope, prop.id)
+    replacement = _rewrite_record(prop.path, module="11-library", sub="reference")
+
+    assert review.contents != replacement
+    assert review.sha256 == hashlib.sha256(review.contents).hexdigest()
+    # The fingerprint the operator holds no longer matches the file: this is
+    # exactly what the action boundary in Task 3 will compare.
+    with pytest.raises(ReviewedProposalChanged):
+        require_review_match(replacement, review.sha256)
+
+
+def test_the_same_id_with_only_byte_differences_reviews_differently(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    first = get_proposal_review(scope, prop.id)
+
+    # Same meaningful fields, different stored bytes: re-serialised sorted.
+    record = yaml.safe_load(first.contents.decode("utf-8"))
+    prop.path.write_bytes(yaml.safe_dump(record, sort_keys=True).encode("utf-8"))
+    second = get_proposal_review(scope, prop.id)
+
+    assert second.contents != first.contents
+    assert second.sha256 != first.sha256
+    assert second.value == first.value        # the values are indistinguishable
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../../../etc/passwd",
+        "..",
+        "nested/20260102T030405-" + "ab" * 16,
+        "20260102T030405-" + "ab" * 16 + "/../other",
+        "not-a-proposal-id",
+        "",
+        "20260102T030405-" + "AB" * 16,        # uppercase is non-canonical
+    ],
+)
+def test_review_refuses_a_non_canonical_proposal_id(tmp_path, bad_id):
+    get_proposal_review = _review_imports()
+    scope, _prop = _propose(_vault(tmp_path))
+    before = _vault_tree(scope.root)
+
+    with pytest.raises(Exception) as raised:
+        get_proposal_review(scope, bad_id)
+    assert not isinstance(raised.value, AssertionError)
+
+    assert _vault_tree(scope.root) == before
+
+
+def test_review_refuses_a_missing_proposal(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+    prop.path.unlink()
+
+    with pytest.raises(outbox.OutboxError):
+        get_proposal_review(scope, prop.id)
+
+
+def test_review_refuses_an_unreadable_record(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+    prop.path.write_text("{ not: [valid, yaml", encoding="utf-8")
+
+    with pytest.raises(outbox.OutboxError):
+        get_proposal_review(scope, prop.id)
+
+
+def test_review_refuses_a_redirected_proposal_leaf(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop, _target = _redirect_proposal_leaf(_vault(tmp_path))
+
+    with pytest.raises(CrossScopeError):
+        get_proposal_review(scope, prop.id)
+
+
+def test_review_refuses_a_cross_scope_proposal(two_entity_vault):
+    """An alpha-entity record sitting in beta's outbox: the filename and id
+    are canonical, so only the scope check refuses it."""
+    get_proposal_review = _review_imports()
+    vault = two_entity_vault
+    alpha_scope = Scope(vault, "alpha")
+    beta_scope = Scope(vault, "beta")
+    record = _canonical_alpha_record(alpha_scope)
+    path = _write_record(
+        beta_scope, f"{record['id']}.yaml", yaml.safe_dump(record, sort_keys=False)
+    )
+    assert path.exists()
+
+    with pytest.raises(outbox.OutboxScopeError):
+        get_proposal_review(beta_scope, record["id"])
+
+    # And the misfiled record is left exactly where it was for diagnosis.
+    assert path.read_bytes() == yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+
+
+def test_get_proposal_delegates_to_the_review_reader(tmp_path):
+    """`get_proposal` survives only for non-action callers, and must be the
+    review reader's value — never a second, independently parsed read."""
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    assert outbox.get_proposal(scope, prop.id) == get_proposal_review(scope, prop.id).value
+
+    source = inspect.getsource(outbox.get_proposal)
+    assert "get_proposal_review" in source
+    assert "load_proposals" not in source.split("get_proposal_review")[-1]
