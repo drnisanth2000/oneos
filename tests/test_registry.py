@@ -1263,9 +1263,13 @@ def _registry_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
     """
     entries = []
     for path in root.rglob("*"):
-        if ".git/" in path.as_posix() or path.name == ".git":
-            continue
         relative = path.relative_to(root).as_posix()
+        # Only the repository's own `.git`. Matching `.git` anywhere in the
+        # path would hide ordinary vault content — a directory named
+        # `ordinary.git/`, or any file beneath one — from a proof whose
+        # whole job is to notice content changing.
+        if relative == ".git" or relative.startswith(".git/"):
+            continue
         if path.is_symlink():
             entries.append((relative, "symlink", path.readlink().as_posix()))
         elif path.is_dir():

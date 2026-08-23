@@ -21,17 +21,40 @@ Every mutation below is a single, exact string substitution. Apply it, run
 the named selection, confirm the named test fails, restore the file from a
 pre-image copy, and confirm `cmp` reports no difference.
 
-The whole campaign is scripted so a reviewer need not retype anything:
+The whole campaign is scripted so a reviewer need not retype anything. Run it
+through the project environment:
 
 ```bash
-python3 docs/superpowers/plans/s7_mutation_campaign.py --list      # what it will do
-python3 docs/superpowers/plans/s7_mutation_campaign.py             # run it
+uv run python docs/superpowers/plans/s7_mutation_campaign.py --list   # what it will do
+uv run python docs/superpowers/plans/s7_mutation_campaign.py          # run it
 ```
 
-The script refuses to run against a dirty worktree, applies one mutation at
-a time, restores from an in-memory pre-image, and verifies with `cmp` that
-each file is byte-identical afterwards. It uses no Git commands at all — a
-`git checkout` or `git clean` could erase unrelated work in the same tree.
+The script itself invokes `uv run python -m pytest`, so it behaves correctly
+however it is launched. That matters: a bare interpreter without pytest exits
+non-zero having run nothing, which is indistinguishable from a surviving
+mutant unless the return code is checked. It is checked.
+
+For each mutation the script:
+
+1. **refuses to start** if any target file has uncommitted changes, so a
+   mutation is never applied over unrelated edits and a restore never
+   discards them;
+2. asserts the `OLD` text appears **exactly once**, so a stale edit cannot
+   silently mutate nothing and be recorded as evidence;
+3. runs the selection and **distinguishes a test failure (pytest exit 1)
+   from infrastructure failure** (any other exit, or zero tests collected) —
+   the latter is scored as neither detected nor survived, because it
+   measured nothing;
+4. requires the **named** test to be among the failures, not merely that
+   something failed;
+5. restores from an in-memory pre-image, verifies byte-identity, and
+   **re-runs the same selection to confirm it is green again**; and
+6. runs the **full public suite** after the whole restored group.
+
+Read-only Git (`status --porcelain`) provides the cleanliness check. No
+*destructive* Git command appears anywhere in it: a `git checkout` or
+`git clean` in a shared tree could erase unrelated work, and a mutation
+harness is the last place that should be possible.
 
 ---
 
@@ -40,10 +63,26 @@ each file is byte-identical afterwards. It uses no Git commands at all — a
 Last full run, from the script above:
 
 ```
-M1  RED  M3  RED  M4  RED  M5  RED  M5b RED  M6  RED
-M7  RED  M7b RED  M8  RED  M9  RED  M10 RED  M11 RED
-all 12 mutations detected by their named test
+M1  RED then GREEN   M3  RED then GREEN   M4  RED then GREEN
+M5  RED then GREEN   M5b RED then GREEN   M6  RED then GREEN
+M7  RED then GREEN   M7b RED then GREEN   M8  RED then GREEN
+M9  RED then GREEN   M10 RED then GREEN   M11 RED then GREEN
+
+all 12 mutations: red under mutation, green once restored
+
+full public suite after the restored campaign group:
+  1233 passed in 79.36s
 ```
+
+The runner's own guards were exercised too, since a harness that cannot fail
+is not evidence either:
+
+| Guard | Probe | Result |
+|---|---|---|
+| dirty target refused | append a line to `app/registry.py`, run | refused, naming the file |
+| infrastructure ≠ survival | pytest exits 4 / 127, or collects nothing | refused as infrastructure failure, scored as neither |
+| required field pinned | `Form(...)` → `Form(None)` on all three routes | RED — "outbox_approve does not REQUIRE review_sha256" |
+| `.git` exclusion is exact | a directory literally named `ordinary.git/` | its `marker.bin` and bytes are captured |
 
 
 Each row gives the file, the exact `OLD` text, the exact `NEW` text, and the

@@ -3,19 +3,31 @@
 
 Each mutation is one exact string substitution. For each, this script:
 
-  1. asserts the OLD text appears exactly once (so a stale edit cannot
-     silently mutate nothing and be recorded as evidence);
-  2. applies it and runs the named pytest selection;
-  3. restores the file from an in-memory pre-image; and
-  4. verifies with `filecmp` that the file is byte-identical again.
+  1. asserts the target file is clean, so a mutation is never applied on top
+     of unrelated edits and a "restore" never discards them;
+  2. asserts the OLD text appears exactly once, so a stale edit cannot
+     silently mutate nothing and be recorded as evidence;
+  3. applies it and runs the named pytest selection **in the project
+     environment** (`uv run`), because a bare `python3` without pytest exits
+     non-zero having run nothing — which looks exactly like a surviving
+     mutant unless the return code is checked;
+  4. distinguishes a *test failure* (pytest exit 1) from *infrastructure
+     failure* (any other non-zero exit, or an empty collection), and refuses
+     to score the latter as evidence either way;
+  5. requires the named test to be among the failures — not merely that
+     something failed;
+  6. restores the file from an in-memory pre-image, verifies byte-identity,
+     and **re-runs the same selection to confirm it is green again**; and
+  7. after the whole group, runs the full public suite.
 
-It uses no Git commands. A `git checkout` or `git clean` in a shared tree
-could erase unrelated work, and a mutation harness is the last place that
-should be possible.
+Read-only Git (`status --porcelain`) is used for the cleanliness check.
+Nothing here ever runs a *destructive* Git command: a `git checkout` or
+`git clean` in a shared tree could erase unrelated work, and a mutation
+harness is the last place that should be possible.
 
 Usage:
-    python3 docs/superpowers/plans/s7_mutation_campaign.py --list
-    python3 docs/superpowers/plans/s7_mutation_campaign.py [--only M6]
+    uv run python docs/superpowers/plans/s7_mutation_campaign.py --list
+    uv run python docs/superpowers/plans/s7_mutation_campaign.py [--only M6]
 """
 from __future__ import annotations
 
@@ -115,24 +127,75 @@ MUTATIONS = [
 ]
 
 
-def run(selection: list[str]) -> str:
-    return subprocess.run(
-        [sys.executable, "-m", "pytest", *selection, "-q", "--no-header"],
+class InfrastructureFailure(RuntimeError):
+    """The run told us nothing about the mutation, so it is not evidence."""
+
+
+def _pytest(selection: list[str]) -> tuple[int, str, str]:
+    completed = subprocess.run(
+        ["uv", "run", "python", "-m", "pytest", *selection, "-q", "--no-header"],
         cwd=ROOT, capture_output=True, text=True,
-    ).stdout
+    )
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def _require_test_outcome(code: int, out: str, err: str, context: str) -> list[str]:
+    """Return the FAILED lines, or refuse to interpret the run at all.
+
+    pytest exits 0 for all-passed and 1 for test failures. Anything else —
+    a missing interpreter, a collection error, a usage mistake, no tests
+    collected — means the run measured nothing, and scoring it as either
+    "detected" or "survived" would be a false entry in the ledger.
+    """
+    if code not in (0, 1):
+        raise InfrastructureFailure(
+            f"{context}: pytest exited {code}\n"
+            f"--- stdout ---\n{out[-2000:]}\n--- stderr ---\n{err[-2000:]}"
+        )
+    if "no tests ran" in out or "collected 0 items" in out:
+        raise InfrastructureFailure(f"{context}: no tests were collected\n{out[-2000:]}")
+    return [line for line in out.splitlines() if line.startswith("FAILED")]
+
+
+def _dirty(paths: list[str]) -> list[str]:
+    completed = subprocess.run(
+        ["git", "status", "--porcelain", "--", *paths],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    if completed.returncode != 0:
+        raise InfrastructureFailure(
+            f"could not check worktree cleanliness: {completed.stderr.strip()}"
+        )
+    return [line for line in completed.stdout.splitlines() if line.strip()]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--only")
+    parser.add_argument(
+        "--skip-full-suite", action="store_true",
+        help="skip the closing full-suite run (for iterating on one mutation)",
+    )
     arguments = parser.parse_args()
 
     selected = [m for m in MUTATIONS if not arguments.only or m[0] == arguments.only]
+    if not selected:
+        print(f"no mutation named {arguments.only!r}")
+        return 1
     if arguments.list:
         for identifier, target, old, _new, selection, expected in selected:
             print(f"{identifier:4} {target:38} {expected}  [{' '.join(selection)}]")
         return 0
+
+    targets = sorted({target for _i, target, *_rest in selected})
+    dirty = _dirty(targets)
+    if dirty:
+        print("refusing to run: these targets have uncommitted changes, and a")
+        print("restore would discard them:")
+        for line in dirty:
+            print(f"  {line}")
+        return 1
 
     failures = []
     for identifier, target, old, new, selection, expected in selected:
@@ -140,29 +203,69 @@ def main() -> int:
         pristine = path.read_bytes()
         source = pristine.decode("utf-8")
         if source.count(old) != 1:
-            print(f"{identifier:4} SKIPPED — anchor not found exactly once")
+            print(f"{identifier:4} UNANCHORED — the OLD text is not present exactly once")
             failures.append(identifier)
             continue
+
         path.write_text(source.replace(old, new), encoding="utf-8")
         try:
-            output = run(selection)
+            code, out, err = _pytest(selection)
+            red = _require_test_outcome(code, out, err, f"{identifier} (mutated)")
+        except InfrastructureFailure as problem:
+            path.write_bytes(pristine)
+            print(f"{identifier:4} INFRASTRUCTURE FAILURE — not evidence\n{problem}")
+            failures.append(identifier)
+            continue
         finally:
             path.write_bytes(pristine)
-        assert path.read_bytes() == pristine, f"{identifier}: restore failed"
 
-        red = [line for line in output.splitlines() if line.startswith("FAILED")]
-        caught = any(expected in line for line in red)
-        print(f"{identifier:4} {'RED  ' if caught else 'ALIVE'} {expected}")
+        if path.read_bytes() != pristine:
+            raise SystemExit(f"{identifier}: restore failed — STOPPING")
+
+        caught = [line for line in red if expected in line]
         if not caught:
-            failures.append(identifier)
+            print(f"{identifier:4} ALIVE  {expected}")
             for line in red[:3]:
-                print(f"       (also red: {line})")
+                print(f"       (other failures: {line})")
+            failures.append(identifier)
+            continue
+
+        # The green rerun: a mutation is only evidence if the same selection
+        # passes once the exact implementation is back.
+        try:
+            code, out, err = _pytest(selection)
+            still_red = _require_test_outcome(code, out, err, f"{identifier} (restored)")
+        except InfrastructureFailure as problem:
+            print(f"{identifier:4} INFRASTRUCTURE FAILURE on rerun\n{problem}")
+            failures.append(identifier)
+            continue
+        if still_red:
+            print(f"{identifier:4} RESTORE INCOMPLETE — still failing: {still_red[:3]}")
+            failures.append(identifier)
+            continue
+
+        print(f"{identifier:4} RED then GREEN  {expected}")
 
     print()
     if failures:
-        print(f"SURVIVED OR UNANCHORED: {', '.join(failures)}")
+        print(f"NOT EVIDENCE: {', '.join(failures)}")
         return 1
-    print(f"all {len(selected)} mutations detected by their named test")
+    print(f"all {len(selected)} mutations: red under mutation, green once restored")
+
+    if arguments.skip_full_suite:
+        return 0
+    print("\nfull public suite after the restored campaign group:")
+    try:
+        code, out, err = _pytest([])
+        red = _require_test_outcome(code, out, err, "full suite")
+    except InfrastructureFailure as problem:
+        print(problem)
+        return 1
+    summary = [line for line in out.splitlines() if " passed" in line or " failed" in line]
+    print(f"  {summary[-1] if summary else out[-200:]}")
+    if red:
+        print(f"  FULL SUITE NOT GREEN: {red[:5]}")
+        return 1
     return 0
 
 

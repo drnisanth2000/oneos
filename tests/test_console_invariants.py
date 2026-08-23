@@ -1718,6 +1718,13 @@ def test_every_reviewed_route_requires_and_passes_the_fingerprint(
         route = getattr(main, name)
         parameters = inspect.signature(route).parameters
         assert "review_sha256" in parameters, name
+        # Present is not enough: `Form(None)` would keep the parameter and
+        # every forwarding check below green while quietly restoring the
+        # id-only path the Global Constraints forbid.
+        field = parameters["review_sha256"].default
+        assert getattr(field, "is_required", lambda: False)(), (
+            f"{name} does not REQUIRE review_sha256"
+        )
         source = _executable_source(route)
         tree = ast.parse(source)
         # A parameter is an `arg` node, not a `Name`; a `Name` is a *use*.
