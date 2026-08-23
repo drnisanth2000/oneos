@@ -28,13 +28,22 @@
      still transports exactly the id and the fingerprint. They are display
      evidence only: the server re-reads and re-validates everything it acts
      on, and never trusts these. #}
+  {# The values as reviewed, sent back with the action so a refusal can name
+     exactly what changed — and, just as importantly, name what it could not
+     compare. One JSON field, because an empty form value arrives as `None`
+     and would make "reviewed as empty" indistinguishable from "not reported".
+     `hx-include` keeps it out of `hx-vals`, which still transports exactly
+     the id and the fingerprint. This is display evidence only: the server
+     re-reads and re-validates everything it acts on. #}
+  {% set reviewed_values = {
+       "module": row.proposal.module,
+       "sub": row.proposal.sub or "",
+       "block": row.proposal.block,
+       "src": row.proposal.src,
+       "dst": row.proposal.dst,
+       "source_sha256": row.proposal.source_sha256} %}
   <div id="review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}" hidden>
-    <input type="hidden" name="reviewed_module" value="{{ row.proposal.module }}">
-    <input type="hidden" name="reviewed_sub" value="{{ row.proposal.sub if row.proposal.sub is not none else '' }}">
-    <input type="hidden" name="reviewed_block" value="{{ row.proposal.block }}">
-    <input type="hidden" name="reviewed_src" value="{{ row.proposal.src }}">
-    <input type="hidden" name="reviewed_dst" value="{{ row.proposal.dst }}">
-    <input type="hidden" name="reviewed_source_sha256" value="{{ row.proposal.source_sha256 }}">
+    <input type="hidden" name="reviewed_values" value='{{ reviewed_values | tojson }}'>
   </div>
   <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}">
     {% if row.can_approve %}

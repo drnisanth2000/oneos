@@ -5018,11 +5018,11 @@ def test_a_changed_review_names_the_fields_that_changed(
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
     proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
 
-    body = client.get("/outbox/alpha").text
-    reviewed = _reviewed_fields(body)
+    page = client.get("/outbox/alpha").text
+    reviewed = _reviewed_fields(page)
     assert reviewed, "the card must carry its reviewed values for comparison"
     stale = _action_data(tmp_path, proposal_id)
-    assert reviewed["reviewed_src"] == "alpha/00-inbox/active/marker.md"
+    assert _reported(page)["src"] == "alpha/00-inbox/active/marker.md"
 
     # A genuine rewrite into an equally valid proposal: same module, but it
     # now moves a *different* receipt. Nothing about the comparison is
@@ -5047,22 +5047,35 @@ def test_a_changed_review_names_the_fields_that_changed(
     differences = text.split("What changed", 1)[1].split("</ul>", 1)[0]
     # Each genuinely changed field is named, with the server's own current
     # value — never the value the browser submitted (Rule 8).
-    assert "src" in differences
+    assert "source path" in differences
     assert "alpha/00-inbox/active/second.md" in differences
-    assert "dst" in differences
+    assert "destination path" in differences
     assert "alpha/02-work/active/second.md" in differences
+    # The source's recorded contents changed with it, and is named too.
+    assert "source contents" in differences
     # Fields that did not change are not reported.
     assert "module" not in differences
     assert "block" not in differences
 
 
 def _reviewed_fields(body: str) -> dict:
-    return {
-        name: value
-        for name, value in re.findall(
-            r'<input type="hidden" name="(reviewed_[a-z0-9_]+)" value="([^"]*)"', body
-        )
-    }
+    """The values a rendered card reports back, as the form data to post.
+
+    One JSON field, so "reviewed as empty" stays distinguishable from "not
+    reported" — an empty form value arrives at FastAPI as `None`.
+    """
+    match = re.search(
+        r"""<input type="hidden" name="reviewed_values" value='([^']*)'""", body
+    )
+    if match is None:
+        return {}
+    return {"reviewed_values": html.unescape(match.group(1))}
+
+
+def _reported(body: str) -> dict:
+    """The reviewed mapping itself, decoded."""
+    fields = _reviewed_fields(body)
+    return json.loads(fields["reviewed_values"]) if fields else {}
 
 
 def test_a_byte_only_change_says_so_rather_than_listing_no_differences(
@@ -5101,8 +5114,12 @@ def test_the_reviewed_values_are_never_treated_as_authority(
         f"/outbox/alpha/approve",
         data={
             **stale,
-            "reviewed_module": '"><script>alert(1)</script>',
-            "reviewed_sub": "spoofed-sub-marker",
+            "reviewed_values": json.dumps(
+                {
+                    "module": '"><script>alert(1)</script>',
+                    "sub": "spoofed-sub-marker",
+                }
+            ),
         },
     ).text
 
@@ -5202,9 +5219,7 @@ def test_a_changed_delete_review_names_the_changed_impact(tmp_path, monkeypatch)
     ).text
     stale = json.loads(_hx_vals(preview)[0])
     reviewed = _reviewed_fields(preview)
-    assert set(reviewed) == {
-        "reviewed_kind", "reviewed_slug", "reviewed_total", "reviewed_impact",
-    }
+    assert set(_reported(preview)) == {"kind", "slug", "total", "impact"}
 
     proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
     record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
@@ -5325,7 +5340,7 @@ def test_a_changed_source_fingerprint_is_named(tmp_path, monkeypatch):
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
     proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
     reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
-    assert "reviewed_source_sha256" in reviewed
+    assert "source_sha256" in _reported(client.get("/outbox/alpha").text)
     stale = _action_data(tmp_path, proposal_id)
 
     source = tmp_path / "alpha/00-inbox/active/marker.md"
@@ -5342,10 +5357,11 @@ def test_a_changed_source_fingerprint_is_named(tmp_path, monkeypatch):
 
     assert "What changed" in body, body
     differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
-    assert "source" in differences
-    assert current_hash in differences
+    assert "source contents" in differences
+    # Abbreviated for readability; the dedicated test pins that choice.
+    assert current_hash[:12] in differences
     assert "module" not in differences
-    assert "dst" not in differences
+    assert "destination path" not in differences
 
 
 @pytest.mark.parametrize("action", ["approve", "reject"])
@@ -5362,9 +5378,12 @@ def test_an_unreported_review_is_not_called_identical(tmp_path, monkeypatch, act
 
     assert "identical" not in body.lower(), body
     assert "What changed" not in body
-    # It says plainly that it cannot show the comparison, and still offers
-    # the current version to act on.
-    assert "cannot show" in body.lower()
+    # It says plainly that nothing could be compared, names every field it
+    # could not compare, and still offers the current version to act on.
+    assert "could not be compared" in body.lower()
+    for field in ("module", "sub", "block", "source path", "destination path",
+                  "source contents"):
+        assert field in body, field
     assert f"review-card-{proposal_id}-" in body
 
 
@@ -5384,7 +5403,7 @@ def test_a_byte_only_change_with_evidence_still_says_identical(
     ).text
 
     assert "identical" in body.lower()
-    assert "cannot show" not in body.lower()
+    assert "could not be compared" not in body.lower()
 
 
 # --- the refresh integrity matrix, completed --------------------------------
@@ -5456,3 +5475,168 @@ def test_check_again_refuses_every_unreviewable_shape_read_only(
         assert proposal.is_symlink()
     elif shape == "non-file":
         assert proposal.is_dir()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_partial_evidence_is_never_reported_as_complete(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): reporting some fields is not reporting all of them.
+
+    If every field the browser did report happens to match, saying the
+    values "look identical" claims a comparison of fields OneOS never saw.
+    The uncompared fields must be named instead.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# byte-only\n")
+
+    # The browser reports everything except the source state.
+    reported = json.loads(reviewed["reviewed_values"])
+    reported.pop("source_sha256")
+    partial = {"reviewed_values": json.dumps(reported)}
+    body = client.post(f"/outbox/alpha/{action}", data={**stale, **partial}).text
+
+    assert "identical" not in body.lower(), body
+    assert "could not be compared" in body.lower()
+    uncompared = body.split("could not be compared", 1)[1].split("</p>", 1)[0]
+    assert "source contents" in uncompared
+    # Fields that were reported and matched are not listed as uncompared.
+    assert "module" not in uncompared
+    assert "destination path" not in uncompared
+
+
+def test_a_changed_digest_is_shown_readably_not_as_raw_hex(tmp_path, monkeypatch):
+    """P2 (review): a 64-character digest tells the operator nothing. It is
+    named in words and abbreviated, so the line is readable and still
+    identifies the value."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+
+    source = tmp_path / "alpha/00-inbox/active/marker.md"
+    source.write_text(
+        "---\ntitle: outbox-route-marker\nsub: triage\n---\nedited\n",
+        encoding="utf-8",
+    )
+    current_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["source_sha256"] = current_hash
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    body = client.post("/outbox/alpha/approve", data={**stale, **reviewed}).text
+    differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
+
+    assert "source contents" in differences.lower()
+    assert current_hash not in differences, "the full digest is unreadable noise"
+    assert current_hash[:12] in differences, "it must still identify the value"
+
+
+@pytest.mark.parametrize("surface", ["outbox", "registry"])
+def test_check_again_never_reads_through_a_redirected_leaf(
+    tmp_path, monkeypatch, surface
+):
+    """P2 (review): asserting the target is unchanged proves no mutation, not
+    that it was never read. Record what each read resolves to."""
+    import os as _os
+
+    if surface == "outbox":
+        main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+        url = f"/outbox/alpha/review/{proposal_id}"
+    else:
+        main, client, slug = _registry_client(tmp_path, monkeypatch)
+        preview = client.post(
+            "/registry/alpha/product/delete-preview", data={"slug": slug}
+        ).text
+        proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+        url = f"/registry/alpha/product/review/{proposal_id}"
+
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    outside = tmp_path / "outside-marker.yaml"
+    planted = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    planted["planted_marker"] = "REDIRECT-TARGET-CONTENTS-MARKER"
+    outside.write_text(yaml.safe_dump(planted, sort_keys=False), encoding="utf-8")
+    proposal.unlink()
+    proposal.symlink_to(outside)
+
+    reads: list[str] = []
+    real_read_bytes = Path.read_bytes
+    real_read_text = Path.read_text
+
+    def spy_bytes(self):
+        reads.append(_os.path.realpath(self))
+        return real_read_bytes(self)
+
+    def spy_text(self, *args, **kwargs):
+        reads.append(_os.path.realpath(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", spy_bytes)
+    monkeypatch.setattr(Path, "read_text", spy_text)
+
+    body = client.get(url).text
+
+    assert _os.path.realpath(outside) not in reads, (
+        f"the redirected target was read: {reads}"
+    )
+    assert "REDIRECT-TARGET-CONTENTS-MARKER" not in body
+    assert not _rendered_control_ids(body)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"module": 7, "sub": ["a"], "block": {"x": 1}}',   # wrong value types
+        '["not", "a", "mapping"]',                          # wrong shape
+        "not json at all",                                  # unparseable
+        '{"module": null}',                                 # explicit null
+        "",                                                 # empty
+    ],
+)
+def test_malformed_reported_evidence_is_treated_as_absent(
+    tmp_path, monkeypatch, payload
+):
+    """Evidence the browser sends is parsed defensively.
+
+    Anything that is not a plain string-to-string mapping is treated as not
+    reported: it may withhold a line of explanation, never add a false one,
+    and never reach the action or the page.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    body = client.post(
+        "/outbox/alpha/approve",
+        data={**stale, "reviewed_values": payload},
+    ).text
+
+    assert reached == [], f"fallback reached: {reached}"
+    # Nothing is claimed about fields that were not properly reported: they
+    # are listed as uncompared, never rendered as differences.
+    assert "identical" not in body.lower()
+    assert "could not be compared" in body.lower()
+    assert "What changed" not in body, body
+    uncompared = body.split("could not be compared", 1)[1].split("</p>", 1)[0]
+    for label in ("module", "sub", "block", "source path", "destination path",
+                  "source contents"):
+        assert label in uncompared, f"{label} missing from {uncompared}"
+    # Nothing submitted is echoed, and the current card is the server's own.
+    for fragment in ("not json at all", "not a mapping", "[&#39;a&#39;]", "{&#39;x&#39;"):
+        assert fragment not in body
+    assert f"review-card-{proposal_id}-{current}" in body
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()

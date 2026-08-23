@@ -19,18 +19,22 @@
     <li><code>{{ field }}</code> is now <em>{{ now }}</em></li>
     {% endfor %}
   </ul>
-  {% elif comparable %}
+  {% elif not uncompared %}
   <p class="muted">
     The stored record changed, even though the values you reviewed look
     identical. OneOS refuses on the stored bytes, so this still needs a
     fresh review.
   </p>
-  {% else %}
+  {% endif %}
+  {% if uncompared %}
+  {# Partial evidence is not complete evidence. Whatever was compared, these
+     fields were not reported back, so nothing is claimed about them. #}
   <p class="muted">
-    The stored record changed. OneOS cannot show you which values differ,
-    because the version you reviewed was not reported back with this action
-    — it never sees the earlier bytes itself. Compare the version above with
-    the current one below before acting.
+    {% if not differences %}The stored record changed. {% endif %}
+    These values could not be compared, because the version you reviewed did
+    not report them back — OneOS never sees the earlier bytes itself:
+    {% for field in uncompared %}<code>{{ field }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    Compare the version above with the current one below before acting.
   </p>
   {% endif %}
   <p class="muted">

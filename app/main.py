@@ -6,6 +6,8 @@ bundle's flags only. No slug, path, or module list is hardcoded here.
 """
 from __future__ import annotations
 
+import json
+
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -712,6 +714,49 @@ def _review_row(scope: Scope, proposal_id: str):
     return None
 
 
+#: How each compared field is named to an operator, and how its value is
+#: rendered. A 64-character digest tells nobody anything, so it is named in
+#: words and abbreviated — enough to identify the value, short enough to read.
+_FIELD_LABELS = {
+    "module": "module",
+    "sub": "sub",
+    "block": "block",
+    "src": "source path",
+    "dst": "destination path",
+    "source_sha256": "source contents",
+    "kind": "kind",
+    "slug": "value",
+    "total": "total references",
+    "impact": "impact breakdown",
+}
+
+
+def _field_label(field: str) -> str:
+    return _FIELD_LABELS.get(field, field)
+
+
+def _display_value(field: str, value: str) -> str:
+    if field.endswith("sha256") and len(value) > 16:
+        return f"{value[:12]}…"
+    return value
+
+
+def _uncompared_fields(
+    reviewed: dict[str, str | None], current: dict[str, str]
+) -> list[str]:
+    """Fields the browser did not report, so nothing can be said about them.
+
+    Partial evidence is not complete evidence: if every field that *was*
+    reported happens to match, calling the versions identical claims a
+    comparison of fields OneOS never saw.
+    """
+    return [
+        _field_label(field)
+        for field in current
+        if reviewed.get(field) is None
+    ]
+
+
 def _meaningful_differences(
     reviewed: dict[str, str | None], current: dict[str, str]
 ) -> list[tuple[str, str]]:
@@ -730,7 +775,7 @@ def _meaningful_differences(
     hostile value can withhold or add a line of explanation and nothing more.
     """
     return [
-        (field, current[field])
+        (_field_label(field), _display_value(field, current[field]))
         for field in current
         if reviewed.get(field) is not None and reviewed[field] != current[field]
     ]
@@ -774,10 +819,10 @@ def _review_changed_response(
             "stale_controls": stale_controls,
             "review_error": error,
             "differences": _meaningful_differences(reviewed, current_fields(context)),
-        # Whether a comparison was possible at all. With nothing reported
-        # back, "the values look identical" would assert a comparison that
-        # never happened.
-        "comparable": any(value is not None for value in reviewed.values()),
+        # What could not be compared, because the browser did not report it.
+        # With nothing reported back, or only part of it, "the values look
+        # identical" would assert a comparison that never happened.
+        "uncompared": _uncompared_fields(reviewed, current_fields(context)),
             "current_card_template": current_card,
             **context,
         },
@@ -836,17 +881,30 @@ def _outbox_review_changed(
     )
 
 
-def _reviewed_outbox_fields(
-    module: str | None,
-    sub: str | None,
-    block: str | None,
-    src: str | None,
-    dst: str | None,
-    source_sha256: str | None,
-) -> dict[str, str | None]:
+def _reported_review(reviewed_values: str | None) -> dict[str, str | None]:
+    """What the browser reported it was showing, as evidence only.
+
+    One JSON field rather than several form fields: an empty form value
+    arrives as `None`, which would make "reviewed as empty" indistinguishable
+    from "not reported at all" — and that distinction is the whole point of
+    saying what could not be compared.
+
+    Anything malformed is treated as nothing reported. It can only ever
+    withhold or add a line of explanation; it never reaches the action, and
+    it is never rendered.
+    """
+    if not reviewed_values:
+        return {}
+    try:
+        reported = json.loads(reviewed_values)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(reported, dict):
+        return {}
     return {
-        "module": module, "sub": sub, "block": block, "src": src, "dst": dst,
-        "source_sha256": source_sha256,
+        name: value
+        for name, value in reported.items()
+        if isinstance(name, str) and isinstance(value, str)
     }
 
 
@@ -928,12 +986,7 @@ def outbox_approve(
     scope: EntityScope,
     id: str = Form(...),
     review_sha256: str = Form(...),
-    reviewed_module: str | None = Form(None),
-    reviewed_sub: str | None = Form(None),
-    reviewed_block: str | None = Form(None),
-    reviewed_src: str | None = Form(None),
-    reviewed_dst: str | None = Form(None),
-    reviewed_source_sha256: str | None = Form(None),
+    reviewed_values: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_approve_response`, which catches `approve` itself refusing and,
@@ -951,10 +1004,7 @@ def outbox_approve(
     """
     return _outbox_approve_response(
         request, scope, id, review_sha256,
-        _reviewed_outbox_fields(
-            reviewed_module, reviewed_sub, reviewed_block, reviewed_src,
-            reviewed_dst, reviewed_source_sha256,
-        ),
+        _reported_review(reviewed_values),
     )
 
 
@@ -1004,12 +1054,7 @@ def outbox_reject(
     scope: EntityScope,
     id: str = Form(...),
     review_sha256: str = Form(...),
-    reviewed_module: str | None = Form(None),
-    reviewed_sub: str | None = Form(None),
-    reviewed_block: str | None = Form(None),
-    reviewed_src: str | None = Form(None),
-    reviewed_dst: str | None = Form(None),
-    reviewed_source_sha256: str | None = Form(None),
+    reviewed_values: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_reject_response`, which catches `reject` itself refusing and,
@@ -1027,10 +1072,7 @@ def outbox_reject(
     """
     return _outbox_reject_response(
         request, scope, id, review_sha256,
-        _reviewed_outbox_fields(
-            reviewed_module, reviewed_sub, reviewed_block, reviewed_src,
-            reviewed_dst, reviewed_source_sha256,
-        ),
+        _reported_review(reviewed_values),
     )
 
 
@@ -1244,10 +1286,7 @@ def registry_delete_execute(
     scope: EntityScope,
     id: str = Form(...),
     review_sha256: str = Form(...),
-    reviewed_kind: str | None = Form(None),
-    reviewed_slug: str | None = Form(None),
-    reviewed_total: str | None = Form(None),
-    reviewed_impact: str | None = Form(None),
+    reviewed_values: str | None = Form(None),
 ) -> HTMLResponse:
     # Rule 8 (design §6): the success copy must name the SERVER-derived
     # slug, never the submitted one.
@@ -1266,12 +1305,7 @@ def registry_delete_execute(
         try:
             return _delete_review_changed(
                 request, scope, id, review_sha256, review_error,
-                {
-                    "kind": reviewed_kind,
-                    "slug": reviewed_slug,
-                    "total": reviewed_total,
-                    "impact": reviewed_impact,
-                },
+                _reported_review(reviewed_values),
             )
         except _REGISTRY_DELETE_CATCHES as render_exc:
             # S6 composition: both outcomes survive.

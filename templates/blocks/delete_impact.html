@@ -18,11 +18,13 @@
      serialised with `tojson`; hand-built JSON is forbidden. #}
   {% set delete_execute_values = {"id": prop.id,
                                   "review_sha256": review_sha256} %}
+  {% set reviewed_values = {
+       "kind": prop.kind,
+       "slug": prop.slug,
+       "total": prop.total | string,
+       "impact": impact_signature} %}
   <div id="review-fields-{{ prop.id }}-{{ review_sha256 }}" hidden>
-    <input type="hidden" name="reviewed_kind" value="{{ prop.kind }}">
-    <input type="hidden" name="reviewed_slug" value="{{ prop.slug }}">
-    <input type="hidden" name="reviewed_total" value="{{ prop.total }}">
-    <input type="hidden" name="reviewed_impact" value="{{ impact_signature }}">
+    <input type="hidden" name="reviewed_values" value='{{ reviewed_values | tojson }}'>
   </div>
   <div class="prop-actions" id="review-controls-{{ prop.id }}-{{ review_sha256 }}">
     <button class="reject"{% if disabled %} disabled{% endif %}
