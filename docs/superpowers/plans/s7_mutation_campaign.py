@@ -68,14 +68,6 @@ MUTATIONS = [
           "DID NOT RAISE InvalidReviewToken")],
     ),
     (
-        "M4", "app/outbox.py",
-        "            make_review_snapshot(_require_destination(scope, proposal), contents)",
-        "            make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4",
-        ["tests/test_outbox.py", "tests/test_console_projection.py"],
-        [("tests/test_outbox.py::test_review_value_and_hash_come_from_one_capture_not_a_second_read",
-          "the review carries bytes other than the ones it captured")],
-    ),
-    (
         "M4b", "app/outbox.py",
         "    return make_review_snapshot(_require_destination(scope, proposal), contents)",
         "    return make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4b",
@@ -141,8 +133,8 @@ MUTATIONS = [
     ),
     (
         "M10", "app/registry.py",
-        "        report = reference_count(scope, prop.kind, prop.slug)\n        if report.total:",
-        '        path.write_bytes(path.read_bytes() + b"# MUTANT\\n")\n        report = reference_count(scope, prop.kind, prop.slug)\n        if report.total:',
+        "            report = reference_count(scope, prop.kind, prop.slug)\n            if report.total:",
+        '            path.write_bytes(path.read_bytes() + b"# MUTANT\\n")\n            report = reference_count(scope, prop.kind, prop.slug)\n            if report.total:',
         ["tests/test_registry.py"],
         [("tests/test_registry.py::test_the_delete_no_mutation_matrix[new-live-reference]",
           "new-live-reference")],

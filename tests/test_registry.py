@@ -1046,24 +1046,27 @@ def test_delete_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
     registry_before = (vault / "_system/products.yaml").read_bytes()
     head_before = git_head(vault)
 
-    real_count = reg.reference_count
+    # The reference count now runs as a transaction precondition, under the
+    # approval lock and *after* the plan is built, so it is no longer in the
+    # window this test needs. The registry file's own capture is: it happens
+    # after the proposal's fingerprint comparison and before the plan.
+    real_capture = reg.capture_path_state
     replaced = []
 
-    def rewrite_then_count(scope_arg, kind, slug):
-        # Fires between the fingerprint comparison and the transaction plan.
-        if not replaced:
+    def rewrite_then_capture(vault_arg, relative_path, *args, **kwargs):
+        if relative_path.endswith("products.yaml") and not replaced:
             record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
             raw = yaml.safe_dump(record, sort_keys=True).encode("utf-8")
             prop.path.write_bytes(raw)
             replaced.append(raw)
-        return real_count(scope_arg, kind, slug)
+        return real_capture(vault_arg, relative_path, *args, **kwargs)
 
-    reg.reference_count = rewrite_then_count
+    reg.capture_path_state = rewrite_then_capture
     try:
         with pytest.raises(Exception) as raised:
             reg.execute_delete(scope, prop.id, review.sha256)
     finally:
-        reg.reference_count = real_count
+        reg.capture_path_state = real_capture
 
     assert replaced, "the probe never replaced the record"
     assert replaced[0] != review.contents
