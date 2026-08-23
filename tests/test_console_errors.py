@@ -615,6 +615,12 @@ def test_map_ReviewTokenError_base_is_an_internal_defect():
     assert _code_of(ReviewTokenError("probe")) == "E-INTERNAL"
 
 
+def test_map_ReviewContractViolation():
+    from app.review_tokens import ReviewContractViolation
+
+    assert _code_of(ReviewContractViolation("probe")) == "E-INTERNAL"
+
+
 def test_review_outcomes_do_not_inherit_each_others_codes():
     from app.review_tokens import InvalidReviewToken, ReviewedProposalChanged
 
@@ -624,8 +630,11 @@ def test_review_outcomes_do_not_inherit_each_others_codes():
     class SyntheticInvalid(InvalidReviewToken):
         pass
 
-    # Exact entries never pass through MRO; both fall back to the base's
-    # internal-defect code rather than silently claiming a changed review.
+    # Exact entries never pass through MRO. A subclass degrading to the
+    # base's internal-defect code is the safe runtime backstop, not the
+    # intended end state: the closed-family walk in
+    # tests/test_console_invariants.py fails until any new application
+    # subclass declares its own exact outcome.
     assert _code_of(SyntheticChanged("probe")) == "E-INTERNAL"
     assert _code_of(SyntheticInvalid("probe")) == "E-INTERNAL"
 

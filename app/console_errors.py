@@ -248,6 +248,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _registry.RegistryTransactionError: _CODES["E-GIT"],
     _review_tokens.ReviewedProposalChanged: _CODES["E-REVIEW"],
     _review_tokens.InvalidReviewToken: _CODES["E-REQUEST"],
+    _review_tokens.ReviewContractViolation: _CODES["E-INTERNAL"],
     RequestValidationError: _CODES["E-REQUEST"],
 }
 

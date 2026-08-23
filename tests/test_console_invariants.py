@@ -130,6 +130,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         proposal_identity,
         registry,
         rename,
+        review_tokens,
         scope,
         vault,
     )
@@ -198,6 +199,10 @@ def test_every_application_exception_resolves_to_its_designed_code():
         entities.EntitySelectionError: "E-ENTITY",
         registry.RegistryTransactionError: "E-GIT",
         registry.RegistryError: "E-REGISTRY",
+        review_tokens.ReviewedProposalChanged: "E-REVIEW",
+        review_tokens.InvalidReviewToken: "E-REQUEST",
+        review_tokens.ReviewContractViolation: "E-INTERNAL",
+        review_tokens.ReviewTokenError: "E-INTERNAL",
         ingest_base.IngestError: "E-INGEST",
         rename.RenameError: "E-ADMIN",
         RequestValidationError: "E-REQUEST",
@@ -238,6 +243,22 @@ def test_closed_family_every_subclass_has_exact_entry():
     # is a deliberate member.
     for cls in _transitive_subclasses(GitTransactionFailure):
         assert cls in ALLOWLIST, f"{cls.__qualname__} is not allowlisted"
+
+
+def test_review_token_family_every_subclass_has_exact_entry():
+    """S7's outcome family is closed the same way S5's is.
+
+    `ReviewTokenError` is documented as never raised directly, so its base
+    entry is a runtime backstop, not a home for real outcomes. Without this
+    walk a future subclass would degrade silently to E-INTERNAL — a
+    stop-and-inspect 500 — for what may in fact be an ordinary refusal that
+    changed nothing. Declaring an outcome must be deliberate.
+    """
+    from app.console_errors import _EXACT
+    from app.review_tokens import ReviewTokenError
+
+    for cls in _transitive_subclasses(ReviewTokenError):
+        assert cls in _EXACT, f"{cls.__qualname__} lacks its own exact entry"
 
 
 def test_no_domain_module_imports_the_taxonomy():
