@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import inspect
 import html
 import json
 import os
@@ -1649,7 +1650,15 @@ def test_delete_preview_hx_vals_survive_hostile_slug(tmp_path, monkeypatch):
     parser.feed(response.text)
     assert len(parser.values) == 1
     parsed = json.loads(parser.values[0])
-    assert parsed == {"id": proposal_id}
+    # S7 added the fingerprint to the same serialised mapping; it is still
+    # `tojson`, still server-rendered, and the hostile slug still never
+    # appears in it.
+    assert parsed == {
+        "id": proposal_id,
+        "review_sha256": hashlib.sha256(
+            (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").read_bytes()
+        ).hexdigest(),
+    }
     assert "hostile-injected-id-marker" not in response.text
 
     # M1 (review): `prop.id` is server-generated
@@ -1698,7 +1707,8 @@ def test_delete_execute_success_copy_from_validated_slug(tmp_path, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id, "slug": "hostile-spoofed-slug-marker"},
+        data={**_delete_action_data(tmp_path, proposal),
+              "slug": "hostile-spoofed-slug-marker"},
     )
 
     assert response.status_code == 200
@@ -1730,7 +1740,7 @@ def test_delete_execute_error_is_templated_and_escaped(tmp_path, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id},
+        data=_delete_action_data(tmp_path, proposal),
     )
 
     assert response.status_code == 200
@@ -1821,7 +1831,7 @@ def test_all_five_s5_outcomes_via_real_execute_delete(tmp_path, monkeypatch):
 
         response = client.post(
             "/registry/alpha/product/delete-execute",
-            data={"id": proposal.id},
+            data=_delete_action_data(tmp_path, proposal),
         )
 
         assert response.status_code == expected_status, response.text
@@ -1850,7 +1860,7 @@ def test_all_five_s5_outcomes_via_real_execute_delete(tmp_path, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": committed_proposal.id},
+        data=_delete_action_data(tmp_path, committed_proposal),
     )
 
     assert response.status_code == 500
@@ -2080,16 +2090,20 @@ def test_registry_declared_family_never_reaches_the_global_fallback(
         def _raise(*args, __exc=raiser, **kwargs):
             raise __exc
 
-        monkeypatch.setattr(main, "get_delete_proposal", _raise)
+        # S7: the route no longer reads through a value-only reader —
+        # `execute_delete` is its single domain call, and returns the
+        # bound proposal used for the success copy.
+        monkeypatch.setattr(main, "execute_delete", _raise)
         response = client.post(
-            "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+            "/registry/alpha/product/delete-execute",
+        data=_delete_action_data(tmp_path, proposal),
         )
         assert expected_code in response.text, response.text
         assert reached == [], (
-            f"registry_delete_execute (get_delete_proposal): fallback reached "
+            f"registry_delete_execute (execute_delete): fallback reached "
             f"for {expected_code}"
         )
-    monkeypatch.setattr(main, "get_delete_proposal", registry.get_delete_proposal)
+    monkeypatch.setattr(main, "execute_delete", registry.execute_delete)
 
     for raiser, expected_code in (
         (RedirectedPathError("redirected outbox"), "E-TAMPER"),
@@ -2102,7 +2116,8 @@ def test_registry_declared_family_never_reaches_the_global_fallback(
 
         monkeypatch.setattr(main, "execute_delete", _raise)
         response = client.post(
-            "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+            "/registry/alpha/product/delete-execute",
+        data=_delete_action_data(tmp_path, proposal),
         )
         assert expected_code in response.text, response.text
         assert reached == [], (
@@ -2196,6 +2211,11 @@ def test_registry_delete_execute_real_corrupt_proposal_shows_e_unreadable(
     # the likelier hand-editing mistake `yaml.safe_load(...) or {}` cannot
     # guard against.
     proposal.path.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    # S7: submit the fingerprint of the corrupt bytes themselves. The
+    # comparison runs before the parse (design §3), so an unrelated
+    # fingerprint would refuse as a changed review and never reach the
+    # unreadable-record outcome this test exists to pin.
+    corrupt_fingerprint = hashlib.sha256(proposal.path.read_bytes()).hexdigest()
 
     reached = []
     original = main.app.exception_handlers[Exception]
@@ -2207,7 +2227,8 @@ def test_registry_delete_execute_real_corrupt_proposal_shows_e_unreadable(
     monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
 
     response = TestClient(main.app).post(
-        "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+        "/registry/alpha/product/delete-execute",
+        data={"id": proposal.id, "review_sha256": corrupt_fingerprint},
     )
 
     assert reached == [], f"fallback reached: {reached}"
@@ -2309,7 +2330,7 @@ def test_delete_execute_fragment_does_not_reproduce_delete_impact_root(
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id},
+        data=_delete_action_data(tmp_path, proposal),
         headers={"HX-Target": "hostile-target-marker"},
     )
 
@@ -2324,7 +2345,8 @@ def test_delete_execute_fragment_does_not_reproduce_delete_impact_root(
 
     error_response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": "not-a-real-proposal-id"},
+        data={"id": "not-a-real-proposal-id",
+              "review_sha256": _UNBOUND_FINGERPRINT},
         headers={"HX-Target": "hostile-target-marker"},
     )
 
@@ -2543,7 +2565,7 @@ def _state_proof_no_none(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "products_for", _raise_registry_error)
     registry_products_response = client.get("/registry/alpha/products")
 
-    monkeypatch.setattr(main, "get_delete_proposal", _raise_registry_error)
+    monkeypatch.setattr(main, "execute_delete", _raise_registry_error)
     registry_delete_execute_response = client.post(
         "/registry/alpha/product/delete-execute", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
     )
@@ -2660,7 +2682,8 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
     monkeypatch.setattr(git_transaction, "_remove_temporary_index", _fail_cleanup)
 
     response = client.post(
-        "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+        "/registry/alpha/product/delete-execute",
+        data=_delete_action_data(tmp_path, proposal),
     )
 
     from app.console_errors import _CODES
@@ -3180,13 +3203,17 @@ def test_alerts_never_contain_paths_slugs_or_echoes(tmp_path, monkeypatch):
         main, client, slug = _registry_client(subdir, monkeypatch)
         marker = _marker(f"registry-delete-execute-{code}")
         id_marker = _marker(f"registry-delete-execute-{code}-id")
+        # S7: a second submitted value, so Rule 8 is proved for the
+        # fingerprint field too.
+        fingerprint_marker = _marker(f"registry-delete-execute-{code}-fp")
 
         def _raise_execute(*args, __exc=exc_factory(marker), **kwargs):
             raise __exc
 
-        monkeypatch.setattr(main, "get_delete_proposal", _raise_execute)
+        monkeypatch.setattr(main, "execute_delete", _raise_execute)
         response = client.post(
-            "/registry/alpha/product/delete-execute", data={"id": id_marker}
+            "/registry/alpha/product/delete-execute",
+            data={"id": id_marker, "review_sha256": fingerprint_marker},
         )
         _assert_alert_discloses_nothing(response, code, [marker, id_marker, slug])
 
@@ -3283,7 +3310,7 @@ def _route_totality_plan(main) -> dict:
             "request": lambda c: c.post(
                 "/registry/alpha/product/delete-execute", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
             ),
-            "patch_targets": [(main, "get_delete_proposal")],
+            "patch_targets": [(main, "execute_delete")],
         },
         main.pulse: {"request": lambda c: c.get("/blocks/pulse"), "patch_targets": []},
     }
@@ -4557,3 +4584,122 @@ def test_a_second_rewrite_invalidates_the_fingerprint_the_refusal_just_issued(
     parser = HxValsParser()
     parser.feed(second_refusal.text)
     assert json.loads(parser.values[0])["review_sha256"] != reissued
+
+
+# --- S7 Task 4: the delete fingerprint travels and binds --------------------
+
+
+def _delete_action_data(tmp_path, proposal, entity="alpha"):
+    """Form data for delete-execute, carrying the proposal's own fingerprint
+    exactly as the rendered button would. Falls back to a well-formed but
+    unbound value when the record cannot be reviewed at all — those tests
+    are about refusals reached before any comparison."""
+    from app.registry import get_delete_review
+    from app.scope import Scope
+
+    try:
+        fingerprint = get_delete_review(
+            Scope(Path(tmp_path), entity), proposal.id
+        ).sha256
+    except Exception:
+        fingerprint = _UNBOUND_FINGERPRINT
+    return {"id": proposal.id, "review_sha256": fingerprint}
+
+
+def _delete_preview_values(main, client, tmp_path, slug):
+    """Render the impact fragment and read back the values its button sends."""
+    from tests.test_app import HxValsParser
+
+    response = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    )
+    parser = HxValsParser()
+    parser.feed(response.text)
+    assert len(parser.values) == 1, response.text
+    return json.loads(parser.values[0])
+
+
+def test_delete_impact_carries_id_and_fingerprint_through_tojson(
+    tmp_path, monkeypatch
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+
+    values = _delete_preview_values(main, client, tmp_path, slug)
+
+    assert set(values) == {"id", "review_sha256"}
+    proposal = tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    assert values["review_sha256"] == hashlib.sha256(
+        proposal.read_bytes()
+    ).hexdigest()
+
+
+def test_delete_execute_requires_a_fingerprint(tmp_path, monkeypatch):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(main, client, tmp_path, slug)
+    registry_file = tmp_path / "_system/products.yaml"
+    before = registry_file.read_bytes()
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute", data={"id": values["id"]}
+    )
+
+    assert "E-REQUEST" in response.text
+    assert registry_file.read_bytes() == before
+
+
+def test_delete_execute_with_a_stale_fingerprint_shows_the_approved_refusal(
+    tmp_path, monkeypatch
+):
+    from app.console_errors import _CODES
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    stale = _delete_preview_values(main, client, tmp_path, slug)
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    registry_file = tmp_path / "_system/products.yaml"
+    before = registry_file.read_bytes()
+
+    response = client.post("/registry/alpha/product/delete-execute", data=stale)
+
+    assert "E-REVIEW" in response.text
+    assert _CODES["E-REVIEW"].message in response.text
+    assert registry_file.read_bytes() == before
+    assert proposal.exists()
+
+
+def test_delete_execute_passes_the_submitted_fingerprint_unchanged(
+    tmp_path, monkeypatch
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(main, client, tmp_path, slug)
+    submitted = "d" * 64
+    seen = {}
+
+    def _spy(scope, id, review_sha256):
+        seen["id"] = id
+        seen["review_sha256"] = review_sha256
+        raise RuntimeError("stop before mutating")
+
+    monkeypatch.setattr(main, "execute_delete", _spy)
+    with pytest.raises(RuntimeError):
+        client.post(
+            "/registry/alpha/product/delete-execute",
+            data={"id": values["id"], "review_sha256": submitted},
+        )
+
+    assert seen == {"id": values["id"], "review_sha256": submitted}
+
+
+def test_delete_success_copy_comes_from_the_bound_execution(tmp_path, monkeypatch):
+    """The route must not perform an earlier, unbound read for display."""
+    import inspect as _inspect
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(main, client, tmp_path, slug)
+
+    response = client.post("/registry/alpha/product/delete-execute", data=values)
+
+    assert response.status_code == 200
+    assert slug in response.text
+    source = _inspect.getsource(main.registry_delete_execute)
+    assert "get_delete_proposal(" not in source

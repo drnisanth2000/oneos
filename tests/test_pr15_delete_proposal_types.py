@@ -18,6 +18,8 @@ never validated as persisted data, since it never comes from the record.
 """
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from tests.conftest import write_vault
@@ -100,7 +102,10 @@ def test_kind_as_unhashable_list_no_longer_raises_typeerror_in_execute_delete(tm
     _write_delete_proposal(tmp_path, proposal_id, _dump(record))
 
     with pytest.raises(UnreadableProposalRecord):
-        execute_delete(scope, proposal_id)
+        # S7: a well-formed fingerprint that binds nothing — the shape
+        # refusal under test is about the record, and must still be
+        # reached for a record whose own fingerprint is submitted.
+        execute_delete(scope, proposal_id, _fingerprint(scope, proposal_id))
 
 
 def test_wrong_action_type_keeps_its_own_message(tmp_path):
@@ -189,3 +194,10 @@ def test_path_field_is_never_read_from_the_record(tmp_path):
     expected = scope.resolve("outbox") / f"{proposal_id}.yaml"
     assert prop.path == expected
     assert str(prop.path) != "/etc/passwd"
+
+
+def _fingerprint(scope, proposal_id: str) -> str:
+    """The fingerprint of exactly the bytes on disk, so the comparison passes
+    and the record-shape refusal under test is the one that fires."""
+    path = scope.resolve("outbox", f"{proposal_id}.yaml")
+    return hashlib.sha256(path.read_bytes()).hexdigest()

@@ -573,6 +573,14 @@ def test_unknown_route_entity_is_404_without_entity_directory_read(client, monke
 _UNBOUND_FINGERPRINT = "0" * 64
 
 
+def _delete_fingerprint(vault, proposal_id, entity="alpha") -> str:
+    """The fingerprint of a delete proposal as it now stands (S7)."""
+    from app.registry import get_delete_review
+    from app.scope import Scope
+
+    return get_delete_review(Scope(vault, entity), proposal_id).sha256
+
+
 def _outbox_action_data(vault, proposal_id, entity="alpha"):
     """Form data for an outbox action, carrying the proposal's own
     fingerprint exactly as a rendered button would (S7)."""
@@ -648,7 +656,8 @@ def test_registry_transaction_error_is_a_registry_error(client, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id, "slug": "alpha-only"},
+        data={"id": proposal.id, "slug": "alpha-only",
+              "review_sha256": _delete_fingerprint(client.vault, proposal.id)},
     )
 
     # design §6 regression table, second row: this asserted the raw internal

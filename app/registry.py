@@ -20,11 +20,17 @@ from .git_transaction import (
     GitTransactionError,
     PathChange,
     PathState,
+    ReviewedPathUnavailable,
     TransactionPlan,
     capture_path_state,
     execute_transaction,
 )
 from .console_routing import structured_reader
+from .review_tokens import (
+    ReviewSnapshot,
+    make_review_snapshot,
+    require_review_match,
+)
 from .inbox import split_front_matter
 from .outbox import UnreadableProposalRecord
 from .proposal_identity import (
@@ -339,24 +345,30 @@ def propose_delete(scope: Scope, kind: str, slug: str) -> DeleteProposal:
 
 
 @structured_reader(category="proposal")
-def get_delete_proposal(scope: Scope, proposal_id: str) -> DeleteProposal:
-    path = _delete_proposal_path(scope, proposal_id)
-    if not path.is_file():
-        raise RegistryError(f"no delete proposal {proposal_id!r}")
+def _parse_delete_record(contents: bytes) -> object:
+    """Parse a delete proposal from bytes already in hand.
+
+    S7's single-read rule lives on this seam: a caller holding captured
+    bytes must parse *those* bytes, never re-open the path and parse
+    whatever is there now.
+    """
     try:
-        rec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        text = contents.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise UnreadableProposalRecord(
             "delete proposal record is not valid UTF-8"
         ) from exc
-    except OSError as exc:
-        raise UnreadableProposalRecord(
-            "delete proposal record could not be read"
-        ) from exc
+    try:
+        return yaml.safe_load(text) or {}
     except yaml.YAMLError as exc:
         raise UnreadableProposalRecord(
             "delete proposal record is invalid YAML"
         ) from exc
+
+
+def _validate_delete_record(
+    scope: Scope, path: Path, rec: object
+) -> DeleteProposal:
     if not isinstance(rec, dict):
         raise UnreadableProposalRecord(
             "delete proposal record must be a mapping"
@@ -366,7 +378,9 @@ def get_delete_proposal(scope: Scope, proposal_id: str) -> DeleteProposal:
     except ProposalIdentityError as exc:
         raise RegistryError("invalid delete proposal id") from exc
     if rec.get("action") != "delete":
-        raise RegistryError(f"{proposal_id!r} is not a delete proposal")
+        # `require_proposal_identity` above has already proved the record's
+        # id matches this filename, so the stem is the validated id.
+        raise RegistryError(f"{path.stem!r} is not a delete proposal")
     # PR #15 must-fix 5: `DeleteProposal` is a plain dataclass and enforces
     # nothing at runtime. Without this, e.g. `kind: []` passed silently and
     # later made `_REGISTRY_FILE.get(prop.kind)` raise a raw `TypeError` in
@@ -393,6 +407,52 @@ def get_delete_proposal(scope: Scope, proposal_id: str) -> DeleteProposal:
         raise UnreadableProposalRecord(
             "delete proposal record is missing a required field"
         ) from exc
+
+
+def _capture_delete_proposal_state(
+    scope: Scope, path: Path, proposal_id: str
+) -> PathState:
+    """One no-follow capture of a delete proposal, in the registry's own
+    vocabulary — so an unreadable record keeps the outcome it always had
+    rather than surfacing a transaction-layer type."""
+    relative = path.relative_to(scope.root).as_posix()
+    try:
+        state = capture_path_state(scope.root, relative)
+    except ReviewedPathUnavailable as exc:
+        raise UnreadableProposalRecord(
+            "delete proposal record could not be read"
+        ) from exc
+    if state.contents is None:
+        raise RegistryError(f"no delete proposal {proposal_id!r}")
+    return state
+
+
+def get_delete_review(
+    scope: Scope, proposal_id: str
+) -> ReviewSnapshot[DeleteProposal]:
+    """The reviewable state of one delete proposal.
+
+    The sequence is fixed (design §Architecture-1): capture one byte
+    snapshot, parse *those* bytes, validate the value they produced, and
+    fingerprint the same bytes. Displayed kind, value and recorded impact
+    all come from this snapshot — never from a second live report that is
+    not part of what was fingerprinted.
+    """
+    path = _delete_proposal_path(scope, proposal_id)
+    state = _capture_delete_proposal_state(scope, path, proposal_id)
+    proposal = _validate_delete_record(
+        scope, path, _parse_delete_record(state.contents)
+    )
+    return make_review_snapshot(proposal, state.contents)
+
+
+def get_delete_proposal(scope: Scope, proposal_id: str) -> DeleteProposal:
+    """The validated value alone, for callers that will not act on it.
+
+    No action may use this: an action needs the fingerprint that came from
+    the same bytes, which only `get_delete_review` can supply.
+    """
+    return get_delete_review(scope, proposal_id).value
 
 
 _REGISTRY_FILE = {"product": "products.yaml", "member": "members.yaml"}
@@ -437,54 +497,49 @@ def _remove_scoped_registry_value(
 
 
 @structured_reader(category="proposal")
-def execute_delete(scope: Scope, proposal_id: str) -> None:
+def execute_delete(
+    scope: Scope, proposal_id: str, review_sha256: object
+) -> DeleteProposal:
     """On approval: refuse if references remain (recomputed fresh), else remove
-    the value from its registry and commit."""
-    prop = get_delete_proposal(scope, proposal_id)
-    report = reference_count(scope, prop.kind, prop.slug)
-    if report.total:
-        raise RegistryError(
-            f"refusing to delete — references remain.\n{report.as_text()}"
+    the value from its registry and commit.
+
+    Bound to the reviewed proposal bytes. `review_sha256` is required, has no
+    default and no id-only fallback, and is compared against the state the
+    transaction will own — so the proposal consumed is the one reviewed.
+
+    The fingerprint does not authorise the deletion by itself: scope,
+    kind/value existence, current registry state, a freshly repeated
+    reference count and transaction-owned state all remain independent gates.
+    """
+    vault = scope.root
+    path = _delete_proposal_path(scope, proposal_id)
+    proposal_rel = path.relative_to(vault).as_posix()
+    try:
+        # Transaction authority, captured once. The comparison, the parse and
+        # the consumption are all about THIS state; a later reread may never
+        # replace it.
+        proposal_state = _capture_delete_proposal_state(scope, path, proposal_id)
+        require_review_match(proposal_state.contents, review_sha256)
+        prop = _validate_delete_record(
+            scope, path, _parse_delete_record(proposal_state.contents)
         )
 
-    vault = scope.root
-    filename = _REGISTRY_FILE.get(prop.kind)
-    if filename is None:
-        raise RegistryError(f"delete not supported for kind {prop.kind!r}")
-    registry_rel = scope.system_path(filename).relative_to(vault).as_posix()
-    proposal_rel = prop.path.relative_to(vault).as_posix()
-    try:
+        # Independent of the fingerprint: the proposal binds its own bytes,
+        # not the registries. References that appeared since the review still
+        # refuse the deletion.
+        report = reference_count(scope, prop.kind, prop.slug)
+        if report.total:
+            raise RegistryError(
+                f"refusing to delete — references remain.\n{report.as_text()}"
+            )
+
+        filename = _REGISTRY_FILE.get(prop.kind)
+        if filename is None:
+            raise RegistryError(f"delete not supported for kind {prop.kind!r}")
+        registry_rel = scope.system_path(filename).relative_to(vault).as_posix()
         registry_state = capture_path_state(vault, registry_rel)
-        proposal_state = capture_path_state(vault, proposal_rel)
         if registry_state.contents is None or registry_state.mode is None:
             raise RegistryError(f"{filename!r} registry is missing")
-        if proposal_state.contents is None:
-            raise RegistryError("delete proposal changed since it was loaded")
-
-        try:
-            persisted = yaml.safe_load(
-                proposal_state.contents.decode("utf-8")
-            ) or {}
-        except (UnicodeDecodeError, yaml.YAMLError) as exc:
-            raise UnreadableProposalRecord(
-                "delete proposal record is unparseable"
-            ) from exc
-        if not isinstance(persisted, dict):
-            raise UnreadableProposalRecord(
-                "delete proposal record must be a mapping"
-            )
-        try:
-            require_proposal_identity(prop.path, persisted.get("id"))
-        except ProposalIdentityError as exc:
-            raise RegistryError("invalid delete proposal id") from exc
-        if (
-            persisted.get("id") != prop.id
-            or persisted.get("entity") != prop.entity
-            or persisted.get("action") != "delete"
-            or persisted.get("kind") != prop.kind
-            or persisted.get("slug") != prop.slug
-        ):
-            raise RegistryError("delete proposal changed since it was loaded")
 
         rendered_registry_bytes = _remove_scoped_registry_value(
             scope, prop.kind, prop.slug, registry_state.contents
@@ -510,3 +565,4 @@ def execute_delete(scope: Scope, proposal_id: str) -> None:
         raise RegistryTransactionError(
             "registry deletion transaction failed"
         ) from exc
+    return prop

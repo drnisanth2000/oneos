@@ -352,6 +352,13 @@ def _outbox_fixture(tmp_path):
     return vault, scope, proposal
 
 
+def _fp_delete(scope, proposal_id: str) -> str:
+    """The fingerprint of the delete proposal as it now stands (S7)."""
+    from app.registry import get_delete_review
+
+    return get_delete_review(scope, proposal_id).sha256
+
+
 def _registry_fixture(tmp_path):
     from app.registry import propose_delete
     from app.scope import Scope
@@ -435,7 +442,7 @@ def test_recovery_outcome_survives_both_wrappers(tmp_path, monkeypatch):
     _vault, scope, proposal = _registry_fixture(tmp_path / "registry-vault")
     monkeypatch.setattr(registry, "execute_transaction", fail_transaction)
     with pytest.raises(registry.RegistryTransactionError) as via_registry:
-        registry.execute_delete(scope, proposal.id)
+        registry.execute_delete(scope, proposal.id, _fp_delete(scope, proposal.id))
     assert _code_of(via_registry.value) == "E-RECOVER"
 
 
@@ -453,7 +460,7 @@ def test_all_five_s5_outcomes_via_registry_wrapper(
     monkeypatch.setattr(registry, "execute_transaction", fail_transaction)
 
     with pytest.raises(registry.RegistryTransactionError) as raised:
-        registry.execute_delete(scope, proposal.id)
+        registry.execute_delete(scope, proposal.id, _fp_delete(scope, proposal.id))
 
     assert _code_of(raised.value) == expected
 

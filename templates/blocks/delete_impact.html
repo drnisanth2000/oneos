@@ -8,7 +8,11 @@
   {% else %}
   <div class="diff-head">No references — safe to delete.</div>
   {% endif %}
-  {% set delete_execute_values = {"id": prop.id} %}
+  {# S7: the action carries the fingerprint of the exact bytes this
+     impact report was built from. Both values are server-rendered and
+     serialised with `tojson`; hand-built JSON is forbidden. #}
+  {% set delete_execute_values = {"id": prop.id,
+                                  "review_sha256": review_sha256} %}
   <div class="prop-actions">
     <button class="reject"
             hx-post="/registry/{{ entity }}/product/delete-execute"

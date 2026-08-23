@@ -45,7 +45,7 @@ from .review_tokens import ReviewTokenError
 from .registry import (
     RegistryError,
     execute_delete,
-    get_delete_proposal,
+    get_delete_review,
     products_for,
     propose_delete,
     reference_count,
@@ -796,8 +796,12 @@ _REGISTRY_PRODUCTS_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError,
     SystemRegistryPathError,  # see _TRIAGE_CATCHES
 )
+#: `ReviewTokenError` (S7): a stale or malformed review fingerprint is a
+#: declared outcome of delete-execute, not an escape — the same addition the
+#: outbox actions needed.
 _REGISTRY_DELETE_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError, UnreadableProposalRecord,
+    ReviewTokenError,
 )
 
 
@@ -833,36 +837,45 @@ def registry_delete_preview(
 ) -> HTMLResponse:
     try:
         selected = scope.current_entity()
-        prop = propose_delete(scope, "product", slug)
+        written = propose_delete(scope, "product", slug)
         # propose_delete has already written the proposal file by this
         # point (design §8: "the domain action succeeded, and S6 must not
         # roll back a successful write merely because rendering failed"), so
         # a failure from here on is `(committed=no, persistence=
         # proposal-written)`, not `persistence=none`.
+        #
+        # S7: the displayed proposal and its fingerprint come from one review
+        # snapshot of the just-written record, so the button is bound to the
+        # exact bytes this fragment was rendered from.
+        review = get_delete_review(scope, written.id)
         report = reference_count(scope, "product", slug)
     except _REGISTRY_DELETE_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
-        {"entity": selected, "slug": slug, "prop": prop, "report": report},
+        {"entity": selected, "slug": slug, "prop": review.value,
+         "review_sha256": review.sha256, "report": report},
     )
 
 
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
 @console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
 def registry_delete_execute(
-    request: Request, scope: EntityScope, id: str = Form(...)
+    request: Request,
+    scope: EntityScope,
+    id: str = Form(...),
+    review_sha256: str = Form(...),
 ) -> HTMLResponse:
     # Rule 8 (design §6): the success copy must name the SERVER-derived
-    # slug, never the submitted one. `execute_delete` returns `None` and
-    # removes the proposal file as an owned change (app/registry.py:292,
-    # :346), so the record cannot be read afterwards — the validated slug is
-    # therefore held from a `get_delete_proposal` call made BEFORE
-    # `execute_delete`, and the route no longer even declares a `slug` form
-    # field (item D: it is unused for display and must not be submitted).
+    # slug, never the submitted one.
+    #
+    # S7: `execute_delete` now returns the bound `DeleteProposal` it actually
+    # executed, so the validated slug comes from the execution itself. The
+    # earlier `get_delete_proposal` read is gone — it was an unbound read of
+    # a record the action had not yet compared, and using it for display
+    # could describe bytes the deletion never consumed.
     try:
-        prop = get_delete_proposal(scope, id)
-        execute_delete(scope, id)
+        prop = execute_delete(scope, id, review_sha256)
     except _REGISTRY_DELETE_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
