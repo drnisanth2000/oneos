@@ -1,6 +1,6 @@
 # S7 — Bound Review Tokens
 
-**Status:** DRAFT — conversational design approved; awaiting written review
+**Status:** APPROVED — conversational and written design approved
 
 **Base:** merged `origin/main` at
 `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f`. Fresh public baseline:

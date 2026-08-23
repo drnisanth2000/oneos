@@ -1,0 +1,694 @@
+# S7 Bound Review Tokens Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Ensure approve, reject, and registry delete can act only on the exact
+proposal bytes the operator reviewed, while keeping a changed review on the
+same screen and requiring a fresh confirmation.
+
+**Architecture:** Treat S7 as an architectural safety boundary. A small shared
+review-token module owns exact-byte SHA-256 snapshots and submitted-token
+validation. The outbox and registry services build their validated domain
+objects from the same bytes they fingerprint, and each action compares the
+submitted fingerprint at its final pre-mutation boundary. FastAPI/Jinja/HTMX
+carry the server-rendered token and preserve the old browser review on a
+conflict while rendering the current review beside it. Services, not routes,
+remain the enforcement boundary.
+
+**Tech Stack:** Python 3.12, FastAPI, Jinja2, HTMX 2.0.4, Alpine with
+alpine-morph, Pydantic v2, GitPython, pytest, `uv`.
+
+**Spec:** `docs/superpowers/specs/2026-08-23-s7-bound-review-tokens-design.md`
+— approved and normative. If this plan and the spec differ, the spec wins.
+
+## Global Constraints
+
+- Work only on `codex/s7-bound-review-tokens`, based on exact merged-main SHA
+  `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f`.
+- The established public baseline is `uv run python -m pytest -q` → 926 passed.
+- Grey Matter is read-only. Record and compare its exact pre/post state; never
+  clean, stash, normalize, or overwrite pre-existing private edits.
+- No dependency, schema, convention, registry-value, authentication, or
+  authorization change belongs in S7.
+- Direct registry add/edit remains direct and reversible. Only registry delete
+  joins the bound-review contract.
+- The separately sequenced inherited work—public-document leakage checking,
+  route-declaration completeness, and the named specific configuration
+  outcomes—remains mandatory before live gates but is not implemented here.
+- A changed proposal always refuses with exactly:
+  `Proposal changed since your review. Nothing was changed.`
+- Approve, reject, and registry delete use the same required-token semantics.
+  Missing or malformed tokens are invalid requests, never legacy fallbacks.
+- Independent review and mutation-tested verification are release gates. A
+  test counts as mutation evidence only after the protection is deliberately
+  broken, the test fails for the intended reason, the exact protection is
+  restored, and the test passes again.
+- Each task follows red → green → focused regression → commit. Do not combine
+  task commits or push/open a PR without separate authorization.
+
+---
+
+## Preconditions
+
+- [ ] Confirm branch, exact base ancestry, clean worktree, and approved spec:
+
+```bash
+git branch --show-current
+git merge-base HEAD d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f
+git status --short
+sed -n '1,380p' docs/superpowers/specs/2026-08-23-s7-bound-review-tokens-design.md
+```
+
+Expected branch: `codex/s7-bound-review-tokens`. Expected merge-base: the full
+S7 baseline SHA above. Before product implementation, only the approved S7
+design and this plan may be ahead of it.
+
+- [ ] Re-run the public baseline before the first product-code edit:
+
+```bash
+uv run python -m pytest -q
+```
+
+Expected: 926 passed.
+
+- [ ] Record Grey Matter's exact read-only pre-state in a unique proof
+  directory. Preserve the vault path configured by the trusted local
+  environment; never print it into tracked files:
+
+```bash
+export ONEOS_VAULT="${ONEOS_VAULT:?set ONEOS_VAULT to the private vault root}"
+S7_PROOF="$(mktemp -d /private/tmp/oneos-s7-proof.XXXXXX)"
+git -C "$ONEOS_VAULT" rev-parse HEAD > "$S7_PROOF/head.before"
+git -C "$ONEOS_VAULT" status --porcelain=v2 -z --untracked-files=all > "$S7_PROOF/status.before"
+git -C "$ONEOS_VAULT" diff --binary > "$S7_PROOF/worktree.before"
+git -C "$ONEOS_VAULT" diff --cached --binary > "$S7_PROOF/cached.before"
+```
+
+Keep `$S7_PROOF` in the executing shell or private handoff only. Never add it
+to this repository.
+
+---
+
+## File Map
+
+| File | Responsibility |
+|---|---|
+| `app/review_tokens.py` (new) | Immutable snapshots, lowercase SHA-256, strict submitted-token validation, and changed-review exception. |
+| `app/outbox.py` | Exact-byte classification reviews, projected hashes, and bound approve/reject. |
+| `app/registry.py` | Exact-byte delete reviews, bound delete execution, returned success value, and fresh reference refusal. |
+| `app/git_transaction.py` | One narrow conditional-removal primitive for reject using existing state ownership. |
+| `app/console_errors.py` | Safe changed-review and invalid-token outcomes. |
+| `app/main.py` | Required token fields, bound service calls, and read-only fresh-review fragments. |
+| `templates/blocks/outbox_list.html` | Outbox token transport and card delegation. |
+| `templates/blocks/outbox_card.html` (new) | One classification review with active or disabled controls. |
+| `templates/blocks/delete_impact.html` | Delete impact from the fingerprinted snapshot and its token. |
+| `templates/blocks/review_changed.html` (new) | Same-screen refusal, disabled old controls, and current review. |
+| `templates/blocks/review_unavailable.html` (new) | Safe no-action state, read-only check, and triage guidance. |
+| `tests/test_review_tokens.py` (new) | Shared primitive tests. |
+| `tests/test_outbox.py`, `tests/test_console_projection.py` | Classification service and projection safety. |
+| `tests/test_registry.py` | Delete binding, reference recount, return value, and races. |
+| `tests/test_console_routes.py`, `tests/test_console_invariants.py` | Transport, same-screen behavior, read-only refresh, declarations, and structural proof. |
+| `tests/test_console_errors.py` | Exact outcome mapping and taxonomy invariants. |
+| `tests/test_git_transaction.py` | Conditional reject-removal tests only if its service changes. |
+| `docs/superpowers/plans/2026-08-23-s7-mutation-ledger.md` (new during verification) | Break/red/restore/green evidence and independent-review resolutions. |
+
+---
+
+## Task 1: Add the Shared Exact-Byte Review Contract
+
+**Files:** create `app/review_tokens.py`, `tests/test_review_tokens.py`; modify
+`app/console_errors.py`, `tests/test_console_errors.py`
+
+- [ ] **RED:** Add tests that pin exact-byte hashing, frozen snapshots, strict
+  lowercase 64-character hexadecimal tokens, different bytes under the same id,
+  and exception messages that reveal no proposal bytes or private paths.
+
+```python
+def test_review_snapshot_hashes_the_exact_bytes():
+    raw = b"id: same-id\nvalue: first\n"
+    snap = make_review_snapshot("validated", raw)
+    assert snap.contents == raw
+    assert snap.sha256 == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize("token", [None, "", "0" * 63, "G" * 64, "g" * 64, 123])
+def test_submitted_review_sha256_is_strict(token):
+    with pytest.raises(InvalidReviewToken):
+        require_review_match(b"proposal", token)
+```
+
+- [ ] Run focused tests and observe the import/behavior failures:
+
+```bash
+uv run pytest tests/test_review_tokens.py tests/test_console_errors.py -q
+```
+
+- [ ] **GREEN:** Implement the small domain module without route or storage
+knowledge:
+
+```python
+T = TypeVar("T")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class ReviewTokenError(Exception):
+    pass
+
+
+class InvalidReviewToken(ReviewTokenError):
+    pass
+
+
+class ReviewedProposalChanged(ReviewTokenError):
+    pass
+
+
+@dataclass(frozen=True)
+class ReviewSnapshot(Generic[T]):
+    value: T
+    contents: bytes
+    sha256: str
+
+
+def make_review_snapshot(value: T, contents: bytes) -> ReviewSnapshot[T]:
+    raw = bytes(contents)
+    return ReviewSnapshot(value, raw, hashlib.sha256(raw).hexdigest())
+
+
+def require_review_match(contents: bytes, submitted: object) -> str:
+    if not isinstance(submitted, str) or _SHA256.fullmatch(submitted) is None:
+        raise InvalidReviewToken("invalid review fingerprint")
+    if hashlib.sha256(contents).hexdigest() != submitted:
+        raise ReviewedProposalChanged("proposal changed since review")
+    return submitted
+```
+
+The hash is a change detector, not a secret. Do not add signing, storage,
+sessions, or a dependency.
+
+- [ ] Map `ReviewedProposalChanged` exactly to the approved message, refusal
+severity, `committed=no`, HTTP 409, and reload/review-again guidance. Map
+`InvalidReviewToken` to the existing invalid-request outcome. Extend existing
+map-completeness tests.
+
+- [ ] Run focused and full public tests, then commit:
+
+```bash
+uv run pytest tests/test_review_tokens.py tests/test_console_errors.py -q
+uv run python -m pytest -q
+git add app/review_tokens.py app/console_errors.py tests/test_review_tokens.py tests/test_console_errors.py
+git commit -m "feat: add exact-byte review token contract"
+```
+
+---
+
+## Task 2: Produce Classification Reviews From One Byte Snapshot
+
+**Files:** modify `app/outbox.py`, `tests/test_outbox.py`,
+`tests/test_console_projection.py`
+
+- [ ] **RED:** Add tests proving:
+
+  - `get_proposal_review(scope, id)` returns the validated `Proposal`, exact raw
+    bytes, and their SHA-256;
+  - parsing and hashing use one captured byte value, even if the file is
+    replaced immediately after capture;
+  - `project_outbox()` puts `review_sha256` on every well-formed row whose
+    proposal can safely be rejected;
+  - a missing/unreadable source can disable approve while preserving reject
+    and its proposal hash;
+  - malformed, missing, redirected, non-regular, or cross-scope proposal
+    records expose no review token and no action buttons; and
+  - the same proposal id with different bytes produces a different hash.
+
+- [ ] Run focused tests and observe failures:
+
+```bash
+uv run pytest tests/test_outbox.py tests/test_console_projection.py -q
+```
+
+- [ ] **GREEN:** Add a typed exact-byte reader around the existing S5/S6 safe
+path primitives. Its fixed sequence is capture → parse those bytes → validate
+that value → hash those bytes. Never parse one read and hash another.
+
+```python
+def get_proposal_review(
+    scope: Scope,
+    proposal_id: str,
+) -> ReviewSnapshot[Proposal]:
+    path = _require_outbox_path(scope, proposal_id)
+    relative = path.relative_to(scope.root).as_posix()
+    state = capture_path_state(scope.root, relative)
+    contents = _require_regular_proposal_contents(state)
+    proposal = _validate_proposal_bytes(scope, path, contents)
+    return make_review_snapshot(proposal, contents)
+```
+
+Names may follow local conventions, but the single-state flow is mandatory.
+Translate missing/unreadable proposal states into existing safe outcomes and
+preserve integrity/tamper outcomes rather than flattening them.
+
+- [ ] Extend the frozen projection row without breaking blocked-row creation:
+
+```python
+@dataclass(frozen=True)
+class OutboxRow:
+    proposal: Proposal | None
+    diff: str | None
+    error: Exception | None
+    can_approve: bool
+    can_reject: bool
+    review_sha256: str | None = None
+```
+
+Build `proposal` and `review_sha256` from the same review snapshot. Preserve
+the hash when source-diff construction fails but rejection remains safe.
+
+- [ ] Keep `get_proposal(scope, id)` only for legitimate non-action callers,
+implemented as `get_proposal_review(scope, proposal_id).value`. No action may
+use it.
+
+- [ ] Run focused and full tests, then commit:
+
+```bash
+uv run pytest tests/test_outbox.py tests/test_console_projection.py -q
+uv run python -m pytest -q
+git add app/outbox.py tests/test_outbox.py tests/test_console_projection.py
+git commit -m "feat: project exact classification review snapshots"
+```
+
+---
+
+## Task 3: Bind Classification Approve and Reject at Mutation Time
+
+**Files:** modify `app/outbox.py`, `app/git_transaction.py`,
+`tests/test_git_transaction.py`, `tests/test_outbox.py`, and
+`tests/test_console_errors.py`
+
+- [ ] **RED:** Change direct service tests first so the contract is explicit:
+
+```python
+review = get_proposal_review(scope, proposal.id)
+approved = approve(scope, proposal.id, review.sha256)
+
+review = get_proposal_review(scope, proposal.id)
+rejected = reject(scope, proposal.id, review.sha256)
+```
+
+Add failures for absent and malformed hashes. There must be no default,
+optional argument, or id-only compatibility path.
+
+- [ ] Add same-id replacement tests for approve and reject. Repeat with an
+action-relevant change and a byte-only change such as whitespace/key order.
+Both must raise `ReviewedProposalChanged` and preserve complete vault state.
+
+```python
+review = get_proposal_review(scope, proposal.id)
+rewrite_proposal_at_same_path(proposal.id)
+with pytest.raises(ReviewedProposalChanged):
+    approve(scope, proposal.id, review.sha256)
+assert_entire_vault_state_unchanged()
+```
+
+- [ ] Add final-boundary race tests. Inject a replacement after the initial
+review comparison but before the first mutation. Approve must commit nothing;
+reject must not unlink the replacement. Cover disappearance, symlink,
+directory, and safe non-file substitutions without blocking.
+
+- [ ] Run focused tests and confirm the missing enforcement fails:
+
+```bash
+uv run pytest tests/test_outbox.py -q
+```
+
+- [ ] **GREEN — approve:** Change the exact public signature to
+`approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal`.
+Capture proposal state once, compare its bytes, validate those bytes, retain
+the existing source/policy checks, and give that same captured state to the
+transaction as proposal authority.
+
+Never call the value-only reader before capturing transaction authority, and
+never replace `proposal_state` with a later reread.
+
+- [ ] **GREEN — reject:** Use the identical capture/compare/validate sequence,
+then conditionally remove only that captured regular leaf.
+
+Add exactly one narrow public API to the transaction module:
+
+```python
+def remove_path_if_unchanged(
+    vault: Path,
+    relative_path: str,
+    expected: PathState,
+) -> None:
+    """Remove one untracked regular leaf only while it matches expected."""
+    try:
+        _validate_transaction_path(relative_path)
+    except ValueError as exc:
+        raise InvalidTransactionPath("reviewed path is unsafe") from exc
+    if expected.contents is None:
+        raise ValueError("conditional removal requires a regular expected state")
+    root = Path(os.path.abspath(os.fspath(vault)))
+    change = PathChange(relative_path, expected, PathState.absent())
+    with _approval_lock(root):
+        _apply_state(root, change)
+```
+
+It must reuse existing lexical validation, no-follow capture, approval lock,
+and state comparison. It must not create a Git commit, accept absent expected
+state, or become an arbitrary-delete utility. Have the safety reviewer assess
+the compare/remove timing boundary before adoption.
+
+- [ ] Preserve existing guarantees: source fingerprint, destination policy,
+one approval commit, exact revertibility, identity, scope confinement, and safe
+visible errors.
+
+- [ ] Run focused and full tests, then commit only needed files:
+
+```bash
+uv run pytest tests/test_git_transaction.py tests/test_outbox.py tests/test_console_errors.py -q
+uv run python -m pytest -q
+git add app/outbox.py tests/test_outbox.py tests/test_console_errors.py
+git add app/git_transaction.py tests/test_git_transaction.py
+git commit -m "feat: bind approve and reject to reviewed proposal bytes"
+```
+
+---
+
+## Task 4: Bind Registry Delete and Keep the Live Reference Gate
+
+**Files:** modify `app/registry.py`, `tests/test_registry.py`,
+`tests/test_console_errors.py`
+
+- [ ] **RED:** Add `get_delete_review(scope, id)` tests equivalent to the
+classification snapshot tests. Displayed `kind`, `value`, and saved impact must
+come from `review.value`, never a second live report.
+
+- [ ] Require a hash in direct execution tests and add:
+
+  - same-id proposal replacement → changed-review refusal, registry unchanged,
+    replacement preserved;
+  - missing/malformed hash → invalid request, no mutation;
+  - replacement after comparison but before transaction ownership → refusal,
+    no commit;
+  - matching proposal plus a new live reference → existing reference refusal;
+  - matching proposal without references → one revertible commit; and
+  - return value equals the validated proposal whose bytes matched, so the
+    route needs no earlier unbound read for success copy.
+
+- [ ] Observe focused failures:
+
+```bash
+uv run pytest tests/test_registry.py tests/test_console_errors.py -q
+```
+
+- [ ] **GREEN:** Change the exact public signature to
+`execute_delete(scope: Scope, proposal_id: str, review_sha256: object) ->
+DeleteProposal`. Capture the delete-proposal state once; compare, parse, and
+validate its bytes; repeat the live reference count; build the existing
+transaction with that same state as proposal-removal authority; execute; then
+return the bound `DeleteProposal`.
+
+The hash does not authorize deletion by itself. Scope, kind/value existence,
+current registry state, fresh references, and transaction-owned state remain
+independent gates.
+
+- [ ] Implement `get_delete_review()` through the same byte parser used by
+execution. Any retained value-only reader delegates to it and is never used by
+an action.
+
+- [ ] Run focused and full tests, then commit:
+
+```bash
+uv run pytest tests/test_registry.py tests/test_console_errors.py -q
+uv run python -m pytest -q
+git add app/registry.py tests/test_registry.py tests/test_console_errors.py
+git commit -m "feat: bind registry delete to reviewed proposal bytes"
+```
+
+---
+
+## Task 5: Carry Tokens Through HTMX and Reconfirm on the Same Screen
+
+**Files:** modify `app/main.py`, `templates/blocks/outbox_list.html`,
+`templates/blocks/delete_impact.html`, `tests/test_console_routes.py`, and
+`tests/test_console_invariants.py`; create `templates/blocks/outbox_card.html`,
+`templates/blocks/review_changed.html`, and
+`templates/blocks/review_unavailable.html`
+
+- [ ] **RED — transport:** Require both server-rendered values on every action:
+
+```html
+hx-vals='{{ {"id": row.proposal.id,
+             "review_sha256": row.review_sha256}|tojson }}'
+```
+
+Apply the same `tojson` rule to approve, reject, and registry delete. Tests
+must fail hand-built JSON, missing hashes, hashes from another row, and action
+buttons on rows without hashes.
+
+- [ ] **RED — service plumbing:** Prove each route passes the submitted hash
+unchanged. Delete success copy must use the `DeleteProposal` returned by
+`execute_delete`; fail if the route calls `get_delete_proposal()` first.
+
+- [ ] **RED — same-screen change:** For approve, reject, and delete, render a
+review, replace its stored proposal under the same id, and submit the old
+controls. Assert the response:
+
+  - is HTTP 409 with the exact approved message;
+  - leaves the old review visible;
+  - replaces its old controls with disabled controls through a hash-specific
+    HTMX out-of-band target;
+  - appends a separately identified current review built from current
+    server-validated bytes;
+  - gives only the current review a fresh hash and active controls;
+  - changes no proposal, destination, registry, or Git state; and
+  - repeats correctly if the current proposal changes again.
+
+- [ ] **RED — refresh/unavailable:** Add read-only fresh-review routes. A normal
+check returns the current review and token. Missing, malformed, redirected,
+cross-scope, or non-file proposals render the existing safe outcome and no
+controls. `Check again` performs only a read. A missing classification proposal
+may link safely to the existing triage screen; it never reconstructs, moves, or
+guesses a proposal/source path.
+
+- [ ] Run focused tests and observe failures:
+
+```bash
+uv run pytest tests/test_console_routes.py tests/test_console_invariants.py -q
+```
+
+- [ ] **GREEN — routes:** Require
+`review_sha256: Annotated[str, Form()]` with no default on each action route and
+pass it unchanged to the corresponding three-argument service.
+
+Mirror this contract for reject and registry delete. Add decorated, declared
+GET fragment routes for read-only current review. Name all reachable typed
+failures in their S6 route declarations; never broaden catches to `Exception`.
+
+- [ ] **GREEN — HTMX behavior:** Keep the existing list target for success. On
+`ReviewedProposalChanged`, use `HX-Retarget` and `HX-Reswap` to append beside
+the hash-specific old card; include an out-of-band replacement that disables
+the old controls. A practical DOM contract is:
+
+```text
+review-card-<proposal-id>-<review-sha256>
+review-controls-<proposal-id>-<review-sha256>
+```
+
+Use the same pattern for classification and delete. Escape attributes normally
+and serialize HTMX values only with `tojson`.
+
+- [ ] Do not imply the old review came back from the server. It remains browser
+presentation evidence. The appended card is the server-validated current state
+and the only source of active controls.
+
+- [ ] Run focused tests, inspect synthetic rendered fragments, then run the
+full public suite:
+
+```bash
+uv run pytest tests/test_console_routes.py tests/test_console_invariants.py -q
+uv run python -m pytest -q
+```
+
+- [ ] Commit:
+
+```bash
+git add app/main.py templates/blocks/outbox_list.html templates/blocks/outbox_card.html
+git add templates/blocks/delete_impact.html templates/blocks/review_changed.html
+git add templates/blocks/review_unavailable.html
+git add tests/test_console_routes.py tests/test_console_invariants.py
+git commit -m "feat: require same-screen reconfirmation after review changes"
+```
+
+---
+
+## Task 6: Prove Complete No-Mutation Outcomes and Mutation Resistance
+
+**Files:** modify existing S7 tests only; create
+`docs/superpowers/plans/2026-08-23-s7-mutation-ledger.md`
+
+- [ ] Add or confirm a parameterized matrix for all three actions:
+
+| State at action boundary | Required result |
+|---|---|
+| exact reviewed bytes | existing successful behavior |
+| same id, meaningful byte change | changed-review refusal |
+| same id, byte-only difference | changed-review refusal |
+| missing or malformed token | invalid request |
+| missing proposal | existing safe missing outcome |
+| malformed proposal | existing safe unreadable outcome |
+| symlink, redirect, or cross-scope | existing integrity/refusal outcome |
+| regular file replaced before mutation | changed/state-conflict refusal |
+| non-regular replacement | integrity/refusal outcome |
+
+For every refusal, compare proposal bytes/type, source/destination, registry
+bytes, references, Git HEAD, index, tracked diff, untracked paths, and commit
+count. “No mutation” must not mean only “no new commit.”
+
+- [ ] Add AST/template tests proving:
+
+  - all three service and route signatures require `review_sha256`;
+  - all three routes pass it;
+  - all three action templates carry it through `tojson`;
+  - action routes never call value-only proposal readers;
+  - delete success uses the service return;
+  - no error row has active controls; and
+  - every new route has a truthful `@console_route` declaration.
+
+These checks cover only S7's changed surface. Do not expand them into the
+separately sequenced global route-declaration audit.
+
+- [ ] Run all S7-focused tests together:
+
+```bash
+uv run pytest tests/test_review_tokens.py tests/test_outbox.py \
+  tests/test_console_projection.py tests/test_registry.py \
+  tests/test_console_errors.py tests/test_console_routes.py \
+  tests/test_console_invariants.py tests/test_git_transaction.py -q
+```
+
+- [ ] Deliberately make each mutation below, one at a time, without committing
+the broken state:
+
+  1. bypass `require_review_match()` in approve;
+  2. bypass it in reject;
+  3. bypass it in registry delete;
+  4. hash a second read instead of the parsed/rendered bytes;
+  5. replace approve/delete transaction authority with a later reread;
+  6. make reject unlink by id without comparing captured state;
+  7. omit `review_sha256` from one HTMX action; and
+  8. make delete success pre-read an unbound proposal.
+
+For each, record the exact temporary diff, named failing test, intended
+assertion, exact restoration, and green rerun in the mutation ledger. Restore
+the specific lines with `apply_patch`; never use destructive Git cleanup that
+could erase unrelated work.
+
+- [ ] Run the full public suite after every restored mutation group:
+
+```bash
+uv run python -m pytest -q
+```
+
+- [ ] Commit verification additions and the ledger:
+
+```bash
+git add tests docs/superpowers/plans/2026-08-23-s7-mutation-ledger.md
+git commit -m "test: prove S7 review binding resists mutation"
+```
+
+---
+
+## Task 7: Independent Review, Private Read-Only Gates, and Handoff
+
+**Files:** modify S7 files only for accepted findings; update the mutation
+ledger with review evidence
+
+- [ ] Invoke `superpowers:requesting-code-review` and obtain at least two
+independent reviews with different assignments:
+
+  1. **Safety/transaction reviewer:** single-read byte lineage, service
+     enforcement, compare-to-mutation timing, conditional reject removal,
+     live-reference recount, and no-mutation proof.
+  2. **Route/operator/scope reviewer:** same-screen old/current behavior,
+     disabled stale controls, HTMX token transport, safe errors, read-only
+     checking, declarations, and exclusion of inherited/non-S7 work.
+
+Neither reviewer may be the implementer. Each reads the approved spec, this
+plan, and the complete diff from the exact baseline.
+
+- [ ] Resolve every finding with evidence. For any code change, write or name
+the failing regression first, make the smallest correction, run focused tests,
+and repeat the affected mutation proof. Record accepted and rejected findings
+with concrete reasons.
+
+- [ ] Invoke `superpowers:verification-before-completion` and run fresh public
+verification from the final tree:
+
+```bash
+git status --short
+git diff --check d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f..HEAD
+uv run python -m pytest -q
+```
+
+- [ ] Run existing private gates read-only:
+
+```bash
+cd "$ONEOS_VAULT/_system/scripts"
+python3 -m unittest discover
+cd "$ONEOS_VAULT"
+python3 _system/scripts/check_v2.py .
+```
+
+Expected inherited private baseline: 37 tests pass; `check_v2` reports zero
+errors and zero warnings. If it differs, investigate rather than changing Grey
+Matter.
+
+- [ ] Prove Grey Matter remained byte-for-byte untouched:
+
+```bash
+git -C "$ONEOS_VAULT" rev-parse HEAD > "$S7_PROOF/head.after"
+git -C "$ONEOS_VAULT" status --porcelain=v2 -z --untracked-files=all > "$S7_PROOF/status.after"
+git -C "$ONEOS_VAULT" diff --binary > "$S7_PROOF/worktree.after"
+git -C "$ONEOS_VAULT" diff --cached --binary > "$S7_PROOF/cached.after"
+cmp "$S7_PROOF/head.before" "$S7_PROOF/head.after"
+cmp "$S7_PROOF/status.before" "$S7_PROOF/status.after"
+cmp "$S7_PROOF/worktree.before" "$S7_PROOF/worktree.after"
+cmp "$S7_PROOF/cached.before" "$S7_PROOF/cached.after"
+```
+
+- [ ] Confirm S7-only scope and no instance-specific values:
+
+```bash
+git diff --stat d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f..HEAD
+git log --oneline d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f..HEAD
+git status --short --branch
+```
+
+- [ ] Prepare a handoff stating repository root, baseline, branch, worktree,
+HEAD, live PR/merge state, public/private gates, mutation evidence, reviewer
+outcomes, and Grey Matter preservation. Do not push, open a PR, merge, delete
+branches, or remove worktrees without separate authorization.
+
+---
+
+## Completion Conditions
+
+S7 is complete only when:
+
+- approve, reject, and registry delete refuse an id-identical byte replacement
+  at both service and final pre-mutation boundaries;
+- every actionable review is parsed, validated, and hashed from one exact byte
+  snapshot;
+- stale controls stay visible but disabled, the current review appears on the
+  same screen, and only its fresh controls can act;
+- registry delete independently repeats the live-reference check;
+- all refusals prove complete state non-mutation;
+- deliberate mutations produce the intended red tests and exact restoration
+  returns them to green;
+- two independent reviews are resolved;
+- final public and private gates pass;
+- Grey Matter's exact pre-existing state is preserved; and
+- the inherited pre-live-gate items remain separately sequenced rather than
+  silently claimed complete.
