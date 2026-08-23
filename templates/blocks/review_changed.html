@@ -7,7 +7,7 @@
    browser sent back purely as evidence, (b) disable exactly the controls
    issued for the stale bytes, out-of-band, and (c) offer the current,
    server-validated review with a fresh fingerprint. #}
-<div class="review-changed" id="review-changed-{{ proposal_id }}-{{ review_sha256 }}">
+<div class="review-changed" id="review-changed-{{ proposal_id }}-{{ review_sha256 }}-{{ current_issue }}">
   {% with error=review_error %}{% include "blocks/alert.html" %}{% endwith %}
   {% if differences %}
   {# Only the field name and the server's own current value: Rule 8 forbids
@@ -46,11 +46,12 @@
     <em>Previously reviewed</em>, and its controls are no longer active.
     Act again below if you still want to.
   </p>
-  {% with label="Current version — review this before acting" %}
+  {% with label="Current version — review this before acting",
+          issue=current_issue %}
   {% include current_card_template %}
   {% endwith %}
   <div class="prop-actions">
-    {% with check_again_target = "#review-changed-" ~ proposal_id ~ "-" ~ review_sha256 %}
+    {% with check_again_target = "#review-changed-" ~ proposal_id ~ "-" ~ review_sha256 ~ "-" ~ current_issue %}
     {% include "blocks/check_again.html" %}
     {% endwith %}
   </div>

@@ -852,6 +852,10 @@ def _review_changed_response(
             "review_sha256": context["review_sha256"],
             "stale_review_sha256": stale_review_sha256,
             "stale_issue": stale_issue,
+            # One issuance for the whole appended fragment — its wrapper,
+            # its current card, and the target `Check again` swaps — so a
+            # recurring digest cannot produce a recurring element id.
+            "current_issue": _new_issue(),
             "stale_controls": stale_controls,
             "review_error": error,
             "check_again_url": check_again_url,

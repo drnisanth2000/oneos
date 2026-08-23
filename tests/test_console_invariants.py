@@ -1863,3 +1863,34 @@ def _load_console_main(tmp_path, monkeypatch):
     import app.main as main
 
     return importlib.reload(main)
+
+
+def test_no_module_level_definition_is_shadowed_by_a_later_one():
+    """A second `def` of the same name silently replaces the first.
+
+    Python does not warn, and pytest collects only the survivor — so an
+    edit that appends a strengthened test beside the weak original runs
+    the *original*, reports green, and proves nothing. That has now
+    happened twice in this branch's history, both times undetected until
+    a mutation refused to turn red. A cheap parse catches it at once.
+    """
+    import ast
+    import collections
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    shadowed = {}
+    for path in sorted(
+        [*(root / "app").rglob("*.py"), *(root / "tests").rglob("*.py")]
+    ):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        seen = collections.Counter(
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        repeats = {name: n for name, n in seen.items() if n > 1}
+        if repeats:
+            shadowed[str(path.relative_to(root))] = repeats
+
+    assert not shadowed, f"module-level names defined more than once: {shadowed}"

@@ -1,6 +1,11 @@
 {% set issue = issue | default(new_issue()) %}
+{# A card that offers no action carries no digest at all — not in `hx-vals`,
+   not in its own id, not in any target. A fingerprint is the value that
+   binds an action to reviewed bytes; on a card that can never act it is
+   nothing but an unreviewed value on screen. #}
 <div class="delete-impact{% if disabled %} proposal-superseded{% endif %}"
-     id="review-card-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}">
+     {% if prop.total %}id="review-unactionable-{{ prop.id }}-{{ issue }}"
+     {% else %}id="review-card-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}"{% endif %}>
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
   {# S7: the impact shown is the impact inside the fingerprint — the values
      recorded on the reviewed proposal, not a live count taken while
@@ -16,7 +21,13 @@
      control bound to bytes that permanently refuse would be worse. #}
   <p class="muted">
     This proposal was reviewed while references existed, so it can never be
-    approved. Clear the references, then review the deletion again.
+    approved — its recorded impact is part of what was fingerprinted and
+    cannot change. Re-reading it would say the same thing forever.
+  </p>
+  <p class="muted">
+    Clear the references, then start a new deletion from
+    <a href="/registry/{{ entity }}/products">the registry</a>. That reviews
+    the deletion as it stands and allocates a new proposal.
   </p>
   {% else %}
   <div class="diff-head">No references to '{{ prop.slug }}' — safe to delete.</div>
@@ -25,14 +36,9 @@
      impact report was built from. Both values are server-rendered and
      serialised with `tojson`; hand-built JSON is forbidden. #}
   {% if prop.total %}
-  {# No control, and therefore no fingerprint — the same rule
-     `OutboxRow.__post_init__` enforces for classification rows. #}
-  <div class="prop-actions">
-    {% with check_again_url = "/registry/" ~ entity ~ "/product/review/" ~ prop.id,
-            check_again_target = "#review-card-" ~ prop.id ~ "-" ~ review_sha256 ~ "-" ~ issue %}
-    {% include "blocks/check_again.html" %}
-    {% endwith %}
-  </div>
+  {# No control, no fingerprint, and no `Check again`: re-reading an
+     immutable record loops forever. The way forward is a new proposal,
+     linked above. #}
   {% else %}
   {% set delete_execute_values = {"id": prop.id,
                                   "review_sha256": review_sha256} %}

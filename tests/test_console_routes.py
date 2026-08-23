@@ -5786,9 +5786,13 @@ def test_a_referenced_delete_preview_offers_no_control_and_says_why(
     assert "review_sha256" not in body
     # And the copy says what is actually true.
     assert "until these are cleared" not in body
-    assert "review the deletion again" in body.lower()
-    # A fresh review is still reachable.
-    assert "Check again" in body
+    # A new proposal is the way forward, not a re-read of an immutable one.
+    assert "start a new deletion" in body.lower()
+    assert 'href="/registry/alpha/products"' in body
+    # Not just the field name: the digest itself must be absent from the
+    # whole fragment. It used to survive in the card id and `hx-target`,
+    # which is what made the "no fingerprint" claim above false.
+    assert not re.search(r"[0-9a-f]{64}", body), body
 
 
 def test_an_unreferenced_delete_preview_still_offers_its_control(
@@ -5804,6 +5808,9 @@ def test_an_unreferenced_delete_preview_still_offers_its_control(
     assert "hx-post" in body
     assert "review_sha256" in body
     assert "Approve delete" in body
+    # The control for the assertion above: this fragment *does* carry a
+    # 64-character digest, so its absence there is a real difference.
+    assert re.search(r"[0-9a-f]{64}", body), body
 
 
 @pytest.mark.parametrize(
@@ -5839,43 +5846,146 @@ def test_the_unavailable_fragment_uses_the_taxonomy_status(
     assert response.status_code == status_for(_CODES[expected_code], True)
 
 
+class _ElementIds(HTMLParser):
+    """Element ids in a fragment, split by what they mean.
+
+    An `hx-swap-oob` element *replaces* something already on the page, so
+    its id is expected to repeat. Every other id introduces a new element
+    and must be unique in the resulting document. Conflating the two is what
+    made an earlier version of this test vacuous.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.introduced: list[str] = []
+        self.replaces: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        element_id = attributes.get("id")
+        if not element_id:
+            return
+        if attributes.get("hx-swap-oob"):
+            self.replaces.add(element_id)
+        else:
+            self.introduced.append(element_id)
+
+
+def _element_ids(body: str) -> _ElementIds:
+    parser = _ElementIds()
+    parser.feed(body)
+    return parser
+
+
 def test_a_reverted_proposal_never_produces_duplicate_dom_ids(
     tmp_path, monkeypatch
 ):
     """P1 (review): `(id, sha)` names a *version*, and a version recurs.
 
     An external rewrite cycle that returns the file to earlier bytes — an
-    editor undo, an idempotent regenerator — reissues the same digest. With
-    the digest alone as the DOM key the document ends up holding two cards
-    with one id, and `HX-Retarget` resolves to the *first*, anchoring the
-    comparison against the wrong "old" version.
+    editor undo, an idempotent regenerator — reissues the same digest. This
+    drives three real exchanges, posting the issuance each rendered card
+    reports, accumulates the DOM as a browser would, and requires that every
+    selector a response asks the page to find is actually there.
     """
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
     proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
     v1 = proposal.read_bytes()
-    first = _action_data(tmp_path, proposal_id)
 
-    proposal.write_bytes(v1 + b"# v2\n")
-    body_1 = client.post("/outbox/alpha/approve", data=first).text
-    reissued = json.loads(_hx_vals(body_1)[0])["review_sha256"]
+    listing = client.get("/outbox/alpha").text
+    dom = list(_element_ids(listing).introduced)
+    live = {
+        "id": proposal_id,
+        "review_sha256": _outbox_fingerprint(tmp_path, proposal_id),
+        "review_issue": _card_issue(listing),
+    }
 
-    proposal.write_bytes(v1)                       # back to the v1 bytes
-    body_2 = client.post(
-        "/outbox/alpha/approve",
-        data={"id": proposal_id, "review_sha256": reissued},
+    for step, bytes_now in enumerate((v1 + b"# v2\n", v1, v1 + b"# v2\n"), start=1):
+        # Rewrite *after* the token was issued, so `live` is stale and the
+        # action is refused — the changed-review path this test is about.
+        # (Recomputing the digest here would make approve succeed and the
+        # test would prove nothing; it did, until this comment was needed.)
+        proposal.write_bytes(bytes_now)
+        response = client.post("/outbox/alpha/approve", data=live)
+        body = response.text
+        assert "E-REVIEW" in body, f"step {step} was not a changed-review refusal"
+
+        parsed = _element_ids(body)
+
+        # Every selector this response asks the browser to resolve — the
+        # retarget anchor and each out-of-band replacement — must name an
+        # element the accumulated DOM actually holds.
+        retarget = response.headers.get("HX-Retarget", "").lstrip("#")
+        assert retarget, f"step {step}: no retarget"
+        for selector in {retarget} | parsed.replaces:
+            assert selector in dom, (
+                f"step {step}: response targets #{selector}, which is not on "
+                f"the page. Present: {sorted(dom)}"
+            )
+
+        # And every element it *introduces* must be new.
+        for element_id in parsed.introduced:
+            assert element_id not in dom, (
+                f"step {step}: duplicate element id {element_id}"
+            )
+            dom.append(element_id)
+
+        # The token the operator now holds: the one this very response
+        # issued for the current version.
+        live = {
+            "id": proposal_id,
+            "review_sha256": json.loads(_hx_vals(body)[0])["review_sha256"],
+            "review_issue": _card_issue(body),
+        }
+
+    # The v1 bytes were reviewed twice, so the digest genuinely recurred.
+    assert len(dom) == len(set(dom)), "an element id was issued twice"
+
+
+
+
+
+
+
+
+
+
+def test_a_referenced_delete_card_carries_no_digest_anywhere(tmp_path, monkeypatch):
+    """P1 (review): "no fingerprint" must mean the digest is absent, not
+    merely absent from `hx-vals`. It was still in the card id and the
+    `hx-target`."""
+    import app.registry as registry
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    referenced = registry.ReferenceReport("product", slug, {"front-matter": 2})
+    monkeypatch.setattr(registry, "reference_count", lambda *a, **k: referenced)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
     ).text
 
-    ids_1 = _rendered_card_ids(body_1) | _rendered_control_ids(body_1)
-    ids_2 = _rendered_card_ids(body_2) | _rendered_control_ids(body_2)
-    assert ids_1, body_1
-    assert ids_2, body_2
-    # No element id issued by the second response repeats one from the
-    # first, even though the underlying bytes — and so the digest — do.
-    assert not (ids_1 & ids_2), sorted(ids_1 & ids_2)
+    proposal = next((tmp_path / "alpha/outbox").glob("*.yaml"))
+    digest = hashlib.sha256(proposal.read_bytes()).hexdigest()
+    assert digest not in body, "the digest is still on a non-actionable card"
+    assert not re.search(r"[0-9a-f]{64}", body), re.search(r"[0-9a-f]{64}", body)
 
-    # The retarget names the card the operator actually acted from.
-    retarget = client.post(
-        "/outbox/alpha/approve",
-        data={"id": proposal_id, "review_sha256": reissued},
-    )
-    assert retarget.headers["HX-Retarget"].startswith("#review-card-")
+
+def test_a_referenced_delete_card_sends_the_operator_to_make_a_new_proposal(
+    tmp_path, monkeypatch
+):
+    """P1 (review): re-reading an immutable record loops forever. Its
+    recorded impact is inside the fingerprint and can never change, so
+    "review the deletion again" means creating a *new* proposal after
+    clearing the references — not checking this one again."""
+    import app.registry as registry
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    referenced = registry.ReferenceReport("product", slug, {"front-matter": 2})
+    monkeypatch.setattr(registry, "reference_count", lambda *a, **k: referenced)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "Check again" not in body, "an immutable record cannot be re-reviewed"
+    assert 'href="/registry/alpha/products"' in body, body
