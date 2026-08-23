@@ -395,6 +395,29 @@ def _validate_record(path: Path, record: object) -> Proposal | None:
         ) from exc
 
 
+def review_snapshot_for(
+    scope: Scope, leaf: Path
+) -> ReviewSnapshot[Proposal] | None:
+    """The one place a classification review snapshot is ever constructed.
+
+    Capture once, parse *those* bytes, validate the value they produced,
+    fingerprint the same bytes. `None` for a well-formed `action: delete`
+    record, which both callers skip identically.
+
+    There is exactly one of these on purpose. When the strict loader and the
+    projection each built their own snapshot, the digest an operator's button
+    carried came from the projection while every test bound against the
+    loader's — so a mutation of the operator-facing one changed nothing any
+    test could see. One construction site means production and tests cannot
+    drift apart again.
+    """
+    contents = _capture_proposal_contents(scope, leaf)
+    proposal = _validate_record(leaf, _parse_record_bytes(contents))
+    if proposal is None:
+        return None
+    return make_review_snapshot(_require_destination(scope, proposal), contents)
+
+
 def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
     """The strict loader, as review snapshots — one safe scan, one read each.
 
@@ -416,8 +439,7 @@ def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
     for discovered in sorted(outbox.glob("*.yaml")):
         leaf = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
-            contents = _capture_proposal_contents(scope, leaf)
-            proposal = _validate_record(leaf, _parse_record_bytes(contents))
+            review = review_snapshot_for(scope, leaf)
         except UnreadableProposalRecord as exc:
             # D1 (ledger): re-narrow to the strict loader's existing escaping
             # type, so every `except OutboxDestinationError` clause and every
@@ -425,11 +447,9 @@ def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
             raise OutboxDestinationError(
                 "proposal record could not be read"
             ) from exc
-        if proposal is None:
+        if review is None:
             continue
-        reviews.append(
-            make_review_snapshot(_require_destination(scope, proposal), contents)
-        )
+        reviews.append(review)
     return reviews
 
 
@@ -551,10 +571,11 @@ def project_outbox(scope: Scope) -> OutboxListing:
     for discovered in sorted(outbox.glob("*.yaml")):
         path = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
-            # S7: one capture supplies this row's value AND its fingerprint.
-            contents = _capture_proposal_contents(scope, path)
-            record = _parse_record_bytes(contents)
-            proposal = _validate_record(path, record)
+            # S7: the shared constructor — the same snapshot the strict
+            # loader gets, so the digest on this row's buttons is the one
+            # every test binds against. Phase 2 (`_require_destination`,
+            # inside it) still propagates and aborts the projection.
+            review = review_snapshot_for(scope, path)
         except UnreadableProposalRecord as exc:
             blocked = True
             rows.append(
@@ -565,18 +586,10 @@ def project_outbox(scope: Scope) -> OutboxListing:
                 )
             )
             continue
-        if proposal is None:
+        if review is None:
             # A well-formed `action: delete` record — skipped exactly as
             # `load_proposals` skips it: renders nothing, blocks nothing.
             continue
-
-        # Phase 2 — propagates. `_require_destination` is the same
-        # destination-canonicalization the strict loader applies; left
-        # uncaught here, its exception aborts this function entirely.
-        proposal = _require_destination(scope, proposal)
-        # The value and the digest are paired here, from the one capture
-        # above — never from `path` again.
-        review = make_review_snapshot(proposal, contents)
 
         try:
             diff = _render_diff(scope, review.value)

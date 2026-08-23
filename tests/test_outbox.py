@@ -2590,3 +2590,48 @@ def test_reject_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
     assert prop.path.read_bytes() == replaced[0]
     assert not _quarantined(vault)
     assert _approval_state(vault)["head"] == before["head"]
+
+
+def test_a_rollback_that_cannot_restore_the_record_reports_it_as_stranded(tmp_path):
+    """The one reachable restoration-blocked path that had no test.
+
+    Approve quarantines the proposal, a later phase fails, and during
+    rollback the record's own name has been retaken. `E-RECOVER` would say
+    "rollback was blocked by a change made at the same time" — true in tier,
+    but it does not tell the operator that their record is in quarantine and
+    that both files survive. `E-STRANDED` does.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    occupant = b"id: squatter\nvalue: took the name\n"
+
+    real_require = gt._require_unrelated_state_unchanged
+
+    def fail_after_quarantine_and_take_the_name(vault_arg, unrelated, plan):
+        # The record is already in quarantine by now; take its outbox name so
+        # the rollback's atomic no-overwrite move back cannot land.
+        if not prop.path.exists():
+            prop.path.write_bytes(occupant)
+        raise gt.GitTransactionFailure("injected failure after quarantine")
+
+    gt._require_unrelated_state_unchanged = fail_after_quarantine_and_take_the_name
+    try:
+        with pytest.raises(Exception) as raised:
+            approve(scope, prop.id, review.sha256)
+    finally:
+        gt._require_unrelated_state_unchanged = real_require
+
+    assert describe(raised.value).code == "E-STRANDED"
+    outcome = describe(raised.value)
+    assert outcome.committed == "unknown"
+    assert "Nothing was changed" not in outcome.message
+
+    # Both files survive: the occupant holds the name, the record is retained.
+    assert prop.path.read_bytes() == occupant
+    quarantined = _quarantined(vault)
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == review.contents

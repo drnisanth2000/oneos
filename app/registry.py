@@ -572,14 +572,22 @@ def execute_delete(
                 "references remained. Review the deletion again."
             )
 
-        # The live count: the fingerprint binds the proposal's bytes, not the
-        # registries, so references that appeared since the review refuse it
-        # even when the fingerprint still matches.
-        report = reference_count(scope, prop.kind, prop.slug)
-        if report.total:
-            raise RegistryError(
-                f"refusing to delete — references remain.\n{report.as_text()}"
-            )
+        # The live count runs as a transaction **precondition**, so it is
+        # evaluated under the approval lock immediately before any mutation.
+        #
+        # Counting here, before the lock, would leave a window the reviewed
+        # bytes cannot close: another approval can acquire the lock and
+        # commit a new reference in between, and this transaction's own
+        # expected states — the registry file and the proposal record —
+        # would still match, so the deletion would proceed and orphan it.
+        # Acceptance criterion 5 is about that instant, not about an earlier
+        # one.
+        def _require_no_live_references() -> None:
+            report = reference_count(scope, prop.kind, prop.slug)
+            if report.total:
+                raise RegistryError(
+                    f"refusing to delete — references remain.\n{report.as_text()}"
+                )
 
         filename = _REGISTRY_FILE.get(prop.kind)
         if filename is None:
@@ -607,6 +615,7 @@ def execute_delete(
             owned_changes=(
                 PathChange(proposal_rel, proposal_state, PathState.absent()),
             ),
+            preconditions=(_require_no_live_references,),
         )
         execute_transaction(vault, plan)
     except GitTransactionError as exc:

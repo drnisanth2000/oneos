@@ -152,6 +152,13 @@ class TransactionPlan:
     changes: tuple[PathChange, ...]
     commit_paths: tuple[str, ...]
     owned_changes: tuple[PathChange, ...] = ()
+    #: Checks that must hold **under the approval lock, immediately before
+    #: any mutation**. A precondition whose truth depends on state this
+    #: transaction does not own — a live reference count, say — cannot be
+    #: evaluated before the lock: another approval can commit between the
+    #: check and the lock, and the transaction's own expected states would
+    #: still match. Each callable raises to refuse; none may mutate.
+    preconditions: tuple[Callable[[], None], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.message, str) or not self.message or "\n" in self.message:
@@ -160,6 +167,8 @@ class TransactionPlan:
             raise ValueError("transaction requires reviewed changes")
         if not isinstance(self.commit_paths, tuple) or not self.commit_paths:
             raise ValueError("transaction requires commit paths")
+        if not isinstance(self.preconditions, tuple):
+            raise ValueError("preconditions must be a tuple")
         if not isinstance(self.owned_changes, tuple):
             raise ValueError("owned changes must be a tuple")
 
@@ -396,6 +405,10 @@ def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult
             _require_owned_paths_untracked(vault, start_head, plan.owned_changes)
             unrelated = _capture_unrelated_state(vault, plan)
             _require_expected_states(vault, plan)
+            # Under the lock, before anything is applied: the last moment at
+            # which a refusal still costs nothing.
+            for precondition in plan.preconditions:
+                precondition()
             _require_reviewed_index_matches_head(
                 vault, start_head, plan.commit_paths
             )
@@ -506,8 +519,7 @@ def _execute_locked(
         result = TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
     except Exception as exc:
         transaction_cause = exc
-        blocked_paths = set(
-            _rollback_transaction(
+        rolled_back_paths, stranded_records = _rollback_transaction(
                 vault,
                 start_head,
                 commit_oid,
@@ -519,11 +531,17 @@ def _execute_locked(
                 plan,
                 applied_changes,
                 quarantined,
-            )
         )
+        blocked_paths = set(rolled_back_paths)
         if isinstance(exc, _ReviewedIndexOwnershipConflict):
             blocked_paths.update(exc.paths)
-        if blocked_paths:
+        if stranded_records:
+            # A consumed record that could not be returned to its own name is
+            # a more specific fact than "rollback was blocked", and the only
+            # one that tells the operator both files survive and where the
+            # record is. It outranks the generic recovery outcome.
+            transaction_error = stranded_records[0]
+        elif blocked_paths:
             transaction_error = GitTransactionRecoveryError(tuple(blocked_paths))
         else:
             transaction_error = GitTransactionFailure(
@@ -571,8 +589,9 @@ def _rollback_transaction(
     plan: TransactionPlan,
     applied_changes: list[tuple[PathChange, PathState]],
     quarantined: list[tuple[PathChange, str]] = (),
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[QuarantineRestorationBlocked, ...]]:
     blocked_paths: set[str] = set()
+    stranded: list[QuarantineRestorationBlocked] = []
 
     # Amendment 1: a rolled-back approval must leave the proposal pending and
     # actionable again, with a fingerprint that still matches its unchanged
@@ -580,6 +599,16 @@ def _rollback_transaction(
     for change, quarantined_name in reversed(list(quarantined)):
         try:
             restore_quarantined_leaf(vault, change.path, quarantined_name)
+        except QuarantineRestorationBlocked as exc:
+            # Keep it: this is the one outcome that names what actually
+            # happened — the record is in quarantine, something else holds
+            # its name, and both survive. Collapsing it into the generic
+            # blocked-path set would report E-RECOVER ("rollback was blocked
+            # by a change made at the same time"), which describes a
+            # different situation and does not tell the operator where the
+            # record is.
+            stranded.append(exc)
+            blocked_paths.add(change.path)
         except (OSError, GitTransactionError):
             blocked_paths.add(change.path)
 
@@ -650,7 +679,7 @@ def _rollback_transaction(
     else:
         blocked_paths.update(_changed_unrelated_paths(unrelated, current_unrelated))
 
-    return tuple(sorted(blocked_paths))
+    return tuple(sorted(blocked_paths)), tuple(stranded)
 
 
 def _entries_by_path(

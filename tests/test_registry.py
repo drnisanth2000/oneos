@@ -1371,3 +1371,107 @@ def test_the_delete_no_mutation_matrix(tmp_path, state):
         assert prop.path.is_symlink()
     elif state == "non-regular-replacement":
         assert prop.path.is_dir()
+
+
+# --- S7: the live reference gate runs under the approval lock ---------------
+
+
+def test_a_reference_committed_before_the_lock_still_refuses_the_delete(tmp_path):
+    """The race acceptance criterion 5 exists to close.
+
+    Counting references before acquiring the approval lock leaves a window
+    another approval can commit into: this transaction's own expected states
+    — the registry file and the proposal record — are untouched by a new
+    *reference*, so they still match and the deletion proceeds, orphaning it.
+
+    The reference here appears strictly after the fingerprint comparison and
+    strictly before the lock, which is exactly that window.
+    """
+    import app.git_transaction as gt
+    import app.registry as reg
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = reg.get_delete_review(scope, prop.id)
+    products_before = (vault / "_system/products.yaml").read_bytes()
+
+    real_lock = reg.execute_transaction
+    landed = []
+
+    def reference_appears_then_execute(vault_arg, plan):
+        if not landed:
+            note = vault / "demo/11-knowledge/active/late.md"
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text(
+                "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
+            )
+            landed.append(note)
+        return real_lock(vault_arg, plan)
+
+    reg.execute_transaction = reference_appears_then_execute
+    try:
+        with pytest.raises(registry.RegistryError) as raised:
+            reg.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        reg.execute_transaction = real_lock
+
+    assert landed, "the probe never created the late reference"
+    assert "references remain" in str(raised.value)
+    # Nothing deleted, and the new reference is not orphaned.
+    assert (vault / "_system/products.yaml").read_bytes() == products_before
+    assert "widgetx:" in (vault / "_system/products.yaml").read_text()
+    assert landed[0].exists()
+    assert prop.path.exists()
+
+
+def test_the_reference_recount_holds_the_approval_lock(tmp_path):
+    """Not merely "late" — provably inside the locked window.
+
+    A refusal test alone cannot distinguish "counted under the lock" from
+    "counted a moment earlier", so assert the lock is actually held while
+    the count runs: a non-blocking `flock` from this same process on a
+    separate descriptor must fail.
+    """
+    import fcntl
+    import os as _os
+    import subprocess as _subprocess
+
+    import app.registry as reg
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = reg.get_delete_review(scope, prop.id)
+
+    git_dir = Path(
+        _subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+            cwd=vault, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    )
+    lock_path = git_dir / "oneos-approval.lock"
+
+    observed = []
+    real_count = reg.reference_count
+
+    def count_and_probe_the_lock(scope_arg, kind, slug):
+        descriptor = _os.open(lock_path, _os.O_RDWR | _os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            observed.append("lock was FREE")
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            observed.append("lock was HELD")
+        finally:
+            _os.close(descriptor)
+        return real_count(scope_arg, kind, slug)
+
+    reg.reference_count = count_and_probe_the_lock
+    try:
+        reg.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        reg.reference_count = real_count
+
+    assert observed, "the reference count never ran"
+    assert observed[-1] == "lock was HELD", observed

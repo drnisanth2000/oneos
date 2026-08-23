@@ -700,3 +700,69 @@ def test_the_projected_token_survives_a_replacement_only_as_a_mismatch(tmp_path)
     fresh = next(r for r in project_outbox(scope).rows if r.proposal is not None)
     assert fresh.review_sha256 != row.review_sha256
     assert fresh.review_sha256 == _sha256(prop.path.read_bytes())
+
+
+def test_the_projected_value_and_hash_come_from_one_capture(tmp_path):
+    """The fingerprint an operator's button actually carries.
+
+    This is the digest that reaches a browser. It had no mutation evidence:
+    every test bound against `get_proposal_review`'s snapshot, whose digest
+    no production caller reads, so hashing a second read here changed
+    nothing any test could see while handing the operator a token for bytes
+    they never reviewed.
+    """
+    import hashlib
+
+    import app.outbox as outbox
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    original = prop.path.read_bytes()
+    replaced = []
+
+    real_capture = outbox._capture_proposal_contents
+
+    def capture_then_replace(scope_arg, path):
+        contents = real_capture(scope_arg, path)
+        if path.name == prop.path.name and not replaced:
+            record = yaml.safe_load(original.decode("utf-8"))
+            record["module"] = "11-library"
+            record["sub"] = "reference"
+            record["dst"] = "demo/11-library/active/note.md"
+            raw = yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+            prop.path.write_bytes(raw)
+            replaced.append(raw)
+        return contents
+
+    outbox._capture_proposal_contents = capture_then_replace
+    try:
+        row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    finally:
+        outbox._capture_proposal_contents = real_capture
+
+    assert replaced, "the probe never replaced the record"
+    assert replaced[0] != original
+    # The rendered row and the token it carries both describe the capture.
+    assert row.review_sha256 == hashlib.sha256(original).hexdigest()
+    assert row.review_sha256 != hashlib.sha256(replaced[0]).hexdigest()
+    assert row.proposal.module == "11-knowledge"
+
+
+def test_the_projection_and_the_loader_issue_the_same_snapshot(tmp_path):
+    """Production and tests must bind against one snapshot, not two.
+
+    The projection issues the operator's token; the tests reach for
+    `get_proposal_review`. If those ever diverge again, a mutation of the
+    operator-facing one is invisible to the suite — which is exactly how the
+    gap above survived six rounds of mutation testing.
+    """
+    import app.outbox as outbox
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    review = outbox.get_proposal_review(scope, prop.id)
+
+    assert row.review_sha256 == review.sha256
+    assert row.proposal == review.value
