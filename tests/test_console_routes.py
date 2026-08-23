@@ -42,6 +42,7 @@ from tests.conftest import (
     git_count_commits,
     git_head,
     git_index_entries,
+    git_status_apart_from_quarantine,
     git_status_bytes,
     git_worktree_diff,
     scaffold_modules,
@@ -1884,7 +1885,7 @@ def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch)
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
     outbox_before = _outbox_snapshot(vault)
 
     def _fail_after_persisting(*args, **kwargs):
@@ -1912,7 +1913,7 @@ def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch)
     assert git_worktree_diff(vault) == worktree_before
     # git itself sees nothing new anywhere — the proposal file is gitignored,
     # exactly as this fixture's own `.gitignore` says.
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
 
     outbox_after = _outbox_snapshot(vault)
     assert outbox_before - outbox_after == set(), "nothing was removed"
@@ -1944,7 +1945,7 @@ def _state_proof_proposal_written_propose(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
     outbox_before = _outbox_snapshot(vault)
 
     def _fail_after_persisting(*args, **kwargs):
@@ -1965,7 +1966,7 @@ def _state_proof_proposal_written_propose(tmp_path, monkeypatch):
     assert git_index_entries(vault) == index_before
     assert git_cached_diff(vault) == cached_before
     assert git_worktree_diff(vault) == worktree_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
 
     outbox_after = _outbox_snapshot(vault)
     assert outbox_before - outbox_after == set(), "nothing was removed"
@@ -2508,7 +2509,7 @@ def _state_proof_no_none(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
     outbox_before = _outbox_snapshot(vault)
 
     real_project_outbox = main.project_outbox
@@ -2571,7 +2572,7 @@ def _state_proof_no_none(tmp_path, monkeypatch):
     assert git_index_entries(vault) == index_before
     assert git_cached_diff(vault) == cached_before
     assert git_worktree_diff(vault) == worktree_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
     assert _outbox_snapshot(vault) == outbox_before
 
 
@@ -2651,7 +2652,7 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
     index_before = _index_entries_by_path(git_index_entries(vault))
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     def _fail_cleanup(temporary_index):
         return OSError("injected post-commit temporary index cleanup failure")
@@ -2674,7 +2675,7 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
 
     assert git_worktree_diff(vault) == worktree_before
     assert git_cached_diff(vault) == cached_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
     index_after = _index_entries_by_path(git_index_entries(vault))
     index_before.pop(reviewed_path, None)
     index_after.pop(reviewed_path, None)
@@ -2707,7 +2708,7 @@ def _state_proof_unknown(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     blocked_path = "alpha/11-other/active/blocked-path-marker.md"
     real_execute_transaction = outbox_module.execute_transaction
@@ -2732,7 +2733,7 @@ def _state_proof_unknown(tmp_path, monkeypatch):
         assert git_index_entries(vault) == index_before
         assert git_cached_diff(vault) == cached_before
         assert git_worktree_diff(vault) == worktree_before
-        assert git_status_bytes(vault) == status_before
+        assert git_status_apart_from_quarantine(vault) == status_before
 
         # The owned path — the proposal's source — matches its pre-request
         # state.
@@ -2779,7 +2780,7 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
     head_before = git_head(vault)
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     concurrent_bytes = b"concurrent replacement\n"
     hook = vault / ".git/hooks/pre-commit"
@@ -2845,7 +2846,7 @@ def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     def _raise(self):
         raise DestinationRegistryError("registries unreadable")
@@ -2862,7 +2863,7 @@ def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):
     assert git_index_entries(vault) == index_before
     assert git_cached_diff(vault) == cached_before
     assert git_worktree_diff(vault) == worktree_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
 
 
 @pytest.mark.parametrize("cell", ["no-none", "no-proposal-written", "yes", "unknown"])

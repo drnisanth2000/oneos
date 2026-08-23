@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import ctypes
+import ctypes.util
 from dataclasses import dataclass
 import errno
+import platform
+import sys
 import fcntl
 import hashlib
 import os
@@ -63,17 +67,38 @@ class _ApprovalLockCleanupFailure(GitTransactionFailure):
         super().__init__("approval lock cleanup failed")
 
 
-class ConditionalRemovalCleanupError(GitTransactionFailure):
-    """The reviewed file was removed; only the cleanup afterwards failed.
+class AtomicMoveUnavailable(GitTransactionError):
+    """This kernel or filesystem has no atomic no-overwrite move.
+
+    S7 fails closed here rather than degrading to an ordinary rename, which
+    silently overwrites its destination (design §3, Amendment 1).
+    """
+
+
+class QuarantineRestorationBlocked(GitTransactionError):
+    """A consumed record could not be returned to its own name.
+
+    Both files survive — the record in quarantine and whatever took its
+    name — and neither is deleted to tidy up. The state is indeterminate and
+    must be reported as such, never as "nothing was changed".
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__("reviewed record could not be restored to its name")
+
+
+class QuarantineCleanupError(GitTransactionFailure):
+    """The record was quarantined; only the cleanup afterwards failed.
 
     Distinct from `_ApprovalLockCleanupFailure`, which reaches the operator
     as "nothing was changed and it was rolled back". After a completed
-    removal that sentence is simply false.
+    consumption that sentence is simply false.
     """
 
     def __init__(self, cleanup_error: OSError) -> None:
         self.cleanup_error = cleanup_error
-        super().__init__("reviewed file was removed but cleanup failed")
+        super().__init__("reviewed record was quarantined but cleanup failed")
 
 
 class _ReviewedIndexOwnershipConflict(GitTransactionFailure):
@@ -351,51 +376,6 @@ def _approval_lock(vault: Path) -> Iterator[None]:
                 raise _ApprovalLockCleanupFailure(cleanup_error) from cleanup_error
 
 
-def remove_path_if_unchanged(
-    vault: Path,
-    relative_path: str,
-    expected: PathState,
-) -> None:
-    """Remove one untracked regular leaf only while it matches `expected`.
-
-    Reject is not a commit: it discards a proposal that was never tracked.
-    But it is still a mutation, and S7 requires it to be conditional on the
-    exact state that was reviewed. `_apply_state` re-captures the leaf under
-    the same directory descriptor it unlinks through and refuses unless it
-    still equals `expected`, so a rewrite, type swap, redirection or
-    disappearance between the review and this call is a refusal rather than
-    permission to unlink whatever took its place.
-
-    Deliberately narrow. It creates no commit, touches no index, accepts no
-    absent expected state, and is not an arbitrary-delete utility: the only
-    thing it can do is complete a removal that was already reviewed.
-    """
-    try:
-        _validate_transaction_path(relative_path)
-    except ValueError as exc:
-        raise InvalidTransactionPath("reviewed path is unsafe") from exc
-    if expected.contents is None:
-        raise ValueError("conditional removal requires a regular expected state")
-    root = Path(os.path.abspath(os.fspath(vault)))
-    change = PathChange(relative_path, expected, PathState.absent())
-    removed = False
-
-    def _mark_removed(_state: PathState) -> None:
-        nonlocal removed
-        removed = True
-
-    try:
-        with _approval_lock(root):
-            _apply_state(root, change, on_applied=_mark_removed)
-    except _ApprovalLockCleanupFailure as exc:
-        # Mirrors `execute_transaction`'s own distinction: once the work has
-        # happened, a cleanup failure may not be reported as "nothing was
-        # changed and it was rolled back".
-        if not removed:
-            raise
-        raise ConditionalRemovalCleanupError(exc.cleanup_error) from exc.cleanup_error
-
-
 def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult:
     """Commit exactly the reviewed paths while preserving unrelated Git state."""
     vault = Path(vault).resolve()
@@ -435,6 +415,7 @@ def _execute_locked(
     plan: TransactionPlan,
 ) -> TransactionResult:
     applied_changes: list[tuple[PathChange, PathState]] = []
+    quarantined: list[tuple[PathChange, str]] = []
     temporary_index: str | None = None
     commit_oid: str | None = None
     commit_created = False
@@ -444,13 +425,23 @@ def _execute_locked(
     transaction_error: GitTransactionError | None = None
     transaction_cause: Exception | None = None
     try:
-        for change in plan.changes + plan.owned_changes:
+        for change in plan.changes:
             _apply_state(
                 vault,
                 change,
                 on_applied=lambda state, change=change: applied_changes.append(
                     (change, state)
                 ),
+            )
+        # Amendment 1: owned changes are proposal records, and a proposal
+        # record is consumed by moving it into quarantine — never unlinked.
+        # A rollback moves it back under its own name.
+        for change in plan.owned_changes:
+            quarantined.append(
+                (
+                    change,
+                    quarantine_path_if_unchanged(vault, change.path, change.before),
+                )
             )
         _checkpoint("filesystem-applied")
 
@@ -518,6 +509,7 @@ def _execute_locked(
                 unrelated,
                 plan,
                 applied_changes,
+                quarantined,
             )
         )
         if isinstance(exc, _ReviewedIndexOwnershipConflict):
@@ -569,8 +561,18 @@ def _rollback_transaction(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
     applied_changes: list[tuple[PathChange, PathState]],
+    quarantined: list[tuple[PathChange, str]] = (),
 ) -> tuple[str, ...]:
     blocked_paths: set[str] = set()
+
+    # Amendment 1: a rolled-back approval must leave the proposal pending and
+    # actionable again, with a fingerprint that still matches its unchanged
+    # bytes — so the record is moved back, not rewritten from a copy.
+    for change, quarantined_name in reversed(list(quarantined)):
+        try:
+            restore_quarantined_leaf(vault, change.path, quarantined_name)
+        except (OSError, GitTransactionError):
+            blocked_paths.add(change.path)
 
     for change, state_written in reversed(applied_changes):
         try:
@@ -950,6 +952,10 @@ def _capture_unrelated_state(vault: Path, plan: TransactionPlan) -> _UnrelatedSt
     unrelated_entries = tuple(
         entry for entry in all_entries if entry.path not in reviewed
     )
+    # Amendment 1: an owned proposal is consumed by moving it into
+    # quarantine, so its destination is part of the transaction's own effect,
+    # not unrelated state that changed underneath it.
+    owned |= {quarantine_destination(path) for path in owned}
     dirty_paths = _capture_dirty_paths(vault, reviewed | owned)
     return _UnrelatedState(unrelated_entries, dirty_paths)
 
@@ -1108,80 +1114,274 @@ def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
             os.close(descriptor)
 
 
-def _discard_private_name(directory_descriptor: int, claim: str) -> None:
-    """Drop an unused reservation — but never anything holding bytes.
-
-    Only ever called when the rename never happened, so the reservation is
-    still this call's own empty sentinel. It is checked anyway: this
-    function must not be capable of deleting content, whatever a future
-    caller does with it.
-    """
-    try:
-        reserved = os.lstat(claim, dir_fd=directory_descriptor)
-    except OSError:
-        return
-    if not stat.S_ISREG(reserved.st_mode) or reserved.st_size != 0:
-        return
-    try:
-        os.unlink(claim, dir_fd=directory_descriptor)
-    except OSError:
-        return
+#: The single kernel operation Amendment 1 rests on: move a leaf and fail if
+#: the destination exists. Reserving a name and renaming onto it later is two
+#: operations and does not compose into one guarantee — another writer can
+#: take the reservation in between, and an ordinary rename destroys what took
+#: it. `ctypes` is stdlib, so this adds no dependency.
+_RENAME_EXCL = 0x4          # macOS renameatx_np
+_RENAME_NOREPLACE = 0x1     # Linux renameat2
+_SYS_RENAMEAT2 = {"x86_64": 316, "aarch64": 276, "arm64": 276, "i686": 353, "armv7l": 382}
 
 
-def _restore_claimed_leaf(
-    directory_descriptor: int, claim: str, leaf: str, path: str
+def _atomic_mover():
+    """Resolve the platform's atomic no-overwrite move, or `None`."""
+    library = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    if sys.platform == "darwin":
+        entry = getattr(library, "renameatx_np", None)
+        if entry is None:
+            return None
+        entry.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint
+        ]
+        entry.restype = ctypes.c_int
+        return lambda ffd, f, tfd, t: entry(ffd, f, tfd, t, _RENAME_EXCL)
+    if sys.platform.startswith("linux"):
+        entry = getattr(library, "renameat2", None)
+        if entry is not None:
+            entry.argtypes = [
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            entry.restype = ctypes.c_int
+            return lambda ffd, f, tfd, t: entry(ffd, f, tfd, t, _RENAME_NOREPLACE)
+        number = _SYS_RENAMEAT2.get(platform.machine())
+        if number is None:
+            return None
+        library.syscall.restype = ctypes.c_long
+        return lambda ffd, f, tfd, t: library.syscall(
+            ctypes.c_long(number),
+            ctypes.c_int(ffd), ctypes.c_char_p(f),
+            ctypes.c_int(tfd), ctypes.c_char_p(t),
+            ctypes.c_uint(_RENAME_NOREPLACE),
+        )
+    return None
+
+
+_MOVE_NO_REPLACE = _atomic_mover()
+
+#: Errnos that mean "this kernel or filesystem cannot do it", as opposed to
+#: "it refused for a reason about these files".
+_UNSUPPORTED_ERRNOS = {
+    errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM,
+}
+
+
+def _move_no_replace(
+    from_descriptor: int, from_name: str, to_descriptor: int, to_name: str
 ) -> None:
-    """Put a claimed file back under its own name, or refuse to guess.
+    """Atomically move a leaf, raising `FileExistsError` if the destination exists.
 
-    Renaming back would silently overwrite anything that took the name in
-    the meantime, so the name must still be free. When it is not, the file
-    stays under its private name and the caller learns the state is
-    indeterminate — never a comfortable lie about it.
+    Never falls back to an ordinary rename: overwriting is the exact harm
+    this exists to prevent.
+    """
+    if _MOVE_NO_REPLACE is None:
+        raise AtomicMoveUnavailable(
+            "this platform has no atomic no-overwrite move"
+        )
+    ctypes.set_errno(0)
+    outcome = _MOVE_NO_REPLACE(
+        from_descriptor, os.fsencode(from_name), to_descriptor, os.fsencode(to_name)
+    )
+    if outcome == 0:
+        return
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        raise FileExistsError(code, os.strerror(code), to_name)
+    if code in _UNSUPPORTED_ERRNOS:
+        raise AtomicMoveUnavailable(
+            "this filesystem has no atomic no-overwrite move"
+        )
+    raise OSError(code, os.strerror(code), from_name)
+
+
+#: Amendment 1: a proposal record is consumed by moving it here, never by
+#: unlinking it. Outside the outbox's `*.yaml` glob, so quarantined records
+#: never appear in a listing and no reviewed action can reach them.
+QUARANTINE_DIRECTORY = ".consumed"
+
+
+def quarantine_destination(relative_path: str) -> str:
+    """Where a consumed record lands: `<parent>/.consumed/<name>`."""
+    leaf = PurePosixPath(relative_path)
+    return (leaf.parent / QUARANTINE_DIRECTORY / leaf.name).as_posix()
+
+
+def _open_quarantine(parent_descriptor: int) -> int:
+    """Open the quarantine directory relative to an already-checked parent.
+
+    Opened through `_open_checked_directory` and relative to the parent's
+    descriptor, so neither the parent nor the quarantine can be swapped
+    between validation and use.
     """
     try:
-        os.lstat(leaf, dir_fd=directory_descriptor)
-    except FileNotFoundError:
-        try:
-            os.rename(
-                claim,
-                leaf,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-            )
-        except OSError as exc:
-            raise GitTransactionRecoveryError((path,)) from exc
-        return
+        os.mkdir(QUARANTINE_DIRECTORY, 0o700, dir_fd=parent_descriptor)
+    except FileExistsError:
+        pass
     except OSError as exc:
-        raise GitTransactionRecoveryError((path,)) from exc
-    raise GitTransactionRecoveryError((path,))
+        raise ReviewedPathUnavailable("quarantine is unavailable") from exc
+    return _open_checked_directory(
+        QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+    )
 
 
-def _reserve_private_name(directory_descriptor: int) -> str:
-    """Reserve a name in this directory that nothing else occupies.
+def _quarantine_reviewed_leaf(
+    parent_descriptor: int,
+    leaf: str,
+    expected: PathState,
+    quarantine_descriptor: int,
+    path: str,
+) -> str:
+    """Move one reviewed leaf into quarantine, or leave everything as found.
 
-    Created with ``O_EXCL``, so reservation *fails* rather than silently
-    taking over a name already in use. The later rename can then only ever
-    overwrite this call's own empty sentinel — never an unrelated file that
-    happened to be sitting at the name.
+    The move is atomic and cannot overwrite. Verification happens through an
+    `O_NOFOLLOW` descriptor on the moved file — a descriptor is bound to one
+    inode for its lifetime, so nothing can be substituted underneath it. A
+    mismatch is moved back the same way. No step unlinks anything, so losing
+    a race costs a refusal rather than a file.
     """
-    for _ in range(100):
-        candidate = f".oneos-remove-{secrets.token_hex(12)}"
+    try:
+        _move_no_replace(parent_descriptor, leaf, quarantine_descriptor, leaf)
+    except FileNotFoundError as exc:
+        raise ReviewedStateChanged(
+            f"reviewed path changed before mutation: {path}"
+        ) from exc
+    except FileExistsError as exc:
+        # A record under this id is already quarantined: this one was
+        # consumed already, so the state is not what was reviewed.
+        raise ReviewedStateChanged(
+            f"reviewed path changed before mutation: {path}"
+        ) from exc
+
+    def _restore() -> None:
         try:
-            sentinel = os.open(
-                candidate,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=directory_descriptor,
+            _move_no_replace(quarantine_descriptor, leaf, parent_descriptor, leaf)
+        except (FileExistsError, OSError) as exc:
+            raise QuarantineRestorationBlocked(path) from exc
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(leaf, flags, dir_fd=quarantine_descriptor)
+    except OSError as exc:
+        _restore()
+        raise _unsafe_open_failure(
+            exc, "reviewed path could not be opened safely"
+        ) from exc
+    try:
+        try:
+            held = _held_state(descriptor)
+        except BaseException:
+            _restore()
+            raise
+        if held != expected:
+            _restore()
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
             )
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise GitTransactionFailure(
-                "could not reserve a private removal name"
-            ) from exc
-        os.close(sentinel)
-        return candidate
-    raise GitTransactionFailure("could not reserve a private removal name")
+    finally:
+        os.close(descriptor)
+    return leaf
+
+
+def _walk_to_parent(vault: Path, relative_path: str) -> tuple[int, str]:
+    """Open the leaf's parent through checked, no-follow descriptors."""
+    root = Path(os.path.abspath(os.fspath(vault)))
+    parts = PurePosixPath(relative_path).parts
+    descriptor = _open_checked_directory(root, "vault root")
+    try:
+        for part in parts[:-1]:
+            nxt = _open_checked_directory(part, "reviewed parent", dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = nxt
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, parts[-1]
+
+
+def quarantine_path_if_unchanged(
+    vault: Path, relative_path: str, expected: PathState
+) -> str:
+    """Consume one reviewed regular leaf by moving it into quarantine."""
+    try:
+        _validate_transaction_path(relative_path)
+    except ValueError as exc:
+        raise InvalidTransactionPath("reviewed path is unsafe") from exc
+    if expected.contents is None:
+        raise ValueError("quarantine requires a regular expected state")
+
+    parent_descriptor, leaf = _walk_to_parent(vault, relative_path)
+    try:
+        created = QUARANTINE_DIRECTORY not in os.listdir(parent_descriptor)
+        quarantine_descriptor = _open_quarantine(parent_descriptor)
+        try:
+            return _quarantine_reviewed_leaf(
+                parent_descriptor, leaf, expected,
+                quarantine_descriptor, relative_path,
+            )
+        except BaseException:
+            # "A refusal that completes restoration leaves the outbox exactly
+            # as it found it" — including not leaving an empty directory
+            # behind that was not there before.
+            if created:
+                try:
+                    os.rmdir(QUARANTINE_DIRECTORY, dir_fd=parent_descriptor)
+                except OSError:
+                    pass
+            raise
+        finally:
+            os.close(quarantine_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def consume_reviewed_proposal(
+    vault: Path, relative_path: str, expected: PathState
+) -> str:
+    """Quarantine one reviewed record under the per-vault approval lock.
+
+    The lock is taken here rather than inside `quarantine_path_if_unchanged`
+    because the transaction already holds it when it consumes owned changes.
+    A standalone consumer — reject — must not race an approval that owns the
+    same record, so it takes the lock itself.
+    """
+    root = Path(os.path.abspath(os.fspath(vault)))
+    quarantined: str | None = None
+    try:
+        with _approval_lock(root):
+            quarantined = quarantine_path_if_unchanged(root, relative_path, expected)
+    except _ApprovalLockCleanupFailure as exc:
+        # Mirrors `execute_transaction`: once the work has happened, a cleanup
+        # failure may not be reported as "nothing was changed".
+        if quarantined is None:
+            raise
+        raise QuarantineCleanupError(exc.cleanup_error) from exc.cleanup_error
+    return quarantined
+
+
+def restore_quarantined_leaf(
+    vault: Path, relative_path: str, quarantined_name: str
+) -> None:
+    """Move a quarantined record back under its own name (rollback)."""
+    try:
+        _validate_transaction_path(relative_path)
+    except ValueError as exc:
+        raise InvalidTransactionPath("reviewed path is unsafe") from exc
+    parent_descriptor, leaf = _walk_to_parent(vault, relative_path)
+    try:
+        quarantine_descriptor = _open_checked_directory(
+            QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+        )
+        try:
+            _move_no_replace(
+                quarantine_descriptor, quarantined_name, parent_descriptor, leaf
+            )
+        except (FileExistsError, OSError) as exc:
+            raise QuarantineRestorationBlocked(relative_path) from exc
+        finally:
+            os.close(quarantine_descriptor)
+    finally:
+        os.close(parent_descriptor)
 
 
 def _read_open_file(descriptor: int) -> bytes:
@@ -1207,107 +1407,6 @@ def _held_state(descriptor: int) -> PathState:
     return PathState.regular(_read_open_file(descriptor), stat.S_IMODE(opened.st_mode))
 
 
-def _remove_reviewed_leaf(
-    directory_descriptor: int, leaf: str, expected: PathState, path: str
-) -> None:
-    """Remove the reviewed file, never whatever answers to a name.
-
-    POSIX offers no way to unlink an inode: ``unlink`` resolves a name at
-    the instant it runs, so "compare a name, then destroy that name" always
-    leaves a gap in which the name can be rebound. This is checking a
-    parcel's label and then looking away before destroying it.
-
-    What this does instead:
-
-    1. reserve a private name with ``O_EXCL`` — no unrelated file can be
-       displaced, because the reservation fails if the name is taken;
-    2. rename the leaf onto that reservation, which takes the file out of
-       reach of anything targeting the proposal's own filename, and frees
-       the original name so a replacement created there is never touched;
-    3. verify through an ``O_NOFOLLOW`` **descriptor** — identity and
-       contents both come from a handle bound to one inode, not from a
-       fresh lookup; and
-    4. re-verify identity *and* contents through that same descriptor
-       immediately before the unlink, so an in-place rewrite or a name
-       rebinding is a refusal rather than a silent deletion.
-
-    A refusal always puts the file back under its own name. The residual —
-    a rebinding between step 4 and the unlink itself — cannot be closed in
-    POSIX; it is bounded by the approval lock and by a name that exists
-    only inside this call.
-    """
-    claim = _reserve_private_name(directory_descriptor)
-    try:
-        os.rename(
-            leaf,
-            claim,
-            src_dir_fd=directory_descriptor,
-            dst_dir_fd=directory_descriptor,
-        )
-    except FileNotFoundError as exc:
-        _discard_private_name(directory_descriptor, claim)
-        raise ReviewedStateChanged(
-            f"reviewed path changed before mutation: {path}"
-        ) from exc
-    except OSError as exc:
-        _discard_private_name(directory_descriptor, claim)
-        raise GitTransactionFailure("could not claim the reviewed file") from exc
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(claim, flags, dir_fd=directory_descriptor)
-    except OSError as exc:
-        _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-        raise _unsafe_open_failure(
-            exc, "reviewed path could not be opened safely"
-        ) from exc
-
-    try:
-        try:
-            held = _held_state(descriptor)
-            identity = os.fstat(descriptor)
-        except BaseException:
-            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-            raise
-        if held != expected:
-            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-            raise ReviewedStateChanged(
-                f"reviewed path changed before mutation: {path}"
-            )
-
-        # The last gate, immediately before the only destructive call.
-        try:
-            current = os.lstat(claim, dir_fd=directory_descriptor)
-            rebound = (current.st_dev, current.st_ino) != (
-                identity.st_dev,
-                identity.st_ino,
-            )
-            rewritten = _held_state(descriptor) != expected
-        except BaseException:
-            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-            raise
-        if rebound or rewritten:
-            if not rebound:
-                # Still our inode, rewritten in place: put it back under its
-                # own name so the operator can see what it became.
-                _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-            # If the name was rebound, whatever now holds it is a file this
-            # call never verified, so it is left exactly as found. An oddly
-            # named leftover is a far smaller harm than deleting bytes
-            # nobody reviewed, and the refusal tells the operator to look.
-            raise ReviewedStateChanged(
-                f"reviewed path changed before mutation: {path}"
-            )
-
-        try:
-            os.unlink(claim, dir_fd=directory_descriptor)
-        except OSError as exc:
-            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-            raise GitTransactionFailure("could not remove reviewed file") from exc
-    finally:
-        os.close(descriptor)
-
-
 def _apply_state(
     vault: Path,
     change: PathChange,
@@ -1331,9 +1430,17 @@ def _apply_state(
             )
         if change.after.contents is None:
             if change.before.contents is not None:
-                _remove_reviewed_leaf(
-                    directory_descriptor, leaf, change.before, change.path
-                )
+                # Not a proposal record: this branch serves approve's
+                # source-to-destination move, whose removal is the intended,
+                # committed, Git-revertible effect (Amendment 1 scopes the
+                # no-deletion rule to proposal records). The state was
+                # compared immediately above, under this same descriptor.
+                try:
+                    os.unlink(leaf, dir_fd=directory_descriptor)
+                except OSError as exc:
+                    raise GitTransactionFailure(
+                        "could not remove reviewed file"
+                    ) from exc
                 if on_applied is not None:
                     on_applied(change.after)
                     _checkpoint("filesystem-path-applied")

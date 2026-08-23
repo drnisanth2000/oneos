@@ -132,8 +132,14 @@ def _temporary_directory_state(directory: Path) -> tuple[tuple[str, bytes], ...]
 def _complete_state(
     vault: Path, plan: TransactionPlan, index_directory: Path
 ) -> dict[str, object]:
+    from app.git_transaction import quarantine_destination
+
     owned_paths = tuple(change.path for change in plan.changes + plan.owned_changes)
-    excluded = set(owned_paths)
+    # Amendment 1: an owned proposal is consumed into quarantine, so its
+    # destination is the transaction's own effect, not unrelated state.
+    excluded = set(owned_paths) | {
+        quarantine_destination(change.path) for change in plan.owned_changes
+    }
     return {
         "head": git_head(vault),
         "owned": tuple(
@@ -517,7 +523,14 @@ def test_unrelated_staged_unstaged_and_untracked_state_is_preserved_exactly(tmp_
     git_bytes(vault, "add", "staged.md")
     unrelated_unstaged.write_bytes(unstaged_bytes)
     unrelated_untracked.write_bytes(untracked_bytes)
+    # Amendment 1: an owned proposal is consumed by moving it into
+    # quarantine, so its destination is the transaction's own effect and not
+    # unrelated state that changed underneath it.
+    from app.git_transaction import quarantine_destination
+
     status_exclusions = set(plan.commit_paths) | {
+        quarantine_destination(change.path) for change in plan.owned_changes
+    } | {
         change.path for change in plan.owned_changes
     }
     status_before = _unrelated_status(vault, status_exclusions)
@@ -1514,7 +1527,13 @@ def test_sha256_post_commit_failure_restores_exact_starting_state(
     assert _complete_state(vault, plan, index_directory) == before
 
 
-# --- S7 Task 3: conditional removal for reject -------------------------------
+# --- S7 Task 3c: quarantine safety, replacing the retired removal tests ----
+#
+# The `remove_path_if_unchanged` suite that stood here was deleted with the
+# primitive it exercised: Amendment 1 forbids deleting a proposal record, so
+# a conditional *removal* has nothing left to test. Its still-relevant
+# conditions — unsafe paths, an absent expected state, and unrelated Git
+# state — are carried over to the quarantine primitive below.
 
 
 def _conditional_vault(tmp_path):
@@ -1526,108 +1545,36 @@ def _conditional_vault(tmp_path):
     return vault, leaf
 
 
-def test_conditional_removal_removes_only_the_expected_state(tmp_path):
-    from app.git_transaction import capture_path_state, remove_path_if_unchanged
-    from tests.conftest import git_count_commits, git_head
-
-    vault, leaf = _conditional_vault(tmp_path)
-    head_before, commits_before = git_head(vault), git_count_commits(vault)
-
-    expected = capture_path_state(vault, "outbox-record.yaml")
-    remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-
-    assert not leaf.exists()
-    # A removal, not a commit: reject never enters Git history.
-    assert git_head(vault) == head_before
-    assert git_count_commits(vault) == commits_before
-
-
-def test_conditional_removal_refuses_a_rewritten_leaf(tmp_path):
-    from app.git_transaction import (
-        ReviewedStateChanged,
-        capture_path_state,
-        remove_path_if_unchanged,
-    )
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-    leaf.write_bytes(b"id: probe\nvalue: second\n")
-
-    with pytest.raises(ReviewedStateChanged):
-        remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-
-    assert leaf.read_bytes() == b"id: probe\nvalue: second\n"
-
-
-def test_conditional_removal_refuses_a_leaf_swapped_for_a_symlink(tmp_path):
-    from app.git_transaction import (
-        ReviewedStateConflict,
-        capture_path_state,
-        remove_path_if_unchanged,
-    )
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-    outside = tmp_path / "outside.yaml"
-    outside.write_bytes(expected.contents)
-    leaf.unlink()
-    leaf.symlink_to(outside)
-
-    with pytest.raises(ReviewedStateConflict):
-        remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-
-    # The redirection target is never followed and never unlinked.
-    assert outside.exists()
-    assert leaf.is_symlink()
-
-
-def test_conditional_removal_refuses_a_vanished_leaf(tmp_path):
-    from app.git_transaction import (
-        ReviewedStateChanged,
-        capture_path_state,
-        remove_path_if_unchanged,
-    )
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-    leaf.unlink()
-
-    with pytest.raises(ReviewedStateChanged):
-        remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-
-
-def test_conditional_removal_refuses_an_absent_expected_state(tmp_path):
-    from app.git_transaction import PathState, remove_path_if_unchanged
+def test_quarantine_refuses_an_absent_expected_state(tmp_path):
+    from app.git_transaction import PathState, quarantine_path_if_unchanged
 
     vault, _leaf = _conditional_vault(tmp_path)
-
-    # Not an arbitrary-delete utility: without reviewed bytes there is
-    # nothing to have reviewed.
     with pytest.raises(ValueError):
-        remove_path_if_unchanged(vault, "outbox-record.yaml", PathState.absent())
+        quarantine_path_if_unchanged(
+            vault, "outbox-record.yaml", PathState.absent()
+        )
 
 
 @pytest.mark.parametrize(
     "unsafe", ["/absolute.yaml", "../escape.yaml", ".git/config", "", "a//b.yaml"]
 )
-def test_conditional_removal_refuses_an_unsafe_path(tmp_path, unsafe):
+def test_quarantine_refuses_an_unsafe_path(tmp_path, unsafe):
     from app.git_transaction import (
         InvalidTransactionPath,
         PathState,
-        remove_path_if_unchanged,
+        quarantine_path_if_unchanged,
     )
 
     vault, _leaf = _conditional_vault(tmp_path)
-
     with pytest.raises(InvalidTransactionPath):
-        remove_path_if_unchanged(
+        quarantine_path_if_unchanged(
             vault, unsafe, PathState.regular(b"probe", 0o644)
         )
 
 
-def test_conditional_removal_leaves_unrelated_git_state_untouched(tmp_path):
-    from app.git_transaction import capture_path_state, remove_path_if_unchanged
-    from tests.conftest import git_cached_diff, git_status_bytes, git_worktree_diff
+def test_quarantine_leaves_unrelated_git_state_untouched(tmp_path):
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+    from tests.conftest import git_cached_diff, git_worktree_diff
 
     vault, leaf = _conditional_vault(tmp_path)
     (vault / "tracked.md").write_text("locally edited\n", encoding="utf-8")
@@ -1635,331 +1582,361 @@ def test_conditional_removal_leaves_unrelated_git_state_untouched(tmp_path):
     cached_before = git_cached_diff(vault)
 
     expected = capture_path_state(vault, "outbox-record.yaml")
-    remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
 
     assert not leaf.exists()
     assert git_worktree_diff(vault) == worktree_before
     assert git_cached_diff(vault) == cached_before
-    assert b"outbox-record.yaml" not in git_status_bytes(vault)
 
 
-# --- S7 Task 3 review: the compare-to-unlink gap -----------------------------
+def test_quarantine_makes_no_commit(tmp_path):
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+    from tests.conftest import git_count_commits, git_head
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    head_before, commits_before = git_head(vault), git_count_commits(vault)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert git_head(vault) == head_before
+    assert git_count_commits(vault) == commits_before
 
 
-def test_conditional_removal_never_destroys_a_replacement_swapped_after_comparison(
-    tmp_path,
-):
-    """P1 (review): comparing a name and then unlinking that name are two
-    operations, and `os.unlink` destroys whatever holds the name when it
-    runs — not what was compared.
+# --- S7 Task 3c: consumption by quarantine, never by deletion ---------------
 
-    Checking the parcel's label and then looking away before destroying it
-    lets someone swap the parcel in the gap. The removal must act on the
-    reviewed file itself, never on whatever currently answers to its name.
-    """
-    import app.git_transaction as gt
+
+def test_atomic_move_refuses_an_occupied_destination(tmp_path):
+    """The one primitive everything rests on: a single kernel operation that
+    moves and fails if the destination exists. An ordinary rename would
+    silently overwrite."""
+    from app.git_transaction import _move_no_replace
+
+    (tmp_path / "src").write_bytes(b"SRC\n")
+    (tmp_path / "occupied").write_bytes(b"MUST SURVIVE\n")
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+    try:
+        with pytest.raises(FileExistsError):
+            _move_no_replace(descriptor, "src", descriptor, "occupied")
+        assert (tmp_path / "occupied").read_bytes() == b"MUST SURVIVE\n"
+        assert (tmp_path / "src").read_bytes() == b"SRC\n"
+
+        _move_no_replace(descriptor, "src", descriptor, "free")
+        assert (tmp_path / "free").read_bytes() == b"SRC\n"
+        assert not (tmp_path / "src").exists()
+    finally:
+        os.close(descriptor)
+
+
+def test_no_reviewed_action_can_unlink_a_proposal_record():
+    """The structural guarantee of Amendment 1, checked by AST: proposal
+    consumption never reaches an unlink."""
+    import ast
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(__file__).resolve().parents[1]
+    source = (root / "app" / "git_transaction.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    consuming = {
+        "quarantine_path_if_unchanged",
+        "_quarantine_reviewed_leaf",
+        "restore_quarantined_leaf",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in consuming:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    name = getattr(inner.func, "attr", getattr(inner.func, "id", ""))
+                    assert name != "unlink", (
+                        f"{node.name} reaches unlink — Amendment 1 forbids it"
+                    )
+    # And the destructive primitive it replaces is gone entirely.
+    assert "def remove_path_if_unchanged" not in source
+
+
+def test_quarantine_moves_the_reviewed_record_and_keeps_its_bytes(tmp_path):
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    name = quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert not leaf.exists()
+    quarantined = vault / ".consumed" / name
+    assert quarantined.read_bytes() == reviewed
+
+
+def test_quarantine_refuses_a_changed_record_and_restores_it(tmp_path):
     from app.git_transaction import (
-        ReviewedStateConflict,
+        ReviewedStateChanged,
         capture_path_state,
-        remove_path_if_unchanged,
+        quarantine_path_if_unchanged,
     )
 
     vault, leaf = _conditional_vault(tmp_path)
-    reviewed = b"id: probe\nvalue: first\n"
-    assert leaf.read_bytes() == reviewed
     expected = capture_path_state(vault, "outbox-record.yaml")
+    replacement = b"id: probe\nvalue: REPLACEMENT\n"
+    leaf.write_bytes(replacement)
 
-    replacement = b"id: probe\nvalue: REPLACEMENT-NOBODY-REVIEWED\n"
-    real_capture = gt._capture_leaf_state
-    swapped = []
+    with pytest.raises(ReviewedStateChanged):
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
 
-    def capture_then_swap(dir_fd, name):
-        state = real_capture(dir_fd, name)
-        if not swapped and name == "outbox-record.yaml":
-            swapped.append(True)
-            leaf.write_bytes(replacement)
-        return state
-
-    gt._capture_leaf_state = capture_then_swap
-    try:
-        with pytest.raises(ReviewedStateConflict):
-            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt._capture_leaf_state = real_capture
-
-    assert swapped, "the probe never swapped the file"
-    assert leaf.exists(), "the unreviewed replacement was destroyed"
     assert leaf.read_bytes() == replacement
-
-
-def test_conditional_removal_leaves_no_orphan_after_refusing_a_replacement(tmp_path):
-    """Whatever mechanism refuses the swap must not strand the file under
-    some other name: the outbox is globbed, and an orphan there is a record
-    nobody can see, review or clear."""
-    import app.git_transaction as gt
-    from app.git_transaction import (
-        ReviewedStateConflict,
-        capture_path_state,
-        remove_path_if_unchanged,
+    assert not (vault / ".consumed").exists() or not any(
+        (vault / ".consumed").iterdir()
     )
 
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-    before = {p.name for p in vault.iterdir()}
 
-    real_capture = gt._capture_leaf_state
-    swapped = []
+def _after_forward_move(gt, vault, action):
+    """Wrap the atomic move so `action` runs once, right after the forward
+    move into quarantine and before the file is verified — the only seam
+    where a swap can still change what gets consumed."""
+    real = gt._move_no_replace
+    fired = []
 
-    def capture_then_swap(dir_fd, name):
-        state = real_capture(dir_fd, name)
-        if not swapped and name == "outbox-record.yaml":
-            swapped.append(True)
-            leaf.write_bytes(b"id: probe\nvalue: replacement\n")
-        return state
+    def wrapper(from_fd, from_name, to_fd, to_name):
+        real(from_fd, from_name, to_fd, to_name)
+        if not fired:
+            fired.append(True)
+            action()
 
-    gt._capture_leaf_state = capture_then_swap
-    try:
-        with pytest.raises(ReviewedStateConflict):
-            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt._capture_leaf_state = real_capture
-
-    assert {p.name for p in vault.iterdir()} == before
+    return real, wrapper, fired
 
 
-def test_conditional_removal_reports_a_completed_removal_when_cleanup_fails(tmp_path):
-    """P1 (review): the removal succeeded, so the operator must not be told
-    that nothing was changed. `execute_transaction` already makes this
-    distinction for a commit; a completed reject deserves the same honesty."""
-    import app.git_transaction as gt
-    from app.console_errors import describe
-    from app.git_transaction import capture_path_state, remove_path_if_unchanged
+def test_quarantine_refuses_a_swap_landing_before_verification(tmp_path):
+    """The seam that mattered in Task 3, now non-destructive.
 
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-
-    real_flock = gt.fcntl.flock
-
-    def failing_unlock(descriptor, operation):
-        if operation == gt.fcntl.LOCK_UN:
-            raise OSError(5, "simulated unlock failure")
-        return real_flock(descriptor, operation)
-
-    gt.fcntl.flock = failing_unlock
-    try:
-        with pytest.raises(gt.GitTransactionError) as raised:
-            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt.fcntl.flock = real_flock
-
-    assert not leaf.exists(), "the removal did happen"
-    outcome = describe(raised.value)
-    # It must not claim nothing changed, must not invite a retry of an
-    # action that already took effect, and must not shrug: this is a known,
-    # handled condition, so "an unexpected error was not handled" would be
-    # its own kind of untruth.
-    assert "Nothing was changed" not in outcome.message
-    assert "rolled back" not in outcome.message
-    assert outcome.retry == "stop"
-    assert outcome.committed != "no"
-    assert outcome.code != "E-UNKNOWN"
-    assert "unexpected" not in outcome.message.lower()
-    # The operator is told plainly that the discard did happen.
-    assert "discarded" in outcome.message.lower()
-
-
-def test_conditional_removal_cleanup_failure_before_removal_still_reports_no_change(
-    tmp_path,
-):
-    """The mirror case: if the removal never happened, the operator must
-    still be told nothing changed."""
-    import app.git_transaction as gt
-    from app.console_errors import describe
-    from app.git_transaction import PathState, capture_path_state, remove_path_if_unchanged
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-    leaf.write_bytes(b"id: probe\nvalue: changed before the call\n")
-    survived = leaf.read_bytes()
-
-    real_flock = gt.fcntl.flock
-
-    def failing_unlock(descriptor, operation):
-        if operation == gt.fcntl.LOCK_UN:
-            raise OSError(5, "simulated unlock failure")
-        return real_flock(descriptor, operation)
-
-    gt.fcntl.flock = failing_unlock
-    try:
-        with pytest.raises(gt.GitTransactionError) as raised:
-            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt.fcntl.flock = real_flock
-
-    assert leaf.read_bytes() == survived
-    assert describe(raised.value).committed == "no"
-
-
-# --- S7 Task 3 review, round 2: the claim name is not a hiding place --------
-
-
-def test_conditional_removal_never_displaces_a_file_already_at_the_claim_name(
-    tmp_path,
-):
-    """P1 (review): reserving the private name must fail rather than take
-    over a name in use. `os.rename` overwrites its destination silently, so
-    a claim name that collides destroys whatever was there — unrelated
-    state the removal was never reviewed against."""
-    import app.git_transaction as gt
-    from app.git_transaction import capture_path_state, remove_path_if_unchanged
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-
-    # Force every reservation attempt onto one predictable name, and put an
-    # unrelated file there first.
-    real_token_hex = gt.secrets.token_hex
-    gt.secrets.token_hex = lambda size: "cafe" * 6
-    victim = vault / (".oneos-remove-" + "cafe" * 6)
-    victim.write_bytes(b"UNRELATED PRE-EXISTING STATE\n")
-
-    try:
-        with pytest.raises(gt.GitTransactionError):
-            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt.secrets.token_hex = real_token_hex
-
-    assert victim.exists(), "an unrelated file at the claim name was destroyed"
-    assert victim.read_bytes() == b"UNRELATED PRE-EXISTING STATE\n"
-    # The reviewed record is left where it was, not stranded.
-    assert leaf.exists()
-    assert leaf.read_bytes() == expected.contents
-
-
-def test_conditional_removal_refuses_a_rewrite_landing_on_the_claimed_file(tmp_path):
-    """P1 (review): moving the file to a private name must not merely move
-    the compare-then-destroy race along with it.
-
-    The verification and the final gate both read through the descriptor
-    holding the claimed file, so a rewrite that lands after the first check
-    is still seen — the removal refuses instead of destroying bytes nobody
-    reviewed.
+    A rewrite that lands after the record reaches quarantine but before it
+    is verified must refuse — and, unlike the deletion design, refusing
+    costs nothing: the record goes back under its own name and no bytes are
+    lost on any path.
     """
     import app.git_transaction as gt
     from app.git_transaction import (
         ReviewedStateConflict,
         capture_path_state,
-        remove_path_if_unchanged,
+        quarantine_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    def rewrite_the_quarantined_file():
+        next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(
+            b"REWRITTEN-IN-QUARANTINE\n"
+        )
+
+    real, wrapper, fired = _after_forward_move(gt, vault, rewrite_the_quarantined_file)
+    gt._move_no_replace = wrapper
+    try:
+        with pytest.raises(ReviewedStateConflict):
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._move_no_replace = real
+
+    assert fired, "the probe never fired"
+    # Nothing destroyed, nothing stranded: the record is back where it was,
+    # and the outbox is exactly as the refusal found it — including no empty
+    # quarantine directory left behind.
+    assert leaf.read_bytes() == b"REWRITTEN-IN-QUARANTINE\n"
+    assert not (vault / gt.QUARANTINE_DIRECTORY).exists()
+
+
+def test_a_post_verification_rewrite_cannot_destroy_anything(tmp_path):
+    """The residual that deletion could never close is simply not harmful
+    here. A rewrite landing after verification changes a record that has
+    already been consumed; the reviewed bytes were the ones moved, and
+    nothing was destroyed. There is no unlink left to race."""
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    real_held = gt._held_state
+    fired = []
+
+    def rewrite_after_verifying(descriptor):
+        state = real_held(descriptor)
+        if not fired:
+            fired.append(True)
+            next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(b"LATER\n")
+        return state
+
+    gt._held_state = rewrite_after_verifying
+    try:
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._held_state = real_held
+
+    assert fired
+    assert not leaf.exists()                       # consumed, as reviewed
+    quarantined = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert len(quarantined) == 1                   # nothing destroyed
+
+
+def test_quarantine_reports_an_indeterminate_state_when_restoration_is_blocked(
+    tmp_path,
+):
+    """Both files must survive, nothing is deleted to tidy up, and the
+    outcome must not claim that nothing was changed."""
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    def rewrite_and_occupy_the_original_name():
+        next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(b"REWRITTEN\n")
+        leaf.write_bytes(b"SOMETHING ELSE TOOK THE NAME\n")
+
+    real, wrapper, fired = _after_forward_move(
+        gt, vault, rewrite_and_occupy_the_original_name
+    )
+    gt._move_no_replace = wrapper
+    try:
+        with pytest.raises(gt.QuarantineRestorationBlocked) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._move_no_replace = real
+
+    assert fired
+    assert leaf.read_bytes() == b"SOMETHING ELSE TOOK THE NAME\n"
+    stranded = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert len(stranded) == 1 and stranded[0].read_bytes() == b"REWRITTEN\n"
+
+    outcome = describe(raised.value)
+    assert outcome.code == "E-STRANDED"
+    assert "Nothing was changed" not in outcome.message
+    assert outcome.committed == "unknown"
+    assert outcome.retry == "stop"
+
+
+def test_quarantine_fails_closed_when_the_atomic_move_is_unavailable(tmp_path):
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    def unavailable(*_args, **_kwargs):
+        raise gt.AtomicMoveUnavailable("no atomic no-overwrite move here")
+
+    real = gt._move_no_replace
+    gt._move_no_replace = unavailable
+    try:
+        with pytest.raises(gt.AtomicMoveUnavailable) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._move_no_replace = real
+
+    # Nothing changed, and no destructive fallback ran.
+    assert leaf.read_bytes() == reviewed
+    outcome = describe(raised.value)
+    assert outcome.committed == "no"
+    assert outcome.code != "E-UNKNOWN"
+
+
+@pytest.mark.parametrize("shape", ["symlink", "file", "outside-entity"])
+def test_quarantine_refuses_a_redirected_or_invalid_consumed_directory(
+    tmp_path, shape
+):
+    from app.git_transaction import (
+        ReviewedStateConflict,
+        capture_path_state,
+        quarantine_path_if_unchanged,
     )
 
     vault, leaf = _conditional_vault(tmp_path)
     reviewed = leaf.read_bytes()
     expected = capture_path_state(vault, "outbox-record.yaml")
 
-    replacement = b"REPLACEMENT-NOBODY-REVIEWED\n"
-    real_held = gt._held_state
-    swapped = []
+    consumed = vault / ".consumed"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if shape == "symlink":
+        consumed.symlink_to(outside, target_is_directory=True)
+    elif shape == "file":
+        consumed.write_bytes(b"not a directory\n")
+    else:
+        consumed.symlink_to(outside.resolve(), target_is_directory=True)
 
-    def verify_then_rewrite_the_claim(descriptor):
-        state = real_held(descriptor)
-        if not swapped:
-            swapped.append(True)
-            claim = next(
-                entry for entry in vault.iterdir()
-                if entry.name.startswith(".oneos-remove-")
-            )
-            claim.write_bytes(replacement)
-        return state
+    with pytest.raises(ReviewedStateConflict):
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
 
-    gt._held_state = verify_then_rewrite_the_claim
-    try:
-        with pytest.raises(ReviewedStateConflict):
-            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt._held_state = real_held
-
-    assert swapped, "the probe never rewrote the claimed file"
-    # Nothing was destroyed, and nothing is stranded under a private name.
-    assert leaf.exists()
-    assert leaf.read_bytes() == replacement
-    assert not [e for e in vault.iterdir() if e.name.startswith(".oneos-remove-")]
-    assert reviewed != replacement
+    assert leaf.read_bytes() == reviewed
+    assert not list(outside.iterdir()), "a record was written outside the entity"
 
 
-def test_conditional_removal_refuses_when_the_claim_name_is_rebound(tmp_path):
-    """The other half: the name is repointed at a different inode.
+@pytest.mark.parametrize("code", ["ENOSYS", "EINVAL", "ENOTSUP", "EOPNOTSUPP"])
+def test_an_unsupported_errno_fails_closed_and_never_falls_back(tmp_path, code):
+    """The errno path itself, not a patched-out `_move_no_replace`.
 
-    The descriptor still holds the reviewed file, so the mismatch is
-    visible. The planted file was never verified by this call, so it is
-    left exactly as found — an oddly named leftover is a far smaller harm
-    than deleting bytes nobody reviewed.
+    A kernel or filesystem that cannot do the atomic move reports it through
+    errno. That must become a refusal — never a plain `rename`, which would
+    silently overwrite the destination and reintroduce the exact destructive
+    behaviour Amendment 1 removes.
     """
+    import ctypes
+    import errno as _errno
+
     import app.git_transaction as gt
-    from app.git_transaction import (
-        ReviewedStateConflict,
-        capture_path_state,
-        remove_path_if_unchanged,
-    )
 
     vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
+    reviewed = leaf.read_bytes()
+    occupied = vault / "occupied"
+    occupied.write_bytes(b"MUST SURVIVE\n")
 
-    real_held = gt._held_state
-    swapped = []
+    real = gt._MOVE_NO_REPLACE
 
-    def verify_then_rebind_the_claim(descriptor):
-        state = real_held(descriptor)
-        if not swapped:
-            swapped.append(True)
-            claim = next(
-                entry for entry in vault.iterdir()
-                if entry.name.startswith(".oneos-remove-")
-            )
-            planted = vault / "planted.yaml"
-            planted.write_bytes(b"PLANTED\n")
-            claim.unlink()
-            planted.rename(claim)          # a different inode, same name
-        return state
+    def unsupported(_ffd, _f, _tfd, _t):
+        ctypes.set_errno(getattr(_errno, code))
+        return -1
 
-    gt._held_state = verify_then_rebind_the_claim
-    try:
-        with pytest.raises(ReviewedStateConflict):
-            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt._held_state = real_held
-
-    assert swapped, "the probe never rebound the claim"
-    leftovers = [e for e in vault.iterdir() if e.name.startswith(".oneos-remove-")]
-    assert len(leftovers) == 1
-    assert leftovers[0].read_bytes() == b"PLANTED\n", (
-        "an unverified planted file was destroyed"
-    )
-
-
-def test_discarding_a_reservation_never_deletes_content(tmp_path):
-    """The reservation-cleanup path is only reached before any rename, so
-    it should only ever see this call's own empty sentinel. It refuses to
-    delete anything else regardless — a helper that can delete content is
-    one refactor away from being used where it must not be."""
-    import app.git_transaction as gt
-
-    vault, _leaf = _conditional_vault(tmp_path)
-    holding_bytes = vault / ".oneos-remove-holding-bytes"
-    holding_bytes.write_bytes(b"content\n")
-    a_directory = vault / ".oneos-remove-a-directory"
-    a_directory.mkdir()
-    empty_sentinel = vault / ".oneos-remove-empty"
-    empty_sentinel.write_bytes(b"")
-
+    gt._MOVE_NO_REPLACE = unsupported
     descriptor = os.open(vault, os.O_RDONLY)
     try:
-        gt._discard_private_name(descriptor, holding_bytes.name)
-        gt._discard_private_name(descriptor, a_directory.name)
-        gt._discard_private_name(descriptor, "never-existed")
-        gt._discard_private_name(descriptor, empty_sentinel.name)
+        with pytest.raises(gt.AtomicMoveUnavailable):
+            gt._move_no_replace(descriptor, "outbox-record.yaml", descriptor, "occupied")
     finally:
         os.close(descriptor)
+        gt._MOVE_NO_REPLACE = real
 
-    assert holding_bytes.exists() and holding_bytes.read_bytes() == b"content\n"
-    assert a_directory.is_dir()
-    assert not empty_sentinel.exists()   # its own sentinel is cleaned up
+    # No fallback ran: neither file moved, and the occupant is intact.
+    assert leaf.read_bytes() == reviewed
+    assert occupied.read_bytes() == b"MUST SURVIVE\n"
+
+
+def test_a_consumption_fails_closed_end_to_end_on_an_unsupported_errno(tmp_path):
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    real = gt._MOVE_NO_REPLACE
+
+    def unsupported(_ffd, _f, _tfd, _t):
+        ctypes.set_errno(_errno.ENOTSUP)
+        return -1
+
+    gt._MOVE_NO_REPLACE = unsupported
+    try:
+        with pytest.raises(gt.AtomicMoveUnavailable) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._MOVE_NO_REPLACE = real
+
+    assert leaf.read_bytes() == reviewed
+    assert not (vault / gt.QUARANTINE_DIRECTORY).exists()
+    assert describe(raised.value).code == "E-UNSUPPORTED"
+    assert describe(raised.value).committed == "no"

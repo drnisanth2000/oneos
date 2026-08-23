@@ -39,6 +39,7 @@ from tests.conftest import (
     git_head_message,
     git_index_entries,
     git_is_clean,
+    git_is_clean_apart_from_quarantine,
     git_status_bytes,
 )
 
@@ -354,7 +355,7 @@ def test_add_workspace_is_direct_and_commits(tmp_path):
     assert "id: rti" in ws
     assert git_count_commits(vault) == before + 1
     assert git_head_message(vault).startswith("registry: add workspace")
-    assert git_is_clean(vault)
+    assert git_is_clean_apart_from_quarantine(vault)
 
 
 def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
@@ -542,7 +543,7 @@ def test_execute_delete_removes_when_unreferenced(tmp_path):
     assert "widgetx:" not in prods
     assert "other:" in prods                    # sibling untouched
     assert git_head_message(vault).startswith("registry: delete product")
-    assert git_is_clean(vault)
+    assert git_is_clean_apart_from_quarantine(vault)
 
 
 def test_delete_with_unrelated_staged_unstaged_and_untracked_work_commits_only_registry_file(

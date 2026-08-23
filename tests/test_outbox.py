@@ -8,6 +8,7 @@ Temp git vaults only; the real vault is never touched.
 """
 import hashlib
 import inspect
+import os
 import re
 import subprocess
 import textwrap
@@ -91,6 +92,21 @@ def _vault_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
         else:
             entries.append((relative, "file", path.read_bytes()))
     return tuple(sorted(entries))
+
+
+def _quarantined(vault: Path) -> list[Path]:
+    """Every consumed record currently held in quarantine (Amendment 1)."""
+    return sorted(vault.rglob(".consumed/*.yaml"))
+
+
+def _is_clean_apart_from_quarantine(vault: Path) -> bool:
+    """Quarantined records are untracked by design, so `git status` is never
+    empty after a consumption. Everything else must still be clean."""
+    output = git_status_bytes(vault)
+    return all(
+        not record or "/.consumed/" in os.fsdecode(record[3:])
+        for record in output.split(b"\0")
+    )
 
 
 def _approval_state(vault: Path):
@@ -597,7 +613,7 @@ def test_module_general_approval_removes_triage_sub_in_one_revertible_commit(
     assert restored.exists()
     assert "sub: triage" in restored.read_text(encoding="utf-8")
     assert not destination.exists()
-    assert git_is_clean(vault)
+    assert _is_clean_apart_from_quarantine(vault)
 
 
 def test_preview_diff_shows_move_and_sub_change(tmp_path):
@@ -964,7 +980,7 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
 
     assert git_count_commits(vault) == before + 1
     assert git_head_message(vault).startswith("outbox: approve")
-    assert git_is_clean(vault)
+    assert _is_clean_apart_from_quarantine(vault)
 
 
 def test_approval_refuses_changed_source_without_any_added_mutation(tmp_path):
@@ -2012,11 +2028,17 @@ def test_reject_still_discards_when_the_review_matches(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
     commits_before = git_count_commits(vault)
+    reviewed_bytes = prop.path.read_bytes()
 
     rejected = reject(scope, prop.id, _review_of(scope, prop).sha256)
 
     assert rejected.id == prop.id
     assert not prop.path.exists()
+    # Amendment 1: consumed, not deleted — the reviewed bytes are retained.
+    quarantined = _quarantined(vault)
+    assert len(quarantined) == 1
+    assert quarantined[0].name == prop.path.name
+    assert quarantined[0].read_bytes() == reviewed_bytes
     assert git_count_commits(vault) == commits_before
     assert (vault / prop.src).exists()
 
@@ -2068,7 +2090,7 @@ def test_a_replacement_between_the_comparison_and_the_mutation_refuses(
     review = _review_of(scope, prop)
     before = _approval_state(vault)
 
-    mutating_call = "execute_transaction" if action == "approve" else "remove_path_if_unchanged"
+    mutating_call = "execute_transaction" if action == "approve" else "consume_reviewed_proposal"
     real = getattr(outbox, mutating_call)
     replaced = []
 
@@ -2099,7 +2121,8 @@ def test_a_replacement_between_the_comparison_and_the_mutation_refuses(
     proposal_rel = prop.path.relative_to(vault).as_posix()
     # `.git/oneos-approval.lock` is the transaction's own lock file, created
     # by taking the lock and not vault content.
-    ignored = {proposal_rel, ".git/oneos-approval.lock"}
+    ignored = {proposal_rel, ".git/oneos-approval.lock",
+               "demo/outbox/.consumed"}
 
     def _comparable(tree):
         return tuple(entry for entry in tree if entry[0] not in ignored)
@@ -2125,7 +2148,7 @@ def test_a_non_regular_substitution_before_mutation_refuses_without_blocking(
     outside = tmp_path / "elsewhere.yaml"
     outside.write_bytes(review.contents)
 
-    mutating_call = "execute_transaction" if action == "approve" else "remove_path_if_unchanged"
+    mutating_call = "execute_transaction" if action == "approve" else "consume_reviewed_proposal"
     real = getattr(outbox, mutating_call)
     swapped = []
 
@@ -2279,29 +2302,36 @@ def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
     source_before = (vault / prop.src).read_bytes()
 
     replacement = b"id: swapped\nvalue: REPLACEMENT-NOBODY-REVIEWED\n"
-    real_capture = gt._capture_leaf_state
+    # Amendment 1: the seam is the atomic move into quarantine. The swap
+    # lands after the record is moved and before it is verified — the only
+    # window in which what gets consumed can still change.
+    real_move = gt._move_no_replace
     swapped = []
 
-    def capture_then_swap(dir_fd, name):
-        state = real_capture(dir_fd, name)
-        if not swapped and name == leaf_name:
+    def move_then_swap(from_fd, from_name, to_fd, to_name):
+        real_move(from_fd, from_name, to_fd, to_name)
+        if not swapped and from_name == leaf_name:
             swapped.append(True)
-            prop.path.write_bytes(replacement)
-        return state
+            next((vault / "demo/outbox" / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(
+                replacement
+            )
+        return None
 
-    gt._capture_leaf_state = capture_then_swap
+    gt._move_no_replace = move_then_swap
     try:
         with pytest.raises(Exception) as raised:
             getattr(outbox, action)(scope, prop.id, review.sha256)
     finally:
-        gt._capture_leaf_state = real_capture
+        gt._move_no_replace = real_move
 
     assert swapped, "the probe never swapped the proposal"
     assert describe(raised.value).code in {"E-CONFLICT", "E-TAMPER"}
 
-    # The replacement survives, byte for byte.
-    assert prop.path.exists(), "the unreviewed replacement was destroyed"
+    # Nothing was destroyed: the record is back under its own name, holding
+    # the replacement bytes, and nothing is stranded in quarantine.
+    assert prop.path.exists(), "the record was destroyed"
     assert prop.path.read_bytes() == replacement
+    assert not _quarantined(vault), "a record was stranded in quarantine"
 
     # Approve moved nothing and committed nothing.
     assert git_count_commits(vault) == commits_before

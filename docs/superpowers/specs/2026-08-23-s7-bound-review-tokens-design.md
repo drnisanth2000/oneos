@@ -2,7 +2,7 @@
 
 **Status:** APPROVED — conversational and written design approved
 
-**Amendment 1 (proposed, pending approval):** consumed proposals are
+**Amendment 1 (APPROVED at e0316cc):** consumed proposals are
 quarantined rather than deleted. Amended clauses are marked
 *(Amendment 1)*. Rationale in “Why deletion cannot satisfy criterion 4”
 below.

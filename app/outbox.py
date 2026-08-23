@@ -32,7 +32,7 @@ from .git_transaction import (
     TransactionPlan,
     capture_path_state,
     execute_transaction,
-    remove_path_if_unchanged,
+    consume_reviewed_proposal,
 )
 from .inbox import split_front_matter
 from .destinations import DestinationError, resolve_classification_destination
@@ -828,18 +828,18 @@ def reject(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
     """Discard the proposal. No move, no commit — the proposal was never
     tracked.
 
-    Bound to the reviewed bytes exactly as approve is. The removal is
-    conditional on the captured state: reject unlinks the leaf it reviewed
-    or it unlinks nothing. A rewrite, type swap, redirection or
-    disappearance before the removal is a refusal, never permission to
-    discard whatever took its place.
+    Bound to the reviewed bytes exactly as approve is, and consumed by
+    moving the reviewed record into quarantine rather than deleting it
+    (Amendment 1). A rewrite, type swap, redirection or disappearance before
+    the move is a refusal, never permission to consume whatever took its
+    place — and refusing costs nothing, because no step deletes.
     """
     proposal_rel, proposal_state, prop = _own_reviewed_proposal(
         scope, proposal_id, review_sha256
     )
     _require_outbox_path(scope, prop.path, require_leaf=True)
     try:
-        remove_path_if_unchanged(scope.root, proposal_rel, proposal_state)
+        consume_reviewed_proposal(scope.root, proposal_rel, proposal_state)
     except GitTransactionError as exc:
         # Reject takes the approval lock now, so lock outcomes are reachable
         # through it. Wrapped the way approve wraps its transaction, so the

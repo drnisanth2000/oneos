@@ -57,16 +57,39 @@ _CODES: dict[str, ConsoleError] = {
             "stop", "yes", 500,
         ),
         ConsoleError(
-            # S7. Reject makes no Git commit, so E-COMMITTED's "the commit
-            # succeeded" would be untrue — but the discard itself is done and
-            # durable, which is the fact the operator has to act on. That is
-            # what the `committed` tier encodes here: the effect took hold,
-            # so do not retry.
-            "E-DISCARDED", "committed", "attention",
-            "The proposal was discarded, but the cleanup afterwards failed. "
-            "Do not retry — the proposal is already gone. Inspect vault "
-            "state with git status.",
+            # S7 Amendment 1. Reject makes no Git commit, so E-COMMITTED's
+            # "the commit succeeded" would be untrue — but the consumption
+            # itself is done, which is the fact the operator has to act on.
+            # That is what the `committed` tier encodes here: the effect took
+            # hold, so do not retry. It does NOT say the record is gone;
+            # under quarantine it is retained and recoverable.
+            "E-QUARANTINED", "committed", "attention",
+            "The proposal was consumed and set aside; only the cleanup "
+            "afterwards failed. Do not retry — the action already took "
+            "effect, and the record is retained. Inspect vault state with "
+            "git status.",
             "stop", "yes", 500,
+        ),
+        ConsoleError(
+            # S7 Amendment 1. A mismatch was found, but the record could not
+            # be returned to its own name because something else now holds
+            # it. Both files survive and neither is deleted to tidy up; the
+            # state is genuinely indeterminate and is reported as such.
+            "E-STRANDED", "recovery", "attention",
+            "The reviewed proposal could not be returned to its place, "
+            "because something else now holds its name. Both it and that "
+            "file are preserved. Do not retry. Inspect vault state with git "
+            "status.",
+            "stop", "unknown", 500,
+        ),
+        ConsoleError(
+            # S7 Amendment 1. Fails closed: OneOS refuses rather than
+            # degrading to an ordinary rename, which overwrites silently.
+            "E-UNSUPPORTED", "integrity", "attention",
+            "This vault's filesystem cannot move files safely, so proposals "
+            "cannot be approved, rejected or deleted here. Nothing was "
+            "changed.",
+            "none", "no", 500,
         ),
         ConsoleError(
             "E-RECOVER", "recovery", "attention",
@@ -244,7 +267,9 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.GitTransactionFailure: _CODES["E-GIT"],
     _git_transaction.GitTransactionError: _CODES["E-GIT"],
     _git_transaction._ApprovalLockCleanupFailure: _CODES["E-GIT"],
-    _git_transaction.ConditionalRemovalCleanupError: _CODES["E-DISCARDED"],
+    _git_transaction.QuarantineCleanupError: _CODES["E-QUARANTINED"],
+    _git_transaction.QuarantineRestorationBlocked: _CODES["E-STRANDED"],
+    _git_transaction.AtomicMoveUnavailable: _CODES["E-UNSUPPORTED"],
     _git_transaction._ReviewedIndexOwnershipConflict: _CODES["E-CONFLICT"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.StaleProposalSource: _CODES["E-STALE"],
@@ -298,7 +323,7 @@ ALLOWLIST: frozenset[type[BaseException]] = frozenset(
         _outbox.OutboxDestinationError,
         _git_transaction.GitTransactionFailure,
         _git_transaction._ApprovalLockCleanupFailure,
-        _git_transaction.ConditionalRemovalCleanupError,
+        _git_transaction.QuarantineCleanupError,
         _git_transaction._ReviewedIndexOwnershipConflict,
     }
 )
