@@ -1,0 +1,25 @@
+{# A proposal that cannot currently be reviewed (spec, approved decision 8).
+
+   No controls, no fingerprint, and no guessing: OneOS never reconstructs a
+   damaged record, never moves a cross-scope one, and never reuses a stale
+   id. `Check again` re-reads and nothing more. #}
+<div class="proposal proposal-unreadable" id="review-unavailable-{{ proposal_id }}">
+  {% with error=review_error %}{% include "blocks/alert.html" %}{% endwith %}
+  <p class="muted">
+    This proposal cannot be reviewed right now, so no action is offered for
+    it. Checking again only re-reads it.
+  </p>
+  <div class="prop-actions">
+    <button class="check-again"
+            hx-get="/outbox/{{ entity }}/review/{{ proposal_id }}"
+            hx-target="#review-unavailable-{{ proposal_id }}"
+            hx-swap="outerHTML">Check again</button>
+  </div>
+  {% if recreatable %}
+  <p class="muted">
+    If the item still needs classifying, start again from
+    <a href="/triage/{{ entity }}">triage</a> — that allocates a new
+    proposal, and never reuses this one's id.
+  </p>
+  {% endif %}
+</div>

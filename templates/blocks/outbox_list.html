@@ -13,39 +13,7 @@
   {% endif %}
   {% for row, error in rows %}
   {% if row.proposal %}
-  {# S7: the action carries the fingerprint of the exact bytes this row
-     was rendered from. Both values are server-rendered and serialised
-     with `tojson`; hand-built JSON is forbidden. A row without controls
-     carries no fingerprint, which `OutboxRow` enforces. #}
-  {% set outbox_values = {"id": row.proposal.id,
-                          "review_sha256": row.review_sha256} %}
-  <div class="proposal">
-    <div class="prop-head">
-      <code class="prop-id">{{ row.proposal.id }}</code>
-      <span class="prop-route">{{ row.proposal.module }} / {{ row.proposal.sub }} <span class="block-tag">{{ row.proposal.block }}</span></span>
-    </div>
-    {% if row.diff is not none %}
-    <pre class="diff-body">{{ row.diff }}</pre>
-    {% elif error %}
-    {% include "blocks/alert.html" %}
-    {% endif %}
-    {% if row.can_approve or row.can_reject %}
-    <div class="prop-actions">
-      {% if row.can_approve %}
-      <button class="approve"
-              hx-post="/outbox/{{ entity }}/approve"
-              hx-vals='{{ outbox_values | tojson }}'
-              hx-target="#outbox-list" hx-swap="outerHTML">Approve → move + commit</button>
-      {% endif %}
-      {% if row.can_reject %}
-      <button class="reject"
-              hx-post="/outbox/{{ entity }}/reject"
-              hx-vals='{{ outbox_values | tojson }}'
-              hx-target="#outbox-list" hx-swap="outerHTML">Reject</button>
-      {% endif %}
-    </div>
-    {% endif %}
-  </div>
+  {% include "blocks/outbox_card.html" %}
   {% else %}
   <div class="proposal proposal-unreadable">
     <p class="muted">An item in this outbox could not be read as a proposal.</p>

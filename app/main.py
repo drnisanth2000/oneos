@@ -41,7 +41,7 @@ from .outbox import (
     propose_classification,
     reject,
 )
-from .review_tokens import ReviewTokenError
+from .review_tokens import ReviewedProposalChanged, ReviewTokenError
 from .registry import (
     RegistryError,
     execute_delete,
@@ -686,6 +686,119 @@ def _outbox_list_error(
     )
 
 
+def _review_row(scope: Scope, proposal_id: str):
+    """The current projected row for one proposal, or `None`.
+
+    Read-only, and deliberately taken from the same projection the listing
+    uses: a fresh review must be the listing's own view of the record, not a
+    second opinion assembled elsewhere.
+    """
+    for row in project_outbox(scope).rows:
+        if row.proposal is not None and row.proposal.id == proposal_id:
+            return row
+    return None
+
+
+def _review_changed_response(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    stale_review_sha256: str,
+    error: ConsoleError,
+) -> HTMLResponse:
+    """Reconfirm on the same screen (spec §Presentation).
+
+    The response is appended *beside* the card the operator acted from —
+    `HX-Retarget` plus `HX-Reswap: afterend` — rather than swapping the whole
+    list, so the version they reviewed stays on screen to compare against.
+
+    Status is 200, not E-REVIEW's 409, and that is deliberate: S6's rule is
+    that a fragment refusal renders at 200 (`status_for`), and HTMX does not
+    swap a 4xx response at all — a 409 here would leave the operator with no
+    current card, no disabled stale controls, and no way to reconfirm. The
+    refusal is fully visible in the fragment itself.
+    """
+    row = _review_row(scope, proposal_id)
+    if row is None:
+        return _review_unavailable_response(request, scope, proposal_id, error)
+    response = templates.TemplateResponse(
+        request,
+        "blocks/review_changed.html",
+        {
+            "entity": scope.current_entity(),
+            "row": row,
+            "error": None,
+            "review_error": error,
+            "stale_review_sha256": stale_review_sha256,
+        },
+        status_code=200,
+    )
+    response.headers["HX-Retarget"] = (
+        f"#review-card-{proposal_id}-{stale_review_sha256}"
+    )
+    response.headers["HX-Reswap"] = "afterend"
+    return response
+
+
+def _review_unavailable_response(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    error: ConsoleError,
+    *,
+    status: int = 200,
+) -> HTMLResponse:
+    """A safe no-action state: no controls, no fingerprint, no guessing."""
+    return templates.TemplateResponse(
+        request,
+        "blocks/review_unavailable.html",
+        {
+            "entity": scope.current_entity(),
+            "proposal_id": proposal_id,
+            "review_error": error,
+            "recreatable": error.code in {"E-INVALID", "E-MISSING"},
+        },
+        status_code=status,
+    )
+
+
+@app.get("/outbox/{entity}/review/{proposal_id}", response_class=HTMLResponse)
+@console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
+def outbox_review_fragment(
+    request: Request, scope: EntityScope, proposal_id: str
+) -> HTMLResponse:
+    """`Check again`: read, validate, render. It writes nothing.
+
+    A missing, malformed, redirected or cross-scope record renders the safe
+    unavailable state rather than an error page, so the operator keeps a
+    place to check again from.
+    """
+    try:
+        row = _review_row(scope, proposal_id)
+    except _OUTBOX_CATCHES as exc:
+        return _review_unavailable_response(
+            request, scope, proposal_id, describe(exc)
+        )
+    if row is None:
+        # The projection lists every readable record, so an id it does not
+        # hold names no pending proposal — described through the outbox's own
+        # outcome rather than a code chosen here.
+        return _review_unavailable_response(
+            request, scope, proposal_id,
+            describe(OutboxError("no pending proposal for this entity")),
+        )
+    return templates.TemplateResponse(
+        request,
+        "blocks/outbox_card.html",
+        {
+            "entity": scope.current_entity(),
+            "row": row,
+            "error": describe(row.error) if row.error is not None else None,
+            "label": "Current version",
+        },
+    )
+
+
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
 @console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
 def outbox_approve(
@@ -720,6 +833,12 @@ def _outbox_approve_response(
         # route must never derive one — recomputing here would rebind the
         # action to whatever is on disk now, which is the defect S7 closes.
         approve(scope, id, review_sha256)
+    except ReviewedProposalChanged as exc:
+        # Not a list re-render: the operator keeps the version they reviewed
+        # on screen and reconfirms against the current one beside it.
+        return _review_changed_response(
+            request, scope, id, review_sha256, describe(exc)
+        )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
     try:
@@ -762,6 +881,10 @@ def _outbox_reject_response(
     try:
         # S7: same contract as approve — passed through, never derived.
         reject(scope, id, review_sha256)
+    except ReviewedProposalChanged as exc:
+        return _review_changed_response(
+            request, scope, id, review_sha256, describe(exc)
+        )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
     try:

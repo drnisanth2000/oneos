@@ -1,0 +1,31 @@
+{# Same-screen reconfirmation after a changed review (spec §Presentation).
+
+   Appended beside the card the operator acted from, which the browser still
+   holds. Nothing here re-serves the old review: the server never saw those
+   bytes and must not infer them. What it does is (a) label the stale card,
+   (b) disable exactly the controls issued for it, out-of-band, and (c) offer
+   the current, server-validated review with a fresh fingerprint.
+
+   The two cards sit side by side so the operator can read the difference
+   themselves — the old one is browser evidence, the current one is the only
+   thing that can act. #}
+<div class="review-changed" id="review-changed-{{ row.proposal.id }}-{{ row.review_sha256 }}">
+  {% with error=review_error %}{% include "blocks/alert.html" %}{% endwith %}
+  <p class="muted">
+    The version you reviewed is shown above, marked
+    <em>Previously reviewed</em>, and its controls are no longer active.
+    Compare it with the current version below and act again if you still
+    want to.
+  </p>
+  {% with label="Current version — review this before acting" %}
+  {% include "blocks/outbox_card.html" %}
+  {% endwith %}
+</div>
+
+{# Out-of-band: the stale card's controls become inert in place. #}
+<div class="prop-actions" hx-swap-oob="true"
+     id="review-controls-{{ row.proposal.id }}-{{ stale_review_sha256 }}">
+  <button class="approve" disabled>Approve → move + commit</button>
+  <button class="reject" disabled>Reject</button>
+  <p class="muted review-label">Previously reviewed — no longer actionable.</p>
+</div>

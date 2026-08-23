@@ -1372,9 +1372,13 @@ def test_outbox_hx_vals_are_tojson(tmp_path, monkeypatch):
             "review_sha256": fingerprint,
         }
 
+    # S7 Task 5 moved the card — and with it the `hx-vals` — into
+    # `blocks/outbox_card.html`, which the list includes. Follow it there:
+    # scanning the list alone would now scan zero attributes and pass having
+    # proved nothing.
     source = (
         Path(__file__).resolve().parents[1]
-        / "templates/blocks/outbox_list.html"
+        / "templates/blocks/outbox_card.html"
     ).read_text(encoding="utf-8")
     hx_vals_attrs = re.findall(r"hx-vals='([^']*)'", source)
     assert hx_vals_attrs, "expected at least one hx-vals attribute"
@@ -3331,6 +3335,12 @@ def _route_totality_plan(main) -> dict:
             ),
             "patch_targets": [(main, "execute_delete")],
         },
+        main.outbox_review_fragment: {
+            "request": lambda c: c.get(
+                "/outbox/alpha/review/20260815T090703-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            "patch_targets": [(main, "project_outbox")],
+        },
         main.pulse: {"request": lambda c: c.get("/blocks/pulse"), "patch_targets": []},
     }
 
@@ -4822,3 +4832,164 @@ def test_the_preview_route_never_renders_the_submitted_slug(tmp_path, monkeypatc
         Path(__file__).resolve().parents[1] / "templates/blocks/delete_impact.html"
     ).read_text(encoding="utf-8")
     assert "{{ slug }}" not in template
+
+
+# --- S7 Task 5: reconfirm on the same screen --------------------------------
+
+
+def _rendered_card_ids(body: str) -> set[str]:
+    return set(re.findall(r'id="(review-card-[^"]+)"', body))
+
+
+def _rendered_control_ids(body: str) -> set[str]:
+    return set(re.findall(r'id="(review-controls-[^"]+)"', body))
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_keeps_the_old_card_and_appends_the_current_one(
+    tmp_path, monkeypatch, action
+):
+    """Spec §Presentation, "Changed-since-review response", points 2-6."""
+    from app.console_errors import _CODES
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+    body = response.text
+
+    # 4 + 6: a newly validated current card, and only it offers controls.
+    assert f"review-card-{proposal_id}-{current}" in body
+    assert _CODES["E-REVIEW"].message in body
+
+    # 3: the old controls are replaced out-of-band with disabled ones.
+    old_controls = f"review-controls-{proposal_id}-{stale['review_sha256']}"
+    assert old_controls in body
+    assert 'hx-swap-oob="true"' in body
+    disabled_block = body.split(old_controls, 1)[1].split("</div>", 1)[0]
+    assert "disabled" in disabled_block
+
+    # 2: the old card is labelled rather than replaced or re-served.
+    assert "Previously reviewed" in body
+
+    # The response is appended beside the old card, not swapped over the list.
+    assert response.headers.get("HX-Retarget") == (
+        f"#review-card-{proposal_id}-{stale['review_sha256']}"
+    )
+    assert response.headers.get("HX-Reswap") == "afterend"
+
+    # 6: the stale fingerprint is never re-offered as actionable.
+    for raw in _hx_vals(body):
+        assert json.loads(raw)["review_sha256"] == current
+
+
+def _hx_vals(body: str) -> list[str]:
+    from tests.test_app import HxValsParser
+
+    parser = HxValsParser()
+    parser.feed(body)
+    return parser.values
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_changes_no_state(tmp_path, monkeypatch, action):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    proposal_before = proposal.read_bytes()
+    source_before = (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes()
+    status_before = git_status_apart_from_quarantine(tmp_path)
+
+    client.post(f"/outbox/alpha/{action}", data=stale)
+
+    assert proposal.read_bytes() == proposal_before
+    assert (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes() == source_before
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+    assert git_status_apart_from_quarantine(tmp_path) == status_before
+
+
+def test_repeated_rewrites_never_accumulate_live_controls(tmp_path, monkeypatch):
+    """Approved decision 4: only the newest reviewed version may act."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    proposal.write_bytes(proposal.read_bytes() + b"# first\n")
+    first = client.post("/outbox/alpha/approve", data=stale).text
+    reissued = json.loads(_hx_vals(first)[0])["review_sha256"]
+
+    proposal.write_bytes(proposal.read_bytes() + b"# second\n")
+    second = client.post(
+        "/outbox/alpha/approve",
+        data={"id": proposal_id, "review_sha256": reissued},
+    ).text
+    newest = _outbox_fingerprint(tmp_path, proposal_id)
+
+    live = {json.loads(raw)["review_sha256"] for raw in _hx_vals(second)}
+    assert live == {newest}
+    assert reissued not in live
+    assert stale["review_sha256"] not in live
+
+
+# --- read-only refresh ------------------------------------------------------
+
+
+def test_check_again_returns_the_current_review_and_writes_nothing(
+    tmp_path, monkeypatch
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+    status_before = git_status_apart_from_quarantine(tmp_path)
+    proposal_before = proposal.read_bytes()
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    assert response.status_code == 200
+    assert f"review-card-{proposal_id}-{current}" in response.text
+    assert json.loads(_hx_vals(response.text)[0])["review_sha256"] == current
+    # Read-only: nothing written, nothing moved, nothing consumed.
+    assert proposal.read_bytes() == proposal_before
+    assert git_status_apart_from_quarantine(tmp_path) == status_before
+
+
+@pytest.mark.parametrize("shape", ["missing", "malformed", "hostile-id"])
+def test_check_again_on_an_unreviewable_proposal_offers_no_controls(
+    tmp_path, monkeypatch, shape
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    if shape == "missing":
+        proposal.unlink()
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    else:
+        proposal_id = "hostile-nonexistent-id"
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    body = response.text
+    assert 'role="alert"' in body
+    assert not _rendered_control_ids(body), body
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+
+
+def test_the_review_fragment_route_is_declared_and_read_only():
+    """S6 route declarations: the new GET fragment names its own family and
+    never broadens to a catch-all."""
+    import app.main as main
+
+    declaration = main.outbox_review_fragment.__console_route__
+    assert declaration.surface == "fragment-only"
+    assert Exception not in declaration.catches
+    assert BaseException not in declaration.catches
+    source = inspect.getsource(main.outbox_review_fragment)
+    for mutating in ("approve(", "reject(", "propose_classification(", "unlink"):
+        assert mutating not in source
