@@ -32,6 +32,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .console_routing import structured_reader
+
 # Mirror of oneos_wizard.SLUG_RE / RESERVED — the app cannot import from the
 # vault (it is public and vault-path-free), so the grammar is restated and the
 # rename test is what keeps the two honest.
@@ -142,6 +144,16 @@ def _insert_former_slug(text: str, key: str, old: str, indent_hint: int = 2) -> 
     return "".join(out)
 
 
+def _quote_identifier(name: str) -> str:
+    """Quote a SQLite identifier (table or column name) discovered from a
+    file's own schema, never trusted as SQL syntax. Doubling an embedded `"`
+    is SQLite's own escaping rule for a quoted identifier. This also fixes
+    legitimate names containing spaces, hyphens, or reserved words, which
+    previously broke the generated SQL outright."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+@structured_reader(category="admin-db")
 def _books_db_refs(vault: Path, column_values: dict[str, str]) -> list[str]:
     """Count (never modify) books.db rows referencing `old` in the given
     {table_or_any: column} sense. Reported for the human; the actual column
@@ -154,24 +166,35 @@ def _books_db_refs(vault: Path, column_values: dict[str, str]) -> list[str]:
         except sqlite3.Error:
             continue
         try:
-            tables = [
-                r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            ]
-            for table in tables:
-                cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-                for col, val in column_values.items():
-                    if col in cols:
-                        n = conn.execute(
-                            f"SELECT COUNT(*) FROM {table} WHERE {col} = ?", (val,)
-                        ).fetchone()[0]
-                        if n:
-                            rel = db.relative_to(vault)
-                            reports.append(
-                                f"{rel}: {n} row(s) in {table}.{col} = '{val}' "
-                                f"(not modified — see spec §2.2c)"
-                            )
+            try:
+                tables = [
+                    r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                ]
+                for table in tables:
+                    qtable = _quote_identifier(table)
+                    cols = {
+                        r[1] for r in conn.execute(f"PRAGMA table_info({qtable})")
+                    }
+                    for col, val in column_values.items():
+                        if col in cols:
+                            qcol = _quote_identifier(col)
+                            n = conn.execute(
+                                f"SELECT COUNT(*) FROM {qtable} WHERE {qcol} = ?",
+                                (val,),
+                            ).fetchone()[0]
+                            if n:
+                                rel = db.relative_to(vault)
+                                reports.append(
+                                    f"{rel}: {n} row(s) in {table}.{col} = "
+                                    f"'{val}' (not modified — see spec §2.2c)"
+                                )
+            except sqlite3.DatabaseError as exc:
+                # connect() with mode=ro never validates the header, so a
+                # corrupt file only fails at the first query. Normalize the
+                # type; the existing skip-on-open tolerance is untouched.
+                raise RenameError("books.db could not be read") from exc
         finally:
             conn.close()
     return reports

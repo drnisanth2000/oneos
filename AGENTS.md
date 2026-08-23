@@ -34,8 +34,24 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
 Current task: the remaining **Safety Foundation** work marked in `BUILD.md`,
-required before live Phase 1 gate trials. S1-S5 are merged; S6 is next. This
-hardening does not unlock a new phase or authorize deferred screens.
+required before live Phase 1 gate trials. **S1-S6 are complete** — every
+public and private gate passes, including the combined repo+vault history
+audit. **S7 — bound review tokens — is next.** A branch's merge/PR state is
+never recorded here as a point-in-time fact: this file ships inside every pull
+request opened from that branch, so any such claim written here is stale the
+moment the request exists. Check it live instead: `git log
+origin/main..<branch>` and the hosting UI's pull-request list name the actual
+state.
+
+**Do not begin S7 until S6 is merged into `origin/main` and a fresh
+merged-`main` baseline passes.** Safety Foundation steps are sequential
+integration boundaries (see "Repository and task hygiene" below); starting S7
+against an unmerged predecessor breaks that rule. What S7 inherits from S6 is
+recorded in `docs/STATUS.md`, and the central item is that the approval gate
+does not bind reviewed bytes — a proposal id names a mutable file, not the bytes
+an operator reviewed.
+
+This hardening does not unlock a new phase or authorize deferred screens.
 
 Product direction and naming are frozen in `PRODUCT-THESIS.md`.
 

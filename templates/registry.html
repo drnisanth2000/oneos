@@ -1,15 +1,8 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OneOS · Registry</title>
-  <link rel="stylesheet" href="/static/app.css">
-  <script defer src="/static/vendor/htmx.min.js"></script>
-  <script defer src="/static/vendor/alpine-morph.min.js"></script>
-  <script defer src="/static/vendor/alpine-persist.min.js"></script>
-  <script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
-  <script defer src="/static/vendor/alpine.min.js"></script>
+  {% set page_title = "OneOS · Registry" %}
+  {% include "_head.html" %}
 </head>
 <body hx-ext="alpine-morph">
   {% include "_sidebar.html" %}
@@ -25,10 +18,11 @@
       {% for slug in products %}
       <li class="triage-item">
         <div class="ti-head"><span class="ti-title">{{ slug }}</span></div>
+        {% set delete_preview_values = {"slug": slug} %}
         <div class="prop-actions">
           <button class="reject"
                   hx-post="/registry/{{ entity }}/product/delete-preview"
-                  hx-vals='{"slug": "{{ slug }}"}'
+                  hx-vals='{{ delete_preview_values | tojson }}'
                   hx-target="#impact-{{ loop.index0 }}" hx-swap="innerHTML">Delete…</button>
         </div>
         <div id="impact-{{ loop.index0 }}"></div>

@@ -1,27 +1,50 @@
 <div id="outbox-list">
   {% if approval_error %}
-  <p class="diff-head" role="alert">{{ approval_error }}</p>
+  {% with error=approval_error %}{% include "blocks/alert.html" %}{% endwith %}
   {% endif %}
-  {% if not props %}
+  {% if blocked_notice %}
+  {% with error=blocked_notice %}{% include "blocks/alert.html" %}{% endwith %}
+  {% endif %}
+  {% if listing_error %}
+  {% with error=listing_error %}{% include "blocks/alert.html" %}{% endwith %}
+  {% endif %}
+  {% if not rows and not listing_unavailable %}
   <p class="muted">No pending proposals. Approve or reject clears them from here.</p>
   {% endif %}
-  {% for p, diff in props %}
+  {% for row, error in rows %}
+  {% if row.proposal %}
+  {% set outbox_values = {"id": row.proposal.id} %}
   <div class="proposal">
     <div class="prop-head">
-      <code class="prop-id">{{ p.id }}</code>
-      <span class="prop-route">{{ p.module }} / {{ p.sub }} <span class="block-tag">{{ p.block }}</span></span>
+      <code class="prop-id">{{ row.proposal.id }}</code>
+      <span class="prop-route">{{ row.proposal.module }} / {{ row.proposal.sub }} <span class="block-tag">{{ row.proposal.block }}</span></span>
     </div>
-    <pre class="diff-body">{{ diff }}</pre>
+    {% if row.diff is not none %}
+    <pre class="diff-body">{{ row.diff }}</pre>
+    {% elif error %}
+    {% include "blocks/alert.html" %}
+    {% endif %}
+    {% if row.can_approve or row.can_reject %}
     <div class="prop-actions">
+      {% if row.can_approve %}
       <button class="approve"
               hx-post="/outbox/{{ entity }}/approve"
-              hx-vals='{"id": "{{ p.id }}"}'
+              hx-vals='{{ outbox_values | tojson }}'
               hx-target="#outbox-list" hx-swap="outerHTML">Approve → move + commit</button>
+      {% endif %}
+      {% if row.can_reject %}
       <button class="reject"
               hx-post="/outbox/{{ entity }}/reject"
-              hx-vals='{"id": "{{ p.id }}"}'
+              hx-vals='{{ outbox_values | tojson }}'
               hx-target="#outbox-list" hx-swap="outerHTML">Reject</button>
+      {% endif %}
     </div>
+    {% endif %}
   </div>
+  {% else %}
+  <div class="proposal proposal-unreadable">
+    <p class="muted">An item in this outbox could not be read as a proposal.</p>
+  </div>
+  {% endif %}
   {% endfor %}
 </div>

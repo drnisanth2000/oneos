@@ -391,6 +391,15 @@ def test_concurrent_proposal_requests_keep_canonical_destinations_isolated(
     {"filename": "marker.md", "module": "02-work", "sub": "general", "entity": "beta"},
 ])
 def test_tampered_proposal_form_writes_nothing(client, data):
+    # Task 11 / design §8 regression table, third row: `propose` is
+    # fragment-only, so once it catches its declared family every one of
+    # these six cases describes to refusal severity and returns 200 under
+    # Rule 5's route-shape-first selection. Status expectation only — the
+    # three state proofs below are the test's actual subject and stay
+    # verbatim. The added role="alert" / code / message assertions are what
+    # keep the refusal proven now that the status no longer proves it.
+    from app.console_errors import _CODES
+
     for proposal in (client.vault / "alpha/outbox").glob("*.yaml"):
         proposal.unlink()
     route_client = TestClient(client.app, raise_server_exceptions=False)
@@ -400,23 +409,39 @@ def test_tampered_proposal_form_writes_nothing(client, data):
 
     response = route_client.post("/triage/alpha/propose", data=data)
 
-    assert response.status_code >= 400
+    assert response.status_code == 200
     assert git_head(route_client.vault) == before_head
     assert snapshot_entity_bytes(route_client.vault, ("alpha", "beta")) == before
     assert not list((route_client.vault / "alpha/outbox").glob("*.yaml"))
 
+    expected_code = "E-INVALID" if "entity" in data else "E-DEST"
+    body = response.text
+    assert 'role="alert"' in body
+    assert expected_code in body
+    assert _CODES[expected_code].message in body
+    for value in data.values():
+        assert value not in body
+
 
 def test_concurrent_outbox_requests_keep_entity_diffs_isolated(client, monkeypatch):
+    # Ledger's granted ruling on this test (Task 12): `project_outbox` is the
+    # function every outbox route now calls to build its listing (design §3),
+    # so re-pointing the barrier here — target only — is what makes two
+    # concurrent GETs actually overlap inside the read this test means to
+    # exercise. Isolation assertions and concurrency mechanism are verbatim.
     import app.main as main
 
     barrier = threading.Barrier(2)
-    real_load = main.load_proposals
+    real_load = main.project_outbox
+    hits = 0
 
     def overlapped(scope):
+        nonlocal hits
+        hits += 1
         barrier.wait(timeout=5)
         return real_load(scope)
 
-    monkeypatch.setattr(main, "load_proposals", overlapped)
+    monkeypatch.setattr(main, "project_outbox", overlapped)
     with ThreadPoolExecutor(max_workers=2) as pool:
         alpha = pool.submit(client.get, "/outbox/alpha")
         beta = pool.submit(client.get, "/outbox/beta")
@@ -424,6 +449,11 @@ def test_concurrent_outbox_requests_keep_entity_diffs_isolated(client, monkeypat
     beta_html = beta.result().text
     assert "alpha-diff-marker" in alpha_html and "beta-diff-marker" not in alpha_html
     assert "beta-diff-marker" in beta_html and "alpha-diff-marker" not in beta_html
+    # The barrier can only reach its target if both concurrent requests
+    # actually called the patched function — otherwise a future refactor that
+    # moves the outbox routes off `project_outbox` would leave this green
+    # while proving nothing, exactly as it did against `load_proposals`.
+    assert hits == 2
 
 
 @pytest.mark.parametrize(
@@ -499,8 +529,20 @@ def test_approval_route_transaction_error_is_not_a_500_or_general_error_panel(
         "/outbox/alpha/approve", data={"id": proposal_id}
     )
 
+    # Task 12 / design §8 regression table, first row: this asserted
+    # `role="alert"` was ABSENT, because the route swallowed the transaction
+    # error silently (`except OutboxError: pass`). S6 makes the refusal
+    # visible, so the alert must now be PRESENT and carry the described code
+    # and message. Status expectation and all four state proofs below are
+    # unchanged — they are the test's actual subject.
+    from app.console_errors import _CODES
+
     assert response.status_code == 200
-    assert 'role="alert"' not in response.text
+    assert 'role="alert"' in response.text
+    assert "E-GIT" in response.text
+    assert _CODES["E-GIT"].message in response.text
+    # Raw exception text never reaches HTML (design §6).
+    assert "injected route transaction failure" not in response.text
     assert proposal_id in response.text
     assert git_head(client.vault) == head_before
     assert source.read_bytes() == source_bytes
@@ -584,8 +626,18 @@ def test_registry_transaction_error_is_a_registry_error(client, monkeypatch):
         data={"id": proposal.id, "slug": "alpha-only"},
     )
 
+    # design §6 regression table, second row: this asserted the raw internal
+    # string "registry deletion transaction failed" rendered. The disclosure
+    # boundary forbids raw exception text reaching HTML, so it must now be
+    # described instead — the code and curated message from the taxonomy —
+    # and the raw string must be absent. Status expectation and all three
+    # state proofs below are unchanged — they are the test's actual subject.
+    from app.console_errors import _CODES
+
     assert response.status_code == 200
-    assert "registry deletion transaction failed" in response.text
+    assert "E-GIT" in response.text
+    assert _CODES["E-GIT"].message in response.text
+    assert "registry deletion transaction failed" not in response.text
     assert registry_path.read_bytes() == registry_before
     assert proposal.path.read_bytes() == proposal_before
     assert git_head(client.vault) == head_before

@@ -1,0 +1,21 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page_title | default("OneOS") }}</title>
+<link rel="stylesheet" href="/static/app.css">
+<!-- HTMX 2.0.4 does not swap non-2xx by default; override the [45].. entry
+     so described attention statuses still reach the operator's screen while
+     keeping error:true for htmx:responseError (S6 design §4). The meta form
+     is required: every vendor script loads with defer, so an inline
+     statement would execute before htmx is defined. -->
+<meta name="htmx-config" content='{"responseHandling":[
+  {"code":"204","swap":false},
+  {"code":"[23]..","swap":true},
+  {"code":"[45]..","swap":true,"error":true}]}'>
+<!-- Vendored, never CDN (spec §6). defer preserves order: htmx, Alpine
+     plugins, the htmx alpine-morph extension, then Alpine core LAST so the
+     plugins are registered before Alpine boots. -->
+<script defer src="/static/vendor/htmx.min.js"></script>
+<script defer src="/static/vendor/alpine-morph.min.js"></script>
+<script defer src="/static/vendor/alpine-persist.min.js"></script>
+<script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
+<script defer src="/static/vendor/alpine.min.js"></script>

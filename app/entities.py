@@ -7,6 +7,8 @@ import re
 
 import yaml
 
+from .console_routing import structured_reader
+
 _ENTITY_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -73,6 +75,7 @@ class EntityCatalog:
     recipient_routes: tuple[tuple[str, str], ...] = ()
 
     @classmethod
+    @structured_reader(category="registry")
     def load(cls, root: Path | str) -> "EntityCatalog":
         root_path = Path(root).resolve()
         path = resolve_system_registry(root_path, "entities.yaml")

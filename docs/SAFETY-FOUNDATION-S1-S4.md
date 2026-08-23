@@ -236,13 +236,103 @@ secret scanning to pinned Gitleaks and kept Python limited to finite OneOS
 privacy rules. Gitleaks Git mode scans all local refs, so clone-specific stale
 history must be diagnosed at the retaining ref before an ignore is added.
 
+### Design-phase lessons from S6
+
+S6's design took seven review rounds. Every round found something, and the
+pattern in what they found is more useful than the individual findings.
+
+**Enumerations in prose are the recurring failure.** Rounds three through six
+each rejected a hand-written list — tamper raise sites (nine listed, eighteen in
+source), boundary-conversion lines (one range named a function containing no
+YAML), `hx-vals` offenders (two named, four existing), route inventories (eight
+listed, eleven registered). Every list was wrong by *omission*, the one
+direction a written list cannot detect. This is the §5 rule applied to design
+documents: a list that iterates what its author remembered cannot report what
+they forgot.
+
+The fix is to state rules in the document and derive enumerations in tests —
+but only for **facts about source layout**. Which code an exception maps to is a
+product decision and must stay written down; which line raises that exception is
+layout and belongs in a test. One revision deleted the class-to-code contract
+along with the line inventories and had to restore it.
+
+**A declaration is not a derivation.** Replacing a prose list with a
+registration list or a manifest keyed by line reproduces the same drift under a
+new name. A source-derived invariant needs a structural guard: an AST test that
+finds the thing by *what it does* — parses a registry, is registered as a route —
+and fails when it carries no declaration.
+
+**The scope line gets crossed while defending it.** S6's defining constraint is
+that it changes no refusal decision. Three separate revisions breached it: a
+destructive contract for deleting malformed records, a wrapper conversion that
+re-hid the outcome the same revision was fixing elsewhere, and a reader rule
+that would have made absent registries fatal where they are deliberately
+neutral. Each was caught in review, none by self-review. When a change is
+labelled "bounded", check whether it adds a refusal before accepting the label.
+
+**Prefer probes to argument for reachability claims.** Two rounds settled
+security questions by running code against a synthetic vault rather than
+reasoning about it — once refuting an escalation the design's own author had
+raised, once proving a projection would render controls that could never
+succeed. A claim about what an attacker can reach should be executed, not
+debated.
+
+**Deferral is legitimate when the fix crosses a step boundary.** The
+review-binding gap (S7) was recorded rather than absorbed because fixing it adds
+a refusal condition and changes three service signatures. Three reviews
+independently confirmed the deferral was honest and that the step could merge
+with the gap open. Recording an unresolved defect prominently is a better
+outcome than a silent scope breach.
+
+### Implementation-phase lessons from S6
+
+The design-phase lessons above concerned enumerations. The implementation phase
+produced a different and sharper one.
+
+**Across four reviewed tasks, every finding but one was a defect in the
+verification, not in the feature.** The implementations were faithful; the tests
+asserting them were not. Three shapes recurred:
+
+- *A test that passes with the code under test deleted.* One monkeypatched a
+  function and then never called it. Another asserted `hasattr` on a frozen
+  dataclass with fixed fields — unconditionally false. A third asserted a count
+  of zero that an absent file also returns.
+- *A test that proves a mechanism using the one input shape the codebase never
+  produces.* An AST guard's `system_path` trigger matched only a chained call;
+  every real site assigns to a local first, so the trigger fired zero times
+  while its test passed. Repairing it immediately exposed a genuinely
+  undeclared reader.
+- *A ledger claiming something is pinned when it is not.* Twice. The written
+  record is what a later reviewer trusts, so a false "pinned by test" is worse
+  than an admitted gap.
+
+The countermeasure that worked is mutation, not inspection: break the
+implementation, confirm the test fails, restore. It caught six unprotected
+behaviours across two tasks that reading had passed. Reviewers on this step also
+stripped each declaration in turn to prove none was decorative. **Treat "the
+suite is green" as evidence only after something has been broken and the suite
+went red.**
+
+**Escalate a design/reality conflict; do not resolve it silently.** One task
+found the design's literal instruction would break a pre-existing test through a
+route it did not own. It kept the test green, left the out-of-scope file
+untouched, and reported the deviation. Review then confirmed the deviation was
+right for a stronger reason than the implementer had — the two functions
+differed in read policy, not merely in one error case.
+
 ## Remaining attention
 
 S5 closes the isolated-transaction and path-aware Gate 3 gaps for classification
 approval and approved registry deletion. It intentionally does not migrate
 intake, rename, or direct registry add/edit into the new transaction service.
-S6 owns the remaining safe Console error taxonomy. Live Phase 1 timing and
-session trials still remain after S6.
+S6 owns the safe Console error taxonomy and is complete — see `STATUS.md` for
+the certified public/private gate results. S7 — bound review tokens — is the
+next proposed step and is not yet designed. Live Phase 1 timing and session
+trials still remain after S6.
+
+S6's design review found defects that predate it, listed in `STATUS.md`. The
+most serious is that nothing binds an approval to the bytes the operator
+reviewed; it is scheduled as S7 and must not begin before S6 merges.
 
 ## Historical documents
 

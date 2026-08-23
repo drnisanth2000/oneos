@@ -8,10 +8,11 @@
   {% else %}
   <div class="diff-head">No references — safe to delete.</div>
   {% endif %}
+  {% set delete_execute_values = {"id": prop.id} %}
   <div class="prop-actions">
     <button class="reject"
             hx-post="/registry/{{ entity }}/product/delete-execute"
-            hx-vals='{"id": "{{ prop.id }}", "slug": "{{ slug }}"}'
+            hx-vals='{{ delete_execute_values | tojson }}'
             hx-target="closest .delete-impact" hx-swap="innerHTML">Approve delete</button>
   </div>
 </div>

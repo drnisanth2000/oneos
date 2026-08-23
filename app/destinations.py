@@ -18,6 +18,18 @@ class InvalidSourceLeaf(DestinationError):
     pass
 
 
+class RedirectedSourceLeaf(InvalidSourceLeaf):
+    pass
+
+
+class MissingSourceLeaf(InvalidSourceLeaf):
+    pass
+
+
+class NonCanonicalLeaf(InvalidSourceLeaf):
+    pass
+
+
 class InvalidModule(DestinationError):
     pass
 
@@ -31,6 +43,14 @@ class BlockMismatch(DestinationError):
 
 
 class UnsafeDestinationPath(DestinationError):
+    pass
+
+
+class RedirectedDestination(UnsafeDestinationPath):
+    pass
+
+
+class MissingDestination(UnsafeDestinationPath):
     pass
 
 
@@ -64,14 +84,29 @@ def _require_markdown_leaf(leaf: str) -> None:
         or leaf != leaf.strip()
         or Path(leaf).suffix != ".md"
     ):
-        raise InvalidSourceLeaf("source leaf is non-canonical")
+        raise NonCanonicalLeaf("source leaf is non-canonical")
 
 
 def _require_real_directory(scope: Scope, *parts: str) -> Path:
     lexical = scope.root / scope.current_entity() / Path(*parts)
+    # PR #15 must-fix 6: classify a lexical symlink BEFORE calling
+    # `scope.resolve()`. A symlink targeting outside the entity root makes
+    # `scope.resolve()` raise `OutOfScopeError` (-> E-SCOPE), which reports
+    # an ordinary scope refusal for what design §2 requires to be a
+    # redirection finding (-> E-TAMPER). Checking the lexical symlink first
+    # means `scope.resolve()` is only reached for a path that is not itself
+    # a symlink.
+    if lexical.is_symlink():
+        raise RedirectedDestination("destination directory is redirected")
     resolved = scope.resolve(*parts)
-    if resolved != lexical or not lexical.is_dir():
-        raise UnsafeDestinationPath("destination directory is missing or redirected")
+    if resolved != lexical:
+        raise RedirectedDestination("destination directory is redirected")
+    if not lexical.exists():
+        # Absence is a routine condition (the standing E4 state) and must
+        # never raise a tampering alarm.
+        raise MissingDestination("destination directory is missing")
+    if not lexical.is_dir():
+        raise RedirectedDestination("destination directory is not a directory")
     return resolved
 
 
@@ -94,15 +129,17 @@ def resolve_classification_destination(
     _require_markdown_leaf(leaf)
     expected_source = scope.root / entity / "00-inbox" / "active" / leaf
     if source != expected_source:
-        raise InvalidSourceLeaf("source is not the canonical inbox receipt")
+        raise NonCanonicalLeaf("source is not the canonical inbox receipt")
     inbox_dir = _require_real_directory(scope, "00-inbox")
     inbox_active_dir = _require_real_directory(scope, "00-inbox", "active")
     if inbox_active_dir.parent != inbox_dir:
-        raise UnsafeDestinationPath("inbox lifecycle directory is redirected")
-    if expected_source.is_symlink() or (
-        require_source and not expected_source.is_file()
-    ):
-        raise InvalidSourceLeaf("source receipt is missing or redirected")
+        raise RedirectedDestination("inbox lifecycle directory is redirected")
+    if expected_source.is_symlink():
+        raise RedirectedSourceLeaf("source receipt is redirected")
+    if require_source and not expected_source.is_file():
+        if expected_source.exists():
+            raise RedirectedSourceLeaf("source receipt is not a regular file")
+        raise MissingSourceLeaf("source receipt is missing")
 
     if not _is_registry_id(module):
         raise InvalidModule("destination module is non-canonical")
@@ -129,16 +166,22 @@ def resolve_classification_destination(
         raise InvalidModule("destination module has no active lifecycle")
     active_dir = _require_real_directory(scope, module, "active")
     if active_dir.parent != module_dir:
-        raise UnsafeDestinationPath("active lifecycle directory is redirected")
+        raise RedirectedDestination("active lifecycle directory is redirected")
 
     destination_lexical = scope.root / entity / module / "active" / leaf
+    # C2 (S6 review): classify a lexical symlink BEFORE calling
+    # scope.resolve() — the same reasoning as _require_real_directory above.
+    # A symlinked destination leaf targeting outside the entity root makes
+    # scope.resolve() raise OutOfScopeError (-> E-SCOPE) first, reporting an
+    # ordinary scope refusal for what design §2 requires to be a
+    # redirection finding (-> E-TAMPER). Checking the lexical symlink first
+    # means scope.resolve() is only reached for a path that is not itself a
+    # symlink.
+    if destination_lexical.is_symlink():
+        raise RedirectedDestination("destination is not canonical")
     destination = scope.resolve(module, "active", leaf)
-    if (
-        destination.parent != active_dir
-        or destination_lexical.is_symlink()
-        or destination.is_symlink()
-    ):
-        raise UnsafeDestinationPath("destination is not canonical")
+    if destination.parent != active_dir or destination.is_symlink():
+        raise RedirectedDestination("destination is not canonical")
 
     return ClassificationDestination(
         entity=entity,

@@ -1,0 +1,5 @@
+<div class="alert{% if error.severity == 'attention' %} alert-attention{% endif %}"
+     role="alert">
+  <span class="alert-code">{{ error.code }}</span>
+  <span class="alert-message">{{ error.message }}</span>
+</div>

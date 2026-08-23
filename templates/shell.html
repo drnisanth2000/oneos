@@ -1,18 +1,8 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OneOS</title>
-  <link rel="stylesheet" href="/static/app.css">
-  <!-- Vendored, never CDN (spec §6). defer preserves order: htmx, Alpine
-       plugins, the htmx alpine-morph extension, then Alpine core LAST so the
-       plugins are registered before Alpine boots. -->
-  <script defer src="/static/vendor/htmx.min.js"></script>
-  <script defer src="/static/vendor/alpine-morph.min.js"></script>
-  <script defer src="/static/vendor/alpine-persist.min.js"></script>
-  <script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
-  <script defer src="/static/vendor/alpine.min.js"></script>
+  {% set page_title = "OneOS" %}
+  {% include "_head.html" %}
 </head>
 <!-- alpine-morph extension is what makes hx-swap="morph" preserve Alpine
      state across an auto-refresh; mandatory, not optional (spec §6). -->

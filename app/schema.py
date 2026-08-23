@@ -26,6 +26,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from .console_routing import structured_reader
+
 # Mirror of policy_enforcer.REQUIRED_FRONT_MATTER_FIELDS[_BY_TYPE].
 REQUIRED_FIELDS = ["type", "title", "entity", "product", "status", "created", "updated"]
 REQUIRED_FIELDS_BY_TYPE: dict[str, list[str]] = {
@@ -102,6 +104,7 @@ def validate_front_matter(fm: dict) -> tuple[bool, list[str]]:
         return False, problems
 
 
+@structured_reader(category="front-matter")
 def validate_file_text(text: str) -> tuple[bool, list[str]]:
     """Validate a markdown file's text. Extraction replicates
     policy_enforcer.validate_front_matter byte-for-byte so the two agree."""

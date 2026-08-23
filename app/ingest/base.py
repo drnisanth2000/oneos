@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+from ..console_routing import structured_reader
 from ..scope import Scope
 from ..inbox import split_front_matter
 from .envelope import Envelope
@@ -204,6 +205,7 @@ def _tracked_markdown_paths(scope: Scope) -> list[Path]:
     return paths
 
 
+@structured_reader(category="front-matter")
 def find_tracked_receipt(scope: Scope, envelope: Envelope) -> Path | None:
     _require_git_head(scope)
     exact: Path | None = None

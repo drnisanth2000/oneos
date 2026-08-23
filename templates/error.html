@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  {% set page_title = "OneOS" %}
+  {% include "_head.html" %}
+</head>
+<body hx-ext="alpine-morph">
+  {# The sidebar iterates bundles, so it cannot render when the described
+     condition is the registries themselves failing to load; the composition
+     root passes bundles only when they are safe to read (design §6). #}
+  {% if bundles %}{% include "_sidebar.html" %}{% endif %}
+  <main class="main">
+    {% include "blocks/alert.html" %}
+  </main>
+</body>
+</html>

@@ -11,6 +11,7 @@ block-mapping validation — so it never trips check_v2 or the module lint.
 from __future__ import annotations
 
 import difflib
+import errno
 import hashlib
 import os
 import re
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import yaml
 
+from .console_routing import structured_reader
 from .git_transaction import (
     GitTransactionError,
     PathChange,
@@ -36,11 +38,19 @@ from .proposal_identity import (
     proposal_id_candidates,
     require_proposal_identity,
 )
-from .scope import CrossScopeError, Scope
+from .scope import CrossScopeError, OutOfScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError
 
 
 class OutboxError(Exception):
+    pass
+
+
+class UnreadableProposalRecord(OutboxError):
+    pass
+
+
+class ProposalSourceUnavailable(CrossScopeError):
     pass
 
 
@@ -85,6 +95,27 @@ class Proposal:
     status: str = "pending"
 
 
+@dataclass(frozen=True)
+class OutboxRow:
+    """One outbox entry as the Console can safely present it. Rows carry
+    **capabilities**, not kinds (design §3): a row that cannot be diffed or
+    approved is still a row, and it never withholds another row's controls."""
+    proposal: Proposal | None
+    diff: str | None
+    error: BaseException | None
+    can_approve: bool
+    can_reject: bool
+
+
+@dataclass(frozen=True)
+class OutboxListing:
+    """`blocked` is reserved for the family that actually poisons
+    `load_proposals` — a genuinely unreadable record — because those are the
+    conditions under which no action in the entity can succeed."""
+    rows: tuple[OutboxRow, ...]
+    blocked: bool
+
+
 def _require_outbox_path(
     scope: Scope,
     proposal_path: Path | None = None,
@@ -94,19 +125,28 @@ def _require_outbox_path(
 ) -> Path:
     """Retain the lexical outbox path and reject every redirected component."""
     lexical_outbox = scope.root / scope.current_entity() / "outbox"
+    # C2 (S6 review): classify a lexical symlink BEFORE calling
+    # scope.resolve() — matching the correct order already used a few lines
+    # below in this same function. Calling scope.resolve() first (as this
+    # site previously did, by assigning its result before the is_symlink()
+    # check) lets a redirected outbox raise OutOfScopeError (-> E-SCOPE)
+    # instead of RedirectedPathError (-> E-TAMPER), the wrong tier for a
+    # redirection finding (design §2).
+    if lexical_outbox.is_symlink():
+        raise RedirectedPathError("outbox directory is redirected")
     resolved_outbox = scope.resolve("outbox")
-    if lexical_outbox.is_symlink() or resolved_outbox != lexical_outbox:
-        raise CrossScopeError("outbox directory is redirected")
+    if resolved_outbox != lexical_outbox:
+        raise RedirectedPathError("outbox directory is redirected")
     if lexical_outbox.exists():
         if not lexical_outbox.is_dir():
-            raise CrossScopeError("outbox path is not a real directory")
+            raise RedirectedPathError("outbox path is not a real directory")
     elif create_directory:
         try:
             lexical_outbox.mkdir()
         except FileExistsError as exc:
-            raise CrossScopeError("outbox directory changed during creation") from exc
+            raise RedirectedPathError("outbox directory changed during creation") from exc
         if lexical_outbox.is_symlink() or scope.resolve("outbox") != lexical_outbox:
-            raise CrossScopeError("outbox directory is redirected")
+            raise RedirectedPathError("outbox directory is redirected")
 
     if proposal_path is None:
         return lexical_outbox
@@ -117,12 +157,12 @@ def _require_outbox_path(
         or candidate != lexical_outbox / candidate.name
         or candidate.suffix != ".yaml"
     ):
-        raise CrossScopeError("proposal is outside the lexical outbox")
+        raise OutOfScopeError("proposal is outside the lexical outbox")
     if candidate.is_symlink():
-        raise CrossScopeError("proposal leaf is redirected")
+        raise RedirectedPathError("proposal leaf is redirected")
     if candidate.exists():
         if not candidate.is_file() or candidate.resolve() != candidate:
-            raise CrossScopeError("proposal leaf is not a real file")
+            raise RedirectedPathError("proposal leaf is not a real file")
     elif require_leaf:
         raise OutboxError("proposal leaf no longer exists")
     return candidate
@@ -137,11 +177,18 @@ def _read_no_follow_bytes(path: Path) -> bytes:
     except FileNotFoundError:
         raise
     except OSError as exc:
-        raise CrossScopeError("source receipt is redirected or unsafe") from exc
+        if exc.errno in {errno.ELOOP, errno.EMLINK}:
+            # O_NOFOLLOW rejection: ELOOP on Linux/macOS, EMLINK on some BSDs.
+            raise RedirectedPathError(
+                "source receipt is redirected or unsafe"
+            ) from exc
+        raise ProposalSourceUnavailable(
+            "source receipt could not be read"
+        ) from exc
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
-            raise CrossScopeError("source receipt is not a regular file")
+            raise RedirectedPathError("source receipt is not a regular file")
         with os.fdopen(descriptor, "rb", closefd=True) as stream:
             descriptor = -1
             return stream.read()
@@ -258,6 +305,55 @@ def _to_proposal(path: Path, record: dict) -> Proposal:
     )
 
 
+@structured_reader(category="proposal")
+def _read_record(path: Path) -> object:
+    """Read and parse a stored proposal record. A `proposal`-category
+    structured read (design §7 invariant 4): every way reading or shaping it
+    can fail becomes `UnreadableProposalRecord`, never a raw stdlib type."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise UnreadableProposalRecord(
+            "proposal record is not valid UTF-8"
+        ) from exc
+    except OSError as exc:
+        raise UnreadableProposalRecord(
+            "proposal record could not be read"
+        ) from exc
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as exc:
+        raise UnreadableProposalRecord(
+            "proposal record is invalid YAML"
+        ) from exc
+
+
+def _validate_record(path: Path, record: object) -> Proposal | None:
+    """Schema and identity only (design §3 phase 1) — never touches the
+    registries or reads anything beyond the record itself. Returns ``None``
+    for a well-formed ``action: delete`` record, which both the strict loader
+    and the projection skip identically."""
+    if not isinstance(record, dict):
+        raise UnreadableProposalRecord("proposal record must be a mapping")
+    try:
+        require_proposal_identity(path, record.get("id"))
+    except ProposalIdentityError as exc:
+        raise UnreadableProposalRecord("proposal identity is invalid") from exc
+    action = record.get("action")
+    if not isinstance(action, str) or not action:
+        raise UnreadableProposalRecord("proposal action is malformed")
+    if action == "delete":
+        return None
+    if action != "classify":
+        raise UnreadableProposalRecord("proposal action is unknown")
+    try:
+        return _to_proposal(path, record)
+    except OutboxDestinationError as exc:
+        raise UnreadableProposalRecord(
+            "proposal record is malformed"
+        ) from exc
+
+
 def load_proposals(scope: Scope) -> list[Proposal]:
     outbox = _require_outbox_path(scope)
     if not outbox.exists():
@@ -266,23 +362,17 @@ def load_proposals(scope: Scope) -> list[Proposal]:
     for discovered in sorted(outbox.glob("*.yaml")):
         p = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
-            record = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError as exc:
-            raise OutboxDestinationError("proposal record is invalid YAML") from exc
-        if not isinstance(record, dict):
-            raise OutboxDestinationError("proposal record must be a mapping")
-        try:
-            require_proposal_identity(p, record.get("id"))
-        except ProposalIdentityError as exc:
-            raise OutboxDestinationError("proposal identity is invalid") from exc
-        action = record.get("action")
-        if not isinstance(action, str) or not action:
-            raise OutboxDestinationError("proposal action is malformed")
-        if action == "delete":
+            record = _read_record(p)
+            proposal = _validate_record(p, record)
+        except UnreadableProposalRecord as exc:
+            # D1 (ledger): re-narrow to the strict loader's existing escaping
+            # type, so every `except OutboxDestinationError` clause and every
+            # `_assert_destination_error` call site is unchanged.
+            raise OutboxDestinationError(
+                "proposal record could not be read"
+            ) from exc
+        if proposal is None:
             continue
-        if action != "classify":
-            raise OutboxDestinationError("proposal action is unknown")
-        proposal = _to_proposal(p, record)
         props.append(_require_destination(scope, proposal))
     return props
 
@@ -301,9 +391,68 @@ def _apply_sub(text: str, sub: str | None) -> str:
     return text
 
 
+def _diff_text(proposal: Proposal, old: str) -> str:
+    """Render the move diff from already-decoded source text.
+
+    Shared by `_render_diff` and `preview_diff`, which differ only in **read
+    policy** — the diff production itself is identical, and duplicating it let
+    the two drift with no test able to notice.
+    """
+    new = _apply_sub(old, proposal.sub)
+    diff = difflib.unified_diff(
+        old.splitlines(True), new.splitlines(True),
+        fromfile=f"a/{proposal.src}", tofile=f"b/{proposal.dst}",
+    )
+    return f"move: {proposal.src} → {proposal.dst}\n" + "".join(diff)
+
+
+def _render_diff(scope: Scope, proposal: Proposal) -> str:
+    """Diff-only work on an **already-validated** record (design §3 phase 3).
+    Reads the source receipt through the same safe-read boundary `approve`
+    uses, and translates failures into the same domain types `approve` raises
+    for the identical physical cause — so a projected row and its approve
+    button never describe different conditions for one cause."""
+    src = scope.root / proposal.src
+    try:
+        source_bytes = _read_no_follow_bytes(src)
+    except FileNotFoundError as exc:
+        raise MissingProposalSource("proposal source is missing") from exc
+    # RedirectedPathError and ProposalSourceUnavailable are raised directly by
+    # `_read_no_follow_bytes` and pass through unmodified — the same domain
+    # types `approve` lets propagate for the same conditions.
+    try:
+        old = source_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OutboxDestinationError(
+            "proposal source is not UTF-8 markdown"
+        ) from exc
+    return _diff_text(proposal, old)
+
+
 def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
-    src to dst with `sub:` updated. Reads only; renders, never moves."""
+    src to dst with `sub:` updated. Reads only; renders, never moves.
+
+    Deliberately does **not** delegate to `_render_diff`: `_render_diff`
+    raises a described error for a missing/redirected/undecodable receipt
+    (the projection's phase-3 contract), while `preview_diff` renders an
+    empty-old diff for a missing source without raising.
+
+    Task 12 moved every outbox *route* — `outbox_screen`, `outbox_approve`,
+    `outbox_reject` — onto `project_outbox`/`_render_diff`, leaving `propose`
+    as the sole remaining caller. The empty-old fallback is kept because
+    changing it would alter `propose`'s behaviour, which Task 12 does not own
+    — **not** because the source is expected to be absent there:
+    `propose_classification` refuses a missing receipt before persisting, so
+    on that path the source provably existed moments earlier and only a TOCTOU
+    deletion can race it.
+
+    `test_approval_route_visibly_refuses_unfresh_source` now observes
+    `approve`'s own refusal rendered through the projection's listing. Its
+    missing-source case additionally produces a row-level `E-MISSING`; there
+    is no row-level `E-STALE`, because staleness is a revalidation concern
+    rather than a read-boundary one, so a stale row keeps `can_approve` and
+    renders a normal diff."""
     _require_outbox_path(scope, proposal.path, require_leaf=True)
     reloaded = get_proposal(scope, proposal.id)
     if reloaded.id != proposal.id or reloaded.path != proposal.path:
@@ -311,13 +460,94 @@ def preview_diff(scope: Scope, proposal: Proposal) -> str:
     proposal = reloaded
     src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
-    new = _apply_sub(old, proposal.sub)
-    diff = difflib.unified_diff(
-        old.splitlines(True), new.splitlines(True),
-        fromfile=f"a/{proposal.src}", tofile=f"b/{proposal.dst}",
-    )
-    header = f"move: {proposal.src} → {proposal.dst}\n"
-    return header + "".join(diff)
+    return _diff_text(proposal, old)
+
+
+def project_outbox(scope: Scope) -> OutboxListing:
+    """Read-only presentation projection over the outbox (design §3 Rule 3).
+
+    Never calls `get_proposal`, `load_proposals`, or `preview_diff` — it
+    revalidates each record itself, through the same three helpers the strict
+    loader uses, without the strict loader's all-or-nothing re-entry.
+
+    - Phase 1 (record read/schema): `UnreadableProposalRecord` is the family
+      that already poisons `load_proposals`, so it sets `blocked` and
+      withholds every row's controls listing-wide — an accurate reflection
+      of the untouched strict loader's coupling, not an invented one.
+    - Phase 2 (destination/registry/path validation): properties of the
+      vault, not of one file. Left uncaught here, so a condition such as a
+      broken registry or a redirected outbox propagates out of this function
+      entirely, aborting the projection.
+    - Phase 3 (diff rendering): row-local and non-poisoning. A row whose
+      diff fails keeps `can_reject`, loses `can_approve`, and never sets
+      `blocked`.
+    """
+    outbox = _require_outbox_path(scope)
+    if not outbox.exists():
+        return OutboxListing(rows=(), blocked=False)
+
+    rows: list[OutboxRow] = []
+    blocked = False
+    for discovered in sorted(outbox.glob("*.yaml")):
+        path = _require_outbox_path(scope, discovered, require_leaf=True)
+        try:
+            record = _read_record(path)
+            proposal = _validate_record(path, record)
+        except UnreadableProposalRecord as exc:
+            blocked = True
+            rows.append(
+                OutboxRow(
+                    proposal=None, diff=None, error=exc,
+                    can_approve=False, can_reject=False,
+                )
+            )
+            continue
+        if proposal is None:
+            # A well-formed `action: delete` record — skipped exactly as
+            # `load_proposals` skips it: renders nothing, blocks nothing.
+            continue
+
+        # Phase 2 — propagates. `_require_destination` is the same
+        # destination-canonicalization the strict loader applies; left
+        # uncaught here, its exception aborts this function entirely.
+        proposal = _require_destination(scope, proposal)
+
+        try:
+            diff = _render_diff(scope, proposal)
+        except (
+            MissingProposalSource,
+            RedirectedPathError,
+            OutboxDestinationError,
+            ProposalSourceUnavailable,
+        ) as exc:
+            rows.append(
+                OutboxRow(
+                    proposal=proposal, diff=None, error=exc,
+                    can_approve=False, can_reject=True,
+                )
+            )
+            continue
+
+        rows.append(
+            OutboxRow(
+                proposal=proposal, diff=diff, error=None,
+                can_approve=True, can_reject=True,
+            )
+        )
+
+    if blocked:
+        # No check is weakened; the strict loader still refuses everything
+        # in this entity, exactly as today. Withholding every control here
+        # only stops the listing from lying about it.
+        rows = [
+            OutboxRow(
+                row.proposal, row.diff, row.error,
+                can_approve=False, can_reject=False,
+            )
+            for row in rows
+        ]
+
+    return OutboxListing(rows=tuple(rows), blocked=blocked)
 
 
 def _require_scope(scope: Scope, proposal: Proposal) -> Proposal:
@@ -354,6 +584,7 @@ def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
     raise OutboxError(f"no pending proposal {proposal_id!r} for {entity}")
 
 
+@structured_reader(category="proposal")
 def approve(scope: Scope, proposal_id: str) -> Proposal:
     """Perform the proposed move and commit it — exactly one revertible commit.
     The proposal is transaction-owned but never enters the approval commit."""
@@ -384,7 +615,23 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
 
     proposal_rel = prop.path.relative_to(vault).as_posix()
     proposal_state = capture_path_state(vault, proposal_rel)
-    persisted = _to_proposal(prop.path, yaml.safe_load(proposal_state.contents))
+    # Mid-approval re-read, mirroring execute_delete: a vanished file makes
+    # safe_load(None) raise AttributeError, and corrupted bytes raise
+    # YAMLError. Both escape as E-UNKNOWN at the highest-stakes moment. A
+    # non-mapping is already OutboxDestinationError inside _to_proposal, and a
+    # blanket AttributeError/TypeError here would mask programmer errors —
+    # Rule 5 forbids it.
+    if proposal_state.contents is None:
+        raise UnreadableProposalRecord(
+            "proposal record could not be re-read before approval"
+        )
+    try:
+        record = yaml.safe_load(proposal_state.contents)
+    except yaml.YAMLError as exc:
+        raise UnreadableProposalRecord(
+            "proposal record could not be re-read before approval"
+        ) from exc
+    persisted = _to_proposal(prop.path, record)
     persisted = _require_destination(scope, persisted)
     if persisted != prop:
         raise OutboxDestinationError("proposal changed since it was loaded")
