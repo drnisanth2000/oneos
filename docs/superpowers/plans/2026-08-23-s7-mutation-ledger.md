@@ -6,8 +6,7 @@ red for the intended reason, the exact implementation has been restored
 byte-for-byte, and the test has gone green again.
 
 **Baseline:** `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f` → 926 passed.
-**At the time of writing:** 1233 passed. The S7-focused selection is
-703 passed.
+**At the time of writing:** 1239 passed.
 
 Restoration is by `cmp` against a pre-image copy taken before each mutation.
 No destructive Git cleanup is used anywhere in this campaign — a `git
@@ -74,15 +73,16 @@ harness is the last place that should be possible.
 Last full run, from the script above:
 
 ```
-M1  RED then GREEN   M3  RED then GREEN   M4  RED then GREEN
+M1  RED then GREEN   M3  RED then GREEN   M4b RED then GREEN
 M5  RED then GREEN   M5b RED then GREEN   M6  RED then GREEN
 M7  RED then GREEN   M7b RED then GREEN   M8  RED then GREEN
 M9  RED then GREEN   M10 RED then GREEN   M11 RED then GREEN
+M12 RED then GREEN   M13 RED then GREEN   M14 RED then GREEN
 
-all 12 mutations: red under mutation, green once restored
+all 15 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1233 passed in 79.36s
+  1239 passed in 86.09s
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -152,6 +152,26 @@ mutant, because a ledger row that mutates nothing is worse than an absent one.
 -            make_review_snapshot(_require_destination(scope, proposal), contents)
 +            make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4
 ```
+
+### M4b — the operator-facing snapshot hashes a second read
+
+- **file** `app/outbox.py` — `review_snapshot_for`
+- **selection** `tests/test_console_projection.py tests/test_outbox.py`
+- **result** RED — `test_the_projected_value_and_hash_come_from_one_capture`
+
+```diff
+-    return make_review_snapshot(_require_destination(scope, proposal), contents)
++    return make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4b
+```
+
+**Added after independent review, and it replaces M4.** M4 mutated the
+strict loader's snapshot — whose digest, it turned out, no production caller
+reads. The digest that reaches an operator's button came from a *second*
+construction site in `project_outbox`, and mutating that one left the whole
+suite green: 1233 passed, while the button carried the fingerprint of bytes
+the operator never saw. The two sites are now one function, so M4 and M4b
+would mutate the same line; M4 is retired rather than left as a row that
+mutates nothing.
 
 ### M5 — approve: transaction authority from a later reread
 
@@ -271,6 +291,50 @@ boundary now compares the bytes and type of every path in the vault.
 Added after review: the structural test previously asserted only that
 `review_sha256` was *used* somewhere in the route, which a log line would
 satisfy. It now requires it to be an argument of the call that acts.
+
+### M12 — the live reference gate stops running under the lock
+
+- **file** `app/registry.py`
+- **selection** `tests/test_registry.py`
+- **result** RED — `test_the_reference_recount_holds_the_approval_lock`
+
+```diff
+-            preconditions=(_require_no_live_references,),
++  # MUTANT M12: reference gate no longer runs under the lock
+```
+
+Counting references before the approval lock leaves a window another
+approval can commit into: a new *reference* leaves this transaction's own
+expected states — the registry file and the proposal record — untouched, so
+they still match and the deletion proceeds, orphaning it. Acceptance
+criterion 5 is about the instant before mutation.
+
+### M13 — a stranded record collapses into a generic recovery outcome
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED — `test_a_rollback_that_cannot_restore_the_record_reports_it_as_stranded`
+
+```diff
+-        if stranded_records:
++        if False:  # MUTANT M13
+```
+
+### M14 — a simultaneous cleanup failure overwrites the stranded outcome
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED — `test_a_stranded_record_survives_a_simultaneous_cleanup_failure`
+
+```diff
+-            if isinstance(transaction_error, QuarantineRestorationBlocked):
++            if False:  # MUTANT M14
+```
+
+A leftover temporary index is a diagnostic detail; a consumed record
+stranded in quarantine is an indeterminate state. Reporting the first and
+discarding the second says "nothing was changed" while a record sits in
+`.consumed/`.
 
 ---
 
