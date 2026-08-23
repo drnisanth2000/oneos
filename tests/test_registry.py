@@ -1480,3 +1480,68 @@ def test_the_reference_recount_holds_the_approval_lock(tmp_path):
 
     assert observed, "the reference count never ran"
     assert observed[-1] == "lock was HELD", observed
+
+
+def test_execute_delete_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
+    """Item 5 (safety review): the registry half of the same boundary.
+
+    `execute_delete` parses `proposal_state.contents`. Rereading the path
+    there was an equivalent mutant for the same reason it was in the
+    outbox: `PathState` compares full contents, so a replacement still on
+    disk at transaction time is refused either way.
+
+    A replacement that is *put back* before the transaction is not. Every
+    state check then sees the reviewed bytes, because by the time anything
+    checks, that is what the file holds — but the parse saw something
+    else, and in this route the parsed value chooses which registry entry
+    is removed. The witness is therefore which product survives.
+    """
+    import yaml
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    fingerprint = _fingerprint_of(scope, prop.id)
+    reviewed_bytes = prop.path.read_bytes()
+
+    products = vault / "_system/products.yaml"
+    assert "other:" in products.read_text(encoding="utf-8")
+
+    real_match = registry.require_review_match
+    real_parse = registry._parse_delete_record
+    window = []
+
+    def open_the_window(contents, submitted):
+        result = real_match(contents, submitted)
+        record = yaml.safe_load(reviewed_bytes.decode("utf-8"))
+        record["slug"] = "other"
+        prop.path.write_bytes(
+            yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+        )
+        window.append("open")
+        return result
+
+    def close_the_window(contents):
+        try:
+            return real_parse(contents)
+        finally:
+            if window and window[-1] == "open":
+                prop.path.write_bytes(reviewed_bytes)
+                window.append("closed")
+
+    registry.require_review_match = open_the_window
+    registry._parse_delete_record = close_the_window
+    try:
+        deleted = execute_delete(scope, prop.id, fingerprint)
+    finally:
+        registry.require_review_match = real_match
+        registry._parse_delete_record = real_parse
+
+    assert window == ["open", "closed"], window
+
+    # The entry removed is the reviewed one, and the sibling the hostile
+    # record named is untouched.
+    assert deleted.slug == "widgetx", "delete chose a target from a reread"
+    remaining = products.read_text(encoding="utf-8")
+    assert "widgetx:" not in remaining
+    assert "other:" in remaining, "deleted a product nobody reviewed"

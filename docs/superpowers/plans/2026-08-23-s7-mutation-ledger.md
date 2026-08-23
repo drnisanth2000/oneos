@@ -81,16 +81,17 @@ harness is the last place that should be possible.
 Last full run, from the script above:
 
 ```
-M1  RED then GREEN   M3  RED then GREEN   M4b RED then GREEN
-M5  RED then GREEN   M5b RED then GREEN   M6  RED then GREEN
-M7  RED then GREEN   M7b RED then GREEN   M8  RED then GREEN
-M9  RED then GREEN   M10 RED then GREEN   M11 RED then GREEN
-M12 RED then GREEN   M13 RED then GREEN   M14 RED then GREEN
+M1   RED then GREEN   M3   RED then GREEN   M4b  RED then GREEN
+M5   RED then GREEN   M5b  RED then GREEN   M6   RED then GREEN
+M7   RED then GREEN   M7b  RED then GREEN   M8   RED then GREEN
+M9   RED then GREEN   M10  RED then GREEN   M12  RED then GREEN
+M13  RED then GREEN   M14  RED then GREEN   M15  RED then GREEN
+M16  RED then GREEN   M11  RED then GREEN
 
-all 15 mutations: red under mutation, green once restored
+all 17 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1239 passed in 86.09s
+  1258 passed in 91.59s (0:01:31)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -353,6 +354,51 @@ discarding the second says "nothing was changed" while a record sits in
 `.consumed/`.
 
 ---
+
+### M15 — approve parses a fresh read instead of the compared bytes
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED — `test_approve_parses_the_bytes_it_compared_not_a_fresh_read`
+
+```diff
+-    record = _parse_record_bytes(proposal_state.contents)
++    record = _parse_record_bytes((vault / proposal_rel).read_bytes())
+```
+
+### M16 — delete parses a fresh read instead of the compared bytes
+
+- **file** `app/registry.py`
+- **selection** `tests/test_registry.py`
+- **result** RED — `test_execute_delete_parses_the_bytes_it_compared_not_a_fresh_read`
+
+```diff
+-            scope, path, _parse_delete_record(proposal_state.contents)
++            scope, path, _parse_delete_record(path.read_bytes())
+```
+
+Both of these were **equivalent mutants** until their tests existed, and the
+safety review was right to name them: the whole suite passed under either
+one. The reason is `PathState`, which compares full contents rather than
+metadata. If a replacement is still on disk when the transaction runs,
+`_require_expected_states` refuses whichever bytes were parsed, and no
+observer outside the function can tell the two implementations apart.
+
+What separates them is a replacement that does not survive to the
+transaction — a writer that swaps the record and puts the original back.
+Every state check then passes, because by the time anything checks, the
+reviewed bytes are what the file holds. Only the parse saw the replacement,
+and in both routes the parsed value chooses *what the action does*: the
+destination approve moves to, and the registry entry delete removes.
+
+So both tests hold hostile bytes on disk for exactly the window a reread
+would use, restore the reviewed bytes immediately afterwards, and take the
+action's own choice as the witness. Each asserts the window really opened
+and closed, so neither can pass by the race failing to occur. Under M15
+approve filed to `demo/11-library/active/note.md`, which nobody reviewed;
+under M16 delete removed the sibling product `other` and left `widgetx` in
+place. Each mutant fails exactly one node in the full suite — the one added
+for it — which is what "no longer equivalent" means here.
 
 ## M6 — a survivor, and what it cost
 

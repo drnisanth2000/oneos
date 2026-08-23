@@ -2698,3 +2698,74 @@ def test_a_stranded_record_survives_a_simultaneous_cleanup_failure(tmp_path):
     # Both files still survive.
     assert prop.path.read_bytes() == occupant
     assert len(_quarantined(vault)) == 1
+
+
+def test_approve_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
+    """Item 5 (safety review): the action-boundary parse, proved directly.
+
+    `_own_reviewed_proposal` parses `proposal_state.contents`. Swapping
+    that for `path.read_bytes()` was an *equivalent* mutant under every
+    existing test, because `PathState` compares full contents: if the
+    replacement is still on disk when the transaction runs,
+    `_require_expected_states` refuses either way, and the two
+    implementations are indistinguishable from outside.
+
+    The gap is a replacement that does not survive to the transaction. A
+    writer that swaps the record and puts the original back — an
+    fsync-less editor, a regenerator that rewrites and rolls back, a
+    racing proposer — leaves every state check satisfied, because by the
+    time anything checks, the reviewed bytes are what is on disk. Only
+    the parse saw the replacement. A fresh read there would derive the
+    destination from bytes nobody reviewed, and then approve a move to it
+    while the transaction dutifully owns the reviewed record.
+
+    So: hostile bytes on disk for exactly the window a reread would use,
+    reviewed bytes everywhere else, and the destination as the witness.
+    """
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    reviewed_bytes = prop.path.read_bytes()
+
+    reviewed_dst = vault / prop.dst
+    hostile_dst = vault / "demo/11-library/active/note.md"
+    assert prop.dst != "demo/11-library/active/note.md"
+
+    real_match = outbox.require_review_match
+    real_parse = outbox._parse_record_bytes
+    window = []
+
+    def open_the_window(contents, submitted):
+        # Runs after the single capture, before the parse. The comparison
+        # itself is against captured bytes, so it still matches.
+        result = real_match(contents, submitted)
+        _rewrite_same_id_meaningfully(prop)
+        window.append("open")
+        return result
+
+    def close_the_window(contents):
+        # The reread a mutant would perform happens while evaluating this
+        # call's argument, so the replacement is restored only afterwards.
+        try:
+            return real_parse(contents)
+        finally:
+            if window and window[-1] == "open":
+                prop.path.write_bytes(reviewed_bytes)
+                window.append("closed")
+
+    outbox.require_review_match = open_the_window
+    outbox._parse_record_bytes = close_the_window
+    try:
+        approved = approve(scope, prop.id, review.sha256)
+    finally:
+        outbox.require_review_match = real_match
+        outbox._parse_record_bytes = real_parse
+
+    # The window really opened and closed, so the test drove the race it
+    # describes rather than passing because nothing happened.
+    assert window == ["open", "closed"], window
+
+    # The move that landed is the reviewed one.
+    assert approved.dst == prop.dst, "approve chose a destination from a reread"
+    assert reviewed_dst.exists()
+    assert not hostile_dst.exists(), "approved a destination nobody reviewed"

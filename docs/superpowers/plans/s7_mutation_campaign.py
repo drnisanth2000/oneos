@@ -164,6 +164,27 @@ MUTATIONS = [
           "the stranded outcome was overwritten")],
     ),
     (
+        # The two action-boundary parses. Both were equivalent mutants until
+        # M15/M16's tests existed: `PathState` compares full contents, so a
+        # replacement still on disk at transaction time is refused either
+        # way. Only a replacement restored *before* the transaction tells
+        # the two implementations apart.
+        "M15", "app/outbox.py",
+        "    record = _parse_record_bytes(proposal_state.contents)",
+        "    record = _parse_record_bytes((vault / proposal_rel).read_bytes())  # MUTANT M15",
+        ["tests/test_outbox.py"],
+        [("tests/test_outbox.py::test_approve_parses_the_bytes_it_compared_not_a_fresh_read",
+          "approve chose a destination from a reread")],
+    ),
+    (
+        "M16", "app/registry.py",
+        "            scope, path, _parse_delete_record(proposal_state.contents)",
+        "            scope, path, _parse_delete_record(path.read_bytes())  # MUTANT M16",
+        ["tests/test_registry.py"],
+        [("tests/test_registry.py::test_execute_delete_parses_the_bytes_it_compared_not_a_fresh_read",
+          "delete chose a target from a reread")],
+    ),
+    (
         "M11", "app/main.py",
         "        prop = execute_delete(scope, id, review_sha256)",
         '        _unused = review_sha256  # MUTANT M11\n        prop = execute_delete(scope, id, "0" * 64)',
