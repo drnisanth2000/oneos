@@ -57,6 +57,14 @@ For each mutation the script:
      green — scanning output for `FAILED` lines is not sufficient, for the
      same reason.
 
+   Runs use **`--tb=line`**, which prints one line per failure: the failing
+   assertion and nothing else. A full traceback also prints surrounding
+   *source*, so a diagnostic can match a nearby line that **passed** — which
+   is exactly how M4b's expected diagnostic came from its own setup
+   assertion and was accepted. Every diagnostic in this ledger is a message
+   on the assertion the mutant actually breaks, not a string that happens to
+   sit near it.
+
 4. restores from an in-memory pre-image, verifies byte-identity, and
    **re-runs the same selection to confirm it is green again**; and
 5. runs the **full public suite** after the whole restored group.
@@ -98,6 +106,7 @@ is not evidence either:
 | the *exact node* must fail | a different node fails | refused |
 | with its *intended diagnostic* | right node, wrong reason | scored ALIVE |
 | **diagnostic bound to the node** | expected node fails for another reason while a different test emits the diagnostic | **refused** — previously accepted |
+| **diagnostic bound to the failing assertion** | restore M4b's old expectation (a string from its *passing* setup assertion) | **ALIVE** — previously accepted via traceback source context |
 | the node id must still select something | a renamed node | refused |
 | required field pinned | `Form(...)` → `Form(None)` on all three routes | RED — "outbox_approve does not REQUIRE review_sha256" |
 | `.git` exclusion is exact | a directory literally named `ordinary.git/` | its `marker.bin` and bytes are captured |
@@ -142,16 +151,23 @@ mutant, because a ledger row that mutates nothing is worse than an absent one.
 +        pass  # MUTANT M3
 ```
 
-### M4 — hashing a second read instead of the parsed bytes
+### M4 — RETIRED (historical)
 
-- **file** `app/outbox.py`
-- **selection** `tests/test_outbox.py tests/test_console_projection.py`
-- **result** RED — `test_review_value_and_hash_come_from_one_capture_not_a_second_read`
+**Not in the campaign. Do not attempt to reproduce it.** M4 mutated the
+strict loader's snapshot:
 
 ```diff
 -            make_review_snapshot(_require_destination(scope, proposal), contents)
-+            make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4
++            make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())
 ```
+
+Independent review established that the loader's digest is read by no
+production caller — every action's fingerprint came from a *second*
+construction site in `project_outbox`. So M4 proved a protection on a path
+no operator ever touched. Both sites are now one function
+(`review_snapshot_for`), which means M4 and M4b would mutate the same line;
+M4 is retired rather than left as a row that mutates nothing. Kept here only
+so the ledger's history is legible.
 
 ### M4b — the operator-facing snapshot hashes a second read
 
