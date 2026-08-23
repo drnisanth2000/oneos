@@ -64,8 +64,7 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 #: `(proposal id, digest)` recurs — an editor undo or an idempotent
 #: regenerator returns a file to earlier bytes and reissues the same digest —
 #: and two elements sharing an id make `HX-Retarget` resolve to whichever
-#: came first, anchoring the comparison against the wrong "old" card. The
-#: nonce is not a secret and grants nothing; it only makes the id unique.
+#: came first, anchoring the comparison against the wrong "old" card.
 _ISSUE = re.compile(r"[0-9a-f]{12}\Z")
 
 
@@ -76,9 +75,22 @@ def _new_issue() -> str:
 def _require_issue(value: str | None) -> str:
     """Accept a browser-supplied issuance nonce, or mint a fresh one.
 
-    The browser supplies only this token; the id and digest around it are
-    server-derived, so a crafted value cannot retarget an arbitrary element
-    — the worst it can do is name an element that does not exist.
+    **The nonce is untrusted presentation data.** It is checked for syntax
+    only; nothing here proves OneOS ever issued it, and no server-side
+    record of issued nonces exists — approved decision 6 rules out review
+    sessions and temporary review storage, so there is nothing to check a
+    nonce against. Replaying a valid one can therefore select a *different*
+    same-version DOM anchor than the operator's own, or name no element at
+    all.
+
+    That is the whole of its authority. The nonce reaches only element ids
+    and swap selectors: it does not choose the service action, does not
+    select which proposal or which stored bytes the server reads, is not
+    part of the fingerprint, and is not consulted in the comparison that
+    decides whether a mutation is permitted. Every one of those is derived
+    server-side from the current record. Mispointing a swap misplaces
+    markup on one operator's screen; it cannot approve, reject, or delete
+    anything, and it cannot make a stale review pass as current.
     """
     if isinstance(value, str) and _ISSUE.fullmatch(value):
         return value

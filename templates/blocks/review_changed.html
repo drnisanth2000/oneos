@@ -7,7 +7,13 @@
    browser sent back purely as evidence, (b) disable exactly the controls
    issued for the stale bytes, out-of-band, and (c) offer the current,
    server-validated review with a fresh fingerprint. #}
-<div class="review-changed" id="review-changed-{{ proposal_id }}-{{ review_sha256 }}-{{ current_issue }}">
+{# The digest is deliberately absent from this id. A changed review can
+   land on a *current* proposal that is itself non-actionable — a delete
+   reviewed at zero references that now has some — and such a card is
+   required to carry no fingerprint anywhere. Keying the wrapper on the
+   current digest put it back on screen twice on exactly that path. The
+   pair `(proposal id, issuance)` is already unique, so nothing is lost. #}
+<div class="review-changed" id="review-changed-{{ proposal_id }}-{{ current_issue }}">
   {% with error=review_error %}{% include "blocks/alert.html" %}{% endwith %}
   {% if differences %}
   {# Only the field name and the server's own current value: Rule 8 forbids
@@ -51,7 +57,7 @@
   {% include current_card_template %}
   {% endwith %}
   <div class="prop-actions">
-    {% with check_again_target = "#review-changed-" ~ proposal_id ~ "-" ~ review_sha256 ~ "-" ~ current_issue %}
+    {% with check_again_target = "#review-changed-" ~ proposal_id ~ "-" ~ current_issue %}
     {% include "blocks/check_again.html" %}
     {% endwith %}
   </div>

@@ -134,6 +134,16 @@ The browser-retained old review is presentation evidence, never mutation
 authority. Current server-validated bytes alone determine the new review and
 the action's eligibility.
 
+The issuance nonce carried on review element ids is likewise untrusted
+presentation data. It is syntax-checked and nothing more: decision 6 rules out
+review sessions and temporary review storage, so no server-side record of
+issued nonces exists and none can be checked against. Replaying a syntactically
+valid nonce may select a different same-version DOM anchor than the operator's
+own, or name no element at all. It reaches only element ids and swap selectors
+— never the service action, the proposal or bytes the server reads, the
+fingerprint, or the comparison that authorizes a mutation. The realistic worst
+case is misplaced markup on one screen, not an unauthorized action.
+
 ## Architecture
 
 ### 1. Exact-byte review snapshot

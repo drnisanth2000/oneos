@@ -5989,3 +5989,188 @@ def test_a_referenced_delete_card_sends_the_operator_to_make_a_new_proposal(
 
     assert "Check again" not in body, "an immutable record cannot be re-reviewed"
     assert 'href="/registry/alpha/products"' in body, body
+
+
+def test_a_stale_delete_review_whose_current_version_has_references_shows_no_digest(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the composite case the wrapper id leaked through.
+
+    A delete reviewed at zero references is actionable, so its card
+    legitimately carries a fingerprint. If the stored record then gains
+    references, the *current* version can never be approved — and a card
+    that can never act must carry no fingerprint anywhere, which
+    `delete_impact.html` already enforces. But `review_changed.html`
+    wrapped that card in an id keyed on the current digest, and pointed
+    `Check again` at the same string, putting the value back on screen
+    twice on this one path.
+
+    The stale digest is a different matter: the out-of-band selector has
+    to name the element the browser is holding, which is keyed on the
+    bytes the operator actually reviewed. That one stays.
+    """
+    import yaml
+
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+    proposal = registry.propose_delete(scope, "product", slug)
+
+    # Reviewed while nothing referenced it: actionable, and fingerprinted.
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    assert "hx-post" in preview
+    stale = _delete_action_data(tmp_path, proposal)
+    assert stale["review_sha256"] != _UNBOUND_FINGERPRINT
+    stale_issue = _card_issue(preview)
+
+    # The stored record now records references. New bytes, new digest, and
+    # a current version that can never be approved.
+    record = yaml.safe_load(proposal.path.read_text(encoding="utf-8"))
+    record["total_references"] = 2
+    record["impact"] = {"front-matter": 2}
+    proposal.path.write_text(
+        yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+    )
+    current = registry.get_delete_review(scope, proposal.id).sha256
+    assert current != stale["review_sha256"]
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**stale, "review_issue": stale_issue},
+    )
+    body = response.text
+
+    # The refusal the operator sees, with a current card that cannot act.
+    assert "E-REVIEW" in body
+    assert "hx-post" not in body, body
+    assert "would orphan 2 reference(s)" in body
+
+    # The current digest is absent — not in the wrapper id, not in the
+    # `Check again` target, not anywhere.
+    assert current not in body, body
+
+    # Exactly one digest survives, and it is the stale one, and it is there
+    # only to name the stale control being disabled out of band.
+    digests = set(re.findall(r"[0-9a-f]{64}", body))
+    assert digests == {stale["review_sha256"]}, digests
+    oob = re.search(
+        r'hx-swap-oob="true"\s+id="([^"]+)"', body
+    ) or re.search(r'id="([^"]+)"\s+hx-swap-oob="true"', body)
+    assert oob and stale["review_sha256"] in oob.group(1), body
+
+
+def test_a_replayed_issuance_nonce_changes_only_which_anchor_is_named(
+    tmp_path, monkeypatch
+):
+    """P2 (review): the nonce's authority, pinned rather than asserted.
+
+    `_require_issue` validates syntax, not provenance — decision 6 leaves
+    nothing to validate against — so a crafted valid nonce can name some
+    other same-version anchor. The docstring and threat model now claim
+    that this is the whole of its reach: it cannot change the service
+    action, the bytes the server reads, the fingerprint, or the outcome.
+
+    A claim about a threat boundary that no test exercises is the class of
+    defect this review already caught once, so drive it: hold every other
+    input fixed, vary only `review_issue` over hostile-but-valid values,
+    and require the decision to be identical each time.
+    """
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+
+    hostile = ["0" * 12, "f" * 12, "deadbeefcafe", "not-hex-at-all", "", None]
+
+    # A refusal: stale digest. The nonce must not rescue it.
+    proposal = registry.propose_delete(scope, "product", slug)
+    stale = _delete_action_data(tmp_path, proposal)
+    proposal.path.write_text(
+        proposal.path.read_text(encoding="utf-8") + "# changed\n",
+        encoding="utf-8",
+    )
+    current = registry.get_delete_review(scope, proposal.id).sha256
+
+    seen_digests = []
+    for issue in hostile:
+        data = dict(stale)
+        if issue is not None:
+            data["review_issue"] = issue
+        response = client.post(
+            "/registry/alpha/product/delete-execute", data=data
+        )
+        assert response.status_code == 200, issue
+        assert "E-REVIEW" in response.text, issue
+        # The proposal is untouched: no nonce authorized a mutation.
+        assert proposal.path.exists(), issue
+        seen_digests.append(frozenset(re.findall(r"[0-9a-f]{64}", response.text)))
+
+    # Which digests the response carries is a property of the bytes, not of
+    # the nonce: every variant produced exactly the same pair — the stale
+    # one the operator submitted and the current one now on offer.
+    assert len(set(seen_digests)) == 1, seen_digests
+    assert seen_digests[0] == {stale["review_sha256"], current}, seen_digests[0]
+
+    # And the mirror case: a hostile nonce cannot *block* a genuine action
+    # whose digest does match, so the refusals above are the digest's doing.
+    fresh = registry.propose_delete(scope, "product", slug)
+    good = _delete_action_data(tmp_path, fresh)
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**good, "review_issue": "0" * 12},
+    )
+    assert "E-REVIEW" not in response.text, response.text
+    assert "One commit written" in response.text, response.text
+
+
+def test_a_hostile_issuance_nonce_never_reaches_the_rendered_id(
+    tmp_path, monkeypatch
+):
+    """What `_ISSUE`'s syntax check is actually for.
+
+    The nonce grants no authority — the test above pins that — but it is
+    still interpolated into element ids and into selectors the browser is
+    told to resolve. Unvalidated, an attacker-chosen string lands inside
+    an `id="..."` attribute and inside an `hx-swap-oob` target. Rejecting
+    anything that is not twelve hex characters is the whole defence, and
+    until now nothing failed when it was removed: deleting the
+    `fullmatch` left the suite green.
+    """
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+    proposal = registry.propose_delete(scope, "product", slug)
+    stale = _delete_action_data(tmp_path, proposal)
+    proposal.path.write_text(
+        proposal.path.read_text(encoding="utf-8") + "# changed\n",
+        encoding="utf-8",
+    )
+
+    payloads = [
+        '"><script>alert(1)</script>',
+        '" onload="alert(1)',
+        "a' or '1'='1",
+        "../../etc/passwd",
+        "x" * 4096,
+    ]
+    for payload in payloads:
+        body = client.post(
+            "/registry/alpha/product/delete-execute",
+            data={**stale, "review_issue": payload},
+        ).text
+        assert "E-REVIEW" in body, payload
+        # Not reflected in any form — not raw, not escaped, not truncated.
+        assert payload not in body, payload
+        assert payload[:32] not in body, payload
+        # Every id the response renders is still the shape we mint.
+        for element_id in re.findall(r'id="([^"]*)"', body):
+            assert re.fullmatch(r"[A-Za-z0-9_.:-]+", element_id), (
+                f"{payload!r} produced id {element_id!r}"
+            )
