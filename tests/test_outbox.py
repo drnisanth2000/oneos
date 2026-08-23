@@ -2635,3 +2635,64 @@ def test_a_rollback_that_cannot_restore_the_record_reports_it_as_stranded(tmp_pa
     quarantined = _quarantined(vault)
     assert len(quarantined) == 1
     assert quarantined[0].read_bytes() == review.contents
+
+
+def test_a_stranded_record_survives_a_simultaneous_cleanup_failure(tmp_path):
+    """Both failures at once, and the more serious one must stay primary.
+
+    A leftover temporary index is a diagnostic detail. A consumed record
+    stranded in quarantine, with something else holding its name, is an
+    indeterminate state the operator has to act on. Reporting the first and
+    discarding the second would say "nothing was changed" while a record
+    sits in `.consumed/`.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    occupant = b"id: squatter\nvalue: took the name\n"
+
+    real_require = gt._require_unrelated_state_unchanged
+    real_remove = gt._remove_temporary_index
+
+    def fail_after_quarantine_and_take_the_name(vault_arg, unrelated, plan):
+        if not prop.path.exists():
+            prop.path.write_bytes(occupant)
+        raise gt.GitTransactionFailure("injected failure after quarantine")
+
+    cleanup_calls = []
+
+    def cleanup_also_fails(temporary_index):
+        cleanup_calls.append(temporary_index)
+        real_remove(temporary_index)
+        return OSError(5, "simulated temporary index cleanup failure")
+
+    gt._require_unrelated_state_unchanged = fail_after_quarantine_and_take_the_name
+    gt._remove_temporary_index = cleanup_also_fails
+    try:
+        with pytest.raises(Exception) as raised:
+            approve(scope, prop.id, review.sha256)
+    finally:
+        gt._require_unrelated_state_unchanged = real_require
+        gt._remove_temporary_index = real_remove
+
+    assert cleanup_calls, "the cleanup probe never ran"
+    outcome = describe(raised.value)
+    assert outcome.code == "E-STRANDED", "the stranded outcome was overwritten"
+    assert outcome.committed == "unknown"
+    assert "Nothing was changed" not in outcome.message
+    # The cleanup failure is composed onto it, not discarded. `approve`
+    # wraps the transaction outcome, so the note lives on the cause the
+    # taxonomy resolves through — the same link `describe()` walked above.
+    notes = []
+    link = raised.value
+    while link is not None:
+        notes.extend(getattr(link, "__notes__", []))
+        link = link.__cause__
+    assert any("temporary index" in note for note in notes), notes
+
+    # Both files still survive.
+    assert prop.path.read_bytes() == occupant
+    assert len(_quarantined(vault)) == 1

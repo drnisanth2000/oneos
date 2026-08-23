@@ -554,7 +554,21 @@ def _execute_locked(
 
     if transaction_error is not None:
         if cleanup_error is not None:
-            if isinstance(transaction_error, GitTransactionRecoveryError):
+            if isinstance(transaction_error, QuarantineRestorationBlocked):
+                # A consumed record stranded in quarantine outranks a
+                # leftover temporary index. Replacing it here would report
+                # "the commit failed and was rolled back; nothing was
+                # changed" while a record sits in `.consumed/` and something
+                # else holds its name — false, and it would lose the one
+                # outcome that says where the record is. The cleanup failure
+                # is composed onto it rather than over it; the operator is
+                # already told to inspect the vault, which is where the
+                # leftover index becomes visible.
+                transaction_error.add_note(
+                    "the transaction's temporary index could not be removed "
+                    f"either: {cleanup_error}"
+                )
+            elif isinstance(transaction_error, GitTransactionRecoveryError):
                 transaction_error = GitTransactionRecoveryError(
                     transaction_error.paths,
                     temporary_index_cleanup_failed=True,
