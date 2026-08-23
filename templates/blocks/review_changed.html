@@ -49,11 +49,16 @@
   {% with label="Current version — review this before acting" %}
   {% include current_card_template %}
   {% endwith %}
+  <div class="prop-actions">
+    {% with check_again_target = "#review-changed-" ~ proposal_id ~ "-" ~ review_sha256 %}
+    {% include "blocks/check_again.html" %}
+    {% endwith %}
+  </div>
 </div>
 
 {# Out-of-band: the stale card's controls become inert in place. #}
 <div class="prop-actions" hx-swap-oob="true"
-     id="review-controls-{{ proposal_id }}-{{ stale_review_sha256 }}">
+     id="review-controls-{{ proposal_id }}-{{ stale_review_sha256 }}-{{ stale_issue }}">
   {% for caption in stale_controls %}
   <button disabled>{{ caption }}</button>
   {% endfor %}

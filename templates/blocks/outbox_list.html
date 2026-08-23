@@ -11,6 +11,18 @@
   {% if not rows and not listing_unavailable %}
   <p class="muted">No pending proposals. Approve or reject clears them from here.</p>
   {% endif %}
+  {% if blocked %}
+  {# An unreadable record has no validated id — its filename is not a
+     proposal id, and S6 Rule 9 forbids echoing it — so there is nothing to
+     re-read individually. The listing itself is what the operator can
+     re-read, and this writes nothing. #}
+  <div class="prop-actions">
+    {% with check_again_url = "/outbox/" ~ entity,
+            check_again_target = "#outbox-list" %}
+    {% include "blocks/check_again.html" %}
+    {% endwith %}
+  </div>
+  {% endif %}
   {% for row, error in rows %}
   {% if row.proposal %}
   {% include "blocks/outbox_card.html" %}

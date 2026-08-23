@@ -1,5 +1,6 @@
+{% set issue = issue | default(new_issue()) %}
 <div class="delete-impact{% if disabled %} proposal-superseded{% endif %}"
-     id="review-card-{{ prop.id }}-{{ review_sha256 }}">
+     id="review-card-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}">
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
   {# S7: the impact shown is the impact inside the fingerprint — the values
      recorded on the reviewed proposal, not a live count taken while
@@ -9,13 +10,30 @@
   <ul class="impact-list">
     {% for k, v in prop.sources.items() %}{% if v %}<li>{{ k }}: {{ v }}</li>{% endif %}{% endfor %}
   </ul>
-  <p class="muted">Delete is refused until these are cleared.</p>
+  {# The impact shown is the impact *inside the fingerprint*, so it can never
+     change for this proposal: clearing the references will not unblock it.
+     Saying "refused until these are cleared" would be false, and offering a
+     control bound to bytes that permanently refuse would be worse. #}
+  <p class="muted">
+    This proposal was reviewed while references existed, so it can never be
+    approved. Clear the references, then review the deletion again.
+  </p>
   {% else %}
   <div class="diff-head">No references to '{{ prop.slug }}' — safe to delete.</div>
   {% endif %}
   {# S7: the action carries the fingerprint of the exact bytes this
      impact report was built from. Both values are server-rendered and
      serialised with `tojson`; hand-built JSON is forbidden. #}
+  {% if prop.total %}
+  {# No control, and therefore no fingerprint — the same rule
+     `OutboxRow.__post_init__` enforces for classification rows. #}
+  <div class="prop-actions">
+    {% with check_again_url = "/registry/" ~ entity ~ "/product/review/" ~ prop.id,
+            check_again_target = "#review-card-" ~ prop.id ~ "-" ~ review_sha256 ~ "-" ~ issue %}
+    {% include "blocks/check_again.html" %}
+    {% endwith %}
+  </div>
+  {% else %}
   {% set delete_execute_values = {"id": prop.id,
                                   "review_sha256": review_sha256} %}
   {% set reviewed_values = {
@@ -23,14 +41,17 @@
        "slug": prop.slug,
        "total": prop.total | string,
        "impact": impact_signature} %}
-  <div id="review-fields-{{ prop.id }}-{{ review_sha256 }}" hidden>
+  <div id="review-fields-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}" hidden>
     <input type="hidden" name="reviewed_values" value='{{ reviewed_values | tojson }}'>
+    {# So a refusal can name the exact card the operator acted from. #}
+    <input type="hidden" name="review_issue" value="{{ issue }}">
   </div>
-  <div class="prop-actions" id="review-controls-{{ prop.id }}-{{ review_sha256 }}">
+  <div class="prop-actions" id="review-controls-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}">
     <button class="reject"{% if disabled %} disabled{% endif %}
             hx-post="/registry/{{ entity }}/product/delete-execute"
             hx-vals='{{ delete_execute_values | tojson }}'
             hx-target="closest .delete-impact" hx-swap="innerHTML"
-            hx-include="#review-fields-{{ prop.id }}-{{ review_sha256 }}">Approve delete</button>
+            hx-include="#review-fields-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}">Approve delete</button>
   </div>
+  {% endif %}
 </div>

@@ -1,3 +1,4 @@
+{% set issue = issue | default(new_issue()) %}
 {# One classification review.
 
    S7: the card and its controls carry stable, review-specific ids —
@@ -9,7 +10,7 @@
    `disabled` renders the same card with its controls inert, for the
    "Previously reviewed" copy that stays on screen after a refusal. #}
 <div class="proposal{% if disabled %} proposal-superseded{% endif %}"
-     id="review-card-{{ row.proposal.id }}-{{ row.review_sha256 }}">
+     id="review-card-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
   <div class="prop-head">
     <code class="prop-id">{{ row.proposal.id }}</code>
@@ -19,6 +20,17 @@
   <pre class="diff-body">{{ row.diff }}</pre>
   {% elif error %}
   {% include "blocks/alert.html" %}
+  {% endif %}
+  {% if error and not disabled %}
+  {# This row is well-formed but something it depends on is not — a missing
+     or unreadable source. Its id is validated, so it can be re-read on its
+     own. #}
+  <div class="prop-actions">
+    {% with check_again_url = "/outbox/" ~ entity ~ "/review/" ~ row.proposal.id,
+            check_again_target = "#review-card-" ~ row.proposal.id ~ "-" ~ row.review_sha256 ~ "-" ~ issue %}
+    {% include "blocks/check_again.html" %}
+    {% endwith %}
+  </div>
   {% endif %}
   {% if row.can_approve or row.can_reject %}
   {% set outbox_values = {"id": row.proposal.id,
@@ -42,23 +54,25 @@
        "src": row.proposal.src,
        "dst": row.proposal.dst,
        "source_sha256": row.proposal.source_sha256} %}
-  <div id="review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}" hidden>
+  <div id="review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}" hidden>
     <input type="hidden" name="reviewed_values" value='{{ reviewed_values | tojson }}'>
+    {# So a refusal can name the exact card the operator acted from. #}
+    <input type="hidden" name="review_issue" value="{{ issue }}">
   </div>
-  <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}">
+  <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
     {% if row.can_approve %}
     <button class="approve"{% if disabled %} disabled{% endif %}
             {% if not disabled %}hx-post="/outbox/{{ entity }}/approve"
             hx-vals='{{ outbox_values | tojson }}'
             hx-target="#outbox-list" hx-swap="outerHTML"
-            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}"{% endif %}>Approve → move + commit</button>
+            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}"{% endif %}>Approve → move + commit</button>
     {% endif %}
     {% if row.can_reject %}
     <button class="reject"{% if disabled %} disabled{% endif %}
             {% if not disabled %}hx-post="/outbox/{{ entity }}/reject"
             hx-vals='{{ outbox_values | tojson }}'
             hx-target="#outbox-list" hx-swap="outerHTML"
-            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}"{% endif %}>Reject</button>
+            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}"{% endif %}>Reject</button>
     {% endif %}
   </div>
   {% endif %}

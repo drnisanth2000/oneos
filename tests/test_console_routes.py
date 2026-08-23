@@ -4861,7 +4861,18 @@ def test_a_changed_review_keeps_the_old_card_and_appends_the_current_one(
     from app.console_errors import _CODES
 
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
-    stale = _action_data(tmp_path, proposal_id)
+    listing = client.get("/outbox/alpha").text
+    stale = {**_action_data(tmp_path, proposal_id),
+             "review_issue": _card_issue(listing)}
+    # The card the operator will act from, as the listing actually rendered
+    # it — asserting against a hand-built id would not prove the retarget
+    # names anything that exists.
+    rendered_card = next(
+        i for i in _rendered_card_ids(listing) if proposal_id in i
+    )
+    rendered_controls = next(
+        i for i in _rendered_control_ids(listing) if proposal_id in i
+    )
     proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
     proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
     current = _outbox_fingerprint(tmp_path, proposal_id)
@@ -4873,8 +4884,10 @@ def test_a_changed_review_keeps_the_old_card_and_appends_the_current_one(
     assert f"review-card-{proposal_id}-{current}" in body
     assert _CODES["E-REVIEW"].message in body
 
-    # 3: the old controls are replaced out-of-band with disabled ones.
-    old_controls = f"review-controls-{proposal_id}-{stale['review_sha256']}"
+    # 3: the old controls are replaced out-of-band with disabled ones — and
+    # the id must be the one the listing rendered, not a plausible-looking
+    # string that matches nothing on the page.
+    old_controls = rendered_controls
     assert old_controls in body
     assert 'hx-swap-oob="true"' in body
     disabled_block = body.split(old_controls, 1)[1].split("</div>", 1)[0]
@@ -4884,9 +4897,7 @@ def test_a_changed_review_keeps_the_old_card_and_appends_the_current_one(
     assert "Previously reviewed" in body
 
     # The response is appended beside the old card, not swapped over the list.
-    assert response.headers.get("HX-Retarget") == (
-        f"#review-card-{proposal_id}-{stale['review_sha256']}"
-    )
+    assert response.headers.get("HX-Retarget") == f"#{rendered_card}"
     assert response.headers.get("HX-Reswap") == "afterend"
 
     # 6: the stale fingerprint is never re-offered as actionable.
@@ -5059,6 +5070,13 @@ def test_a_changed_review_names_the_fields_that_changed(
     assert "block" not in differences
 
 
+def _card_issue(body: str) -> str:
+    """The issuance nonce the rendered card reports back with its action."""
+    match = re.search(r'name="review_issue" value="([0-9a-f]{12})"', body)
+    assert match, "the card did not report an issuance nonce"
+    return match.group(1)
+
+
 def _reviewed_fields(body: str) -> dict:
     """The values a rendered card reports back, as the form data to post.
 
@@ -5146,7 +5164,13 @@ def test_a_changed_delete_review_reconfirms_on_the_same_screen(
     from app.console_errors import _CODES
 
     main, client, slug = _registry_client(tmp_path, monkeypatch)
-    stale = _delete_preview_values(main, client, tmp_path, slug)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    stale = {**json.loads(_hx_vals(preview)[0]),
+             "review_issue": _card_issue(preview)}
+    rendered_card = next(i for i in _rendered_card_ids(preview))
+    rendered_controls = next(i for i in _rendered_control_ids(preview))
     proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
     proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
     current = hashlib.sha256(proposal.read_bytes()).hexdigest()
@@ -5156,12 +5180,9 @@ def test_a_changed_delete_review_reconfirms_on_the_same_screen(
 
     assert _CODES["E-REVIEW"].message in body
     assert f"review-card-{stale['id']}-{current}" in body
-    old_controls = f"review-controls-{stale['id']}-{stale['review_sha256']}"
-    assert old_controls in body
+    assert rendered_controls in body
     assert 'hx-swap-oob="true"' in body
-    assert response.headers.get("HX-Retarget") == (
-        f"#review-card-{stale['id']}-{stale['review_sha256']}"
-    )
+    assert response.headers.get("HX-Retarget") == f"#{rendered_card}"
     assert response.headers.get("HX-Reswap") == "afterend"
     for raw in _hx_vals(body):
         assert json.loads(raw)["review_sha256"] == current
@@ -5676,3 +5697,185 @@ def test_malformed_reported_evidence_is_treated_as_absent(
         assert fragment not in body
     assert f"review-card-{proposal_id}-{current}" in body
     assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+# --- Task 7 review: the recovery surface needs a way in ---------------------
+
+
+def test_a_row_that_lost_its_diff_offers_a_read_only_check_again(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the `Check again` routes existed but nothing linked to
+    them, so acceptance criterion 6 was reachable only by typing a URL."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/00-inbox/active/marker.md").unlink()
+
+    body = client.get("/outbox/alpha").text
+
+    assert f'hx-get="/outbox/alpha/review/{proposal_id}"' in body, body
+    assert "Check again" in body
+
+
+def test_a_blocked_listing_offers_a_read_only_recheck(tmp_path, monkeypatch):
+    """An unreadable record has no validated id to check individually — the
+    filename is not a proposal id and S6 Rule 9 forbids echoing it. The
+    listing itself is what the operator can re-read."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox/unreadable-marker.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8",
+    )
+
+    body = client.get("/outbox/alpha").text
+
+    assert "Check again" in body
+    assert 'hx-get="/outbox/alpha"' in body
+    # Still no controls and no fingerprints anywhere in a blocked listing.
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+    assert "unreadable-marker" not in body
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_offers_a_check_again_for_the_current_version(
+    tmp_path, monkeypatch, action
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    body = client.post(f"/outbox/alpha/{action}", data=stale).text
+
+    assert f'hx-get="/outbox/alpha/review/{proposal_id}"' in body, body
+    assert "Check again" in body
+
+
+def test_a_changed_delete_review_offers_a_check_again(tmp_path, monkeypatch):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    stale = _delete_preview_values(main, client, tmp_path, slug)
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    body = client.post("/registry/alpha/product/delete-execute", data=stale).text
+
+    assert f'hx-get="/registry/alpha/product/review/{stale["id"]}"' in body, body
+    assert "Check again" in body
+
+
+def test_a_referenced_delete_preview_offers_no_control_and_says_why(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the recorded impact is inside the fingerprint, so a
+    proposal reviewed while references existed refuses forever. Offering a
+    live control bound to it, under copy promising that clearing the
+    references will unblock it, is false on both counts."""
+    import app.registry as registry
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    referenced = registry.ReferenceReport("product", slug, {"front-matter": 2})
+    monkeypatch.setattr(registry, "reference_count", lambda *a, **k: referenced)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "would orphan 2 reference(s)" in body
+    # No control, and therefore no fingerprint — the same rule OutboxRow
+    # enforces for classification rows.
+    assert "hx-post" not in body, body
+    assert "review_sha256" not in body
+    # And the copy says what is actually true.
+    assert "until these are cleared" not in body
+    assert "review the deletion again" in body.lower()
+    # A fresh review is still reachable.
+    assert "Check again" in body
+
+
+def test_an_unreferenced_delete_preview_still_offers_its_control(
+    tmp_path, monkeypatch
+):
+    """The control: a proposal reviewed with no references is actionable."""
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "hx-post" in body
+    assert "review_sha256" in body
+    assert "Approve delete" in body
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_code"),
+    [("redirected", "E-TAMPER"), ("malformed", "E-UNREADABLE"), ("missing", "E-INVALID")],
+)
+def test_the_unavailable_fragment_uses_the_taxonomy_status(
+    tmp_path, monkeypatch, shape, expected_code
+):
+    """P1 (review): S6 §5 is normative — a fragment's status follows the
+    outcome's *severity*, and an `attention` outcome keeps its declared page
+    status so the one class that must not look routine never returns 200.
+    A tamper finding served as 200 tells monitoring nothing happened."""
+    from app.console_errors import _CODES
+    from app.console_render import status_for
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    outside = tmp_path / "outside.yaml"
+    outside.write_bytes(proposal.read_bytes())
+
+    if shape == "redirected":
+        proposal.unlink()
+        proposal.symlink_to(outside)
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    else:
+        proposal.unlink()
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    assert expected_code in response.text
+    assert response.status_code == status_for(_CODES[expected_code], True)
+
+
+def test_a_reverted_proposal_never_produces_duplicate_dom_ids(
+    tmp_path, monkeypatch
+):
+    """P1 (review): `(id, sha)` names a *version*, and a version recurs.
+
+    An external rewrite cycle that returns the file to earlier bytes — an
+    editor undo, an idempotent regenerator — reissues the same digest. With
+    the digest alone as the DOM key the document ends up holding two cards
+    with one id, and `HX-Retarget` resolves to the *first*, anchoring the
+    comparison against the wrong "old" version.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    v1 = proposal.read_bytes()
+    first = _action_data(tmp_path, proposal_id)
+
+    proposal.write_bytes(v1 + b"# v2\n")
+    body_1 = client.post("/outbox/alpha/approve", data=first).text
+    reissued = json.loads(_hx_vals(body_1)[0])["review_sha256"]
+
+    proposal.write_bytes(v1)                       # back to the v1 bytes
+    body_2 = client.post(
+        "/outbox/alpha/approve",
+        data={"id": proposal_id, "review_sha256": reissued},
+    ).text
+
+    ids_1 = _rendered_card_ids(body_1) | _rendered_control_ids(body_1)
+    ids_2 = _rendered_card_ids(body_2) | _rendered_control_ids(body_2)
+    assert ids_1, body_1
+    assert ids_2, body_2
+    # No element id issued by the second response repeats one from the
+    # first, even though the underlying bytes — and so the digest — do.
+    assert not (ids_1 & ids_2), sorted(ids_1 & ids_2)
+
+    # The retarget names the card the operator actually acted from.
+    retarget = client.post(
+        "/outbox/alpha/approve",
+        data={"id": proposal_id, "review_sha256": reissued},
+    )
+    assert retarget.headers["HX-Retarget"].startswith("#review-card-")

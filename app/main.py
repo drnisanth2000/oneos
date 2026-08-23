@@ -7,6 +7,8 @@ bundle's flags only. No slug, path, or module list is hardcoded here.
 from __future__ import annotations
 
 import json
+import re
+import secrets
 
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +59,33 @@ from .vault import DestinationRegistryError, Vault
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
+
+#: S7: a DOM id must name one *issuance* of a review, not one version of it.
+#: `(proposal id, digest)` recurs — an editor undo or an idempotent
+#: regenerator returns a file to earlier bytes and reissues the same digest —
+#: and two elements sharing an id make `HX-Retarget` resolve to whichever
+#: came first, anchoring the comparison against the wrong "old" card. The
+#: nonce is not a secret and grants nothing; it only makes the id unique.
+_ISSUE = re.compile(r"[0-9a-f]{12}\Z")
+
+
+def _new_issue() -> str:
+    return secrets.token_hex(6)
+
+
+def _require_issue(value: str | None) -> str:
+    """Accept a browser-supplied issuance nonce, or mint a fresh one.
+
+    The browser supplies only this token; the id and digest around it are
+    server-derived, so a crafted value cannot retarget an arbitrary element
+    — the worst it can do is name an element that does not exist.
+    """
+    if isinstance(value, str) and _ISSUE.fullmatch(value):
+        return value
+    return _new_issue()
+
+
+templates.env.globals["new_issue"] = _new_issue
 
 app = FastAPI(title="OneOS")
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
@@ -790,6 +819,7 @@ def _review_changed_response(
     scope: Scope,
     proposal_id: str,
     stale_review_sha256: str,
+    stale_issue: str,
     error: ConsoleError,
     *,
     current_card: str,
@@ -797,6 +827,7 @@ def _review_changed_response(
     stale_controls: tuple[str, ...],
     reviewed: dict[str, str | None],
     current_fields,
+    check_again_url: str,
 ) -> HTMLResponse:
     """Reconfirm on the same screen (spec §Presentation).
 
@@ -820,8 +851,10 @@ def _review_changed_response(
             "proposal_id": proposal_id,
             "review_sha256": context["review_sha256"],
             "stale_review_sha256": stale_review_sha256,
+            "stale_issue": stale_issue,
             "stale_controls": stale_controls,
             "review_error": error,
+            "check_again_url": check_again_url,
             "differences": _meaningful_differences(reviewed, current_fields(context)),
         # What could not be compared, because the browser did not report it.
         # With nothing reported back, or only part of it, "the values look
@@ -833,7 +866,7 @@ def _review_changed_response(
         status_code=200,
     )
     response.headers["HX-Retarget"] = (
-        f"#review-card-{proposal_id}-{stale_review_sha256}"
+        f"#review-card-{proposal_id}-{stale_review_sha256}-{stale_issue}"
     )
     response.headers["HX-Reswap"] = "afterend"
     return response
@@ -844,6 +877,7 @@ def _outbox_review_changed(
     scope: Scope,
     proposal_id: str,
     stale_review_sha256: str,
+    stale_issue: str,
     error: ConsoleError,
     reviewed: dict[str, str | None],
 ) -> HTMLResponse:
@@ -876,12 +910,15 @@ def _outbox_review_changed(
         }
 
     return _review_changed_response(
-        request, scope, proposal_id, stale_review_sha256, error,
+        request, scope, proposal_id, stale_review_sha256, stale_issue, error,
         current_card="blocks/outbox_card.html",
         current_context=context,
         stale_controls=("Approve → move + commit", "Reject"),
         reviewed=reviewed,
         current_fields=fields,
+        check_again_url=(
+            f"/outbox/{scope.current_entity()}/review/{proposal_id}"
+        ),
     )
 
 
@@ -942,7 +979,8 @@ def _review_unavailable_response(
             "recreatable": review_path == "outbox"
             and error.code in {"E-INVALID", "E-MISSING"},
         },
-        status_code=status,
+        # Both callers are `surface="fragment-only"`.
+        status_code=status_for(error, True),
     )
 
 
@@ -964,12 +1002,24 @@ def outbox_review_fragment(
             request, scope, proposal_id, describe(exc)
         )
     if row is None:
-        # The projection lists every readable record, so an id it does not
-        # hold names no pending proposal — described through the outbox's own
-        # outcome rather than a code chosen here.
+        # An id the projection does not hold names no *readable* proposal.
+        # Which of those two words applies matters to the operator: if the
+        # entity holds an unreadable record, "create a new proposal" is the
+        # wrong instruction — the existing one has to be repaired or removed
+        # outside the Console. Describe the blocking condition when there is
+        # one, rather than choosing a code here.
+        listing = project_outbox(scope)
+        blocking = next(
+            (r.error for r in listing.rows if r.proposal is None and r.error),
+            None,
+        )
         return _review_unavailable_response(
             request, scope, proposal_id,
-            describe(OutboxError("no pending proposal for this entity")),
+            describe(
+                blocking
+                if blocking is not None
+                else OutboxError("no pending proposal for this entity")
+            ),
         )
     return templates.TemplateResponse(
         request,
@@ -991,6 +1041,7 @@ def outbox_approve(
     id: str = Form(...),
     review_sha256: str = Form(...),
     reviewed_values: str | None = Form(None),
+    review_issue: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_approve_response`, which catches `approve` itself refusing and,
@@ -1009,6 +1060,7 @@ def outbox_approve(
     return _outbox_approve_response(
         request, scope, id, review_sha256,
         _reported_review(reviewed_values),
+        review_issue,
     )
 
 
@@ -1018,6 +1070,7 @@ def _outbox_approve_response(
     id: str,
     review_sha256: str,
     reviewed: dict[str, str | None],
+    review_issue: str | None,
 ) -> HTMLResponse:
     approval_error = None
     try:
@@ -1031,7 +1084,8 @@ def _outbox_approve_response(
         review_error = describe(exc)
         try:
             return _outbox_review_changed(
-                request, scope, id, review_sha256, review_error, reviewed
+                request, scope, id, review_sha256,
+                _require_issue(review_issue), review_error, reviewed,
             )
         except _OUTBOX_CATCHES as render_exc:
             # S6 composition: the refusal and the re-render's own failure are
@@ -1059,6 +1113,7 @@ def outbox_reject(
     id: str = Form(...),
     review_sha256: str = Form(...),
     reviewed_values: str | None = Form(None),
+    review_issue: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_reject_response`, which catches `reject` itself refusing and,
@@ -1077,6 +1132,7 @@ def outbox_reject(
     return _outbox_reject_response(
         request, scope, id, review_sha256,
         _reported_review(reviewed_values),
+        review_issue,
     )
 
 
@@ -1086,6 +1142,7 @@ def _outbox_reject_response(
     id: str,
     review_sha256: str,
     reviewed: dict[str, str | None],
+    review_issue: str | None,
 ) -> HTMLResponse:
     approval_error = None
     try:
@@ -1097,7 +1154,8 @@ def _outbox_reject_response(
         review_error = describe(exc)
         try:
             return _outbox_review_changed(
-                request, scope, id, review_sha256, review_error, reviewed
+                request, scope, id, review_sha256,
+                _require_issue(review_issue), review_error, reviewed,
             )
         except _OUTBOX_CATCHES as render_exc:
             # S6 composition: the refusal and the re-render's own failure are
@@ -1213,6 +1271,7 @@ def _delete_review_changed(
     scope: Scope,
     proposal_id: str,
     stale_review_sha256: str,
+    stale_issue: str,
     error: ConsoleError,
     reviewed: dict[str, str | None],
 ) -> HTMLResponse:
@@ -1237,12 +1296,15 @@ def _delete_review_changed(
 
 
     return _review_changed_response(
-        request, scope, proposal_id, stale_review_sha256, error,
+        request, scope, proposal_id, stale_review_sha256, stale_issue, error,
         current_card="blocks/delete_impact.html",
         current_context=context,
         stale_controls=("Approve delete",),
         reviewed=reviewed,
         current_fields=fields,
+        check_again_url=(
+            f"/registry/{scope.current_entity()}/product/review/{proposal_id}"
+        ),
     )
 
 
@@ -1291,6 +1353,7 @@ def registry_delete_execute(
     id: str = Form(...),
     review_sha256: str = Form(...),
     reviewed_values: str | None = Form(None),
+    review_issue: str | None = Form(None),
 ) -> HTMLResponse:
     # Rule 8 (design §6): the success copy must name the SERVER-derived
     # slug, never the submitted one.
@@ -1308,7 +1371,8 @@ def registry_delete_execute(
         review_error = describe(exc)
         try:
             return _delete_review_changed(
-                request, scope, id, review_sha256, review_error,
+                request, scope, id, review_sha256,
+                _require_issue(review_issue), review_error,
                 _reported_review(reviewed_values),
             )
         except _REGISTRY_DELETE_CATCHES as render_exc:

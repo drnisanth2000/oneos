@@ -1,0 +1,7 @@
+{# A read-only re-read. It writes nothing — no proposal, no curated
+   content, no registry, no Git — and it is the only recovery affordance
+   S7 offers (approved decision 8: recovery does not guess). #}
+<button class="check-again"
+        hx-get="{{ check_again_url }}"
+        hx-target="{{ check_again_target }}"
+        hx-swap="{{ check_again_swap | default('outerHTML') }}">Check again</button>
