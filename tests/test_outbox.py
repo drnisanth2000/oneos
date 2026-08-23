@@ -2516,7 +2516,9 @@ def test_the_no_mutation_matrix(tmp_path, action, state):
         assert isinstance(raised.value, InvalidReviewToken)
 
     # The whole boundary, byte for byte.
-    assert _boundary_state(vault) == before, state
+    assert _boundary_state(vault) == before, (
+        f"refusal mutated vault state ({state})"
+    )
     assert (vault / prop.src).exists()
     assert not (vault / prop.dst).exists()
     assert not _quarantined(vault), state

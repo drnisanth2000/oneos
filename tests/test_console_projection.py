@@ -743,8 +743,12 @@ def test_the_projected_value_and_hash_come_from_one_capture(tmp_path):
     assert replaced, "the probe never replaced the record"
     assert replaced[0] != original
     # The rendered row and the token it carries both describe the capture.
-    assert row.review_sha256 == hashlib.sha256(original).hexdigest()
-    assert row.review_sha256 != hashlib.sha256(replaced[0]).hexdigest()
+    assert row.review_sha256 == hashlib.sha256(original).hexdigest(), (
+        "the operator's fingerprint is not of the captured bytes"
+    )
+    assert row.review_sha256 != hashlib.sha256(replaced[0]).hexdigest(), (
+        "the operator's fingerprint is of the replacement"
+    )
     assert row.proposal.module == "11-knowledge"
 
 

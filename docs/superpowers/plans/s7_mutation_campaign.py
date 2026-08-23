@@ -73,7 +73,7 @@ MUTATIONS = [
         "    return make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4b",
         ["tests/test_console_projection.py", "tests/test_outbox.py"],
         [("tests/test_console_projection.py::test_the_projected_value_and_hash_come_from_one_capture",
-          "the probe never replaced the record")],
+          "the operator's fingerprint is not of the captured bytes")],
     ),
     (
         "M5", "app/outbox.py",
@@ -137,7 +137,7 @@ MUTATIONS = [
         '            path.write_bytes(path.read_bytes() + b"# MUTANT\\n")\n            report = reference_count(scope, prop.kind, prop.slug)\n            if report.total:',
         ["tests/test_registry.py"],
         [("tests/test_registry.py::test_the_delete_no_mutation_matrix[new-live-reference]",
-          "new-live-reference")],
+          "delete refusal mutated vault state")],
     ),
     (
         "M12", "app/registry.py",
@@ -184,7 +184,12 @@ class MutantSurvived(RuntimeError):
 
 def _pytest(selection: list[str]) -> tuple[int, str, str]:
     completed = subprocess.run(
-        ["uv", "run", "python", "-m", "pytest", *selection, "-q", "--no-header"],
+        # `--tb=line` prints one line per failure — the failing assertion and
+        # nothing else. A full traceback includes surrounding *source*, so a
+        # diagnostic could match a nearby line that passed; that is exactly
+        # how M4b's expected diagnostic came from its setup assertion.
+        ["uv", "run", "python", "-m", "pytest", *selection, "-q", "--no-header",
+         "--tb=line"],
         cwd=ROOT, capture_output=True, text=True,
     )
     return completed.returncode, completed.stdout, completed.stderr

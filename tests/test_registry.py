@@ -1366,7 +1366,9 @@ def test_the_delete_no_mutation_matrix(tmp_path, state):
     if state in {"missing-token", "malformed-token"}:
         assert isinstance(raised.value, InvalidReviewToken)
 
-    assert _registry_boundary(vault) == before, state
+    assert _registry_boundary(vault) == before, (
+        f"delete refusal mutated vault state ({state})"
+    )
     assert "widgetx:" in (vault / "_system/products.yaml").read_text()
     assert not sorted(vault.rglob(".consumed/*.yaml")), state
     assert outside.read_bytes() == review.contents
