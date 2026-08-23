@@ -19,11 +19,18 @@
     <li><code>{{ field }}</code> is now <em>{{ now }}</em></li>
     {% endfor %}
   </ul>
-  {% else %}
+  {% elif comparable %}
   <p class="muted">
     The stored record changed, even though the values you reviewed look
     identical. OneOS refuses on the stored bytes, so this still needs a
     fresh review.
+  </p>
+  {% else %}
+  <p class="muted">
+    The stored record changed. OneOS cannot show you which values differ,
+    because the version you reviewed was not reported back with this action
+    — it never sees the earlier bytes itself. Compare the version above with
+    the current one below before acting.
   </p>
   {% endif %}
   <p class="muted">

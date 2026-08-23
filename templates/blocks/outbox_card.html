@@ -34,6 +34,7 @@
     <input type="hidden" name="reviewed_block" value="{{ row.proposal.block }}">
     <input type="hidden" name="reviewed_src" value="{{ row.proposal.src }}">
     <input type="hidden" name="reviewed_dst" value="{{ row.proposal.dst }}">
+    <input type="hidden" name="reviewed_source_sha256" value="{{ row.proposal.source_sha256 }}">
   </div>
   <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}">
     {% if row.can_approve %}

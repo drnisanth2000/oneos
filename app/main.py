@@ -774,6 +774,10 @@ def _review_changed_response(
             "stale_controls": stale_controls,
             "review_error": error,
             "differences": _meaningful_differences(reviewed, current_fields(context)),
+        # Whether a comparison was possible at all. With nothing reported
+        # back, "the values look identical" would assert a comparison that
+        # never happened.
+        "comparable": any(value is not None for value in reviewed.values()),
             "current_card_template": current_card,
             **context,
         },
@@ -815,6 +819,11 @@ def _outbox_review_changed(
             "block": proposal.block,
             "src": proposal.src,
             "dst": proposal.dst,
+            # The record's claim about the source's *contents*. A proposal
+            # rewritten to approve a different state of the same file changes
+            # nothing else — same module, same paths — and would otherwise be
+            # refused with nothing named.
+            "source_sha256": proposal.source_sha256,
         }
 
     return _review_changed_response(
@@ -833,9 +842,11 @@ def _reviewed_outbox_fields(
     block: str | None,
     src: str | None,
     dst: str | None,
+    source_sha256: str | None,
 ) -> dict[str, str | None]:
     return {
         "module": module, "sub": sub, "block": block, "src": src, "dst": dst,
+        "source_sha256": source_sha256,
     }
 
 
@@ -922,6 +933,7 @@ def outbox_approve(
     reviewed_block: str | None = Form(None),
     reviewed_src: str | None = Form(None),
     reviewed_dst: str | None = Form(None),
+    reviewed_source_sha256: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_approve_response`, which catches `approve` itself refusing and,
@@ -941,7 +953,7 @@ def outbox_approve(
         request, scope, id, review_sha256,
         _reviewed_outbox_fields(
             reviewed_module, reviewed_sub, reviewed_block, reviewed_src,
-            reviewed_dst,
+            reviewed_dst, reviewed_source_sha256,
         ),
     )
 
@@ -997,6 +1009,7 @@ def outbox_reject(
     reviewed_block: str | None = Form(None),
     reviewed_src: str | None = Form(None),
     reviewed_dst: str | None = Form(None),
+    reviewed_source_sha256: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_reject_response`, which catches `reject` itself refusing and,
@@ -1016,7 +1029,7 @@ def outbox_reject(
         request, scope, id, review_sha256,
         _reviewed_outbox_fields(
             reviewed_module, reviewed_sub, reviewed_block, reviewed_src,
-            reviewed_dst,
+            reviewed_dst, reviewed_source_sha256,
         ),
     )
 

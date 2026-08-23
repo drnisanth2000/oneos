@@ -5060,7 +5060,7 @@ def _reviewed_fields(body: str) -> dict:
     return {
         name: value
         for name, value in re.findall(
-            r'<input type="hidden" name="(reviewed_[a-z_]+)" value="([^"]*)"', body
+            r'<input type="hidden" name="(reviewed_[a-z0-9_]+)" value="([^"]*)"', body
         )
     }
 
@@ -5315,3 +5315,144 @@ def test_a_failed_delete_current_review_render_keeps_both_outcomes(
     assert _CODES["E-REVIEW"].message in response.text
     assert "E-CONFIG" in response.text
     assert slug in (tmp_path / "_system/products.yaml").read_text()
+
+
+def test_a_changed_source_fingerprint_is_named(tmp_path, monkeypatch):
+    """P1 (review): the record's claim about its source contents is an
+    action-relevant value. A proposal rewritten to approve a *different
+    state of the same file* changes nothing else — same module, same paths —
+    and would otherwise be refused with nothing named."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    assert "reviewed_source_sha256" in reviewed
+    stale = _action_data(tmp_path, proposal_id)
+
+    source = tmp_path / "alpha/00-inbox/active/marker.md"
+    source.write_text(
+        "---\ntitle: outbox-route-marker\nsub: triage\n---\nedited\n",
+        encoding="utf-8",
+    )
+    current_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["source_sha256"] = current_hash
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    body = client.post("/outbox/alpha/approve", data={**stale, **reviewed}).text
+
+    assert "What changed" in body, body
+    differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
+    assert "source" in differences
+    assert current_hash in differences
+    assert "module" not in differences
+    assert "dst" not in differences
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_an_unreported_review_is_not_called_identical(tmp_path, monkeypatch, action):
+    """P1 (review): when the browser reports nothing, OneOS has no evidence
+    of what was reviewed. Saying the values "look identical" asserts a
+    comparison that never happened."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    body = client.post(f"/outbox/alpha/{action}", data=stale).text
+
+    assert "identical" not in body.lower(), body
+    assert "What changed" not in body
+    # It says plainly that it cannot show the comparison, and still offers
+    # the current version to act on.
+    assert "cannot show" in body.lower()
+    assert f"review-card-{proposal_id}-" in body
+
+
+def test_a_byte_only_change_with_evidence_still_says_identical(
+    tmp_path, monkeypatch
+):
+    """The control: with evidence in hand, "identical values, changed bytes"
+    is a true statement and must still be made."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# byte-only\n")
+
+    body = client.post(
+        "/outbox/alpha/approve", data={**stale, **reviewed}
+    ).text
+
+    assert "identical" in body.lower()
+    assert "cannot show" not in body.lower()
+
+
+# --- the refresh integrity matrix, completed --------------------------------
+
+
+@pytest.mark.parametrize("surface", ["outbox", "registry"])
+@pytest.mark.parametrize(
+    "shape", ["missing", "malformed", "redirected", "non-file", "cross-scope"]
+)
+def test_check_again_refuses_every_unreviewable_shape_read_only(
+    tmp_path, monkeypatch, surface, shape
+):
+    """P2 (review): the matrix must cover redirection, non-file and
+    cross-scope states too — each renders the safe no-action state, offers
+    nothing to act on, and writes nothing."""
+    if surface == "outbox":
+        main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+        url = f"/outbox/alpha/review/{proposal_id}"
+    else:
+        main, client, slug = _registry_client(tmp_path, monkeypatch)
+        preview = client.post(
+            "/registry/alpha/product/delete-preview", data={"slug": slug}
+        ).text
+        proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+        url = f"/registry/alpha/product/review/{proposal_id}"
+
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    outside = tmp_path / "outside-marker.yaml"
+    outside.write_bytes(proposal.read_bytes())
+
+    if shape == "missing":
+        proposal.unlink()
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    elif shape == "redirected":
+        proposal.unlink()
+        proposal.symlink_to(outside)
+    elif shape == "non-file":
+        proposal.unlink()
+        proposal.mkdir()
+    else:
+        record = yaml.safe_load(outside.read_text(encoding="utf-8"))
+        record["entity"] = "beta-not-bound"
+        proposal.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+
+    outside_before = outside.read_bytes()
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = client.get(url)
+
+    assert reached == [], f"fallback reached: {reached}"
+    body = response.text
+    assert 'role="alert"' in body
+    assert not _rendered_control_ids(body), body
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+    # Read-only, and the redirect target is never followed or consumed.
+    assert outside.read_bytes() == outside_before
+    if shape == "redirected":
+        assert proposal.is_symlink()
+    elif shape == "non-file":
+        assert proposal.is_dir()
