@@ -3341,6 +3341,13 @@ def _route_totality_plan(main) -> dict:
             ),
             "patch_targets": [(main, "project_outbox")],
         },
+        main.registry_delete_review_fragment: {
+            "request": lambda c: c.get(
+                "/registry/alpha/product/review/"
+                "20260815T090703-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            "patch_targets": [(main, "get_delete_review")],
+        },
         main.pulse: {"request": lambda c: c.get("/blocks/pulse"), "patch_targets": []},
     }
 
@@ -5015,30 +5022,38 @@ def test_a_changed_review_names_the_fields_that_changed(
     reviewed = _reviewed_fields(body)
     assert reviewed, "the card must carry its reviewed values for comparison"
     stale = _action_data(tmp_path, proposal_id)
+    assert reviewed["reviewed_src"] == "alpha/00-inbox/active/marker.md"
 
-    # The record is rewritten (so the review is refused), and the browser
-    # reports the module it was showing — which differs from the module the
-    # server now validates. That difference must be named.
-    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
-    current_module = yaml.safe_load(
-        proposal.read_text(encoding="utf-8")
-    )["module"]
-    assert reviewed["reviewed_module"] == current_module
-    reviewed["reviewed_module"] = "11-knowledge-as-reviewed"
+    # A genuine rewrite into an equally valid proposal: same module, but it
+    # now moves a *different* receipt. Nothing about the comparison is
+    # manufactured in the request — the browser reports exactly what it was
+    # rendered with, and the new record is one the server validates fully.
+    second = tmp_path / "alpha/00-inbox/active/second.md"
+    second.write_text(
+        "---\ntitle: second-marker\nsub: triage\n---\nbody\n", encoding="utf-8"
+    )
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["src"] = "alpha/00-inbox/active/second.md"
+    record["dst"] = "alpha/02-work/active/second.md"
+    record["source_sha256"] = hashlib.sha256(second.read_bytes()).hexdigest()
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
 
     response = client.post(
         f"/outbox/alpha/{action}", data={**stale, **reviewed}
     )
     text = response.text
 
-    assert "What changed" in text
+    assert "What changed" in text, text
     differences = text.split("What changed", 1)[1].split("</ul>", 1)[0]
-    assert "module" in differences
-    assert "11-knowledge-as-reviewed" in differences   # what they reviewed
-    assert current_module in differences               # what it is now
-    # Fields that did not change are not reported as differences.
+    # Each genuinely changed field is named, with the server's own current
+    # value — never the value the browser submitted (Rule 8).
+    assert "src" in differences
+    assert "alpha/00-inbox/active/second.md" in differences
+    assert "dst" in differences
+    assert "alpha/02-work/active/second.md" in differences
+    # Fields that did not change are not reported.
+    assert "module" not in differences
     assert "block" not in differences
-    assert "dst" not in differences
 
 
 def _reviewed_fields(body: str) -> dict:
@@ -5092,6 +5107,9 @@ def test_the_reviewed_values_are_never_treated_as_authority(
     ).text
 
     assert "<script>" not in text
+    # Rule 8: the submitted value is never echoed at all, escaped or not.
+    assert "spoofed-sub-marker" not in text
+    assert "alert(1)" not in text
     # The current card is built from the server's own validated read.
     assert f"review-card-{proposal_id}-{current}" in text
     for raw in _hx_vals(text):
@@ -5172,3 +5190,128 @@ def test_a_failed_current_review_render_still_reports_the_changed_review(
     assert _CODES["E-REVIEW"].message in response.text
     assert "E-CONFIG" in response.text
     assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+def test_a_changed_delete_review_names_the_changed_impact(tmp_path, monkeypatch):
+    """P1 (review): the delete comparison covers the breakdown, not only the
+    total — an impact that moved between sources while summing the same is
+    still a different impact."""
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    stale = json.loads(_hx_vals(preview)[0])
+    reviewed = _reviewed_fields(preview)
+    assert set(reviewed) == {
+        "reviewed_kind", "reviewed_slug", "reviewed_total", "reviewed_impact",
+    }
+
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["total_references"] = 2
+    record["impact"] = {"front-matter": 2}
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    body = client.post(
+        "/registry/alpha/product/delete-execute", data={**stale, **reviewed}
+    ).text
+
+    assert "What changed" in body
+    differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
+    assert "total" in differences
+    assert "impact" in differences and "front-matter=2" in differences
+    assert "slug" not in differences
+
+
+def test_delete_check_again_is_read_only_and_offers_the_current_review(
+    tmp_path, monkeypatch
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = hashlib.sha256(proposal.read_bytes()).hexdigest()
+    before = proposal.read_bytes()
+    registry_before = (tmp_path / "_system/products.yaml").read_bytes()
+
+    response = client.get(f"/registry/alpha/product/review/{proposal_id}")
+
+    assert response.status_code == 200
+    assert f"review-card-{proposal_id}-{current}" in response.text
+    assert json.loads(_hx_vals(response.text)[0])["review_sha256"] == current
+    assert proposal.read_bytes() == before
+    assert (tmp_path / "_system/products.yaml").read_bytes() == registry_before
+
+
+@pytest.mark.parametrize("shape", ["missing", "malformed", "hostile-id"])
+def test_delete_check_again_on_an_unreviewable_proposal_offers_no_controls(
+    tmp_path, monkeypatch, shape
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    if shape == "missing":
+        proposal.unlink()
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    else:
+        proposal_id = "hostile-nonexistent-id"
+
+    body = client.get(f"/registry/alpha/product/review/{proposal_id}").text
+
+    assert 'role="alert"' in body
+    assert not _rendered_control_ids(body), body
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+    # `Check again` points back at the delete review, never the outbox one.
+    assert f"/registry/alpha/product/review/{proposal_id}" in body
+
+
+def test_a_failed_delete_current_review_render_keeps_both_outcomes(
+    tmp_path, monkeypatch
+):
+    """P1 (review): independent composition coverage for the delete path."""
+    from app.console_errors import _CODES
+    from app.vault import DestinationRegistryError
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    stale = json.loads(_hx_vals(preview)[0])
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    calls = []
+    real_review = main.get_delete_review
+
+    def fail_the_second_read(scope, proposal_id):
+        calls.append(1)
+        raise DestinationRegistryError("registries unreadable during re-render")
+
+    monkeypatch.setattr(main, "get_delete_review", fail_the_second_read)
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute", data=stale
+    )
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert calls, "the current-review read was never attempted"
+    assert _CODES["E-REVIEW"].message in response.text
+    assert "E-CONFIG" in response.text
+    assert slug in (tmp_path / "_system/products.yaml").read_text()

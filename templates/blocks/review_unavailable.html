@@ -11,7 +11,7 @@
   </p>
   <div class="prop-actions">
     <button class="check-again"
-            hx-get="/outbox/{{ entity }}/review/{{ proposal_id }}"
+            hx-get="{{ check_again_url }}"
             hx-target="#review-unavailable-{{ proposal_id }}"
             hx-swap="outerHTML">Check again</button>
   </div>

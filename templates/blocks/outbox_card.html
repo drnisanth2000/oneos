@@ -32,6 +32,7 @@
     <input type="hidden" name="reviewed_module" value="{{ row.proposal.module }}">
     <input type="hidden" name="reviewed_sub" value="{{ row.proposal.sub if row.proposal.sub is not none else '' }}">
     <input type="hidden" name="reviewed_block" value="{{ row.proposal.block }}">
+    <input type="hidden" name="reviewed_src" value="{{ row.proposal.src }}">
     <input type="hidden" name="reviewed_dst" value="{{ row.proposal.dst }}">
   </div>
   <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}">

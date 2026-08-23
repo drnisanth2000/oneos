@@ -714,17 +714,23 @@ def _review_row(scope: Scope, proposal_id: str):
 
 def _meaningful_differences(
     reviewed: dict[str, str | None], current: dict[str, str]
-) -> list[tuple[str, str, str]]:
-    """Which reviewed values differ from the current validated ones.
+) -> list[tuple[str, str]]:
+    """Which fields differ from what the browser was showing, and what they
+    are now.
 
     `reviewed` comes from the browser — the server never saw those bytes and
-    may not infer them (approved decision 8) — and is used for this
-    comparison and nothing else. A field the browser did not send is simply
-    not compared, so a missing or hostile value can withhold or add a line
-    of explanation but can never change what the action does.
+    may not infer them (approved decision 8) — so it is used to *decide*
+    which fields differ and is never rendered. Rule 8 (design §6) forbids
+    reflecting a submitted value, and there is no need to: the version the
+    operator reviewed is still on screen directly above, so naming the
+    changed fields and their current, server-derived values tells them
+    exactly what changed without echoing anything they sent.
+
+    A field the browser did not send is simply not compared, so a missing or
+    hostile value can withhold or add a line of explanation and nothing more.
     """
     return [
-        (field, reviewed[field], current[field])
+        (field, current[field])
         for field in current
         if reviewed.get(field) is not None and reviewed[field] != current[field]
     ]
@@ -800,10 +806,14 @@ def _outbox_review_changed(
 
     def fields(ctx):
         proposal = ctx["row"].proposal
+        # Every action-relevant value, including the source: a proposal
+        # rewritten to move a *different* file is exactly the change an
+        # operator most needs named.
         return {
             "module": proposal.module,
             "sub": proposal.sub or "",
             "block": proposal.block,
+            "src": proposal.src,
             "dst": proposal.dst,
         }
 
@@ -818,9 +828,15 @@ def _outbox_review_changed(
 
 
 def _reviewed_outbox_fields(
-    module: str | None, sub: str | None, block: str | None, dst: str | None
+    module: str | None,
+    sub: str | None,
+    block: str | None,
+    src: str | None,
+    dst: str | None,
 ) -> dict[str, str | None]:
-    return {"module": module, "sub": sub, "block": block, "dst": dst}
+    return {
+        "module": module, "sub": sub, "block": block, "src": src, "dst": dst,
+    }
 
 
 def _review_unavailable_response(
@@ -830,16 +846,28 @@ def _review_unavailable_response(
     error: ConsoleError,
     *,
     status: int = 200,
+    review_path: str = "outbox",
 ) -> HTMLResponse:
     """A safe no-action state: no controls, no fingerprint, no guessing."""
+    entity = scope.current_entity()
+    check_again = (
+        f"/registry/{entity}/product/review/{proposal_id}"
+        if review_path == "registry"
+        else f"/outbox/{entity}/review/{proposal_id}"
+    )
     return templates.TemplateResponse(
         request,
         "blocks/review_unavailable.html",
         {
-            "entity": scope.current_entity(),
+            "entity": entity,
             "proposal_id": proposal_id,
             "review_error": error,
-            "recreatable": error.code in {"E-INVALID", "E-MISSING"},
+            "check_again_url": check_again,
+            # Only a classification can be re-proposed from triage; a delete
+            # is recreated from the registry screen, so no triage link is
+            # offered for one.
+            "recreatable": review_path == "outbox"
+            and error.code in {"E-INVALID", "E-MISSING"},
         },
         status_code=status,
     )
@@ -892,6 +920,7 @@ def outbox_approve(
     reviewed_module: str | None = Form(None),
     reviewed_sub: str | None = Form(None),
     reviewed_block: str | None = Form(None),
+    reviewed_src: str | None = Form(None),
     reviewed_dst: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
@@ -911,7 +940,8 @@ def outbox_approve(
     return _outbox_approve_response(
         request, scope, id, review_sha256,
         _reviewed_outbox_fields(
-            reviewed_module, reviewed_sub, reviewed_block, reviewed_dst
+            reviewed_module, reviewed_sub, reviewed_block, reviewed_src,
+            reviewed_dst,
         ),
     )
 
@@ -965,6 +995,7 @@ def outbox_reject(
     reviewed_module: str | None = Form(None),
     reviewed_sub: str | None = Form(None),
     reviewed_block: str | None = Form(None),
+    reviewed_src: str | None = Form(None),
     reviewed_dst: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
@@ -984,7 +1015,8 @@ def outbox_reject(
     return _outbox_reject_response(
         request, scope, id, review_sha256,
         _reviewed_outbox_fields(
-            reviewed_module, reviewed_sub, reviewed_block, reviewed_dst
+            reviewed_module, reviewed_sub, reviewed_block, reviewed_src,
+            reviewed_dst,
         ),
     )
 
@@ -1112,7 +1144,8 @@ def registry_delete_preview(
         # one inside the fingerprint, so the screen cannot describe one
         # product while the button is bound to a proposal naming another.
         {"entity": selected, "prop": review.value,
-         "review_sha256": review.sha256},
+         "review_sha256": review.sha256,
+         "impact_signature": _impact_signature(review.value.sources)},
     )
 
 
@@ -1126,11 +1159,23 @@ def _delete_review_changed(
 ) -> HTMLResponse:
     def context():
         review = get_delete_review(scope, proposal_id)
-        return {"prop": review.value, "review_sha256": review.sha256}
+        return {
+            "prop": review.value,
+            "review_sha256": review.sha256,
+            "impact_signature": _impact_signature(review.value.sources),
+        }
 
     def fields(ctx):
         prop = ctx["prop"]
-        return {"kind": prop.kind, "slug": prop.slug, "total": str(prop.total)}
+        # The breakdown, not only the total: an impact that moved between
+        # sources while summing the same is still a different impact.
+        return {
+            "kind": prop.kind,
+            "slug": prop.slug,
+            "total": str(prop.total),
+            "impact": _impact_signature(prop.sources),
+        }
+
 
     return _review_changed_response(
         request, scope, proposal_id, stale_review_sha256, error,
@@ -1139,6 +1184,43 @@ def _delete_review_changed(
         stale_controls=("Approve delete",),
         reviewed=reviewed,
         current_fields=fields,
+    )
+
+
+def _impact_signature(sources) -> str:
+    """A stable, comparable rendering of an impact breakdown."""
+    return ", ".join(f"{name}={count}" for name, count in sorted(sources.items()))
+
+
+@app.get(
+    "/registry/{entity}/product/review/{proposal_id}", response_class=HTMLResponse
+)
+@console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
+def registry_delete_review_fragment(
+    request: Request, scope: EntityScope, proposal_id: str
+) -> HTMLResponse:
+    """`Check again` for a delete review: read, validate, render.
+
+    It writes nothing — no proposal, no registry, no Git. A record that
+    cannot be reviewed renders the safe no-action state rather than an error
+    page, so the operator keeps somewhere to check again from.
+    """
+    try:
+        review = get_delete_review(scope, proposal_id)
+    except _REGISTRY_DELETE_CATCHES as exc:
+        return _review_unavailable_response(
+            request, scope, proposal_id, describe(exc), review_path="registry"
+        )
+    return templates.TemplateResponse(
+        request,
+        "blocks/delete_impact.html",
+        {
+            "entity": scope.current_entity(),
+            "prop": review.value,
+            "review_sha256": review.sha256,
+            "impact_signature": _impact_signature(review.value.sources),
+            "label": "Current version",
+        },
     )
 
 
@@ -1152,6 +1234,7 @@ def registry_delete_execute(
     reviewed_kind: str | None = Form(None),
     reviewed_slug: str | None = Form(None),
     reviewed_total: str | None = Form(None),
+    reviewed_impact: str | None = Form(None),
 ) -> HTMLResponse:
     # Rule 8 (design §6): the success copy must name the SERVER-derived
     # slug, never the submitted one.
@@ -1174,6 +1257,7 @@ def registry_delete_execute(
                     "kind": reviewed_kind,
                     "slug": reviewed_slug,
                     "total": reviewed_total,
+                    "impact": reviewed_impact,
                 },
             )
         except _REGISTRY_DELETE_CATCHES as render_exc:

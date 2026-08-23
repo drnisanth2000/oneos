@@ -10,10 +10,13 @@
 <div class="review-changed" id="review-changed-{{ proposal_id }}-{{ review_sha256 }}">
   {% with error=review_error %}{% include "blocks/alert.html" %}{% endwith %}
   {% if differences %}
+  {# Only the field name and the server's own current value: Rule 8 forbids
+     reflecting a submitted value, and the version the operator reviewed is
+     still on screen directly above for them to compare against. #}
   <p class="muted">What changed since you reviewed it:</p>
   <ul class="impact-list review-differences">
-    {% for field, was, now in differences %}
-    <li><code>{{ field }}</code>: was <em>{{ was }}</em>, now <em>{{ now }}</em></li>
+    {% for field, now in differences %}
+    <li><code>{{ field }}</code> is now <em>{{ now }}</em></li>
     {% endfor %}
   </ul>
   {% else %}
