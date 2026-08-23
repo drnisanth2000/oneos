@@ -288,8 +288,16 @@ distinct outcomes are required:
 A refusal that completes restoration leaves the outbox exactly as it found
 it. A refusal that cannot complete restoration does not, and says so.
 
-Quarantined records are invisible to every listing and can never be acted on
-again: they are evidence, not pending work.
+Quarantined records are invisible to every listing, and **no reviewed action
+can reach them**: they are never approved, rejected, deleted, re-proposed, or
+re-fingerprinted. They are evidence, not pending work.
+
+This is not a claim that they are untouchable forever. The separately
+sequenced reclaim is a different, explicit operation with its own review — it
+acts on quarantine deliberately, which is precisely why it is out of S7's
+scope rather than a hidden part of it. What S7 guarantees is narrower and
+checkable: nothing in the approve, reject or registry-delete path can consume
+a record twice.
 
 ### 4. Registry-delete freshness
 

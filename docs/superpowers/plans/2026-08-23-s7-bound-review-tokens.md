@@ -29,7 +29,15 @@ alpine-morph, Pydantic v2, GitPython, pytest, `uv`.
 - Grey Matter is read-only. Record and compare its exact pre/post state; never
   clean, stash, normalize, or overwrite pre-existing private edits.
 - No dependency, schema, convention, registry-value, authentication, or
-  authorization change belongs in S7.
+  authorization change belongs in S7, with one explicit exception granted by
+  **Amendment 1**: the quarantine area for consumed proposal records. That is
+  a deliberate, narrowly scoped convention change — a single directory inside
+  the entity's existing `outbox/`, which is already a system area excluded
+  from block-mapping validation — and it is admitted because acceptance
+  criterion 4 cannot be met by any deletion-based construction. It carries no
+  dependency (`ctypes` is stdlib), no schema change, no registry value, and
+  no authentication or authorization change. Nothing else may use this
+  exception to widen S7's scope.
 - Direct registry add/edit remains direct and reversible. Only registry delete
   joins the bound-review contract.
 - The separately sequenced inherited work—public-document leakage checking,
@@ -382,7 +390,15 @@ git commit -m "feat: bind approve and reject to reviewed proposal bytes"
 > criterion 4. Do not start until the amendment is approved.
 
 **Files:** modify `app/git_transaction.py`, `app/outbox.py`,
-`tests/test_git_transaction.py`, `tests/test_outbox.py`
+`app/console_errors.py`, `tests/test_git_transaction.py`,
+`tests/test_outbox.py`, `tests/test_console_errors.py`,
+`tests/test_console_invariants.py`
+
+`console_errors.py` and its two test files are in scope because this task
+retires `E-DISCARDED` and `ConditionalRemovalCleanupError` and adds the three
+replacement outcomes: the codes table, the exact class map, the chain
+allowlist, the closed-family subclass walk, and the transcribed design map all
+change together or the taxonomy tests fail.
 
 - [ ] **RED:** Add tests proving that **no reviewed action unlinks a proposal**:
 
@@ -439,10 +455,46 @@ the moved file `O_NOFOLLOW` and verify identity and contents through the
 and refuse. No step may unlink a proposal record.
 
 - [ ] **Quarantine location:** a `.consumed/` directory inside the entity's
-existing `outbox/`. Same filesystem, so the rename is atomic; inside the area
+existing `outbox/`. Same filesystem, so the move is atomic; inside the area
 already excluded from block-mapping validation, so convention impact is
-minimal; and outside the `*.yaml` top-level glob, so quarantined records are
-invisible to every listing and can never be acted on again.
+minimal; and outside the `*.yaml` top-level glob, so quarantined records never
+appear in a listing and no reviewed action can reach them.
+
+- [ ] **The quarantine directory is resolved as safely as the outbox itself.**
+It is a path the action writes into, so it gets the same treatment
+`_require_outbox_path` already gives the outbox, and for the same reasons:
+
+  - the lexical `<entity>/outbox/.consumed` is checked with `is_symlink()`
+    **before** any `resolve()`, so a redirected quarantine raises the
+    redirection outcome (E-TAMPER) rather than a scope outcome — the C2
+    ordering rule this repository already enforces;
+  - the resolved path must equal the lexical path, and must be a real
+    directory, never a symlink, never a non-directory;
+  - creation is `mkdir` with an explicit mode, and a `FileExistsError` on
+    creation is a redirection refusal, not a silent success; and
+  - it is confined to the bound entity, so no action can quarantine across
+    scopes.
+
+  Add tests for each condition, mirroring the existing outbox-redirect tests.
+
+- [ ] **Rollback: a quarantined record must come back if the action does
+not complete.** Approve consumes the proposal *and* commits a move; if the
+transaction fails or is rolled back after the record was quarantined, leaving
+it in quarantine would discard a proposal for an approval that never
+happened.
+
+  Specify and test:
+
+  - the quarantine move happens inside the transaction's owned-change
+    handling, so the existing rollback path restores it under its original
+    name with the atomic no-overwrite move;
+  - if restoration is blocked because the original name is now occupied, the
+    outcome is the indeterminate recovery one — both files preserved, nothing
+    deleted to tidy up;
+  - a rolled-back approval leaves the proposal pending and actionable again,
+    with a fingerprint that still matches its unchanged bytes; and
+  - reject has no commit to roll back, so its only rollback is the mismatch
+    restoration already specified.
 
 - [ ] **Scope the change precisely.** Quarantine replaces *proposal
 consumption* only. `_apply_state`'s removal branch still serves approve's
@@ -487,9 +539,16 @@ git commit -m "feat: consume reviewed proposals by quarantine"
    exists. S7 stops destroying; it does not own the lifecycle.
 2. On a kernel or filesystem without an atomic no-overwrite move, approve,
    reject and registry delete refuse outright. That is the intended trade:
-   refusing to act is strictly better than acting destructively. Verify the
-   Linux `renameat2(RENAME_NOREPLACE)` path on the target platform before
-   live gates — it is unverified in the current session, which is macOS.
+   refusing to act is strictly better than acting destructively.
+
+**Blocking verification, not a deferred one:** the Linux
+`renameat2(RENAME_NOREPLACE)` **success** path must be exercised on real
+Linux — both that it moves the file and that it refuses an occupied
+destination — before S7 can be declared complete. It is unverified in the
+session that wrote this task, which is macOS, where only
+`renameatx_np(RENAME_EXCL)` was confirmed. This is a completion condition, not
+a pre-live-gate item: an untested success path on a supported platform could
+mean reviewed actions refuse everywhere, or worse, do not.
 
 ---
 
@@ -813,4 +872,8 @@ S7 is complete only when:
 - final public and private gates pass;
 - Grey Matter's exact pre-existing state is preserved; and
 - the inherited pre-live-gate items remain separately sequenced rather than
-  silently claimed complete.
+  silently claimed complete; and
+- the atomic no-overwrite move has been exercised on real Linux
+  (`renameat2(RENAME_NOREPLACE)`) and on macOS
+  (`renameatx_np(RENAME_EXCL)`), covering both the success path and the
+  occupied-destination refusal *(Amendment 1)*.
