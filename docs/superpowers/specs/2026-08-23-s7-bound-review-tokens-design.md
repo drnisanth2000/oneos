@@ -295,6 +295,29 @@ distinct outcomes are required:
 A refusal that completes restoration leaves the outbox exactly as it found
 it. A refusal that cannot complete restoration does not, and says so.
 
+#### What quarantine costs the working tree *(Amendment 1)*
+
+A consumed record is retained, so it remains an untracked file in the vault.
+`git status` is therefore no longer empty after an approve, reject or
+registry delete, where a deletion left it empty. This is a real, permanent
+operational consequence of Amendment 1, accepted alongside accumulation, and
+it is recorded here rather than absorbed silently into test helpers.
+
+What it does **not** weaken is the S5 guarantee itself, which is preserved
+exactly and must stay asserted in that exact form:
+
+- approve still produces **exactly one commit**, and reverting it still
+  restores both paths;
+- the Git **index**, **HEAD**, and every **tracked** path are untouched
+  except by that one commit; and
+- unrelated staged, unstaged and untracked state is byte-identical
+  afterwards.
+
+The only permitted difference is the presence of records at
+`<entity>/outbox/.consumed/*.yaml`. Verification may exclude exactly that
+path shape and nothing broader: a filter that hides any path merely
+containing `.consumed` would conceal real regressions elsewhere in the vault.
+
 Quarantined records are invisible to every listing, and **no reviewed action
 can reach them**: they are never approved, rejected, deleted, re-proposed, or
 re-fingerprinted. They are evidence, not pending work.

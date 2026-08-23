@@ -1207,21 +1207,46 @@ def quarantine_destination(relative_path: str) -> str:
     return (leaf.parent / QUARANTINE_DIRECTORY / leaf.name).as_posix()
 
 
-def _open_quarantine(parent_descriptor: int) -> int:
-    """Open the quarantine directory relative to an already-checked parent.
+def _open_quarantine(parent_descriptor: int) -> tuple[int, bool]:
+    """Open the quarantine directory, creating it only when it is absent.
 
-    Opened through `_open_checked_directory` and relative to the parent's
-    descriptor, so neither the parent nor the quarantine can be swapped
-    between validation and use.
+    Returns the descriptor and whether this call created it. Opened through
+    `_open_checked_directory` and relative to the parent's descriptor, so
+    neither the parent nor the quarantine can be swapped between validation
+    and use.
+
+    `mkdir` is the only thing that establishes ownership, and it does so
+    atomically: a `FileExistsError` means something appeared between the
+    check and the creation. That is refused rather than adopted — whatever
+    appeared was not established here, and silently accepting it would be
+    trusting a directory this call never validated as its own.
     """
+    # One lookup, not two: probing for existence separately from opening
+    # would add a window of this function's own making between the two.
+    try:
+        return (
+            _open_checked_directory(
+                QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+            ),
+            False,
+        )
+    except ReviewedPathUnavailable as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+
     try:
         os.mkdir(QUARANTINE_DIRECTORY, 0o700, dir_fd=parent_descriptor)
-    except FileExistsError:
-        pass
+    except FileExistsError as exc:
+        raise ReviewedPathIntegrityError(
+            "quarantine appeared while it was being created"
+        ) from exc
     except OSError as exc:
         raise ReviewedPathUnavailable("quarantine is unavailable") from exc
-    return _open_checked_directory(
-        QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+    return (
+        _open_checked_directory(
+            QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+        ),
+        True,
     )
 
 
@@ -1256,7 +1281,12 @@ def _quarantine_reviewed_leaf(
     def _restore() -> None:
         try:
             _move_no_replace(quarantine_descriptor, leaf, parent_descriptor, leaf)
-        except (FileExistsError, OSError) as exc:
+        except (OSError, GitTransactionError) as exc:
+            # Whatever stopped it — an occupied name, an I/O failure, or a
+            # move primitive that turned out to be unavailable — the fact is
+            # the same: the record is still in quarantine. Reporting anything
+            # that says nothing changed would be a false statement about
+            # state the operator can see.
             raise QuarantineRestorationBlocked(path) from exc
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -1312,22 +1342,25 @@ def quarantine_path_if_unchanged(
 
     parent_descriptor, leaf = _walk_to_parent(vault, relative_path)
     try:
-        created = QUARANTINE_DIRECTORY not in os.listdir(parent_descriptor)
-        quarantine_descriptor = _open_quarantine(parent_descriptor)
+        quarantine_descriptor, created = _open_quarantine(parent_descriptor)
         try:
             return _quarantine_reviewed_leaf(
                 parent_descriptor, leaf, expected,
                 quarantine_descriptor, relative_path,
             )
-        except BaseException:
+        except BaseException as refusal:
             # "A refusal that completes restoration leaves the outbox exactly
-            # as it found it" — including not leaving an empty directory
-            # behind that was not there before.
+            # as it found it" — including not leaving behind a directory that
+            # was not there before. If that cleanup fails the claim no longer
+            # holds, so it is recorded on the refusal rather than swallowed.
             if created:
                 try:
                     os.rmdir(QUARANTINE_DIRECTORY, dir_fd=parent_descriptor)
-                except OSError:
-                    pass
+                except OSError as cleanup_error:
+                    refusal.add_note(
+                        f"quarantine directory could not be removed after this "
+                        f"refusal, so it remains: {cleanup_error}"
+                    )
             raise
         finally:
             os.close(quarantine_descriptor)
@@ -1376,7 +1409,7 @@ def restore_quarantined_leaf(
             _move_no_replace(
                 quarantine_descriptor, quarantined_name, parent_descriptor, leaf
             )
-        except (FileExistsError, OSError) as exc:
+        except (OSError, GitTransactionError) as exc:
             raise QuarantineRestorationBlocked(relative_path) from exc
         finally:
             os.close(quarantine_descriptor)

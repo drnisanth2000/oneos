@@ -102,11 +102,9 @@ def _quarantined(vault: Path) -> list[Path]:
 def _is_clean_apart_from_quarantine(vault: Path) -> bool:
     """Quarantined records are untracked by design, so `git status` is never
     empty after a consumption. Everything else must still be clean."""
-    output = git_status_bytes(vault)
-    return all(
-        not record or "/.consumed/" in os.fsdecode(record[3:])
-        for record in output.split(b"\0")
-    )
+    from tests.conftest import git_is_clean_apart_from_quarantine
+
+    return git_is_clean_apart_from_quarantine(vault)
 
 
 def _approval_state(vault: Path):

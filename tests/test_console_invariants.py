@@ -1615,3 +1615,35 @@ def test_c2_no_registered_route_calls_resolve_without_any_symlink_guard(
     main = _load_console_app(tmp_path, monkeypatch)
     offenders = _route_level_resolve_offenders(main.app)
     assert offenders == [], f"stage 5 found an unguarded route-level resolve(): {offenders}"
+
+
+def test_the_quarantine_status_filter_hides_only_quarantine_records(tmp_path):
+    """S7 Amendment 1: verification may exclude exactly
+    `<entity>/outbox/.consumed/*.yaml` and nothing broader. A filter that
+    hid any path containing `.consumed` would conceal real regressions
+    elsewhere in the vault."""
+    from tests.conftest import git_status_apart_from_quarantine, git_vault
+
+    vault = git_vault(tmp_path, {"tracked.md": "tracked\n"})
+    hidden = vault / "demo/outbox/.consumed"
+    hidden.mkdir(parents=True)
+    (hidden / "20260101T000000-aa.yaml").write_text("record\n", encoding="utf-8")
+
+    # None of these are quarantine records, and none may be hidden.
+    decoys = {
+        "demo/outbox/.consumed/notes.md": "wrong suffix",
+        "demo/outbox/.consumed/nested/deep.yaml": "nested below quarantine",
+        "demo/.consumed/stray.yaml": "not under an outbox",
+        "elsewhere/.consumed-ish/thing.yaml": "lookalike directory",
+        "top-level.consumed.yaml": "lookalike filename",
+    }
+    for relative in decoys:
+        path = vault / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("decoy\n", encoding="utf-8")
+
+    remaining = git_status_apart_from_quarantine(vault).decode()
+
+    assert "20260101T000000-aa.yaml" not in remaining, "a real record leaked through"
+    for relative, why in decoys.items():
+        assert relative in remaining, f"{why} was wrongly hidden: {relative}"
