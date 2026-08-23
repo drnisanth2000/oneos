@@ -1108,6 +1108,26 @@ def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
             os.close(descriptor)
 
 
+def _discard_private_name(directory_descriptor: int, claim: str) -> None:
+    """Drop an unused reservation — but never anything holding bytes.
+
+    Only ever called when the rename never happened, so the reservation is
+    still this call's own empty sentinel. It is checked anyway: this
+    function must not be capable of deleting content, whatever a future
+    caller does with it.
+    """
+    try:
+        reserved = os.lstat(claim, dir_fd=directory_descriptor)
+    except OSError:
+        return
+    if not stat.S_ISREG(reserved.st_mode) or reserved.st_size != 0:
+        return
+    try:
+        os.unlink(claim, dir_fd=directory_descriptor)
+    except OSError:
+        return
+
+
 def _restore_claimed_leaf(
     directory_descriptor: int, claim: str, leaf: str, path: str
 ) -> None:
@@ -1136,23 +1156,87 @@ def _restore_claimed_leaf(
     raise GitTransactionRecoveryError((path,))
 
 
+def _reserve_private_name(directory_descriptor: int) -> str:
+    """Reserve a name in this directory that nothing else occupies.
+
+    Created with ``O_EXCL``, so reservation *fails* rather than silently
+    taking over a name already in use. The later rename can then only ever
+    overwrite this call's own empty sentinel — never an unrelated file that
+    happened to be sitting at the name.
+    """
+    for _ in range(100):
+        candidate = f".oneos-remove-{secrets.token_hex(12)}"
+        try:
+            sentinel = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise GitTransactionFailure(
+                "could not reserve a private removal name"
+            ) from exc
+        os.close(sentinel)
+        return candidate
+    raise GitTransactionFailure("could not reserve a private removal name")
+
+
+def _read_open_file(descriptor: int) -> bytes:
+    """Read a descriptor's full contents from the start.
+
+    Reads go through the descriptor, never through a fresh lookup: a
+    descriptor is bound to one inode for its lifetime, so nothing can
+    substitute a different file underneath it.
+    """
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1 << 20)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _held_state(descriptor: int) -> PathState:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ReviewedPathIntegrityError("reviewed path is not a regular file")
+    return PathState.regular(_read_open_file(descriptor), stat.S_IMODE(opened.st_mode))
+
+
 def _remove_reviewed_leaf(
     directory_descriptor: int, leaf: str, expected: PathState, path: str
 ) -> None:
-    """Unlink the reviewed file itself, never whatever answers to its name.
+    """Remove the reviewed file, never whatever answers to a name.
 
-    `os.unlink(name)` destroys whatever holds that name at the instant it
-    runs, which need not be what was compared a moment earlier: checking a
-    parcel's label and then looking away before destroying it lets someone
-    swap the parcel in the gap.
+    POSIX offers no way to unlink an inode: ``unlink`` resolves a name at
+    the instant it runs, so "compare a name, then destroy that name" always
+    leaves a gap in which the name can be rebound. This is checking a
+    parcel's label and then looking away before destroying it.
 
-    So claim the name first. Renaming the leaf to a private temporary that
-    only this call knows takes it out of anyone else's reach; the file is
-    then verified under that private name, and unlinked only once it has
-    matched. A mismatch is put back and refused, so a replacement is
-    returned intact rather than destroyed.
+    What this does instead:
+
+    1. reserve a private name with ``O_EXCL`` — no unrelated file can be
+       displaced, because the reservation fails if the name is taken;
+    2. rename the leaf onto that reservation, which takes the file out of
+       reach of anything targeting the proposal's own filename, and frees
+       the original name so a replacement created there is never touched;
+    3. verify through an ``O_NOFOLLOW`` **descriptor** — identity and
+       contents both come from a handle bound to one inode, not from a
+       fresh lookup; and
+    4. re-verify identity *and* contents through that same descriptor
+       immediately before the unlink, so an in-place rewrite or a name
+       rebinding is a refusal rather than a silent deletion.
+
+    A refusal always puts the file back under its own name. The residual —
+    a rebinding between step 4 and the unlink itself — cannot be closed in
+    POSIX; it is bounded by the approval lock and by a name that exists
+    only inside this call.
     """
-    claim = f".oneos-remove-{secrets.token_hex(12)}"
+    claim = _reserve_private_name(directory_descriptor)
     try:
         os.rename(
             leaf,
@@ -1161,27 +1245,67 @@ def _remove_reviewed_leaf(
             dst_dir_fd=directory_descriptor,
         )
     except FileNotFoundError as exc:
+        _discard_private_name(directory_descriptor, claim)
         raise ReviewedStateChanged(
             f"reviewed path changed before mutation: {path}"
         ) from exc
     except OSError as exc:
+        _discard_private_name(directory_descriptor, claim)
         raise GitTransactionFailure("could not claim the reviewed file") from exc
 
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        claimed = _capture_leaf_state(directory_descriptor, claim)
-    except BaseException:
-        _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-        raise
-    if claimed != expected:
-        _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-        raise ReviewedStateChanged(
-            f"reviewed path changed before mutation: {path}"
-        )
-    try:
-        os.unlink(claim, dir_fd=directory_descriptor)
+        descriptor = os.open(claim, flags, dir_fd=directory_descriptor)
     except OSError as exc:
         _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
-        raise GitTransactionFailure("could not remove reviewed file") from exc
+        raise _unsafe_open_failure(
+            exc, "reviewed path could not be opened safely"
+        ) from exc
+
+    try:
+        try:
+            held = _held_state(descriptor)
+            identity = os.fstat(descriptor)
+        except BaseException:
+            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+            raise
+        if held != expected:
+            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
+            )
+
+        # The last gate, immediately before the only destructive call.
+        try:
+            current = os.lstat(claim, dir_fd=directory_descriptor)
+            rebound = (current.st_dev, current.st_ino) != (
+                identity.st_dev,
+                identity.st_ino,
+            )
+            rewritten = _held_state(descriptor) != expected
+        except BaseException:
+            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+            raise
+        if rebound or rewritten:
+            if not rebound:
+                # Still our inode, rewritten in place: put it back under its
+                # own name so the operator can see what it became.
+                _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+            # If the name was rebound, whatever now holds it is a file this
+            # call never verified, so it is left exactly as found. An oddly
+            # named leftover is a far smaller harm than deleting bytes
+            # nobody reviewed, and the refusal tells the operator to look.
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
+            )
+
+        try:
+            os.unlink(claim, dir_fd=directory_descriptor)
+        except OSError as exc:
+            _restore_claimed_leaf(directory_descriptor, claim, leaf, path)
+            raise GitTransactionFailure("could not remove reviewed file") from exc
+    finally:
+        os.close(descriptor)
 
 
 def _apply_state(

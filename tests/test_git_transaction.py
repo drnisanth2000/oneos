@@ -1798,3 +1798,168 @@ def test_conditional_removal_cleanup_failure_before_removal_still_reports_no_cha
 
     assert leaf.read_bytes() == survived
     assert describe(raised.value).committed == "no"
+
+
+# --- S7 Task 3 review, round 2: the claim name is not a hiding place --------
+
+
+def test_conditional_removal_never_displaces_a_file_already_at_the_claim_name(
+    tmp_path,
+):
+    """P1 (review): reserving the private name must fail rather than take
+    over a name in use. `os.rename` overwrites its destination silently, so
+    a claim name that collides destroys whatever was there — unrelated
+    state the removal was never reviewed against."""
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, remove_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    # Force every reservation attempt onto one predictable name, and put an
+    # unrelated file there first.
+    real_token_hex = gt.secrets.token_hex
+    gt.secrets.token_hex = lambda size: "cafe" * 6
+    victim = vault / (".oneos-remove-" + "cafe" * 6)
+    victim.write_bytes(b"UNRELATED PRE-EXISTING STATE\n")
+
+    try:
+        with pytest.raises(gt.GitTransactionError):
+            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt.secrets.token_hex = real_token_hex
+
+    assert victim.exists(), "an unrelated file at the claim name was destroyed"
+    assert victim.read_bytes() == b"UNRELATED PRE-EXISTING STATE\n"
+    # The reviewed record is left where it was, not stranded.
+    assert leaf.exists()
+    assert leaf.read_bytes() == expected.contents
+
+
+def test_conditional_removal_refuses_a_rewrite_landing_on_the_claimed_file(tmp_path):
+    """P1 (review): moving the file to a private name must not merely move
+    the compare-then-destroy race along with it.
+
+    The verification and the final gate both read through the descriptor
+    holding the claimed file, so a rewrite that lands after the first check
+    is still seen — the removal refuses instead of destroying bytes nobody
+    reviewed.
+    """
+    import app.git_transaction as gt
+    from app.git_transaction import (
+        ReviewedStateConflict,
+        capture_path_state,
+        remove_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    replacement = b"REPLACEMENT-NOBODY-REVIEWED\n"
+    real_held = gt._held_state
+    swapped = []
+
+    def verify_then_rewrite_the_claim(descriptor):
+        state = real_held(descriptor)
+        if not swapped:
+            swapped.append(True)
+            claim = next(
+                entry for entry in vault.iterdir()
+                if entry.name.startswith(".oneos-remove-")
+            )
+            claim.write_bytes(replacement)
+        return state
+
+    gt._held_state = verify_then_rewrite_the_claim
+    try:
+        with pytest.raises(ReviewedStateConflict):
+            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._held_state = real_held
+
+    assert swapped, "the probe never rewrote the claimed file"
+    # Nothing was destroyed, and nothing is stranded under a private name.
+    assert leaf.exists()
+    assert leaf.read_bytes() == replacement
+    assert not [e for e in vault.iterdir() if e.name.startswith(".oneos-remove-")]
+    assert reviewed != replacement
+
+
+def test_conditional_removal_refuses_when_the_claim_name_is_rebound(tmp_path):
+    """The other half: the name is repointed at a different inode.
+
+    The descriptor still holds the reviewed file, so the mismatch is
+    visible. The planted file was never verified by this call, so it is
+    left exactly as found — an oddly named leftover is a far smaller harm
+    than deleting bytes nobody reviewed.
+    """
+    import app.git_transaction as gt
+    from app.git_transaction import (
+        ReviewedStateConflict,
+        capture_path_state,
+        remove_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    real_held = gt._held_state
+    swapped = []
+
+    def verify_then_rebind_the_claim(descriptor):
+        state = real_held(descriptor)
+        if not swapped:
+            swapped.append(True)
+            claim = next(
+                entry for entry in vault.iterdir()
+                if entry.name.startswith(".oneos-remove-")
+            )
+            planted = vault / "planted.yaml"
+            planted.write_bytes(b"PLANTED\n")
+            claim.unlink()
+            planted.rename(claim)          # a different inode, same name
+        return state
+
+    gt._held_state = verify_then_rebind_the_claim
+    try:
+        with pytest.raises(ReviewedStateConflict):
+            remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._held_state = real_held
+
+    assert swapped, "the probe never rebound the claim"
+    leftovers = [e for e in vault.iterdir() if e.name.startswith(".oneos-remove-")]
+    assert len(leftovers) == 1
+    assert leftovers[0].read_bytes() == b"PLANTED\n", (
+        "an unverified planted file was destroyed"
+    )
+
+
+def test_discarding_a_reservation_never_deletes_content(tmp_path):
+    """The reservation-cleanup path is only reached before any rename, so
+    it should only ever see this call's own empty sentinel. It refuses to
+    delete anything else regardless — a helper that can delete content is
+    one refactor away from being used where it must not be."""
+    import app.git_transaction as gt
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    holding_bytes = vault / ".oneos-remove-holding-bytes"
+    holding_bytes.write_bytes(b"content\n")
+    a_directory = vault / ".oneos-remove-a-directory"
+    a_directory.mkdir()
+    empty_sentinel = vault / ".oneos-remove-empty"
+    empty_sentinel.write_bytes(b"")
+
+    descriptor = os.open(vault, os.O_RDONLY)
+    try:
+        gt._discard_private_name(descriptor, holding_bytes.name)
+        gt._discard_private_name(descriptor, a_directory.name)
+        gt._discard_private_name(descriptor, "never-existed")
+        gt._discard_private_name(descriptor, empty_sentinel.name)
+    finally:
+        os.close(descriptor)
+
+    assert holding_bytes.exists() and holding_bytes.read_bytes() == b"content\n"
+    assert a_directory.is_dir()
+    assert not empty_sentinel.exists()   # its own sentinel is cleaned up
