@@ -683,7 +683,10 @@ def _outbox_list_error(
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
 @console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
 def outbox_approve(
-    request: Request, scope: EntityScope, id: str = Form(...)
+    request: Request,
+    scope: EntityScope,
+    id: str = Form(...),
+    review_sha256: str = Form(...),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_approve_response`, which catches `approve` itself refusing and,
@@ -699,13 +702,18 @@ def outbox_approve(
     structural check and no measured outcome; an earlier revision kept one
     and had to invent a reason, which is why it is gone.
     """
-    return _outbox_approve_response(request, scope, id)
+    return _outbox_approve_response(request, scope, id, review_sha256)
 
 
-def _outbox_approve_response(request: Request, scope: Scope, id: str) -> HTMLResponse:
+def _outbox_approve_response(
+    request: Request, scope: Scope, id: str, review_sha256: str
+) -> HTMLResponse:
     approval_error = None
     try:
-        approve(scope, id)
+        # S7: the operator's own fingerprint, passed through untouched. The
+        # route must never derive one — recomputing here would rebind the
+        # action to whatever is on disk now, which is the defect S7 closes.
+        approve(scope, id, review_sha256)
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
     try:
@@ -719,7 +727,10 @@ def _outbox_approve_response(request: Request, scope: Scope, id: str) -> HTMLRes
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
 @console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
 def outbox_reject(
-    request: Request, scope: EntityScope, id: str = Form(...)
+    request: Request,
+    scope: EntityScope,
+    id: str = Form(...),
+    review_sha256: str = Form(...),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_reject_response`, which catches `reject` itself refusing and,
@@ -735,13 +746,16 @@ def outbox_reject(
     structural check and no measured outcome; an earlier revision kept one
     and had to invent a reason, which is why it is gone.
     """
-    return _outbox_reject_response(request, scope, id)
+    return _outbox_reject_response(request, scope, id, review_sha256)
 
 
-def _outbox_reject_response(request: Request, scope: Scope, id: str) -> HTMLResponse:
+def _outbox_reject_response(
+    request: Request, scope: Scope, id: str, review_sha256: str
+) -> HTMLResponse:
     approval_error = None
     try:
-        reject(scope, id)
+        # S7: same contract as approve — passed through, never derived.
+        reject(scope, id, review_sha256)
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
     try:

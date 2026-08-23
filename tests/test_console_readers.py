@@ -449,35 +449,30 @@ def test_mid_approval_reread_of_a_vanished_record_is_unreadable(tmp_path, monkey
     then asserted only on a constructed exception, so it passed with the guard
     deleted — the defect it exists to prevent.
     """
-    import sys
-
     from tests.test_outbox import _propose, _vault
     from tests.conftest import git_head
     from app import outbox
     from app.console_errors import describe
-    from app.git_transaction import PathState
 
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
     head_before = git_head(vault)
-    real = outbox.capture_path_state
 
-    def _vanished(root, rel):
-        # S7: fire only for `approve`'s OWN mid-approval re-read, which is
-        # the guard this test names. The strict scan behind `get_proposal`
-        # now captures through this same primitive, and an indiscriminate
-        # lie would vanish the record at that earlier boundary instead —
-        # a different, already-covered refusal, leaving approve's re-read
-        # guard unexercised.
-        state = real(root, rel)
-        caller = sys._getframe(1).f_code.co_name
-        if rel.endswith(".yaml") and caller == "approve":
-            return PathState.absent()
-        return state
+    # S7: the record vanishes between the strict scan that locates it and
+    # the capture that takes ownership of it — a real race, expressed
+    # without inspecting call frames. This is the window approve's guard
+    # exists for, and it is the last read of the proposal before mutation.
+    fingerprint = outbox.get_proposal_review(scope, prop.id).sha256
+    real_scan = outbox._load_proposal_reviews
 
-    monkeypatch.setattr(outbox, "capture_path_state", _vanished)
+    def _vanish_after_locating(bound_scope):
+        reviews = real_scan(bound_scope)
+        prop.path.unlink()
+        return reviews
+
+    monkeypatch.setattr(outbox, "_load_proposal_reviews", _vanish_after_locating)
     with pytest.raises(outbox.UnreadableProposalRecord) as raised:
-        outbox.approve(scope, prop.id)
+        outbox.approve(scope, prop.id, fingerprint)
     assert describe(raised.value).code == "E-UNREADABLE"
     assert git_head(vault) == head_before
 

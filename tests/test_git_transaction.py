@@ -1512,3 +1512,132 @@ def test_sha256_post_commit_failure_restores_exact_starting_state(
     assert str(raised.value) == "approval transaction failed and was rolled back"
     assert len(before["head"]) == 64
     assert _complete_state(vault, plan, index_directory) == before
+
+
+# --- S7 Task 3: conditional removal for reject -------------------------------
+
+
+def _conditional_vault(tmp_path):
+    from tests.conftest import git_vault
+
+    vault = git_vault(tmp_path, {"tracked.md": "tracked\n"})
+    leaf = vault / "outbox-record.yaml"
+    leaf.write_bytes(b"id: probe\nvalue: first\n")
+    return vault, leaf
+
+
+def test_conditional_removal_removes_only_the_expected_state(tmp_path):
+    from app.git_transaction import capture_path_state, remove_path_if_unchanged
+    from tests.conftest import git_count_commits, git_head
+
+    vault, leaf = _conditional_vault(tmp_path)
+    head_before, commits_before = git_head(vault), git_count_commits(vault)
+
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert not leaf.exists()
+    # A removal, not a commit: reject never enters Git history.
+    assert git_head(vault) == head_before
+    assert git_count_commits(vault) == commits_before
+
+
+def test_conditional_removal_refuses_a_rewritten_leaf(tmp_path):
+    from app.git_transaction import (
+        ReviewedStateChanged,
+        capture_path_state,
+        remove_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    leaf.write_bytes(b"id: probe\nvalue: second\n")
+
+    with pytest.raises(ReviewedStateChanged):
+        remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert leaf.read_bytes() == b"id: probe\nvalue: second\n"
+
+
+def test_conditional_removal_refuses_a_leaf_swapped_for_a_symlink(tmp_path):
+    from app.git_transaction import (
+        ReviewedStateConflict,
+        capture_path_state,
+        remove_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    outside = tmp_path / "outside.yaml"
+    outside.write_bytes(expected.contents)
+    leaf.unlink()
+    leaf.symlink_to(outside)
+
+    with pytest.raises(ReviewedStateConflict):
+        remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    # The redirection target is never followed and never unlinked.
+    assert outside.exists()
+    assert leaf.is_symlink()
+
+
+def test_conditional_removal_refuses_a_vanished_leaf(tmp_path):
+    from app.git_transaction import (
+        ReviewedStateChanged,
+        capture_path_state,
+        remove_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    leaf.unlink()
+
+    with pytest.raises(ReviewedStateChanged):
+        remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+
+def test_conditional_removal_refuses_an_absent_expected_state(tmp_path):
+    from app.git_transaction import PathState, remove_path_if_unchanged
+
+    vault, _leaf = _conditional_vault(tmp_path)
+
+    # Not an arbitrary-delete utility: without reviewed bytes there is
+    # nothing to have reviewed.
+    with pytest.raises(ValueError):
+        remove_path_if_unchanged(vault, "outbox-record.yaml", PathState.absent())
+
+
+@pytest.mark.parametrize(
+    "unsafe", ["/absolute.yaml", "../escape.yaml", ".git/config", "", "a//b.yaml"]
+)
+def test_conditional_removal_refuses_an_unsafe_path(tmp_path, unsafe):
+    from app.git_transaction import (
+        InvalidTransactionPath,
+        PathState,
+        remove_path_if_unchanged,
+    )
+
+    vault, _leaf = _conditional_vault(tmp_path)
+
+    with pytest.raises(InvalidTransactionPath):
+        remove_path_if_unchanged(
+            vault, unsafe, PathState.regular(b"probe", 0o644)
+        )
+
+
+def test_conditional_removal_leaves_unrelated_git_state_untouched(tmp_path):
+    from app.git_transaction import capture_path_state, remove_path_if_unchanged
+    from tests.conftest import git_cached_diff, git_status_bytes, git_worktree_diff
+
+    vault, leaf = _conditional_vault(tmp_path)
+    (vault / "tracked.md").write_text("locally edited\n", encoding="utf-8")
+    worktree_before = git_worktree_diff(vault)
+    cached_before = git_cached_diff(vault)
+
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    remove_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert not leaf.exists()
+    assert git_worktree_diff(vault) == worktree_before
+    assert git_cached_diff(vault) == cached_before
+    assert b"outbox-record.yaml" not in git_status_bytes(vault)

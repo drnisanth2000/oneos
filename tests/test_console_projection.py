@@ -56,6 +56,13 @@ PROJECTION_ARCHETYPES = textwrap.dedent(
 )
 
 
+def _fp(scope, proposal_id: str) -> str:
+    """The fingerprint of the proposal exactly as it now stands (S7)."""
+    from app.outbox import get_proposal_review
+
+    return get_proposal_review(scope, proposal_id).sha256
+
+
 def _projection_vault(root, entities, files):
     return git_entity_vault(
         root,
@@ -163,7 +170,7 @@ def test_unblocked_listing_renders_all_valid_rows_with_controls(tmp_path):
 
     # The row's capability corresponds to a genuinely approvable proposal,
     # through the untouched strict path — not merely a flag on the row.
-    approve(scope, a.id)
+    approve(scope, a.id, _fp(scope, a.id))
     assert [p.id for p in load_proposals(scope)] == [b.id]
 
 
@@ -213,9 +220,9 @@ def test_blocked_state_actions_still_refused_by_strict_loader(tmp_path):
     good = next(row for row in listing.rows if row.proposal is not None)
 
     with pytest.raises(outbox.OutboxDestinationError):
-        approve(scope, good.proposal.id)
+        approve(scope, good.proposal.id, _fp(scope, good.proposal.id))
     with pytest.raises(outbox.OutboxDestinationError):
-        reject(scope, good.proposal.id)
+        reject(scope, good.proposal.id, _fp(scope, good.proposal.id))
 
 
 # --- delete proposals: skipped exactly as today ------------------------------
@@ -352,7 +359,7 @@ def test_undiffable_row_error_matches_approve_outcome(tmp_path, monkeypatch, con
         assert row.can_approve is False
 
         try:
-            approve(scope, prop.id)
+            approve(scope, prop.id, _fp(scope, prop.id))
             pytest.fail("approve did not raise for the injected condition")
         except Exception as exc:  # noqa: BLE001 - deliberately broad: compare codes
             approve_error = exc
@@ -397,7 +404,7 @@ def test_approval_after_projection_still_revalidates(tmp_path):
     prop.path.write_text(yaml.safe_dump(record), encoding="utf-8")
 
     with pytest.raises(outbox.OutboxDestinationError):
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
 
 # --- I2: every row of the design's seven-condition phase-1 table ---------------

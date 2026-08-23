@@ -274,6 +274,16 @@ def _assert_destination_error(operation) -> None:
     assert type(raised.value) is outbox.OutboxDestinationError
 
 
+def _fp(scope: Scope, proposal_id: str) -> str:
+    """The fingerprint of the proposal exactly as it now stands.
+
+    S7 test convenience only: a real operator's fingerprint comes from the
+    review they were shown. Tests that need a *stale* fingerprint capture it
+    before mutating the record.
+    """
+    return outbox.get_proposal_review(scope, proposal_id).sha256
+
+
 def _write_record(scope: Scope, name: str, record: str) -> Path:
     path = scope.resolve("outbox", name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -569,7 +579,7 @@ def test_module_general_approval_removes_triage_sub_in_one_revertible_commit(
     assert "+sub:" not in diff
 
     before = git_count_commits(vault)
-    approval = approve(scope, prop.id)
+    approval = approve(scope, prop.id, _fp(scope, prop.id))
     approval_oid = git_head(vault)
     destination = vault / approval.dst
 
@@ -902,7 +912,7 @@ def test_operations_reject_noncanonical_destination_without_mutation(
         proposal = _proposal_from_record(path, record)
         attempt = lambda: preview_diff(scope, proposal)
     else:
-        attempt = lambda: approve(scope, record["id"])
+        attempt = lambda: approve(scope, record["id"], _fp(scope, record["id"]))
 
     _assert_destination_error(attempt)
 
@@ -934,7 +944,7 @@ def test_noncanonical_destination_fails_before_source_body_read(
         proposal = _proposal_from_record(path, record)
         attempt = lambda: preview_diff(scope, proposal)
     else:
-        attempt = lambda: approve(scope, record["id"])
+        attempt = lambda: approve(scope, record["id"], _fp(scope, record["id"]))
 
     _assert_destination_error(attempt)
 
@@ -944,7 +954,7 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
     scope, prop = _propose(vault)
     before = git_count_commits(vault)
 
-    approve(scope, prop.id)
+    approve(scope, prop.id, _fp(scope, prop.id))
 
     assert not scope.resolve("00-inbox", "active", "note.md").exists()
     dst = scope.resolve("11-knowledge", "active", "note.md")
@@ -966,7 +976,7 @@ def test_approval_refuses_changed_source_without_any_added_mutation(tmp_path):
     before = _approval_state(vault)
 
     with pytest.raises(outbox.StaleProposalSource):
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert _approval_state(vault) == before
     assert prop.path.read_bytes() == proposal_bytes
@@ -983,7 +993,7 @@ def test_approval_refuses_missing_source_and_preserves_proposal(tmp_path):
     before = _approval_state(vault)
 
     with pytest.raises(outbox.MissingProposalSource):
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert _approval_state(vault) == before
     assert prop.path.read_bytes() == proposal_bytes
@@ -998,7 +1008,7 @@ def test_approval_with_unrelated_staged_unstaged_and_untracked_work_commits_only
     scope, prop = _propose(vault)
     head_before = git_head(vault)
 
-    approve(scope, prop.id)
+    approve(scope, prop.id, _fp(scope, prop.id))
 
     assert git_changed_paths(vault) == sorted([prop.src, prop.dst])
     assert subprocess.run(
@@ -1035,7 +1045,7 @@ def test_reviewed_source_or_destination_index_dirt_is_refused_before_mutation(
     status_before = git_status_bytes(vault)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert isinstance(raised.value.__cause__, ReviewedStateConflict)
     assert git_head(vault) == head_before
@@ -1061,7 +1071,7 @@ def test_approval_busy_error_preserves_source_destination_proposal_and_git_state
 
     with git_transaction._approval_lock(vault):
         with pytest.raises(outbox.OutboxTransactionError) as raised:
-            approve(scope, prop.id)
+            approve(scope, prop.id, _fp(scope, prop.id))
 
     assert isinstance(raised.value.__cause__, VaultBusyError)
     assert git_head(vault) == head_before
@@ -1091,7 +1101,7 @@ def test_injected_transaction_failure_restores_source_destination_and_exact_prop
     monkeypatch.setattr(git_transaction, "_checkpoint", fail_after_filesystem_apply)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert isinstance(raised.value.__cause__, GitTransactionFailure)
     assert git_head(vault) == head_before
@@ -1111,7 +1121,7 @@ def test_approval_transaction_error_is_an_outbox_error(tmp_path, monkeypatch):
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction, raising=False)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert isinstance(raised.value, outbox.OutboxError)
     assert isinstance(raised.value.__cause__, GitTransactionFailure)
@@ -1143,7 +1153,7 @@ def test_approval_refuses_race_after_verified_snapshot_without_overwriting_sourc
     monkeypatch.setattr(outbox, "capture_path_state", race_after_source_capture)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     destination = scope.resolve("11-knowledge", "active", "note.md")
     assert isinstance(raised.value.__cause__, ReviewedStateConflict)
@@ -1189,7 +1199,7 @@ def test_classification_approval_still_creates_exactly_one_commit_and_one_revert
         rule_id="synthetic-rule",
     )
     before_approval = git_head(vault)
-    approve(scope, prop.id)
+    approve(scope, prop.id, _fp(scope, prop.id))
     approval_oid = git_head(vault)
 
     assert approval_oid != ingest_oid
@@ -1217,7 +1227,7 @@ def test_classification_approval_still_creates_exactly_one_commit_and_one_revert
 def test_reject_discards_proposal_without_moving(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
-    reject(scope, prop.id)
+    reject(scope, prop.id, _fp(scope, prop.id))
     assert not prop.path.exists()
     assert scope.resolve("00-inbox", "active", "note.md").exists()
     assert load_proposals(scope) == []
@@ -1236,9 +1246,9 @@ def test_operations_reject_same_entity_proposal_leaf_symlink_without_mutation(
     if operation == "preview":
         attempt = lambda: preview_diff(scope, proposal)
     elif operation == "approve":
-        attempt = lambda: approve(scope, proposal.id)
+        attempt = lambda: approve(scope, proposal.id, _fp(scope, proposal.id))
     else:
-        attempt = lambda: reject(scope, proposal.id)
+        attempt = lambda: reject(scope, proposal.id, _fp(scope, proposal.id))
 
     with pytest.raises(CrossScopeError):
         attempt()
@@ -1254,11 +1264,17 @@ def test_mutation_revalidates_lexical_proposal_leaf_after_lookup(
 ):
     vault = _vault(tmp_path)
     scope, proposal = _propose(vault)
-    real_get = outbox.get_proposal
+    fingerprint = _fp(scope, proposal.id)
+    # S7: actions no longer read through `get_proposal`; they locate the
+    # leaf through `get_proposal_review`. Patching the reader they actually
+    # use keeps this test's point — the mutation must revalidate the leaf
+    # *after* the lookup — instead of leaving it inert.
+    real_get = outbox.get_proposal_review
     state = {}
 
     def redirect_after_lookup(bound_scope, proposal_id):
-        loaded = real_get(bound_scope, proposal_id)
+        review = real_get(bound_scope, proposal_id)
+        loaded = review.value
         shadow = bound_scope.resolve("proposal-shadow", loaded.path.name)
         shadow.parent.mkdir()
         loaded.path.rename(shadow)
@@ -1266,12 +1282,12 @@ def test_mutation_revalidates_lexical_proposal_leaf_after_lookup(
         state["head"] = git_head(vault)
         state["paths"] = git_tracked_paths(vault)
         state["tree"] = _vault_tree(vault)
-        return loaded
+        return review
 
-    monkeypatch.setattr(outbox, "get_proposal", redirect_after_lookup)
+    monkeypatch.setattr(outbox, "get_proposal_review", redirect_after_lookup)
 
     with pytest.raises(CrossScopeError):
-        operation(scope, proposal.id)
+        operation(scope, proposal.id, fingerprint)
 
     assert git_head(vault) == state["head"]
     assert git_tracked_paths(vault) == state["paths"]
@@ -1284,11 +1300,11 @@ def test_approval_never_scaffolds_destination_parent_after_validation(
 ):
     vault = _vault(tmp_path)
     scope, proposal = _propose(vault)
-    real_get = outbox.get_proposal
+    real_get = outbox.get_proposal_review
     state = {}
 
     def change_parent_after_lookup(bound_scope, proposal_id):
-        loaded = real_get(bound_scope, proposal_id)
+        review = real_get(bound_scope, proposal_id)
         active = vault / "demo/11-knowledge/active"
         saved = vault / "demo/11-knowledge/saved-active"
         active.rename(saved)
@@ -1297,11 +1313,12 @@ def test_approval_never_scaffolds_destination_parent_after_validation(
         state["head"] = git_head(vault)
         state["paths"] = git_tracked_paths(vault)
         state["tree"] = _vault_tree(vault)
-        return loaded
+        return review
 
-    monkeypatch.setattr(outbox, "get_proposal", change_parent_after_lookup)
+    fingerprint = _fp(scope, proposal.id)
+    monkeypatch.setattr(outbox, "get_proposal_review", change_parent_after_lookup)
 
-    _assert_destination_error(lambda: approve(scope, proposal.id))
+    _assert_destination_error(lambda: approve(scope, proposal.id, fingerprint))
 
     assert git_head(vault) == state["head"]
     assert git_tracked_paths(vault) == state["paths"]
@@ -1378,8 +1395,10 @@ def test_outbox_interfaces_have_one_identity_authority():
 
 
 def test_public_routes_remain_single_proposal_actions():
-    assert tuple(inspect.signature(approve).parameters) == ("scope", "proposal_id")
-    assert tuple(inspect.signature(reject).parameters) == ("scope", "proposal_id")
+    """Still one proposal per call — now bound to that proposal's review."""
+    bound = ("scope", "proposal_id", "review_sha256")
+    assert tuple(inspect.signature(approve).parameters) == bound
+    assert tuple(inspect.signature(reject).parameters) == bound
 
 
 def test_propose_rejects_item_path_from_another_entity(two_entity_vault):
@@ -1460,8 +1479,10 @@ def test_mutation_rejects_foreign_record_and_leaves_both_entities_unchanged(
     )
     before = {path: path.read_bytes() for path in watched}
 
+    # A well-formed fingerprint that binds nothing: the scope refusal is
+    # independent of it, and must come first.
     with pytest.raises(outbox.OutboxScopeError):
-        operation(alpha, record["id"])
+        operation(alpha, record["id"], "0" * 64)
 
     assert {path: path.read_bytes() for path in watched} == before
     assert not (two_entity_vault / "alpha/11-knowledge/active/beta.md").exists()
@@ -1907,3 +1928,324 @@ def test_the_strict_scan_never_follows_a_leaf_swapped_after_its_lexical_check(
     Path(target.path).unlink()
     Path(target.path).write_bytes(original_bytes)
     assert outbox.get_proposal_review(scope, target.id).value.module == "11-knowledge"
+
+
+# --- S7 Task 3: approve and reject bound to the reviewed bytes ---------------
+
+
+def _review_of(scope: Scope, prop: Proposal):
+    return outbox.get_proposal_review(scope, prop.id)
+
+
+def _rewrite_same_id_meaningfully(prop: Proposal) -> bytes:
+    """A canonical replacement under the same id and filename."""
+    return _rewrite_record(
+        prop.path,
+        module="11-library",
+        sub="reference",
+        dst="demo/11-library/active/note.md",
+    )
+
+
+def _rewrite_same_id_byte_only(prop: Proposal) -> bytes:
+    """Identical action-relevant values, different stored bytes."""
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    raw = yaml.safe_dump(record, sort_keys=True).encode("utf-8")
+    prop.path.write_bytes(raw)
+    return raw
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_actions_require_a_review_fingerprint_with_no_default(action):
+    signature = inspect.signature(getattr(outbox, action))
+    assert list(signature.parameters) == ["scope", "proposal_id", "review_sha256"]
+    fingerprint = signature.parameters["review_sha256"]
+    assert fingerprint.default is inspect.Parameter.empty
+    assert fingerprint.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_actions_have_no_id_only_compatibility_path(tmp_path, action):
+    scope, prop = _propose(_vault(tmp_path))
+    before = _approval_state(scope.root)
+
+    with pytest.raises(TypeError):
+        getattr(outbox, action)(scope, prop.id)
+
+    assert _approval_state(scope.root) == before
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize(
+    "fingerprint", [None, "", "0" * 63, "0" * 65, "G" * 64, "A" * 64, 123, b"0" * 64]
+)
+def test_actions_refuse_a_malformed_fingerprint_without_mutation(
+    tmp_path, action, fingerprint
+):
+    from app.review_tokens import InvalidReviewToken
+
+    scope, prop = _propose(_vault(tmp_path))
+    before = _approval_state(scope.root)
+
+    with pytest.raises(InvalidReviewToken):
+        getattr(outbox, action)(scope, prop.id, fingerprint)
+
+    assert _approval_state(scope.root) == before
+    assert prop.path.exists()
+
+
+def test_approve_still_moves_and_commits_when_the_review_matches(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    commits_before = git_count_commits(vault)
+
+    approved = approve(scope, prop.id, _review_of(scope, prop).sha256)
+
+    assert approved.id == prop.id
+    assert git_count_commits(vault) == commits_before + 1
+    assert not (vault / prop.src).exists()
+    assert (vault / prop.dst).exists()
+    assert not prop.path.exists()
+
+
+def test_reject_still_discards_when_the_review_matches(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    commits_before = git_count_commits(vault)
+
+    rejected = reject(scope, prop.id, _review_of(scope, prop).sha256)
+
+    assert rejected.id == prop.id
+    assert not prop.path.exists()
+    assert git_count_commits(vault) == commits_before
+    assert (vault / prop.src).exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize(
+    ("label", "rewrite"),
+    [
+        ("meaningful", _rewrite_same_id_meaningfully),
+        ("byte-only", _rewrite_same_id_byte_only),
+    ],
+)
+def test_a_same_id_replacement_refuses_and_changes_nothing(
+    tmp_path, action, label, rewrite
+):
+    from app.review_tokens import ReviewedProposalChanged
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    replacement = rewrite(prop)
+    assert replacement != review.contents, label
+    before = _approval_state(vault)
+
+    with pytest.raises(ReviewedProposalChanged):
+        getattr(outbox, action)(scope, prop.id, review.sha256)
+
+    # Complete non-mutation, and the replacement is preserved for diagnosis.
+    assert _approval_state(vault) == before
+    assert prop.path.read_bytes() == replacement
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_replacement_between_the_comparison_and_the_mutation_refuses(
+    tmp_path, action
+):
+    """The final pre-mutation boundary.
+
+    The fingerprint already matched. A replacement landing *after* that
+    comparison must still be refused, because the state the action owns is
+    the state it compared — not whatever is on disk when it reaches the
+    mutation.
+    """
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    before = _approval_state(vault)
+
+    mutating_call = "execute_transaction" if action == "approve" else "remove_path_if_unchanged"
+    real = getattr(outbox, mutating_call)
+    replaced = []
+
+    def replace_then_run(*args, **kwargs):
+        if not replaced:
+            replaced.append(_rewrite_same_id_byte_only(prop))
+        return real(*args, **kwargs)
+
+    setattr(outbox, mutating_call, replace_then_run)
+    try:
+        # approve wraps the transaction's refusal in its own domain type;
+        # reject raises the conflict directly. The operator outcome is the
+        # contract, so assert that rather than either wrapper.
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        setattr(outbox, mutating_call, real)
+
+    assert describe(raised.value).code == "E-CONFLICT"
+    assert replaced, "the probe never replaced the record"
+
+    # Everything the action could have changed is unchanged. The vault tree
+    # is compared minus the proposal leaf, because the probe itself rewrote
+    # that one file — asserting it equal would assert the probe never ran.
+    after = _approval_state(vault)
+    for key in ("head", "status", "index", "worktree"):
+        assert after[key] == before[key], key
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+    # `.git/oneos-approval.lock` is the transaction's own lock file, created
+    # by taking the lock and not vault content.
+    ignored = {proposal_rel, ".git/oneos-approval.lock"}
+
+    def _comparable(tree):
+        return tuple(entry for entry in tree if entry[0] not in ignored)
+
+    assert _comparable(after["tree"]) == _comparable(before["tree"])
+    assert (vault / prop.src).exists()
+    assert not (vault / prop.dst).exists()
+    # Reject must not unlink the replacement it never reviewed.
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == replaced[0]
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize("substitution", ["absent", "symlink", "directory"])
+def test_a_non_regular_substitution_before_mutation_refuses_without_blocking(
+    tmp_path, action, substitution
+):
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_bytes(review.contents)
+
+    mutating_call = "execute_transaction" if action == "approve" else "remove_path_if_unchanged"
+    real = getattr(outbox, mutating_call)
+    swapped = []
+
+    def substitute_then_run(*args, **kwargs):
+        if not swapped:
+            swapped.append(substitution)
+            prop.path.unlink()
+            if substitution == "symlink":
+                prop.path.symlink_to(outside)
+            elif substitution == "directory":
+                prop.path.mkdir()
+        return real(*args, **kwargs)
+
+    setattr(outbox, mutating_call, substitute_then_run)
+    try:
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        setattr(outbox, mutating_call, real)
+
+    # A changed regular file is a conflict; a type swap is a tamper finding.
+    # Both refuse, neither blocks, and neither is E-UNKNOWN.
+    assert describe(raised.value).code in {"E-CONFLICT", "E-TAMPER"}
+    assert swapped, "the probe never substituted anything"
+    # Whatever was substituted is still there — never followed, never removed.
+    assert outside.exists() and outside.read_bytes() == review.contents
+    if substitution == "symlink":
+        assert prop.path.is_symlink()
+    elif substitution == "directory":
+        assert prop.path.is_dir()
+    else:
+        assert not prop.path.exists()
+
+
+def test_no_action_reads_the_proposal_through_the_value_only_reader():
+    """`get_proposal` survives for non-action callers only. An action that
+    used it would be acting on a value with no fingerprint behind it."""
+    for action in (outbox.approve, outbox.reject):
+        source = inspect.getsource(action)
+        assert "get_proposal(" not in source, action.__name__
+
+
+def test_approve_gives_the_transaction_the_state_it_compared(tmp_path):
+    """The compared bytes and the transaction-owned bytes are one object.
+
+    A reread between the comparison and the plan would reopen exactly the
+    window S7 exists to close, so the owned change must carry the same
+    `PathState` the fingerprint was checked against.
+    """
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+
+    seen = {}
+    real = outbox.execute_transaction
+
+    def record_plan(vault_arg, plan):
+        seen["owned"] = plan.owned_changes
+        return real(vault_arg, plan)
+
+    outbox.execute_transaction = record_plan
+    try:
+        approve(scope, prop.id, review.sha256)
+    finally:
+        outbox.execute_transaction = real
+
+    owned = {change.path: change for change in seen["owned"]}
+    assert proposal_rel in owned
+    assert owned[proposal_rel].before.contents == review.contents
+    assert owned[proposal_rel].after.contents is None
+
+
+def test_approve_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
+    """The reread that a contents comparison alone cannot catch.
+
+    `test_approve_gives_the_transaction_the_state_it_compared` compares the
+    owned bytes to the reviewed bytes — but when nothing changes in between,
+    a fresh capture yields byte-identical contents and the substitution is
+    invisible. So change the record *after* the fingerprint matched and
+    *before* the plan is built: the reviewed state no longer describes the
+    file, and only an implementation that kept the compared state refuses.
+
+    An implementation that recaptured here would take the replacement as
+    authority, `_apply_state` would find it unchanged, and approve would
+    commit a move for a proposal nobody ever reviewed — while unlinking the
+    replacement as though it had been.
+    """
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    commits_before = git_count_commits(vault)
+    before = _approval_state(vault)
+
+    real_read = outbox._read_no_follow_bytes
+    replaced = []
+
+    def rewrite_proposal_then_read(path):
+        # Fires on approve's source-receipt read, which sits between the
+        # fingerprint comparison and the transaction plan.
+        if not replaced:
+            replaced.append(_rewrite_same_id_byte_only(prop))
+        return real_read(path)
+
+    outbox._read_no_follow_bytes = rewrite_proposal_then_read
+    try:
+        with pytest.raises(Exception) as raised:
+            approve(scope, prop.id, review.sha256)
+    finally:
+        outbox._read_no_follow_bytes = real_read
+
+    assert replaced, "the probe never replaced the record"
+    assert replaced[0] != review.contents
+    assert describe(raised.value).code == "E-CONFLICT"
+
+    # Nothing committed, nothing moved, and the replacement is still there.
+    assert git_count_commits(vault) == commits_before
+    assert _approval_state(vault)["head"] == before["head"]
+    assert (vault / prop.src).exists()
+    assert not (vault / prop.dst).exists()
+    assert prop.path.read_bytes() == replaced[0]

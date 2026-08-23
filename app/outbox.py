@@ -32,6 +32,7 @@ from .git_transaction import (
     TransactionPlan,
     capture_path_state,
     execute_transaction,
+    remove_path_if_unchanged,
 )
 from .inbox import split_front_matter
 from .destinations import DestinationError, resolve_classification_destination
@@ -40,7 +41,11 @@ from .proposal_identity import (
     proposal_id_candidates,
     require_proposal_identity,
 )
-from .review_tokens import ReviewSnapshot, make_review_snapshot
+from .review_tokens import (
+    ReviewSnapshot,
+    make_review_snapshot,
+    require_review_match,
+)
 from .scope import CrossScopeError, OutOfScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError
 
@@ -649,24 +654,25 @@ def _require_destination(scope: Scope, proposal: Proposal) -> Proposal:
     return proposal
 
 
-def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
-    """One no-follow byte snapshot of a proposal leaf.
+def _capture_proposal_state(scope: Scope, relative_path: str) -> PathState:
+    """One no-follow capture of a proposal leaf, in the outbox's vocabulary.
 
     Missing and unreadable states become the outbox's existing safe
     outcomes. Integrity outcomes are deliberately *not* flattened into
     them: a leaf that turned into a symlink or a non-regular file between
     the lexical check and this capture is a tamper finding, and saying
     "could not be read" would tell the operator the wrong thing to do.
+
+    Every reader and every action goes through here, so one translation
+    table serves the projection, the strict scan and the mutation boundary
+    alike — they cannot describe the same physical condition differently.
     """
-    relative = path.relative_to(scope.root).as_posix()
     try:
-        state = capture_path_state(scope.root, relative)
+        state = capture_path_state(scope.root, relative_path)
     except ReviewedPathIntegrityError as exc:
-        # The leaf became a symlink or a non-regular file between its
-        # lexical check and this capture. Re-narrowed to the outbox's own
-        # redirection type so route declarations stay truthful; the operator
-        # outcome (E-TAMPER) is identical either way, and the redirected
-        # target is never read.
+        # Re-narrowed to the outbox's own redirection type so route
+        # declarations stay truthful; the operator outcome (E-TAMPER) is
+        # identical either way, and the redirected target is never read.
         raise RedirectedPathError("proposal leaf is redirected") from exc
     except ReviewedPathUnavailable as exc:
         raise UnreadableProposalRecord(
@@ -674,7 +680,13 @@ def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
         ) from exc
     if state.contents is None:
         raise UnreadableProposalRecord("proposal record no longer exists")
-    return state.contents
+    return state
+
+
+def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
+    """The bytes of one no-follow proposal capture."""
+    relative = path.relative_to(scope.root).as_posix()
+    return _capture_proposal_state(scope, relative).contents
 
 
 def get_proposal_review(scope: Scope, proposal_id: str) -> ReviewSnapshot[Proposal]:
@@ -707,12 +719,59 @@ def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
     return get_proposal_review(scope, proposal_id).value
 
 
-@structured_reader(category="proposal")
-def approve(scope: Scope, proposal_id: str) -> Proposal:
-    """Perform the proposed move and commit it — exactly one revertible commit.
-    The proposal is transaction-owned but never enters the approval commit."""
-    prop = _require_destination(scope, get_proposal(scope, proposal_id))
+def _locate_proposal(scope: Scope, proposal_id: str) -> str:
+    """The vault-relative leaf of one pending proposal.
+
+    Runs the strict scan, so an action inherits every listing-wide refusal
+    the loader applies. Its *value* is deliberately discarded: only the
+    state captured afterwards may authorise a mutation.
+    """
+    review = get_proposal_review(scope, proposal_id)
+    return review.value.path.relative_to(scope.root).as_posix()
+
+
+def _own_reviewed_proposal(
+    scope: Scope,
+    proposal_id: str,
+    review_sha256: object,
+) -> tuple[str, PathState, Proposal]:
+    """Take ownership of the exact proposal state the operator reviewed.
+
+    This is S7's boundary, and the order is normative (design §3):
+
+    1. locate the leaf under the scan's listing-wide refusals;
+    2. capture that leaf's state **once** — this state, and no later read,
+       is what the mutation will own;
+    3. compare its bytes against the submitted fingerprint; and
+    4. parse and validate *those same bytes* into the value the action acts on.
+
+    The captured `PathState` is returned so the caller can hand the very
+    same object to the mutation. A reread anywhere after step 2 would
+    reopen the window this exists to close.
+    """
     vault = scope.root
+    proposal_rel = _locate_proposal(scope, proposal_id)
+
+    proposal_state = _capture_proposal_state(scope, proposal_rel)
+    require_review_match(proposal_state.contents, review_sha256)
+    record = _parse_record_bytes(proposal_state.contents)
+    proposal = _require_destination(scope, _to_proposal(vault / proposal_rel, record))
+    return proposal_rel, proposal_state, proposal
+
+
+@structured_reader(category="proposal")
+def approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
+    """Perform the proposed move and commit it — exactly one revertible commit.
+    The proposal is transaction-owned but never enters the approval commit.
+
+    The move is bound to the reviewed proposal bytes: `review_sha256` is
+    required, is compared against the state the transaction will own, and
+    has no default or id-only fallback.
+    """
+    vault = scope.root
+    proposal_rel, proposal_state, prop = _own_reviewed_proposal(
+        scope, proposal_id, review_sha256
+    )
     src = scope.root / prop.src
     try:
         source_bytes = _read_no_follow_bytes(src)
@@ -736,29 +795,11 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
     if source_state.contents != source_bytes:
         raise StaleProposalSource("proposal source has changed")
 
-    proposal_rel = prop.path.relative_to(vault).as_posix()
-    proposal_state = capture_path_state(vault, proposal_rel)
-    # Mid-approval re-read, mirroring execute_delete: a vanished file makes
-    # safe_load(None) raise AttributeError, and corrupted bytes raise
-    # YAMLError. Both escape as E-UNKNOWN at the highest-stakes moment. A
-    # non-mapping is already OutboxDestinationError inside _to_proposal, and a
-    # blanket AttributeError/TypeError here would mask programmer errors —
-    # Rule 5 forbids it.
-    if proposal_state.contents is None:
-        raise UnreadableProposalRecord(
-            "proposal record could not be re-read before approval"
-        )
-    try:
-        record = yaml.safe_load(proposal_state.contents)
-    except yaml.YAMLError as exc:
-        raise UnreadableProposalRecord(
-            "proposal record could not be re-read before approval"
-        ) from exc
-    persisted = _to_proposal(prop.path, record)
-    persisted = _require_destination(scope, persisted)
-    if persisted != prop:
-        raise OutboxDestinationError("proposal changed since it was loaded")
-
+    # No mid-approval re-read of the proposal remains: `proposal_state` is
+    # the state whose bytes the fingerprint matched and from which `prop`
+    # was parsed, and it is handed to the transaction unchanged. Replacing
+    # it here with a fresh capture would mean approving bytes nobody
+    # reviewed — the exact defect S7 closes.
     plan = TransactionPlan(
         message=f"outbox: approve {prop.id} ({prop.src} → {prop.dst})",
         changes=(
@@ -783,9 +824,19 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
     return prop
 
 
-def reject(scope: Scope, proposal_id: str) -> Proposal:
+def reject(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
     """Discard the proposal. No move, no commit — the proposal was never
-    tracked."""
-    prop = get_proposal(scope, proposal_id)
-    _require_outbox_path(scope, prop.path, require_leaf=True).unlink()
+    tracked.
+
+    Bound to the reviewed bytes exactly as approve is. The removal is
+    conditional on the captured state: reject unlinks the leaf it reviewed
+    or it unlinks nothing. A rewrite, type swap, redirection or
+    disappearance before the removal is a refusal, never permission to
+    discard whatever took its place.
+    """
+    proposal_rel, proposal_state, prop = _own_reviewed_proposal(
+        scope, proposal_id, review_sha256
+    )
+    _require_outbox_path(scope, prop.path, require_leaf=True)
+    remove_path_if_unchanged(scope.root, proposal_rel, proposal_state)
     return prop

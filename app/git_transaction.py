@@ -338,6 +338,37 @@ def _approval_lock(vault: Path) -> Iterator[None]:
                 raise _ApprovalLockCleanupFailure(cleanup_error) from cleanup_error
 
 
+def remove_path_if_unchanged(
+    vault: Path,
+    relative_path: str,
+    expected: PathState,
+) -> None:
+    """Remove one untracked regular leaf only while it matches `expected`.
+
+    Reject is not a commit: it discards a proposal that was never tracked.
+    But it is still a mutation, and S7 requires it to be conditional on the
+    exact state that was reviewed. `_apply_state` re-captures the leaf under
+    the same directory descriptor it unlinks through and refuses unless it
+    still equals `expected`, so a rewrite, type swap, redirection or
+    disappearance between the review and this call is a refusal rather than
+    permission to unlink whatever took its place.
+
+    Deliberately narrow. It creates no commit, touches no index, accepts no
+    absent expected state, and is not an arbitrary-delete utility: the only
+    thing it can do is complete a removal that was already reviewed.
+    """
+    try:
+        _validate_transaction_path(relative_path)
+    except ValueError as exc:
+        raise InvalidTransactionPath("reviewed path is unsafe") from exc
+    if expected.contents is None:
+        raise ValueError("conditional removal requires a regular expected state")
+    root = Path(os.path.abspath(os.fspath(vault)))
+    change = PathChange(relative_path, expected, PathState.absent())
+    with _approval_lock(root):
+        _apply_state(root, change)
+
+
 def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult:
     """Commit exactly the reviewed paths while preserving unrelated Git state."""
     vault = Path(vault).resolve()

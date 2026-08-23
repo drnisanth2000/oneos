@@ -13,7 +13,12 @@
   {% endif %}
   {% for row, error in rows %}
   {% if row.proposal %}
-  {% set outbox_values = {"id": row.proposal.id} %}
+  {# S7: the action carries the fingerprint of the exact bytes this row
+     was rendered from. Both values are server-rendered and serialised
+     with `tojson`; hand-built JSON is forbidden. A row without controls
+     carries no fingerprint, which `OutboxRow` enforces. #}
+  {% set outbox_values = {"id": row.proposal.id,
+                          "review_sha256": row.review_sha256} %}
   <div class="proposal">
     <div class="prop-head">
       <code class="prop-id">{{ row.proposal.id }}</code>

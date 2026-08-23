@@ -321,6 +321,13 @@ RECEIPT = textwrap.dedent(
 )
 
 
+def _fp(scope, proposal_id: str) -> str:
+    """The fingerprint of the proposal exactly as it now stands (S7)."""
+    from app.outbox import get_proposal_review
+
+    return get_proposal_review(scope, proposal_id).sha256
+
+
 def _outbox_fixture(tmp_path):
     from app.outbox import propose_classification
     from app.scope import Scope
@@ -406,7 +413,7 @@ def test_committed_outcome_survives_the_domain_wrapper(tmp_path, monkeypatch):
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        outbox.approve(scope, proposal.id)
+        outbox.approve(scope, proposal.id, _fp(scope, proposal.id))
 
     assert _code_of(raised.value) == "E-COMMITTED"
 
@@ -422,7 +429,7 @@ def test_recovery_outcome_survives_both_wrappers(tmp_path, monkeypatch):
     _vault, scope, proposal = _outbox_fixture(tmp_path / "outbox-vault")
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction)
     with pytest.raises(outbox.OutboxTransactionError) as via_outbox:
-        outbox.approve(scope, proposal.id)
+        outbox.approve(scope, proposal.id, _fp(scope, proposal.id))
     assert _code_of(via_outbox.value) == "E-RECOVER"
 
     _vault, scope, proposal = _registry_fixture(tmp_path / "registry-vault")
@@ -465,7 +472,7 @@ def test_all_five_s5_outcomes_via_outbox_wrapper(
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        outbox.approve(scope, proposal.id)
+        outbox.approve(scope, proposal.id, _fp(scope, proposal.id))
 
     assert _code_of(raised.value) == expected
 
