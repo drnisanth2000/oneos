@@ -1721,17 +1721,37 @@ def test_every_reviewed_route_requires_and_passes_the_fingerprint(
         source = _executable_source(route)
         tree = ast.parse(source)
         # A parameter is an `arg` node, not a `Name`; a `Name` is a *use*.
-        # So: declared once, and used at least once to hand it onward.
         declared = [
             node for node in ast.walk(tree)
             if isinstance(node, ast.arg) and node.arg == "review_sha256"
         ]
-        used = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Name) and node.id == "review_sha256"
-        ]
         assert declared, f"{name} does not declare review_sha256"
-        assert used, f"{name} never passes review_sha256 onward"
+
+        # "Used somewhere" is far weaker than this test's name: a route could
+        # log it, or pass it to something harmless, and still hand the action
+        # nothing. Require it to be an *argument of the call that acts*.
+        acting = {
+            "outbox_approve": ("_outbox_approve_response", "approve"),
+            "outbox_reject": ("_outbox_reject_response", "reject"),
+            "registry_delete_execute": ("execute_delete",),
+        }[name]
+        forwarded = [
+            call
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and getattr(call.func, "id", getattr(call.func, "attr", ""))
+            in acting
+            and any(
+                isinstance(argument, ast.Name)
+                and argument.id == "review_sha256"
+                for argument in list(call.args) + [
+                    keyword.value for keyword in call.keywords
+                ]
+            )
+        ]
+        assert forwarded, (
+            f"{name} never passes review_sha256 to {' or '.join(acting)}"
+        )
         assert "get_proposal_review(" not in source, name
         assert "get_delete_review(" not in source, name
 

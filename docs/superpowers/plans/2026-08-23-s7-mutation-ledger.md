@@ -6,7 +6,8 @@ red for the intended reason, the exact implementation has been restored
 byte-for-byte, and the test has gone green again.
 
 **Baseline:** `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f` → 926 passed.
-**At the time of writing:** 1233 passed.
+**At the time of writing:** 1233 passed. The S7-focused selection is
+703 passed.
 
 Restoration is by `cmp` against a pre-image copy taken before each mutation.
 No destructive Git cleanup is used anywhere in this campaign — a `git
@@ -16,27 +17,198 @@ checkout` or `git clean` could erase unrelated work in the same tree.
 
 ## How to reproduce
 
-Each row names the exact edit and the exact selection. Apply the edit, run
-the selection, confirm the named test fails, restore the file from a
-pre-image copy, confirm `cmp` reports no difference, and re-run.
+Every mutation below is a single, exact string substitution. Apply it, run
+the named selection, confirm the named test fails, restore the file from a
+pre-image copy, and confirm `cmp` reports no difference.
+
+The whole campaign is scripted so a reviewer need not retype anything:
+
+```bash
+python3 docs/superpowers/plans/s7_mutation_campaign.py --list      # what it will do
+python3 docs/superpowers/plans/s7_mutation_campaign.py             # run it
+```
+
+The script refuses to run against a dirty worktree, applies one mutation at
+a time, restores from an in-memory pre-image, and verifies with `cmp` that
+each file is byte-identical afterwards. It uses no Git commands at all — a
+`git checkout` or `git clean` could erase unrelated work in the same tree.
 
 ---
 
 ## The campaign
 
-| # | Protection broken | Edit | Selection | Result |
-|---|---|---|---|---|
-| M1 | approve/reject: the fingerprint comparison | `require_review_match(...)` → `pass` in `_own_reviewed_proposal` | `tests/test_outbox.py` | **RED** — `test_actions_refuse_a_malformed_fingerprint_without_mutation[None-approve]` |
-| M2 | *(not a separate site)* | approve and reject share `_own_reviewed_proposal`, so M1 is the reject bypass too. Recorded rather than fabricated as a second mutant. | — | — |
-| M3 | registry delete: the fingerprint comparison | `require_review_match(...)` → `pass` in `execute_delete` | `tests/test_registry.py` | **RED** — `test_execute_delete_refuses_a_malformed_fingerprint[None]` |
-| M4 | hashing the parsed bytes | snapshot built from `leaf.read_bytes()` instead of the captured `contents` | `tests/test_outbox.py tests/test_console_projection.py` | **RED** — `test_review_value_and_hash_come_from_one_capture_not_a_second_read` |
-| M5 | approve: transaction authority | owned change's `before` → a fresh `capture_path_state` | `tests/test_outbox.py` | **RED** — `test_approve_owns_the_reviewed_state_not_whatever_arrives_later` |
-| M5b | delete: transaction authority | same substitution in `execute_delete`'s plan | `tests/test_registry.py` | **RED** — `test_delete_owns_the_reviewed_state_not_whatever_arrives_later` |
-| M6 | reject: consuming the compared state | `consume_reviewed_proposal(..., proposal_state)` → `..., capture_path_state(...)` | `tests/test_outbox.py` | **RED** — `test_reject_owns_the_reviewed_state_not_whatever_arrives_later` |
-| M7 | classification transport | `review_sha256` removed from `outbox_card.html`'s `hx-vals` | `tests/test_console_routes.py tests/test_console_invariants.py` | **RED** — `test_outbox_hx_vals_are_tojson` |
-| M7b | delete transport | `review_sha256` removed from `delete_impact.html`'s `hx-vals` | same | **RED** — `test_delete_preview_hx_vals_survive_hostile_slug` |
-| M8 | delete success copy | route pre-reads via `get_delete_review(...).value` for display | same | **RED** — `test_alerts_never_contain_paths_slugs_or_echoes` |
-| M9 | never following a redirected leaf | *surgical*: open the leaf once, then refuse **identically** | `tests/test_console_routes.py` | **RED** — `test_check_again_never_reads_through_a_redirected_leaf[outbox]` |
+Last full run, from the script above:
+
+```
+M1  RED  M3  RED  M4  RED  M5  RED  M5b RED  M6  RED
+M7  RED  M7b RED  M8  RED  M9  RED  M10 RED  M11 RED
+all 12 mutations detected by their named test
+```
+
+
+Each row gives the file, the exact `OLD` text, the exact `NEW` text, and the
+pytest selection. `OLD` appears exactly once in the file at the commit named
+above; the script asserts that before substituting.
+
+### M1 — approve/reject: the fingerprint comparison
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED — `test_actions_refuse_a_malformed_fingerprint_without_mutation[None-approve]`
+
+```diff
+-    require_review_match(proposal_state.contents, review_sha256)
++    pass  # MUTANT M1
+```
+
+### M2 — reject's bypass is M1
+
+Approve and reject share `_own_reviewed_proposal`, so there is no second
+comparison site to break. Recorded rather than fabricated as a distinct
+mutant, because a ledger row that mutates nothing is worse than an absent one.
+
+### M3 — registry delete: the fingerprint comparison
+
+- **file** `app/registry.py`
+- **selection** `tests/test_registry.py`
+- **result** RED — `test_execute_delete_refuses_a_malformed_fingerprint[None]`
+
+```diff
+-        require_review_match(proposal_state.contents, review_sha256)
++        pass  # MUTANT M3
+```
+
+### M4 — hashing a second read instead of the parsed bytes
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_outbox.py tests/test_console_projection.py`
+- **result** RED — `test_review_value_and_hash_come_from_one_capture_not_a_second_read`
+
+```diff
+-            make_review_snapshot(_require_destination(scope, proposal), contents)
++            make_review_snapshot(_require_destination(scope, proposal), leaf.read_bytes())  # MUTANT M4
+```
+
+### M5 — approve: transaction authority from a later reread
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED — `test_approve_owns_the_reviewed_state_not_whatever_arrives_later`
+
+```diff
+-            PathChange(proposal_rel, proposal_state, PathState.absent()),
++            PathChange(proposal_rel, capture_path_state(vault, proposal_rel), PathState.absent()),  # MUTANT M5
+```
+
+### M5b — delete: transaction authority from a later reread
+
+- **file** `app/registry.py`
+- **selection** `tests/test_registry.py`
+- **result** RED — `test_delete_owns_the_reviewed_state_not_whatever_arrives_later`
+
+```diff
+-                PathChange(proposal_rel, proposal_state, PathState.absent()),
++                PathChange(proposal_rel, capture_path_state(vault, proposal_rel), PathState.absent()),  # MUTANT M5b
+```
+
+### M6 — reject: consuming a recapture instead of the compared state
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED — `test_reject_owns_the_reviewed_state_not_whatever_arrives_later`
+
+```diff
+-        consume_reviewed_proposal(scope.root, proposal_rel, proposal_state)
++        consume_reviewed_proposal(scope.root, proposal_rel, capture_path_state(scope.root, proposal_rel))  # MUTANT M6
+```
+
+### M7 — classification transport
+
+- **file** `templates/blocks/outbox_card.html`
+- **selection** `tests/test_console_routes.py tests/test_console_invariants.py`
+- **result** RED — `test_outbox_hx_vals_are_tojson`
+
+```diff
+-  {% set outbox_values = {"id": row.proposal.id,
+-                          "review_sha256": row.review_sha256} %}
++  {% set outbox_values = {"id": row.proposal.id} %}  {# MUTANT M7 #}
+```
+
+### M7b — delete transport
+
+- **file** `templates/blocks/delete_impact.html`
+- **selection** `tests/test_console_routes.py tests/test_console_invariants.py`
+- **result** RED — `test_delete_preview_hx_vals_survive_hostile_slug`
+
+```diff
+-  {% set delete_execute_values = {"id": prop.id,
+-                                  "review_sha256": review_sha256} %}
++  {% set delete_execute_values = {"id": prop.id} %}  {# MUTANT M7b #}
+```
+
+### M8 — delete success copy from an unbound pre-read
+
+- **file** `app/main.py`
+- **selection** `tests/test_console_routes.py tests/test_console_invariants.py`
+- **result** RED — `test_alerts_never_contain_paths_slugs_or_echoes`
+
+```diff
+-        prop = execute_delete(scope, id, review_sha256)
++        prop = get_delete_review(scope, id).value
++        execute_delete(scope, id, review_sha256)  # MUTANT M8
+```
+
+### M9 — surgical: follow the redirect target, refuse identically
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_routes.py`
+- **result** RED — `test_check_again_never_reads_through_a_redirected_leaf[outbox]`
+
+```diff
++    try:
++        _p = open(candidate, "rb")
++    except OSError:
++        pass
++    else:
++        _p.close()
+     if candidate.is_symlink():
+         raise RedirectedPathError("proposal leaf is redirected")
+```
+
+### M10 — a refusal that silently rewrites the delete proposal
+
+- **file** `app/registry.py`
+- **selection** `tests/test_registry.py`
+- **result** RED — `test_the_delete_no_mutation_matrix[new-live-reference]`
+
+```diff
++        path.write_bytes(path.read_bytes() + b"# MUTANT\n")
+         report = reference_count(scope, prop.kind, prop.slug)
+         if report.total:
+```
+
+Added after review: the delete boundary originally compared Git state and the
+registry file only. A delete proposal is untracked, so a refusal that rewrote
+it left HEAD, the index and the tracked diff identical and passed. The
+boundary now compares the bytes and type of every path in the vault.
+
+### M11 — a route that mentions the fingerprint but never forwards it
+
+- **file** `app/main.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_every_reviewed_route_requires_and_passes_the_fingerprint`
+
+```diff
+-        prop = execute_delete(scope, id, review_sha256)
++        _unused = review_sha256  # MUTANT M11
++        prop = execute_delete(scope, id, "0" * 64)
+```
+
+Added after review: the structural test previously asserted only that
+`review_sha256` was *used* somewhere in the route, which a log line would
+satisfy. It now requires it to be an argument of the call that acts.
+
+---
 
 ## M6 — a survivor, and what it cost
 

@@ -1253,6 +1253,28 @@ _DELETE_MATRIX = (
 )
 
 
+def _registry_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
+    """Every path in the vault, with its type and exact bytes.
+
+    Git state alone is not the boundary: a delete proposal is untracked, so
+    a refusal that silently rewrote or retyped the proposal record would
+    leave HEAD, the index and the tracked diff identical and pass. The bytes
+    and the type of every file are what "nothing changed" has to mean.
+    """
+    entries = []
+    for path in root.rglob("*"):
+        if ".git/" in path.as_posix() or path.name == ".git":
+            continue
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries.append((relative, "symlink", path.readlink().as_posix()))
+        elif path.is_dir():
+            entries.append((relative, "directory", ""))
+        else:
+            entries.append((relative, "file", path.read_bytes()))
+    return tuple(sorted(entries))
+
+
 def _registry_boundary(vault: Path) -> dict:
     def _git(*args: str) -> bytes:
         return subprocess.run(
@@ -1261,10 +1283,12 @@ def _registry_boundary(vault: Path) -> dict:
 
     return {
         "head": _git("rev-parse", "HEAD"),
+        "commits": len(_git("rev-list", "HEAD").split()),
         "index": _git("diff", "--cached", "--binary"),
         "tracked": _git("diff", "--binary"),
         "status": _git("status", "--porcelain=v1", "-z", "--untracked-files=all"),
         "products": (vault / "_system/products.yaml").read_bytes(),
+        "tree": _registry_tree(vault),
     }
 
 
