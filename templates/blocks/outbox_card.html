@@ -23,18 +23,31 @@
   {% if row.can_approve or row.can_reject %}
   {% set outbox_values = {"id": row.proposal.id,
                           "review_sha256": row.review_sha256} %}
+  {# The values as reviewed, sent back with the action so a refusal can name
+     exactly what changed. `hx-include` keeps them out of `hx-vals`, which
+     still transports exactly the id and the fingerprint. They are display
+     evidence only: the server re-reads and re-validates everything it acts
+     on, and never trusts these. #}
+  <div id="review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}" hidden>
+    <input type="hidden" name="reviewed_module" value="{{ row.proposal.module }}">
+    <input type="hidden" name="reviewed_sub" value="{{ row.proposal.sub if row.proposal.sub is not none else '' }}">
+    <input type="hidden" name="reviewed_block" value="{{ row.proposal.block }}">
+    <input type="hidden" name="reviewed_dst" value="{{ row.proposal.dst }}">
+  </div>
   <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}">
     {% if row.can_approve %}
     <button class="approve"{% if disabled %} disabled{% endif %}
             {% if not disabled %}hx-post="/outbox/{{ entity }}/approve"
             hx-vals='{{ outbox_values | tojson }}'
-            hx-target="#outbox-list" hx-swap="outerHTML"{% endif %}>Approve → move + commit</button>
+            hx-target="#outbox-list" hx-swap="outerHTML"
+            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}"{% endif %}>Approve → move + commit</button>
     {% endif %}
     {% if row.can_reject %}
     <button class="reject"{% if disabled %} disabled{% endif %}
             {% if not disabled %}hx-post="/outbox/{{ entity }}/reject"
             hx-vals='{{ outbox_values | tojson }}'
-            hx-target="#outbox-list" hx-swap="outerHTML"{% endif %}>Reject</button>
+            hx-target="#outbox-list" hx-swap="outerHTML"
+            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}"{% endif %}>Reject</button>
     {% endif %}
   </div>
   {% endif %}

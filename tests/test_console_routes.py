@@ -4993,3 +4993,182 @@ def test_the_review_fragment_route_is_declared_and_read_only():
     source = inspect.getsource(main.outbox_review_fragment)
     for mutating in ("approve(", "reject(", "propose_classification(", "unlink"):
         assert mutating not in source
+
+
+# --- Task 5 review: differences, delete reconfirmation, composed failure ----
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_names_the_fields_that_changed(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): two versions side by side is not "show exactly what
+    changed". The operator must be told which values differ, and how.
+
+    The old values come from the browser — the server never saw those bytes
+    and must not infer them (approved decision 8) — and are used for this
+    comparison only, never as authority."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+
+    body = client.get("/outbox/alpha").text
+    reviewed = _reviewed_fields(body)
+    assert reviewed, "the card must carry its reviewed values for comparison"
+    stale = _action_data(tmp_path, proposal_id)
+
+    # The record is rewritten (so the review is refused), and the browser
+    # reports the module it was showing — which differs from the module the
+    # server now validates. That difference must be named.
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current_module = yaml.safe_load(
+        proposal.read_text(encoding="utf-8")
+    )["module"]
+    assert reviewed["reviewed_module"] == current_module
+    reviewed["reviewed_module"] = "11-knowledge-as-reviewed"
+
+    response = client.post(
+        f"/outbox/alpha/{action}", data={**stale, **reviewed}
+    )
+    text = response.text
+
+    assert "What changed" in text
+    differences = text.split("What changed", 1)[1].split("</ul>", 1)[0]
+    assert "module" in differences
+    assert "11-knowledge-as-reviewed" in differences   # what they reviewed
+    assert current_module in differences               # what it is now
+    # Fields that did not change are not reported as differences.
+    assert "block" not in differences
+    assert "dst" not in differences
+
+
+def _reviewed_fields(body: str) -> dict:
+    return {
+        name: value
+        for name, value in re.findall(
+            r'<input type="hidden" name="(reviewed_[a-z_]+)" value="([^"]*)"', body
+        )
+    }
+
+
+def test_a_byte_only_change_says_so_rather_than_listing_no_differences(
+    tmp_path, monkeypatch
+):
+    """The case the spec calls out: the stored bytes changed but every
+    action-relevant value is identical. OneOS still refuses, and must say
+    that plainly instead of showing an empty difference list."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# byte-only\n")
+
+    text = client.post(
+        "/outbox/alpha/approve", data={**stale, **reviewed}
+    ).text
+
+    assert "stored record changed" in text.lower()
+    assert "identical" in text.lower()
+
+
+def test_the_reviewed_values_are_never_treated_as_authority(
+    tmp_path, monkeypatch
+):
+    """Hostile submitted comparison data may reach the screen escaped, but
+    must never alter what the action does or what the current card says."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+
+    text = client.post(
+        f"/outbox/alpha/approve",
+        data={
+            **stale,
+            "reviewed_module": '"><script>alert(1)</script>',
+            "reviewed_sub": "spoofed-sub-marker",
+        },
+    ).text
+
+    assert "<script>" not in text
+    # The current card is built from the server's own validated read.
+    assert f"review-card-{proposal_id}-{current}" in text
+    for raw in _hx_vals(text):
+        assert json.loads(raw)["review_sha256"] == current
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+# --- registry delete gets the same treatment --------------------------------
+
+
+def test_a_changed_delete_review_reconfirms_on_the_same_screen(
+    tmp_path, monkeypatch
+):
+    """P1 (review): registry delete is a reviewed action and must reconfirm
+    exactly as the classification actions do."""
+    from app.console_errors import _CODES
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    stale = _delete_preview_values(main, client, tmp_path, slug)
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = hashlib.sha256(proposal.read_bytes()).hexdigest()
+
+    response = client.post("/registry/alpha/product/delete-execute", data=stale)
+    body = response.text
+
+    assert _CODES["E-REVIEW"].message in body
+    assert f"review-card-{stale['id']}-{current}" in body
+    old_controls = f"review-controls-{stale['id']}-{stale['review_sha256']}"
+    assert old_controls in body
+    assert 'hx-swap-oob="true"' in body
+    assert response.headers.get("HX-Retarget") == (
+        f"#review-card-{stale['id']}-{stale['review_sha256']}"
+    )
+    assert response.headers.get("HX-Reswap") == "afterend"
+    for raw in _hx_vals(body):
+        assert json.loads(raw)["review_sha256"] == current
+    # Nothing deleted.
+    assert slug in (tmp_path / "_system/products.yaml").read_text()
+
+
+# --- the composed failure ---------------------------------------------------
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_failed_current_review_render_still_reports_the_changed_review(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): if building the current card fails on top of the
+    refusal, both outcomes must survive — S6's composition rule. Losing the
+    E-REVIEW would tell the operator their action failed for an unrelated
+    reason and hide that their proposal was rewritten."""
+    from app.console_errors import _CODES
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    def _fail_projection(*args, **kwargs):
+        raise DestinationRegistryError("registries unreadable during re-render")
+
+    monkeypatch.setattr(main, "project_outbox", _fail_projection)
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert _CODES["E-REVIEW"].message in response.text
+    assert "E-CONFIG" in response.text
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()

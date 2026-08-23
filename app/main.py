@@ -148,7 +148,11 @@ _SIDEBAR_CATCHES = (DestinationRegistryError, EntityManifestError)
 
 
 def _render_console_error(
-    request: Request, error, *, force_page_status: bool = False
+    request: Request,
+    error,
+    *,
+    force_page_status: bool = False,
+    action_error=None,
 ) -> HTMLResponse:
     """Shared renderer for every described Console error (design §5): route
     shape first, then HX-Request, decides fragment vs. page; status follows
@@ -163,6 +167,15 @@ def _render_console_error(
     fragment = is_fragment(request, endpoint)
     status = error.page_status if force_page_status else status_for(error, fragment)
     if fragment:
+        if action_error is not None:
+            # design §5: when one response carries several codes the status
+            # is the refusal's, and neither outcome may be dropped.
+            return templates.TemplateResponse(
+                request,
+                "blocks/alerts.html",
+                {"error": error, "action_error": action_error},
+                status_code=status_for(action_error, fragment),
+            )
         return templates.TemplateResponse(
             request, "blocks/alert.html", {"error": error}, status_code=status,
         )
@@ -699,37 +712,64 @@ def _review_row(scope: Scope, proposal_id: str):
     return None
 
 
+def _meaningful_differences(
+    reviewed: dict[str, str | None], current: dict[str, str]
+) -> list[tuple[str, str, str]]:
+    """Which reviewed values differ from the current validated ones.
+
+    `reviewed` comes from the browser — the server never saw those bytes and
+    may not infer them (approved decision 8) — and is used for this
+    comparison and nothing else. A field the browser did not send is simply
+    not compared, so a missing or hostile value can withhold or add a line
+    of explanation but can never change what the action does.
+    """
+    return [
+        (field, reviewed[field], current[field])
+        for field in current
+        if reviewed.get(field) is not None and reviewed[field] != current[field]
+    ]
+
+
 def _review_changed_response(
     request: Request,
     scope: Scope,
     proposal_id: str,
     stale_review_sha256: str,
     error: ConsoleError,
+    *,
+    current_card: str,
+    current_context,
+    stale_controls: tuple[str, ...],
+    reviewed: dict[str, str | None],
+    current_fields,
 ) -> HTMLResponse:
     """Reconfirm on the same screen (spec §Presentation).
 
     The response is appended *beside* the card the operator acted from —
     `HX-Retarget` plus `HX-Reswap: afterend` — rather than swapping the whole
-    list, so the version they reviewed stays on screen to compare against.
+    list, so the version they reviewed stays on screen to compare against,
+    with the differing values named explicitly.
 
-    Status is 200, not E-REVIEW's 409, and that is deliberate: S6's rule is
-    that a fragment refusal renders at 200 (`status_for`), and HTMX does not
-    swap a 4xx response at all — a 409 here would leave the operator with no
-    current card, no disabled stale controls, and no way to reconfirm. The
-    refusal is fully visible in the fragment itself.
+    Status is 200, not E-REVIEW's 409, because S6 states normatively that a
+    fragment refusal renders at 200 (`status_for`), and the S7 spec preserves
+    that behaviour. It is not a workaround for HTMX: this app configures
+    `[45]..` with `swap:true` (`templates/_head.html`), so a 4xx would swap
+    perfectly well — the reason is the taxonomy's rule, not the client's.
     """
-    row = _review_row(scope, proposal_id)
-    if row is None:
-        return _review_unavailable_response(request, scope, proposal_id, error)
+    context = current_context()
     response = templates.TemplateResponse(
         request,
         "blocks/review_changed.html",
         {
             "entity": scope.current_entity(),
-            "row": row,
-            "error": None,
-            "review_error": error,
+            "proposal_id": proposal_id,
+            "review_sha256": context["review_sha256"],
             "stale_review_sha256": stale_review_sha256,
+            "stale_controls": stale_controls,
+            "review_error": error,
+            "differences": _meaningful_differences(reviewed, current_fields(context)),
+            "current_card_template": current_card,
+            **context,
         },
         status_code=200,
     )
@@ -738,6 +778,49 @@ def _review_changed_response(
     )
     response.headers["HX-Reswap"] = "afterend"
     return response
+
+
+def _outbox_review_changed(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    stale_review_sha256: str,
+    error: ConsoleError,
+    reviewed: dict[str, str | None],
+) -> HTMLResponse:
+    def context():
+        row = _review_row(scope, proposal_id)
+        if row is None:
+            raise OutboxError("no pending proposal for this entity")
+        return {
+            "row": row,
+            "error": describe(row.error) if row.error is not None else None,
+            "review_sha256": row.review_sha256,
+        }
+
+    def fields(ctx):
+        proposal = ctx["row"].proposal
+        return {
+            "module": proposal.module,
+            "sub": proposal.sub or "",
+            "block": proposal.block,
+            "dst": proposal.dst,
+        }
+
+    return _review_changed_response(
+        request, scope, proposal_id, stale_review_sha256, error,
+        current_card="blocks/outbox_card.html",
+        current_context=context,
+        stale_controls=("Approve → move + commit", "Reject"),
+        reviewed=reviewed,
+        current_fields=fields,
+    )
+
+
+def _reviewed_outbox_fields(
+    module: str | None, sub: str | None, block: str | None, dst: str | None
+) -> dict[str, str | None]:
+    return {"module": module, "sub": sub, "block": block, "dst": dst}
 
 
 def _review_unavailable_response(
@@ -806,6 +889,10 @@ def outbox_approve(
     scope: EntityScope,
     id: str = Form(...),
     review_sha256: str = Form(...),
+    reviewed_module: str | None = Form(None),
+    reviewed_sub: str | None = Form(None),
+    reviewed_block: str | None = Form(None),
+    reviewed_dst: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_approve_response`, which catches `approve` itself refusing and,
@@ -821,11 +908,20 @@ def outbox_approve(
     structural check and no measured outcome; an earlier revision kept one
     and had to invent a reason, which is why it is gone.
     """
-    return _outbox_approve_response(request, scope, id, review_sha256)
+    return _outbox_approve_response(
+        request, scope, id, review_sha256,
+        _reviewed_outbox_fields(
+            reviewed_module, reviewed_sub, reviewed_block, reviewed_dst
+        ),
+    )
 
 
 def _outbox_approve_response(
-    request: Request, scope: Scope, id: str, review_sha256: str
+    request: Request,
+    scope: Scope,
+    id: str,
+    review_sha256: str,
+    reviewed: dict[str, str | None],
 ) -> HTMLResponse:
     approval_error = None
     try:
@@ -836,9 +932,19 @@ def _outbox_approve_response(
     except ReviewedProposalChanged as exc:
         # Not a list re-render: the operator keeps the version they reviewed
         # on screen and reconfirms against the current one beside it.
-        return _review_changed_response(
-            request, scope, id, review_sha256, describe(exc)
-        )
+        review_error = describe(exc)
+        try:
+            return _outbox_review_changed(
+                request, scope, id, review_sha256, review_error, reviewed
+            )
+        except _OUTBOX_CATCHES as render_exc:
+            # S6 composition: the refusal and the re-render's own failure are
+            # both real. Dropping the E-REVIEW here would tell the operator
+            # their action failed for an unrelated reason and hide that their
+            # proposal was rewritten.
+            return _outbox_list_error(
+                request, scope, render_exc, action_error=review_error
+            )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
     try:
@@ -856,6 +962,10 @@ def outbox_reject(
     scope: EntityScope,
     id: str = Form(...),
     review_sha256: str = Form(...),
+    reviewed_module: str | None = Form(None),
+    reviewed_sub: str | None = Form(None),
+    reviewed_block: str | None = Form(None),
+    reviewed_dst: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_reject_response`, which catches `reject` itself refusing and,
@@ -871,20 +981,41 @@ def outbox_reject(
     structural check and no measured outcome; an earlier revision kept one
     and had to invent a reason, which is why it is gone.
     """
-    return _outbox_reject_response(request, scope, id, review_sha256)
+    return _outbox_reject_response(
+        request, scope, id, review_sha256,
+        _reviewed_outbox_fields(
+            reviewed_module, reviewed_sub, reviewed_block, reviewed_dst
+        ),
+    )
 
 
 def _outbox_reject_response(
-    request: Request, scope: Scope, id: str, review_sha256: str
+    request: Request,
+    scope: Scope,
+    id: str,
+    review_sha256: str,
+    reviewed: dict[str, str | None],
 ) -> HTMLResponse:
     approval_error = None
     try:
         # S7: same contract as approve — passed through, never derived.
         reject(scope, id, review_sha256)
     except ReviewedProposalChanged as exc:
-        return _review_changed_response(
-            request, scope, id, review_sha256, describe(exc)
-        )
+        # Not a list re-render: the operator keeps the version they reviewed
+        # on screen and reconfirms against the current one beside it.
+        review_error = describe(exc)
+        try:
+            return _outbox_review_changed(
+                request, scope, id, review_sha256, review_error, reviewed
+            )
+        except _OUTBOX_CATCHES as render_exc:
+            # S6 composition: the refusal and the re-render's own failure are
+            # both real. Dropping the E-REVIEW here would tell the operator
+            # their action failed for an unrelated reason and hide that their
+            # proposal was rewritten.
+            return _outbox_list_error(
+                request, scope, render_exc, action_error=review_error
+            )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
     try:
@@ -985,6 +1116,32 @@ def registry_delete_preview(
     )
 
 
+def _delete_review_changed(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    stale_review_sha256: str,
+    error: ConsoleError,
+    reviewed: dict[str, str | None],
+) -> HTMLResponse:
+    def context():
+        review = get_delete_review(scope, proposal_id)
+        return {"prop": review.value, "review_sha256": review.sha256}
+
+    def fields(ctx):
+        prop = ctx["prop"]
+        return {"kind": prop.kind, "slug": prop.slug, "total": str(prop.total)}
+
+    return _review_changed_response(
+        request, scope, proposal_id, stale_review_sha256, error,
+        current_card="blocks/delete_impact.html",
+        current_context=context,
+        stale_controls=("Approve delete",),
+        reviewed=reviewed,
+        current_fields=fields,
+    )
+
+
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
 @console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
 def registry_delete_execute(
@@ -992,6 +1149,9 @@ def registry_delete_execute(
     scope: EntityScope,
     id: str = Form(...),
     review_sha256: str = Form(...),
+    reviewed_kind: str | None = Form(None),
+    reviewed_slug: str | None = Form(None),
+    reviewed_total: str | None = Form(None),
 ) -> HTMLResponse:
     # Rule 8 (design §6): the success copy must name the SERVER-derived
     # slug, never the submitted one.
@@ -1003,6 +1163,24 @@ def registry_delete_execute(
     # could describe bytes the deletion never consumed.
     try:
         prop = execute_delete(scope, id, review_sha256)
+    except ReviewedProposalChanged as exc:
+        # Registry delete is a reviewed action and reconfirms exactly as the
+        # classification actions do.
+        review_error = describe(exc)
+        try:
+            return _delete_review_changed(
+                request, scope, id, review_sha256, review_error,
+                {
+                    "kind": reviewed_kind,
+                    "slug": reviewed_slug,
+                    "total": reviewed_total,
+                },
+            )
+        except _REGISTRY_DELETE_CATCHES as render_exc:
+            # S6 composition: both outcomes survive.
+            return _render_console_error(
+                request, describe(render_exc), action_error=review_error
+            )
     except _REGISTRY_DELETE_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(

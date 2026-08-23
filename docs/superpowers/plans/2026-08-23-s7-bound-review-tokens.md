@@ -668,7 +668,13 @@ unchanged. Delete success copy must use the `DeleteProposal` returned by
 review, replace its stored proposal under the same id, and submit the old
 controls. Assert the response:
 
-  - is HTTP 409 with the exact approved message;
+  - carries the exact approved message. The **status is 200**, not
+    E-REVIEW's 409: S6 states normatively that a fragment refusal renders at
+    200 (`status_for`), and the S7 spec preserves S6's outcome behaviour
+    (acceptance criterion 7). A full-page render still uses 409. This is not
+    a client workaround — `templates/_head.html` configures HTMX `[45]..`
+    with `swap:true`, so a 4xx would swap perfectly well; the reason is the
+    taxonomy's rule;
   - leaves the old review visible;
   - replaces its old controls with disabled controls through a hash-specific
     HTMX out-of-band target;
