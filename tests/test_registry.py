@@ -1233,3 +1233,113 @@ def test_a_consistent_saved_impact_is_accepted(tmp_path):
     review = registry.get_delete_review(scope, prop.id)
     assert review.value.total == 3
     assert sum(review.value.sources.values()) == 3
+
+
+# --- S7 Task 6: the delete no-mutation matrix -------------------------------
+
+
+_DELETE_MATRIX = (
+    "exact-reviewed-bytes",
+    "same-id-meaningful-change",
+    "same-id-byte-only-change",
+    "missing-token",
+    "malformed-token",
+    "missing-proposal",
+    "malformed-proposal",
+    "redirected-proposal",
+    "cross-scope-proposal",
+    "non-regular-replacement",
+    "new-live-reference",
+)
+
+
+def _registry_boundary(vault: Path) -> dict:
+    def _git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": _git("rev-parse", "HEAD"),
+        "index": _git("diff", "--cached", "--binary"),
+        "tracked": _git("diff", "--binary"),
+        "status": _git("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        "products": (vault / "_system/products.yaml").read_bytes(),
+    }
+
+
+@pytest.mark.parametrize("state", _DELETE_MATRIX)
+def test_the_delete_no_mutation_matrix(tmp_path, state):
+    from app.console_errors import describe
+    from app.review_tokens import InvalidReviewToken
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    token = review.sha256
+    outside = tmp_path / "outside.yaml"
+    outside.write_bytes(review.contents)
+
+    def _rewrite(**changes):
+        record = yaml.safe_load(review.contents.decode("utf-8"))
+        record.update(changes)
+        prop.path.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+
+    if state == "same-id-meaningful-change":
+        _rewrite(slug="other")
+    elif state == "same-id-byte-only-change":
+        record = yaml.safe_load(review.contents.decode("utf-8"))
+        prop.path.write_text(
+            yaml.safe_dump(record, sort_keys=True), encoding="utf-8"
+        )
+    elif state == "missing-token":
+        token = None
+    elif state == "malformed-token":
+        token = "not-a-fingerprint"
+    elif state == "missing-proposal":
+        prop.path.unlink()
+    elif state == "malformed-proposal":
+        prop.path.write_text("{ not: [valid, yaml", encoding="utf-8")
+    elif state == "redirected-proposal":
+        prop.path.unlink()
+        prop.path.symlink_to(outside)
+    elif state == "cross-scope-proposal":
+        _rewrite(entity="not-the-bound-entity")
+    elif state == "non-regular-replacement":
+        prop.path.unlink()
+        prop.path.mkdir()
+    elif state == "new-live-reference":
+        note = vault / "demo/11-knowledge/active/note.md"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(
+            "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
+        )
+
+    before = _registry_boundary(vault)
+
+    if state == "exact-reviewed-bytes":
+        returned = registry.execute_delete(scope, prop.id, token)
+        assert returned.slug == "widgetx"
+        assert "widgetx:" not in (vault / "_system/products.yaml").read_text()
+        return
+
+    with pytest.raises(Exception) as raised:
+        registry.execute_delete(scope, prop.id, token)
+
+    outcome = describe(raised.value)
+    assert outcome.committed == "no", state
+    assert outcome.code != "E-UNKNOWN", state
+    if state in {"missing-token", "malformed-token"}:
+        assert isinstance(raised.value, InvalidReviewToken)
+
+    assert _registry_boundary(vault) == before, state
+    assert "widgetx:" in (vault / "_system/products.yaml").read_text()
+    assert not sorted(vault.rglob(".consumed/*.yaml")), state
+    assert outside.read_bytes() == review.contents
+    if state == "redirected-proposal":
+        assert prop.path.is_symlink()
+    elif state == "non-regular-replacement":
+        assert prop.path.is_dir()

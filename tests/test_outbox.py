@@ -2410,3 +2410,179 @@ def test_reject_transaction_failures_stay_inside_the_outbox_family(tmp_path):
 
     assert describe(raised.value).code == "E-BUSY"
     assert prop.path.exists()
+
+
+# --- S7 Task 6: the complete no-mutation matrix ------------------------------
+#
+# "No mutation" must not mean only "no new commit". Every refusal below
+# compares proposal bytes and type, source and destination, Git HEAD, index,
+# tracked diff, untracked paths and commit count — the whole boundary.
+
+
+def _boundary_state(vault: Path, quarantine_expected: bool = False) -> dict:
+    def _git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": _git("rev-parse", "HEAD"),
+        "commits": git_count_commits(vault),
+        "index": _git("diff", "--cached", "--binary"),
+        "tracked": _git("diff", "--binary"),
+        "status": _git("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        "tree": _vault_tree(vault),
+    }
+
+
+_MATRIX = (
+    "exact-reviewed-bytes",
+    "same-id-meaningful-change",
+    "same-id-byte-only-change",
+    "missing-token",
+    "malformed-token",
+    "missing-proposal",
+    "malformed-proposal",
+    "redirected-proposal",
+    "cross-scope-proposal",
+    "non-regular-replacement",
+)
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize("state", _MATRIX)
+def test_the_no_mutation_matrix(tmp_path, action, state):
+    from app.console_errors import describe
+    from app.review_tokens import InvalidReviewToken
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    token = review.sha256
+    outside = tmp_path / "outside.yaml"
+    outside.write_bytes(review.contents)
+
+    if state == "same-id-meaningful-change":
+        _rewrite_same_id_meaningfully(prop)
+    elif state == "same-id-byte-only-change":
+        _rewrite_same_id_byte_only(prop)
+    elif state == "missing-token":
+        token = None
+    elif state == "malformed-token":
+        token = "not-a-fingerprint"
+    elif state == "missing-proposal":
+        prop.path.unlink()
+    elif state == "malformed-proposal":
+        prop.path.write_text("{ not: [valid, yaml", encoding="utf-8")
+    elif state == "redirected-proposal":
+        prop.path.unlink()
+        prop.path.symlink_to(outside)
+    elif state == "cross-scope-proposal":
+        record = yaml.safe_load(review.contents.decode("utf-8"))
+        record["entity"] = "not-the-bound-entity"
+        prop.path.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+    elif state == "non-regular-replacement":
+        prop.path.unlink()
+        prop.path.mkdir()
+
+    before = _boundary_state(vault)
+
+    if state == "exact-reviewed-bytes":
+        getattr(outbox, action)(scope, prop.id, token)
+        after = _boundary_state(vault)
+        if action == "approve":
+            assert after["commits"] == before["commits"] + 1
+            assert (vault / prop.dst).exists()
+        else:
+            assert after["commits"] == before["commits"]
+        assert not prop.path.exists()
+        # Consumed, never destroyed (Amendment 1).
+        assert len(_quarantined(vault)) == 1
+        return
+
+    with pytest.raises(Exception) as raised:
+        getattr(outbox, action)(scope, prop.id, token)
+
+    outcome = describe(raised.value)
+    assert outcome.committed == "no", state
+    assert outcome.code != "E-UNKNOWN", state
+    if state in {"missing-token", "malformed-token"}:
+        assert isinstance(raised.value, InvalidReviewToken)
+
+    # The whole boundary, byte for byte.
+    assert _boundary_state(vault) == before, state
+    assert (vault / prop.src).exists()
+    assert not (vault / prop.dst).exists()
+    assert not _quarantined(vault), state
+    # Whatever was substituted is preserved exactly as found.
+    assert outside.read_bytes() == review.contents
+    if state == "redirected-proposal":
+        assert prop.path.is_symlink()
+    elif state == "non-regular-replacement":
+        assert prop.path.is_dir()
+
+
+def test_reject_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
+    """Reject's counterpart to the approve reread proof.
+
+    A contents comparison cannot distinguish a fresh capture from the
+    compared one while nothing changes in between. So change the record
+    *after* the fingerprint matched and *before* the consumption: only an
+    implementation that carried the compared state forward refuses.
+
+    An implementation that recaptured here would quarantine a record nobody
+    reviewed and report the reject as done.
+    """
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    before = _approval_state(vault)
+
+    real_require = outbox._require_outbox_path
+    replaced = []
+
+    # The leaf is checked several times while it is being located, so
+    # counting calls is brittle. Anchor on the boundary instead: the
+    # fingerprint comparison lives inside `_own_reviewed_proposal`, so once
+    # that has returned, the next leaf check is reject's own — the one call
+    # sitting between the comparison and the consumption.
+    compared = []
+    real_own = outbox._own_reviewed_proposal
+
+    def note_comparison(*args, **kwargs):
+        owned = real_own(*args, **kwargs)
+        compared.append(True)
+        return owned
+
+    def rewrite_then_check(scope_arg, proposal_path=None, **kwargs):
+        if (
+            compared
+            and not replaced
+            and proposal_path is not None
+            and Path(proposal_path).name == prop.path.name
+        ):
+            replaced.append(_rewrite_same_id_byte_only(prop))
+        return real_require(scope_arg, proposal_path, **kwargs)
+
+    outbox._own_reviewed_proposal = note_comparison
+    outbox._require_outbox_path = rewrite_then_check
+    try:
+        with pytest.raises(Exception) as raised:
+            reject(scope, prop.id, review.sha256)
+    finally:
+        outbox._require_outbox_path = real_require
+        outbox._own_reviewed_proposal = real_own
+
+    assert replaced, "the probe never replaced the record"
+    assert replaced[0] != review.contents
+    assert describe(raised.value).code == "E-CONFLICT"
+
+    # Nothing consumed, nothing quarantined, the replacement preserved.
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == replaced[0]
+    assert not _quarantined(vault)
+    assert _approval_state(vault)["head"] == before["head"]

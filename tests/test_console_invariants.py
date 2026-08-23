@@ -1647,3 +1647,185 @@ def test_the_quarantine_status_filter_hides_only_quarantine_records(tmp_path):
     assert "20260101T000000-aa.yaml" not in remaining, "a real record leaked through"
     for relative, why in decoys.items():
         assert relative in remaining, f"{why} was wrongly hidden: {relative}"
+
+
+def _executable_source(function) -> str:
+    """A function's code with comments and docstrings removed.
+
+    Matching raw source would let a *comment* — for instance one explaining
+    that a reader was deliberately removed — fail a "must not call" check,
+    and would equally let a commented-out call pass one. Only executable
+    code is evidence.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body.pop(0)
+    return ast.unparse(tree)
+
+
+# --- S7 Task 6: structural proof of the bound-review surface -----------------
+#
+# These cover only S7's changed surface. They are deliberately NOT the
+# separately sequenced global route-declaration audit.
+
+_S7_ACTIONS = ("approve", "reject", "execute_delete")
+_S7_ROUTES = ("outbox_approve", "outbox_reject", "registry_delete_execute")
+_S7_ACTION_TEMPLATES = (
+    "templates/blocks/outbox_card.html",
+    "templates/blocks/delete_impact.html",
+)
+
+
+def _main_module():
+    import app.main as main
+
+    return main
+
+
+def test_every_reviewed_service_requires_the_fingerprint():
+    import inspect
+
+    import app.outbox as outbox
+    import app.registry as registry
+
+    for name in _S7_ACTIONS:
+        service = getattr(outbox, name, None) or getattr(registry, name)
+        parameters = inspect.signature(service).parameters
+        assert list(parameters)[-1] == "review_sha256", name
+        assert parameters["review_sha256"].default is inspect.Parameter.empty, name
+
+
+def test_every_reviewed_route_requires_and_passes_the_fingerprint(
+    tmp_path, monkeypatch
+):
+    import ast
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    for name in _S7_ROUTES:
+        route = getattr(main, name)
+        parameters = inspect.signature(route).parameters
+        assert "review_sha256" in parameters, name
+        source = _executable_source(route)
+        tree = ast.parse(source)
+        # A parameter is an `arg` node, not a `Name`; a `Name` is a *use*.
+        # So: declared once, and used at least once to hand it onward.
+        declared = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.arg) and node.arg == "review_sha256"
+        ]
+        used = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == "review_sha256"
+        ]
+        assert declared, f"{name} does not declare review_sha256"
+        assert used, f"{name} never passes review_sha256 onward"
+        assert "get_proposal_review(" not in source, name
+        assert "get_delete_review(" not in source, name
+
+
+def test_no_reviewed_action_route_reads_through_a_value_only_reader(
+    tmp_path, monkeypatch
+):
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    forbidden = ("get_proposal(", "get_delete_proposal(", "load_proposals(")
+    for name in _S7_ROUTES:
+        source = _executable_source(getattr(main, name))
+        helper = f"_{name}_response"
+        if hasattr(main, helper):
+            source += _executable_source(getattr(main, helper))
+        for reader in forbidden:
+            assert reader not in source, f"{name} reads through {reader}"
+
+
+def test_delete_success_copy_comes_from_the_bound_execution(tmp_path, monkeypatch):
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    source = _executable_source(main.registry_delete_execute)
+    assert "execute_delete(scope, id, review_sha256)" in source
+    assert "get_delete_proposal" not in source
+    # The returned proposal is what the success fragment renders.
+    success = source.split("delete_success.html", 1)[1]
+    assert "prop.kind" in success and "prop.slug" in success
+
+
+def test_every_action_template_carries_the_fingerprint_through_tojson():
+    import re as _re
+
+    for relative in _S7_ACTION_TEMPLATES:
+        source = (_REPO_ROOT / relative).read_text(encoding="utf-8")
+        values = _re.findall(r"hx-vals='([^']*)'", source)
+        assert values, f"{relative} renders no hx-vals"
+        for value in values:
+            assert value.strip().startswith("{{"), relative
+            assert "| tojson" in value, relative
+        assert "review_sha256" in source, relative
+
+
+def test_no_row_without_controls_can_carry_a_fingerprint():
+    """The projection's own invariant, restated where the templates rely on
+    it: controls and fingerprint are issued together or not at all."""
+    from app.outbox import OutboxRow
+
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=False, can_reject=False,
+                  review_sha256="a" * 64)
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=True, can_reject=False,
+                  review_sha256=None)
+
+
+def test_every_review_fragment_route_declares_its_family(tmp_path, monkeypatch):
+    main = _load_console_main(tmp_path, monkeypatch)
+    for name in ("outbox_review_fragment", "registry_delete_review_fragment"):
+        declaration = getattr(main, name).__console_route__
+        assert declaration.surface == "fragment-only", name
+        assert declaration.catches, name
+        assert Exception not in declaration.catches, name
+        assert BaseException not in declaration.catches, name
+
+
+def test_every_review_fragment_route_is_read_only(tmp_path, monkeypatch):
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    mutating = (
+        "approve(", "reject(", "execute_delete(", "propose_classification(",
+        "propose_delete(", "unlink", "write_text", "write_bytes", "mkdir",
+        "execute_transaction(", "quarantine_path_if_unchanged(",
+    )
+    for name in ("outbox_review_fragment", "registry_delete_review_fragment"):
+        source = _executable_source(getattr(main, name))
+        for call in mutating:
+            assert call not in source, f"{name} reaches {call}"
+
+
+def _load_console_main(tmp_path, monkeypatch):
+    import importlib
+
+    from tests.conftest import scaffold_modules, write_vault
+
+    write_vault(
+        tmp_path,
+        '\nversion: "1.0"\nentities:\n  alpha: { label: Alpha, flags: [] }\n',
+    )
+    scaffold_modules(tmp_path, "alpha", ["00-intake", "01-core", "02-work"])
+    monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
+    import app.main as main
+
+    return importlib.reload(main)
