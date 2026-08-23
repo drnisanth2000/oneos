@@ -735,10 +735,14 @@ def _field_label(field: str) -> str:
     return _FIELD_LABELS.get(field, field)
 
 
-def _display_value(field: str, value: str) -> str:
-    if field.endswith("sha256") and len(value) > 16:
-        return f"{value[:12]}…"
-    return value
+#: Fields whose value tells an operator nothing. A digest identifies a state
+#: of a file, not anything a person can read or check — abbreviated or not.
+#: The field is named as changed and no value is offered for it.
+_OPAQUE_FIELDS = frozenset({"source_sha256"})
+
+
+def _display_value(field: str, value: str) -> str | None:
+    return None if field in _OPAQUE_FIELDS else value
 
 
 def _uncompared_fields(

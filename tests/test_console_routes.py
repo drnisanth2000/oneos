@@ -21,6 +21,7 @@ Synthetic vaults only; the real vault is never touched.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import hashlib
 import importlib
 import inspect
@@ -5358,8 +5359,8 @@ def test_a_changed_source_fingerprint_is_named(tmp_path, monkeypatch):
     assert "What changed" in body, body
     differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
     assert "source contents" in differences
-    # Abbreviated for readability; the dedicated test pins that choice.
-    assert current_hash[:12] in differences
+    # Named as changed, with no value: see the dedicated test for why.
+    assert current_hash[:12] not in differences
     assert "module" not in differences
     assert "destination path" not in differences
 
@@ -5531,8 +5532,11 @@ def test_a_changed_digest_is_shown_readably_not_as_raw_hex(tmp_path, monkeypatch
     differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
 
     assert "source contents" in differences.lower()
-    assert current_hash not in differences, "the full digest is unreadable noise"
-    assert current_hash[:12] in differences, "it must still identify the value"
+    # A digest identifies nothing to a person, abbreviated or not. The field
+    # is named as changed and no value is shown for it.
+    assert current_hash not in differences
+    assert current_hash[:12] not in differences
+    assert "changed" in differences.lower()
 
 
 @pytest.mark.parametrize("surface", ["outbox", "registry"])
@@ -5559,28 +5563,60 @@ def test_check_again_never_reads_through_a_redirected_leaf(
     planted = yaml.safe_load(proposal.read_text(encoding="utf-8"))
     planted["planted_marker"] = "REDIRECT-TARGET-CONTENTS-MARKER"
     outside.write_text(yaml.safe_dump(planted, sort_keys=False), encoding="utf-8")
+
+    # The proposal is read through `os.open` with a directory descriptor, so a
+    # spy on `Path.read_bytes` records nothing and passes vacuously. Watch
+    # every descriptor this process opens and identify what was opened by
+    # inode, which no path trick can disguise.
+    opened: list[tuple[int, int]] = []
+
+    def _record(descriptor):
+        try:
+            info = _os.fstat(descriptor)
+        except OSError:
+            return
+        opened.append((info.st_dev, info.st_ino))
+
+    real_os_open = _os.open
+    real_builtin_open = builtins.open
+
+    def spy_os_open(*args, **kwargs):
+        descriptor = real_os_open(*args, **kwargs)
+        _record(descriptor)
+        return descriptor
+
+    def spy_builtin_open(*args, **kwargs):
+        handle = real_builtin_open(*args, **kwargs)
+        try:
+            _record(handle.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return handle
+
+    monkeypatch.setattr(_os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_builtin_open)
+
+    # Positive control: with the real leaf in place, the spy sees the
+    # proposal itself being opened. Without this the negative assertion
+    # below could pass simply by watching the wrong boundary.
+    healthy = proposal.stat()
+    client.get(url)
+    assert (healthy.st_dev, healthy.st_ino) in opened, (
+        "the spy is not watching the boundary the reads go through"
+    )
+
+    # Now redirect the leaf and prove the target is never opened.
+    target = outside.stat()
     proposal.unlink()
     proposal.symlink_to(outside)
-
-    reads: list[str] = []
-    real_read_bytes = Path.read_bytes
-    real_read_text = Path.read_text
-
-    def spy_bytes(self):
-        reads.append(_os.path.realpath(self))
-        return real_read_bytes(self)
-
-    def spy_text(self, *args, **kwargs):
-        reads.append(_os.path.realpath(self))
-        return real_read_text(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_bytes", spy_bytes)
-    monkeypatch.setattr(Path, "read_text", spy_text)
+    opened.clear()
 
     body = client.get(url).text
 
-    assert _os.path.realpath(outside) not in reads, (
-        f"the redirected target was read: {reads}"
+    monkeypatch.undo()
+    assert opened, "the redirected request opened nothing at all"
+    assert (target.st_dev, target.st_ino) not in opened, (
+        "the redirected target was opened"
     )
     assert "REDIRECT-TARGET-CONTENTS-MARKER" not in body
     assert not _rendered_control_ids(body)

@@ -16,7 +16,11 @@
   <p class="muted">What changed since you reviewed it:</p>
   <ul class="impact-list review-differences">
     {% for field, now in differences %}
+    {% if now is none %}
+    <li><code>{{ field }}</code> changed</li>
+    {% else %}
     <li><code>{{ field }}</code> is now <em>{{ now }}</em></li>
+    {% endif %}
     {% endfor %}
   </ul>
   {% elif not uncompared %}
