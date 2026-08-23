@@ -98,7 +98,14 @@ the same rule one artifact later, to the proposal record itself.
 - email/PDF intake, archive, summary, and mailbox-deletion workflows;
 - dashboards, cards, or general workflow screens unrelated to S7;
 - new dependencies, daemons, secrets, schemas, conventions, registry values,
-  or instance-specific configuration; and
+  or instance-specific configuration — with one explicit exception granted by
+  **Amendment 1**: the quarantine directory for consumed proposal records.
+  That single directory inside the entity's existing `outbox/` is a
+  deliberate, narrowly scoped convention change, admitted only because
+  acceptance criterion 4 cannot be met by any deletion-based construction. It
+  adds no dependency (`ctypes` is stdlib), no schema, no registry value, and
+  no daemon, secret, or instance-specific configuration. Nothing else may use
+  this exception to widen S7's scope; and
 - any write to Grey Matter during design or public verification.
 
 The excluded product work is sequenced separately. The three inherited S6

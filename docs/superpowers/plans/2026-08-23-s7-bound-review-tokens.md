@@ -477,6 +477,34 @@ It is a path the action writes into, so it gets the same treatment
 
   Add tests for each condition, mirroring the existing outbox-redirect tests.
 
+- [ ] **The move uses checked directory descriptors, never a resolved
+`Path`.** `_require_outbox_path` validates *lexical* paths; it hands back no
+descriptor, and `_move_no_replace` needs two. Re-opening a validated path by
+name would reintroduce exactly the lookup-after-check gap this amendment
+removes — one directory level up, where a swapped directory redirects every
+move inside it.
+
+  So, after the lexical checks pass:
+
+  - open `<entity>/outbox` and `<entity>/outbox/.consumed` through
+    `_open_checked_directory`, which already `lstat`s, refuses a symlink or
+    non-directory, opens with `O_DIRECTORY | O_NOFOLLOW`, and re-verifies the
+    descriptor by `fstat` — the same primitive `capture_path_state` and
+    `_apply_state` already walk with;
+  - open `.consumed` **relative to the outbox descriptor** (`dir_fd=`), so
+    the parent cannot be swapped between the two opens; and
+  - pass those descriptors to every `_move_no_replace` call — quarantine and
+    restore alike. No step may re-derive a directory from a `Path` after
+    validation.
+
+- [ ] **RED for the directory swap:** replace `<entity>/outbox/.consumed`
+with a symlink to a directory outside the entity in the window between its
+lexical validation and its descriptor being opened. Assert the action refuses
+with the redirection outcome, that the proposal is untouched, and — the point
+of the test — that **nothing is written or moved outside the entity**. Repeat
+with the `outbox` directory itself swapped, since a redirect there
+redirects `.consumed` with it.
+
 - [ ] **Rollback: a quarantined record must come back if the action does
 not complete.** Approve consumes the proposal *and* commits a move; if the
 transaction fails or is rolled back after the record was quarantined, leaving
@@ -527,9 +555,13 @@ leaving a destructive primitive available to a future caller.
 new construction, then commit:
 
 ```bash
-uv run pytest tests/test_git_transaction.py tests/test_outbox.py tests/test_console_routes.py -q
+uv run pytest tests/test_git_transaction.py tests/test_outbox.py \
+  tests/test_console_routes.py tests/test_console_errors.py \
+  tests/test_console_invariants.py -q
 uv run python -m pytest -q
-git add app/git_transaction.py app/outbox.py tests/test_git_transaction.py tests/test_outbox.py
+git add app/git_transaction.py app/outbox.py app/console_errors.py
+git add tests/test_git_transaction.py tests/test_outbox.py
+git add tests/test_console_errors.py tests/test_console_invariants.py
 git commit -m "feat: consume reviewed proposals by quarantine"
 ```
 
