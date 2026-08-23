@@ -6016,26 +6016,40 @@ def test_a_stale_delete_review_whose_current_version_has_references_shows_no_dig
 
     main, client, slug = _registry_client(tmp_path, monkeypatch)
     scope = Scope(Path(tmp_path), "alpha")
-    proposal = registry.propose_delete(scope, "product", slug)
 
-    # Reviewed while nothing referenced it: actionable, and fingerprinted.
+    # Every stale value comes from one rendered page — id, digest, and
+    # issuance alike. An earlier version of this test proposed one deletion
+    # and then rendered the preview, which allocates a *second* proposal;
+    # posting the first one's id with the second one's issuance named an
+    # OOB target that had never been on any page, so the linkage assertions
+    # below were checking a selector against markup that never existed.
     preview = client.post(
         "/registry/alpha/product/delete-preview", data={"slug": slug}
     ).text
     assert "hx-post" in preview
-    stale = _delete_action_data(tmp_path, proposal)
+    stale = json.loads(_hx_vals(preview)[0])
+    assert set(stale) == {"id", "review_sha256"}, stale
     assert stale["review_sha256"] != _UNBOUND_FINGERPRINT
     stale_issue = _card_issue(preview)
 
-    # The stored record now records references. New bytes, new digest, and
+    # The ids the operator's page is actually holding, read off that page.
+    rendered_ids = set(re.findall(r'id="([^"]+)"', preview))
+    stale_card = f"review-card-{stale['id']}-{stale['review_sha256']}-{stale_issue}"
+    stale_controls = (
+        f"review-controls-{stale['id']}-{stale['review_sha256']}-{stale_issue}"
+    )
+    assert stale_card in rendered_ids, sorted(rendered_ids)
+    assert stale_controls in rendered_ids, sorted(rendered_ids)
+
+    # That same proposal now records references. New bytes, new digest, and
     # a current version that can never be approved.
-    record = yaml.safe_load(proposal.path.read_text(encoding="utf-8"))
+    path = registry._delete_proposal_path(scope, stale["id"])
+    record = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert record["total_references"] == 0, record
     record["total_references"] = 2
     record["impact"] = {"front-matter": 2}
-    proposal.path.write_text(
-        yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
-    )
-    current = registry.get_delete_review(scope, proposal.id).sha256
+    path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+    current = registry.get_delete_review(scope, stale["id"]).sha256
     assert current != stale["review_sha256"]
 
     response = client.post(
@@ -6049,18 +6063,25 @@ def test_a_stale_delete_review_whose_current_version_has_references_shows_no_dig
     assert "hx-post" not in body, body
     assert "would orphan 2 reference(s)" in body
 
+    # Both selectors name elements the preview really rendered.
+    assert response.headers.get("HX-Retarget") == f"#{stale_card}", (
+        response.headers.get("HX-Retarget"),
+        stale_card,
+    )
+    oob = re.search(
+        r'hx-swap-oob="true"\s+id="([^"]+)"', body
+    ) or re.search(r'id="([^"]+)"\s+hx-swap-oob="true"', body)
+    assert oob, body
+    assert oob.group(1) == stale_controls, (oob.group(1), stale_controls)
+
     # The current digest is absent — not in the wrapper id, not in the
     # `Check again` target, not anywhere.
     assert current not in body, body
 
-    # Exactly one digest survives, and it is the stale one, and it is there
-    # only to name the stale control being disabled out of band.
+    # Exactly one digest survives, and it is the stale one, present only to
+    # name the stale control being disabled out of band.
     digests = set(re.findall(r"[0-9a-f]{64}", body))
     assert digests == {stale["review_sha256"]}, digests
-    oob = re.search(
-        r'hx-swap-oob="true"\s+id="([^"]+)"', body
-    ) or re.search(r'id="([^"]+)"\s+hx-swap-oob="true"', body)
-    assert oob and stale["review_sha256"] in oob.group(1), body
 
 
 def test_a_replayed_issuance_nonce_changes_only_which_anchor_is_named(
