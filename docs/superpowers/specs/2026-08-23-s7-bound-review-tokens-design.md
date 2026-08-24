@@ -308,14 +308,31 @@ distinct outcomes are required:
   one. It must never be described as "nothing was changed", and nothing is
   ever deleted to tidy it up.
 - **substituted** — the quarantine name no longer identifies the object that
-  was moved into it *(Amendment 2)*. This is a distinct outcome from
-  restoration blocked, and must not be folded into it: restoration blocked
-  can promise that both files survive, and this cannot. It is reported with
-  `committed=unknown` and `retry=stop`, and states plainly that the reviewed
-  record was moved for consumption, that the quarantine name was then
-  replaced, and that the reviewed record may no longer exist. Nothing further
-  is changed: the substitute is left exactly where it is and is never moved
-  under the proposal's name.
+  was moved into it *(Amendment 2)*. A distinct outcome from restoration
+  blocked, and never folded into it: that outcome can promise both files
+  survive, and this one cannot. Nothing further is changed — the substitute
+  is left exactly where it is and is never moved under the proposal's name.
+
+  The contract is closed here, so that no implementation has to invent it:
+
+  | field | value |
+  | --- | --- |
+  | code | `E-SUBSTITUTED` |
+  | tier | `recovery` |
+  | severity | `attention` |
+  | committed | `unknown` |
+  | retry | `stop` |
+  | page status | `500` |
+
+  Message, verbatim: "The reviewed proposal was moved, but its quarantine
+  location was replaced before verification completed. The reviewed record
+  may no longer exist. Do not retry. Inspect vault state with git status."
+
+  The observed `st_nlink` is carried on the typed exception as diagnostic
+  evidence. It must not soften this message, must not vary it, and must not
+  be presented as a route to automatic recovery — a positive link count says
+  only that some link existed at detection time, not where, and not that
+  following it would be safe.
 - **unsupported** — the atomic no-overwrite move is unavailable here. Nothing
   was changed, and no action is possible on this vault until it is resolved.
 
@@ -342,21 +359,32 @@ where it is known not to be.
 Restoring by name after an identity mismatch moves the **substitute** under
 the reviewed record's name. OneOS thereby installs an object nobody reviewed
 where the reviewed record used to be, and does it as a deliberate step of a
-refusal. Meanwhile the reviewed inode, unlinked by whatever rebound the name,
-survives only as long as the descriptor OneOS still holds, and is destroyed
-when that descriptor closes. Measured on the pre-amendment implementation: the
+refusal. Meanwhile the fate of the reviewed inode depends on whether any name still
+refers to it. If whatever rebound the quarantine name unlinked it, and no other
+link remains, it survives only as long as the descriptor OneOS holds and is
+gone once that descriptor closes. If some link does remain, it survives
+somewhere OneOS cannot identify. Both are possible, and which one obtains is
+not knowable from the mismatch alone.
+
+Measured on the pre-amendment implementation, in the first of those cases: the
 reviewed inode had no remaining link anywhere in the vault, the proposal's own
 name held the substitute's bytes, and the outcome reported was `E-CONFLICT`
 with `committed=no` — "nothing was changed" — which was false in both
 directions at once.
 
-The reviewed object cannot be saved portably once another writer has unlinked
-it. Re-linking an open descriptor into a directory requires
+The reviewed object cannot be *preserved* portably once another writer has
+unlinked it. Re-linking an open descriptor into a directory requires
 `linkat(AT_EMPTY_PATH)`, which is Linux-only and privileged, and has no macOS
-equivalent. Reconstructing the record from the verified bytes still held would
-produce a *different* inode and would write during a recovery path, which is
-reconstruction — forbidden by decision 8's principle that OneOS never rebuilds
-a record it could not read.
+equivalent.
+
+Its bytes, by contrast, are perfectly readable — OneOS still holds the
+descriptor and has already verified them. Rebuilding the record from them is
+rejected for two other reasons. It would put a *different object* under the
+reviewed record's name, which is the same substitution this amendment exists
+to stop OneOS from performing, differing only in who supplied the bytes. And
+it would be a further mutation after the mismatch was detected, which is
+precisely the rule being established. Neither reason is that the record could
+not be read; it can.
 
 So S7 stops trying. **After detecting an identity mismatch, no further
 mutation is performed.** The quarantine move has already happened and is not
@@ -366,8 +394,9 @@ either that nothing changed or that both files survive.
 `st_nlink` on the held descriptor is recorded as diagnostic evidence at the
 moment of detection, and is not a recovery signal: zero means no filesystem
 link currently preserves the held inode; greater than zero means some link
-exists, and OneOS must not claim to know where it is or that recovering
-through it would be safe.
+existed then, and OneOS must not claim to know where it is or that recovering
+through it would be safe. The Console message is the conservative one either
+way.
 
 #### What quarantine costs the working tree *(Amendment 1)*
 
