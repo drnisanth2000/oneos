@@ -91,12 +91,12 @@ M5   RED then GREEN   M5b  RED then GREEN   M6   RED then GREEN
 M7   RED then GREEN   M7b  RED then GREEN   M8   RED then GREEN
 M9   RED then GREEN   M10  RED then GREEN   M12  RED then GREEN
 M13  RED then GREEN   M14  RED then GREEN   M15  RED then GREEN
-M16  RED then GREEN   M11  RED then GREEN
+M16  RED then GREEN   M17  RED then GREEN   M11  RED then GREEN
 
-all 17 mutations: red under mutation, green once restored
+all 18 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1272 passed in 89.17s (0:01:29)
+  1272 passed in 91.40s (0:01:31)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -406,6 +406,34 @@ approve filed to `demo/11-library/active/note.md`, which nobody reviewed;
 under M16 delete removed the sibling product `other` and left `widgetx` in
 place. Each mutant fails exactly one node in the full suite — the one added
 for it — which is what "no longer equivalent" means here.
+
+### M17 — restoring by name after an identity mismatch
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_git_transaction.py`
+- **result** RED — `test_a_substituted_quarantine_entry_is_refused_and_nothing_further_moves`
+
+```diff
+             raise QuarantineEntrySubstituted(path, link_count)
++            _restore()  # MUTANT M17
+```
+
+Amendment 2. Identity verification catches a rebound quarantine name, but
+*restoring* by that name afterwards is the harm, not the remedy: the name is
+known to hold the substitute, so the restore moves an object nobody reviewed
+under the reviewed record's name — OneOS performing the substitution itself,
+as a deliberate step of a refusal.
+
+Measured on the implementation that had the identity check but still
+restored: no link to the reviewed inode anywhere in the vault, the proposal's
+own name holding the decoy's bytes, and an outcome of `E-CONFLICT` with
+`committed=no`. Both halves false at once.
+
+The test this mutation turns red is the rewritten one. Its predecessor ended
+in `assert leaf.exists() or list(...)`, which the decoy satisfied — it could
+not distinguish the reviewed record surviving from a substitute standing in
+its place, which is the only question the scenario asks. The replacement
+names every inode and asserts which object is where.
 
 ## M6 — a survivor, and what it cost
 
