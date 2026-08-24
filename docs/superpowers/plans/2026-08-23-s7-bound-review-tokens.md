@@ -113,6 +113,7 @@ to this repository.
 | `templates/blocks/review_changed.html` (new) | Same-screen refusal, removal of the old controls, and current review. |
 | `templates/blocks/review_unavailable.html` (new) | Safe no-action state, read-only check, and triage guidance. |
 | `tests/test_review_tokens.py` (new) | Shared primitive tests. |
+| `docs/superpowers/plans/s7_mutation_campaign.py` (new) | Runnable mutation campaign: applies each mutation, requires the named node to fail for its own reason, restores byte-for-byte, requires green. |
 | `tests/test_outbox.py`, `tests/test_console_projection.py` | Classification service and projection safety. |
 | `tests/test_registry.py` | Delete binding, reference recount, return value, and races. |
 | `tests/test_console_routes.py`, `tests/test_console_invariants.py` | Transport, same-screen behavior, read-only refresh, declarations, and structural proof. |
@@ -443,7 +444,11 @@ nothing, never degrade to a destructive path.
 blocks the syscall answers `EPERM`, and so does a refusal about these
 particular files. It is disambiguated by calling the mover with invalid
 descriptors and empty names — a blocked syscall still answers `EPERM`, while
-a reachable one gets as far as argument validation and answers `EBADF`.
+a reachable one gets as far as argument validation and answers a non-`EPERM`
+argument error, such as `EBADF` or `ENOENT`. Which one is not fixed: the same
+call returns `EBADF` on some platforms and `ENOENT` on macOS. The
+classification turns on the errno *not* being `EPERM`, never on a particular
+alternative.
 
 No classification may write anywhere in the vault. A refusal path that
 created even a temporary file would be vault state changed outside the Git

@@ -5312,8 +5312,22 @@ def test_delete_check_again_on_an_unreviewable_proposal_offers_no_controls(
     assert not _rendered_control_ids(body), body
     assert "review_sha256" not in body
     assert "hx-post" not in body
-    # `Check again` points back at the delete review, never the outbox one.
-    assert f"/registry/alpha/product/review/{proposal_id}" in body
+    if shape == "hostile-id":
+        # Item 6 (review): the id itself is what the route refuses, so no
+        # re-read of it can ever answer differently. This used to render a
+        # `Check again` built from the malformed id — a button that
+        # re-fetched the same refusal forever, whose `hx-target` was built
+        # from the same string and so frequently matched nothing at all.
+        # The untrusted id must not reach the fragment in any form.
+        assert "Check again" not in body, body
+        assert proposal_id not in body, body
+        assert "the registry" in body
+    else:
+        # A well-formed id may become reviewable again, so the read-only
+        # re-read is offered — pointing at the delete review, never the
+        # outbox one.
+        assert "Check again" in body
+        assert f"/registry/alpha/product/review/{proposal_id}" in body
 
 
 def test_a_failed_delete_current_review_render_keeps_both_outcomes(

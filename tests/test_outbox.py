@@ -2427,7 +2427,7 @@ def test_reject_transaction_failures_stay_inside_the_outbox_family(tmp_path):
 # tracked diff, untracked paths and commit count — the whole boundary.
 
 
-def _boundary_state(vault: Path, quarantine_expected: bool = False) -> dict:
+def _boundary_state(vault: Path) -> dict:
     def _git(*args: str) -> bytes:
         return subprocess.run(
             ["git", *args], cwd=vault, check=True, capture_output=True

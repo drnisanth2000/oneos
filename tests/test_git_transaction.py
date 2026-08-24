@@ -2194,10 +2194,20 @@ def _refuse_all_writes(monkeypatch, root: Path):
 
 
 @pytest.mark.parametrize(
-    "blocked", [False, True], ids=["eperm-about-one-file", "syscall-blocked"]
+    "blocked, argument_errno",
+    [
+        # Which argument error a reachable syscall returns is platform
+        # dependent — `EBADF` on some, `ENOENT` on macOS — so the
+        # classification is driven under both. Nothing may depend on the
+        # specific value, only on its not being `EPERM`.
+        (False, errno.EBADF),
+        (False, errno.ENOENT),
+        (True, None),
+    ],
+    ids=["one-file-ebadf", "one-file-enoent", "syscall-blocked"],
 )
 def test_eperm_classification_writes_nothing_into_the_vault(
-    tmp_path, monkeypatch, blocked
+    tmp_path, monkeypatch, blocked, argument_errno
 ):
     """P1 (review): classifying `EPERM` must not touch the vault.
 
@@ -2221,7 +2231,11 @@ def test_eperm_classification_writes_nothing_into_the_vault(
 
     monkeypatch.setattr(transaction, "_MOVE_REACHABLE", None)
     monkeypatch.setattr(
-        transaction, "_MOVE_NO_REPLACE", _eperm_mover(blocked=blocked)
+        transaction, "_MOVE_NO_REPLACE",
+        _eperm_mover(
+            blocked=blocked,
+            **({} if argument_errno is None else {"argument_errno": argument_errno}),
+        ),
     )
 
     before = _vault_snapshot(vault)
@@ -2246,22 +2260,24 @@ def test_eperm_classification_writes_nothing_into_the_vault(
     assert _vault_snapshot(vault) == before
 
 
-def _eperm_mover(*, blocked):
+def _eperm_mover(*, blocked, argument_errno=errno.EBADF):
     """A stand-in mover modelling the two ways `EPERM` can arise.
 
     `blocked=True` is a seccomp-filtered syscall: it answers `EPERM` to
     everything, argument-validity included, because the filter runs before
     the kernel reads any argument. `blocked=False` is a reachable syscall
     that refuses one particular operand — so the classifier's no-operand
-    call reaches argument validation and gets `EBADF`, exactly as the real
-    syscall does.
+    call reaches argument validation and gets a non-`EPERM` argument error,
+    as the real syscall does. Which error is platform-dependent (`EBADF` on
+    some, `ENOENT` on macOS), so `EBADF` here stands for that whole class
+    and nothing depends on the specific value.
     """
     def move(from_descriptor, from_name, to_descriptor, to_name):
         if blocked:
             ctypes.set_errno(errno.EPERM)
             return -1
         if from_descriptor < 0 or not from_name:
-            ctypes.set_errno(errno.EBADF)
+            ctypes.set_errno(argument_errno)
             return -1
         if os.fsdecode(from_name) == "locked":
             ctypes.set_errno(errno.EPERM)

@@ -45,6 +45,7 @@ from .outbox import (
     propose_classification,
     reject,
 )
+from .proposal_identity import ProposalIdentityError, require_proposal_id
 from .review_tokens import ReviewedProposalChanged, ReviewTokenError
 from .registry import (
     RegistryError,
@@ -973,10 +974,26 @@ def _review_unavailable_response(
 ) -> HTMLResponse:
     """A safe no-action state: no controls, no fingerprint, no guessing."""
     entity = scope.current_entity()
+    # `Check again` re-reads a URL built from this id, so it can only help
+    # when the id is one a review route will accept. A malformed id — the
+    # very thing E-INVALID reports — produced a button that re-fetched the
+    # same refusal forever, and whose `hx-target` named an element id built
+    # from the same malformed string, so it often resolved to nothing at
+    # all. An affordance that cannot succeed is worse than no affordance.
+    try:
+        require_proposal_id(proposal_id)
+    except ProposalIdentityError:
+        rereadable = False
+    else:
+        rereadable = True
     check_again = (
-        f"/registry/{entity}/product/review/{proposal_id}"
-        if review_path == "registry"
-        else f"/outbox/{entity}/review/{proposal_id}"
+        (
+            f"/registry/{entity}/product/review/{proposal_id}"
+            if review_path == "registry"
+            else f"/outbox/{entity}/review/{proposal_id}"
+        )
+        if rereadable
+        else None
     )
     return templates.TemplateResponse(
         request,
@@ -984,13 +1001,19 @@ def _review_unavailable_response(
         {
             "entity": entity,
             "proposal_id": proposal_id,
+            # The element id is keyed on a server-minted issuance, never on
+            # the untrusted id: an id that cannot pass validation must not
+            # become part of a selector.
+            "issue": _new_issue(),
             "review_error": error,
             "check_again_url": check_again,
+            "rereadable": rereadable,
             # Only a classification can be re-proposed from triage; a delete
             # is recreated from the registry screen, so no triage link is
             # offered for one.
             "recreatable": review_path == "outbox"
             and error.code in {"E-INVALID", "E-MISSING"},
+            "registry_recreatable": review_path == "registry",
         },
         # Both callers are `surface="fragment-only"`.
         status_code=status_for(error, True),

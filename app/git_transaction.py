@@ -1238,9 +1238,11 @@ def _move_syscall_is_blocked() -> bool:
     at syscall entry, before the kernel looks at any argument, so a call
     with deliberately invalid descriptors and empty names separates the two
     cases: a *blocked* syscall still answers `EPERM`, while a reachable one
-    gets as far as validating its arguments and answers `EBADF` (or another
-    argument error). Either way the call cannot succeed and cannot name a
-    real file, so there is nothing to create, move, or clean up.
+    gets as far as validating its arguments and answers some non-`EPERM`
+    argument error — `EBADF` on some platforms, `ENOENT` on macOS. Which one
+    is deliberately not relied on; only "not `EPERM`" is. Either way the call
+    cannot succeed and cannot name a real file, so there is nothing to
+    create, move, or clean up.
 
     An earlier version of this probed by creating a file in the target
     directory and moving it. That put writes inside the vault on a refusal
