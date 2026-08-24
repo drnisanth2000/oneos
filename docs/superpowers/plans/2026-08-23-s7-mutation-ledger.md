@@ -6,7 +6,12 @@ red for the intended reason, the exact implementation has been restored
 byte-for-byte, and the test has gone green again.
 
 **Baseline:** `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f` → 926 passed.
-**At the time of writing:** 1239 passed.
+
+The current pass count lives in [The campaign](#the-campaign) below and
+nowhere else. It used to be repeated here too, and drifted: this header still
+read 1239 while the campaign block said 1258. A count maintained by hand in
+two places goes stale by construction, so there is now one copy of it, pasted
+from the runner's own output.
 
 Restoration is by `cmp` against a pre-image copy taken before each mutation.
 No destructive Git cleanup is used anywhere in this campaign — a `git

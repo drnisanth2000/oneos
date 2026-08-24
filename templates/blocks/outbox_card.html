@@ -6,10 +6,8 @@
    *version* of a proposal, not a proposal, which is what lets a
    changed-review response append the current card beside the old one and
    disable exactly the controls that were issued for the stale bytes.
-
-   `disabled` renders the same card with its controls inert, for the
-   "Previously reviewed" copy that stays on screen after a refusal. #}
-<div class="proposal{% if disabled %} proposal-superseded{% endif %}"
+ #}
+<div class="proposal"
      id="review-card-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
   <div class="prop-head">
@@ -21,7 +19,7 @@
   {% elif error %}
   {% include "blocks/alert.html" %}
   {% endif %}
-  {% if error and not disabled %}
+  {% if error %}
   {# This row is well-formed but something it depends on is not — a missing
      or unreadable source. Its id is validated, so it can be re-read on its
      own. #}
@@ -61,18 +59,18 @@
   </div>
   <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
     {% if row.can_approve %}
-    <button class="approve"{% if disabled %} disabled{% endif %}
-            {% if not disabled %}hx-post="/outbox/{{ entity }}/approve"
+    <button class="approve"
+            hx-post="/outbox/{{ entity }}/approve"
             hx-vals='{{ outbox_values | tojson }}'
             hx-target="#outbox-list" hx-swap="outerHTML"
-            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}"{% endif %}>Approve → move + commit</button>
+            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">Approve → move + commit</button>
     {% endif %}
     {% if row.can_reject %}
-    <button class="reject"{% if disabled %} disabled{% endif %}
-            {% if not disabled %}hx-post="/outbox/{{ entity }}/reject"
+    <button class="reject"
+            hx-post="/outbox/{{ entity }}/reject"
             hx-vals='{{ outbox_values | tojson }}'
             hx-target="#outbox-list" hx-swap="outerHTML"
-            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}"{% endif %}>Reject</button>
+            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">Reject</button>
     {% endif %}
   </div>
   {% endif %}

@@ -3,7 +3,7 @@
    not in its own id, not in any target. A fingerprint is the value that
    binds an action to reviewed bytes; on a card that can never act it is
    nothing but an unreviewed value on screen. #}
-<div class="delete-impact{% if disabled %} proposal-superseded{% endif %}"
+<div class="delete-impact"
      {% if prop.total %}id="review-unactionable-{{ prop.id }}-{{ issue }}"
      {% else %}id="review-card-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}"{% endif %}>
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
@@ -53,7 +53,7 @@
     <input type="hidden" name="review_issue" value="{{ issue }}">
   </div>
   <div class="prop-actions" id="review-controls-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}">
-    <button class="reject"{% if disabled %} disabled{% endif %}
+    <button class="reject"
             hx-post="/registry/{{ entity }}/product/delete-execute"
             hx-vals='{{ delete_execute_values | tojson }}'
             hx-target="closest .delete-impact" hx-swap="innerHTML"

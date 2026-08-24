@@ -1894,3 +1894,37 @@ def test_no_module_level_definition_is_shadowed_by_a_later_one():
             shadowed[str(path.relative_to(root))] = repeats
 
     assert not shadowed, f"module-level names defined more than once: {shadowed}"
+
+
+def test_no_template_gives_an_inert_control_a_live_action():
+    """Item 6 (review): a greyed button must not still be able to post.
+
+    `delete_impact.html` used to render `disabled` on its Approve button
+    while leaving `hx-post`, `hx-vals` and the fingerprint in place, so
+    the control was inert only cosmetically — `disabled` is a client-side
+    attribute, and anything that cleared it, or any trigger that did not
+    route through a click, had a live mutation bound to stale reviewed
+    bytes. `outbox_card.html` guarded the same attributes correctly, and
+    the two drifting apart is what hid it.
+
+    Both branches are gone now. This keeps them gone: within one tag, a
+    `disabled` attribute and an `hx-` action attribute may not coexist.
+    Jinja conditionals are deliberately not evaluated — the check is on
+    the source, so a branch that *could* emit both fails whether or not
+    any caller currently reaches it.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "templates"
+    actions = ("hx-post", "hx-put", "hx-patch", "hx-delete", "hx-get")
+    offenders = []
+    for path in sorted(root.rglob("*.html")):
+        source = path.read_text(encoding="utf-8")
+        for tag in re.findall(r"<(?:button|a|form|input)\b[^>]*>", source, re.S):
+            if "disabled" in tag and any(action in tag for action in actions):
+                offenders.append(f"{path.relative_to(root)}: {tag[:120]}")
+
+    assert not offenders, "inert controls carrying a live action:\n" + "\n".join(
+        offenders
+    )

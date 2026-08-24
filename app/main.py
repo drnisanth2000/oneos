@@ -836,7 +836,6 @@ def _review_changed_response(
     *,
     current_card: str,
     current_context,
-    stale_controls: tuple[str, ...],
     reviewed: dict[str, str | None],
     current_fields,
     check_again_url: str,
@@ -868,7 +867,6 @@ def _review_changed_response(
             # its current card, and the target `Check again` swaps — so a
             # recurring digest cannot produce a recurring element id.
             "current_issue": _new_issue(),
-            "stale_controls": stale_controls,
             "review_error": error,
             "check_again_url": check_again_url,
             "differences": _meaningful_differences(reviewed, current_fields(context)),
@@ -929,7 +927,6 @@ def _outbox_review_changed(
         request, scope, proposal_id, stale_review_sha256, stale_issue, error,
         current_card="blocks/outbox_card.html",
         current_context=context,
-        stale_controls=("Approve → move + commit", "Reject"),
         reviewed=reviewed,
         current_fields=fields,
         check_again_url=(
@@ -1315,7 +1312,6 @@ def _delete_review_changed(
         request, scope, proposal_id, stale_review_sha256, stale_issue, error,
         current_card="blocks/delete_impact.html",
         current_context=context,
-        stale_controls=("Approve delete",),
         reviewed=reviewed,
         current_fields=fields,
         check_again_url=(

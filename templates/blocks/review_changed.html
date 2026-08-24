@@ -63,11 +63,21 @@
   </div>
 </div>
 
-{# Out-of-band: the stale card's controls become inert in place. #}
+{# Out-of-band: the stale card's controls are *removed* in place, and no
+   replacement buttons are invented.
+
+   This used to render one disabled button per caption from a hardcoded
+   `stale_controls` tuple — `("Approve → move + commit", "Reject")` for the
+   outbox, unconditionally. But which controls the stale card offered is a
+   property of the bytes the operator reviewed, and the server never saw
+   those bytes (approved decision 8). A row whose stale version offered only
+   Reject was shown a greyed "Approve" it had never been given, which is a
+   false statement about what was on screen. Rule 8 rules out reading it back
+   off the submission, and there is nothing else to read it from.
+
+   Emptying the container says only what is true: whatever was here is no
+   longer actionable. The live controls are on the current card above. #}
 <div class="prop-actions" hx-swap-oob="true"
      id="review-controls-{{ proposal_id }}-{{ stale_review_sha256 }}-{{ stale_issue }}">
-  {% for caption in stale_controls %}
-  <button disabled>{{ caption }}</button>
-  {% endfor %}
   <p class="muted review-label">Previously reviewed — no longer actionable.</p>
 </div>

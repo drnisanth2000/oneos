@@ -4884,14 +4884,20 @@ def test_a_changed_review_keeps_the_old_card_and_appends_the_current_one(
     assert f"review-card-{proposal_id}-{current}" in body
     assert _CODES["E-REVIEW"].message in body
 
-    # 3: the old controls are replaced out-of-band with disabled ones — and
-    # the id must be the one the listing rendered, not a plausible-looking
-    # string that matches nothing on the page.
+    # 3: the old controls are emptied out-of-band — and the id must be the
+    # one the listing rendered, not a plausible-looking string that matches
+    # nothing on the page.
     old_controls = rendered_controls
     assert old_controls in body
     assert 'hx-swap-oob="true"' in body
-    disabled_block = body.split(old_controls, 1)[1].split("</div>", 1)[0]
-    assert "disabled" in disabled_block
+    replaced_block = body.split(old_controls, 1)[1].split("</div>", 1)[0]
+    # This used to assert `disabled` appeared here, which the invented
+    # `stale_controls` captions satisfied. Requiring *no* control is
+    # stronger: a greyed button the operator was never offered is a false
+    # claim about the old card, and a live one would be far worse.
+    assert "<button" not in replaced_block, replaced_block
+    assert "hx-post" not in replaced_block, replaced_block
+    assert "no longer actionable" in replaced_block, replaced_block
 
     # 2: the old card is labelled rather than replaced or re-served.
     assert "Previously reviewed" in body
