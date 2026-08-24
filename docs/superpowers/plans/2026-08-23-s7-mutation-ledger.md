@@ -256,7 +256,9 @@ mutates nothing.
 
 - **file** `app/main.py`
 - **selection** `tests/test_console_routes.py tests/test_console_invariants.py`
-- **result** RED — `test_alerts_never_contain_paths_slugs_or_echoes`
+- **result** RED — `test_delete_success_copy_comes_from_the_bound_execution`
+  (this row named `test_alerts_never_contain_paths_slugs_or_echoes`, which is
+  not the node the runner binds M8 to and not the node that goes red)
 
 ```diff
 -        prop = execute_delete(scope, id, review_sha256)

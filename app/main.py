@@ -48,6 +48,7 @@ from .outbox import (
 from .proposal_identity import ProposalIdentityError, require_proposal_id
 from .review_tokens import ReviewedProposalChanged, ReviewTokenError
 from .registry import (
+    MissingDeleteProposal,
     RegistryError,
     execute_delete,
     get_delete_review,
@@ -805,7 +806,7 @@ def _uncompared_fields(
 
 def _meaningful_differences(
     reviewed: dict[str, str | None], current: dict[str, str]
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str | None]]:
     """Which fields differ from what the browser was showing, and what they
     are now.
 
@@ -837,6 +838,7 @@ def _review_changed_response(
     *,
     current_card: str,
     current_context,
+    current_actionable,
     reviewed: dict[str, str | None],
     current_fields,
     check_again_url: str,
@@ -855,6 +857,7 @@ def _review_changed_response(
     perfectly well — the reason is the taxonomy's rule, not the client's.
     """
     context = current_context()
+    current = current_fields(context)
     response = templates.TemplateResponse(
         request,
         "blocks/review_changed.html",
@@ -870,15 +873,27 @@ def _review_changed_response(
             "current_issue": _new_issue(),
             "review_error": error,
             "check_again_url": check_again_url,
-            "differences": _meaningful_differences(reviewed, current_fields(context)),
-        # What could not be compared, because the browser did not report it.
-        # With nothing reported back, or only part of it, "the values look
-        # identical" would assert a comparison that never happened.
-        "uncompared": _uncompared_fields(reviewed, current_fields(context)),
+            "differences": _meaningful_differences(reviewed, current),
+            # What could not be compared, because the browser did not report
+            # it. With nothing reported back, or only part of it, "the values
+            # look identical" would assert a comparison that never happened.
+            "uncompared": _uncompared_fields(reviewed, current),
             "current_card_template": current_card,
+            # Whether the *current* card issued any control. It can be
+            # non-actionable and permanently so — a delete reviewed at zero
+            # references whose record now records some — and then "act
+            # again below" names a control that is not there, and a
+            # `Check again` sits directly under a card that has just said
+            # re-reading it would answer identically forever. Both claims
+            # are the card's to make or withhold, not the wrapper's.
+            "current_actionable": current_actionable(context),
             **context,
         },
-        status_code=200,
+        # Derived, not restated: E-REVIEW is a `refusal`, and S6's rule
+        # makes a fragment refusal 200. Hardcoding the answer meant a
+        # change to E-REVIEW's severity would leave this one response
+        # disagreeing with every other fragment, with nothing to catch it.
+        status_code=status_for(error, True),
     )
     response.headers["HX-Retarget"] = (
         f"#review-card-{proposal_id}-{stale_review_sha256}-{stale_issue}"
@@ -928,6 +943,11 @@ def _outbox_review_changed(
         request, scope, proposal_id, stale_review_sha256, stale_issue, error,
         current_card="blocks/outbox_card.html",
         current_context=context,
+        # A listing that became blocked between the refusal and this
+        # re-render yields a row with no fingerprint and no controls.
+        current_actionable=lambda ctx: bool(
+            ctx["row"].can_approve or ctx["row"].can_reject
+        ),
         reviewed=reviewed,
         current_fields=fields,
         check_again_url=(
@@ -969,8 +989,8 @@ def _review_unavailable_response(
     proposal_id: str,
     error: ConsoleError,
     *,
-    status: int = 200,
     review_path: str = "outbox",
+    record_missing: bool = False,
 ) -> HTMLResponse:
     """A safe no-action state: no controls, no fingerprint, no guessing."""
     entity = scope.current_entity()
@@ -983,9 +1003,17 @@ def _review_unavailable_response(
     try:
         require_proposal_id(proposal_id)
     except ProposalIdentityError:
-        rereadable = False
+        id_is_reviewable = False
     else:
-        rereadable = True
+        id_is_reviewable = True
+    # A re-read is offered only when it could genuinely answer differently.
+    # Two things make it permanently inert: an id no review route will
+    # accept, and a record that is *absent* — ids are never reissued and a
+    # consumed record is quarantined, so nothing can restore this one. A
+    # record that exists but cannot currently be read is the opposite case:
+    # repairing it outside the Console is exactly what the error instructs,
+    # and the re-read is how the operator sees that it worked.
+    rereadable = id_is_reviewable and not record_missing
     check_again = (
         (
             f"/registry/{entity}/product/review/{proposal_id}"
@@ -1000,7 +1028,6 @@ def _review_unavailable_response(
         "blocks/review_unavailable.html",
         {
             "entity": entity,
-            "proposal_id": proposal_id,
             # The element id is keyed on a server-minted issuance, never on
             # the untrusted id: an id that cannot pass validation must not
             # become part of a selector.
@@ -1012,7 +1039,12 @@ def _review_unavailable_response(
             # is recreated from the registry screen, so no triage link is
             # offered for one.
             "recreatable": review_path == "outbox"
-            and error.code in {"E-INVALID", "E-MISSING"},
+            and (record_missing or error.code in {"E-INVALID", "E-MISSING"}),
+            # Always, on the delete path. This used to be gated on the id
+            # also being unacceptable, which in practice meant a
+            # hand-typed URL — so the ordinary case, a delete proposal
+            # whose record is gone, was offered a re-read that could never
+            # succeed and denied the one link that resolves it.
             "registry_recreatable": review_path == "registry",
         },
         # Both callers are `surface="fragment-only"`.
@@ -1033,6 +1065,23 @@ def outbox_review_fragment(
     """
     try:
         row = _review_row(scope, proposal_id)
+        # The second read has to sit inside the same guard. It calls
+        # `project_outbox` again, and a declared member of the family can
+        # arise between the two reads — a destination registry that became
+        # unreadable in between, say. Outside the guard that is the global
+        # fallback and a 500 page for a describable condition. The existing
+        # totality sweeps cannot see it, because they make the function
+        # raise unconditionally and so never get past the first read.
+        blocking = None
+        if row is None:
+            blocking = next(
+                (
+                    r.error
+                    for r in project_outbox(scope).rows
+                    if r.proposal is None and r.error
+                ),
+                None,
+            )
     except _OUTBOX_CATCHES as exc:
         return _review_unavailable_response(
             request, scope, proposal_id, describe(exc)
@@ -1044,11 +1093,6 @@ def outbox_review_fragment(
         # wrong instruction — the existing one has to be repaired or removed
         # outside the Console. Describe the blocking condition when there is
         # one, rather than choosing a code here.
-        listing = project_outbox(scope)
-        blocking = next(
-            (r.error for r in listing.rows if r.proposal is None and r.error),
-            None,
-        )
         return _review_unavailable_response(
             request, scope, proposal_id,
             describe(
@@ -1056,6 +1100,8 @@ def outbox_review_fragment(
                 if blocking is not None
                 else OutboxError("no pending proposal for this entity")
             ),
+            # No blocking record means no record: permanently inert.
+            record_missing=blocking is None,
         )
     return templates.TemplateResponse(
         request,
@@ -1335,6 +1381,9 @@ def _delete_review_changed(
         request, scope, proposal_id, stale_review_sha256, stale_issue, error,
         current_card="blocks/delete_impact.html",
         current_context=context,
+        # `delete_impact.html` withholds every control, and the fingerprint
+        # with it, when the reviewed impact records references.
+        current_actionable=lambda ctx: not ctx["prop"].total,
         reviewed=reviewed,
         current_fields=fields,
         check_again_url=(
@@ -1365,7 +1414,8 @@ def registry_delete_review_fragment(
         review = get_delete_review(scope, proposal_id)
     except _REGISTRY_DELETE_CATCHES as exc:
         return _review_unavailable_response(
-            request, scope, proposal_id, describe(exc), review_path="registry"
+            request, scope, proposal_id, describe(exc), review_path="registry",
+            record_missing=isinstance(exc, MissingDeleteProposal),
         )
     return templates.TemplateResponse(
         request,

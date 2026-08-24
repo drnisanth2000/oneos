@@ -34,11 +34,6 @@
   {% set outbox_values = {"id": row.proposal.id,
                           "review_sha256": row.review_sha256} %}
   {# The values as reviewed, sent back with the action so a refusal can name
-     exactly what changed. `hx-include` keeps them out of `hx-vals`, which
-     still transports exactly the id and the fingerprint. They are display
-     evidence only: the server re-reads and re-validates everything it acts
-     on, and never trusts these. #}
-  {# The values as reviewed, sent back with the action so a refusal can name
      exactly what changed — and, just as importantly, name what it could not
      compare. One JSON field, because an empty form value arrives as `None`
      and would make "reviewed as empty" indistinguishable from "not reported".

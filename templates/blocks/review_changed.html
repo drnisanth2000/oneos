@@ -50,17 +50,22 @@
   <p class="muted">
     The version you reviewed is shown above, marked
     <em>Previously reviewed</em>, and its controls are no longer active.
-    Act again below if you still want to.
+    {% if current_actionable %}Act again below if you still want to.{% endif %}
   </p>
   {% with label="Current version — review this before acting",
           issue=current_issue %}
   {% include current_card_template %}
   {% endwith %}
+  {% if current_actionable %}
   <div class="prop-actions">
     {% with check_again_target = "#review-changed-" ~ proposal_id ~ "-" ~ current_issue %}
     {% include "blocks/check_again.html" %}
     {% endwith %}
   </div>
+  {% endif %}
+  {# When the current card is not actionable it has already said why, and
+     said what to do instead. Adding a re-read here would contradict it:
+     the card's whole point is that re-reading answers identically. #}
 </div>
 
 {# Out-of-band: the stale card's controls are *removed* in place, and no

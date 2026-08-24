@@ -1304,11 +1304,11 @@ def quarantine_destination(relative_path: str) -> str:
     return (leaf.parent / QUARANTINE_DIRECTORY / leaf.name).as_posix()
 
 
-def _open_quarantine(parent_descriptor: int) -> tuple[int, bool]:
+def _open_quarantine(parent_descriptor: int) -> int:
     """Open the quarantine directory, creating it only when it is absent.
 
-    Returns the descriptor and whether this call created it. Opened through
-    `_open_checked_directory` and relative to the parent's descriptor, so
+    Opened through `_open_checked_directory` and relative to the
+    parent's descriptor, so
     neither the parent nor the quarantine can be swapped between validation
     and use.
 
@@ -1321,11 +1321,8 @@ def _open_quarantine(parent_descriptor: int) -> tuple[int, bool]:
     # One lookup, not two: probing for existence separately from opening
     # would add a window of this function's own making between the two.
     try:
-        return (
-            _open_checked_directory(
-                QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
-            ),
-            False,
+        return _open_checked_directory(
+            QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
         )
     except ReviewedPathUnavailable as exc:
         if not isinstance(exc.__cause__, FileNotFoundError):
@@ -1339,11 +1336,8 @@ def _open_quarantine(parent_descriptor: int) -> tuple[int, bool]:
         ) from exc
     except OSError as exc:
         raise ReviewedPathUnavailable("quarantine is unavailable") from exc
-    return (
-        _open_checked_directory(
-            QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
-        ),
-        True,
+    return _open_checked_directory(
+        QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
     )
 
 
@@ -1356,55 +1350,114 @@ def _quarantine_reviewed_leaf(
 ) -> str:
     """Move one reviewed leaf into quarantine, or leave everything as found.
 
-    The move is atomic and cannot overwrite. Verification happens through an
-    `O_NOFOLLOW` descriptor on the moved file — a descriptor is bound to one
-    inode for its lifetime, so nothing can be substituted underneath it. A
-    mismatch is moved back the same way. No step unlinks anything, so losing
-    a race costs a refusal rather than a file.
+    The move is atomic and cannot overwrite. Verification runs through a
+    descriptor opened on the **source**, before the move, and held across
+    it: a descriptor is bound to one inode for its lifetime, so the object
+    verified is provably the object consumed (design §3, Amendment 1 step
+    3 — "identity and contents, never a fresh name lookup").
+
+    This previously opened the descriptor *after* the move, by name, in the
+    quarantine directory. That is a fresh name lookup, and it verified
+    contents and mode but never identity, so a writer that replaced
+    `.consumed/<leaf>` between the move and the open had the substitute
+    verified — and, on mismatch, moved back under the reviewed record's
+    name while the real record was gone. The docstring claimed the
+    guarantee the code did not implement.
+
+    The single name lookup that remains has the opposite job: confirming
+    that the quarantined name resolves to the very inode held open. If it
+    does not, something other than the reviewed object is sitting there and
+    the move is undone.
+
+    No step unlinks anything, so losing a race costs a refusal rather than
+    a file.
     """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        _move_no_replace(parent_descriptor, leaf, quarantine_descriptor, leaf)
+        descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
     except FileNotFoundError as exc:
         raise ReviewedStateChanged(
             f"reviewed path changed before mutation: {path}"
         ) from exc
-    except FileExistsError as exc:
-        # A record under this id is already quarantined: this one was
-        # consumed already, so the state is not what was reviewed.
-        raise ReviewedStateChanged(
-            f"reviewed path changed before mutation: {path}"
-        ) from exc
-
-    def _restore() -> None:
-        try:
-            _move_no_replace(quarantine_descriptor, leaf, parent_descriptor, leaf)
-        except (OSError, GitTransactionError) as exc:
-            # Whatever stopped it — an occupied name, an I/O failure, or a
-            # move primitive that turned out to be unavailable — the fact is
-            # the same: the record is still in quarantine. Reporting anything
-            # that says nothing changed would be a false statement about
-            # state the operator can see.
-            raise QuarantineRestorationBlocked(path) from exc
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(leaf, flags, dir_fd=quarantine_descriptor)
     except OSError as exc:
-        _restore()
         raise _unsafe_open_failure(
             exc, "reviewed path could not be opened safely"
         ) from exc
+
     try:
-        try:
-            held = _held_state(descriptor)
-        except BaseException:
-            _restore()
-            raise
+        # The reviewed object, established before anything moves.
+        held = _held_state(descriptor)
         if held != expected:
-            _restore()
             raise ReviewedStateChanged(
                 f"reviewed path changed before mutation: {path}"
             )
+        identity = os.fstat(descriptor)
+
+        try:
+            _move_no_replace(
+                parent_descriptor, leaf, quarantine_descriptor, leaf
+            )
+        except FileNotFoundError as exc:
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
+            ) from exc
+        except FileExistsError as exc:
+            # A record under this id is already quarantined: this one was
+            # consumed already, so the state is not what was reviewed.
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
+            ) from exc
+        except OSError as exc:
+            # An operand-level refusal: `EPERM` on an immutable record or a
+            # sticky-bit outbox, `EACCES`, `EROFS`, an I/O error. Nothing
+            # moved, so this is a plain refusal and must be described as
+            # one. It is normalised *here*, at the boundary that knows what
+            # the operation meant, rather than by widening a route's catch
+            # list — a raw `OSError` reaching a route would resolve to
+            # E-UNKNOWN ("an unexpected error was not handled",
+            # committed=unknown, retry=stop) for a designed refusal in
+            # which the vault is provably untouched.
+            #
+            # Reject reaches this path without an `except Exception` above
+            # it, unlike approve and delete, so before this clause existed
+            # a `chattr +i` record produced E-UNKNOWN there and a truthful
+            # refusal everywhere else.
+            raise ReviewedPathUnavailable(
+                "reviewed record could not be consumed"
+            ) from exc
+
+        def _restore() -> None:
+            try:
+                _move_no_replace(
+                    quarantine_descriptor, leaf, parent_descriptor, leaf
+                )
+            except (OSError, GitTransactionError) as exc:
+                # Whatever stopped it — an occupied name, an I/O failure, or
+                # a move primitive that turned out to be unavailable — the
+                # fact is the same: the record is still in quarantine.
+                # Reporting anything that says nothing changed would be a
+                # false statement about state the operator can see.
+                raise QuarantineRestorationBlocked(path) from exc
+
+        try:
+            # Identity: the quarantined name must be this inode, not a
+            # look-alike that arrived in the meantime.
+            landed = os.lstat(leaf, dir_fd=quarantine_descriptor)
+            if (landed.st_dev, landed.st_ino) != (
+                identity.st_dev, identity.st_ino
+            ):
+                raise ReviewedStateChanged(
+                    f"reviewed path changed before mutation: {path}"
+                )
+            # Contents: re-read through the descriptor still held, so an
+            # in-place rewrite during the move is caught too.
+            if _held_state(descriptor) != expected:
+                raise ReviewedStateChanged(
+                    f"reviewed path changed before mutation: {path}"
+                )
+        except BaseException:
+            _restore()
+            raise
     finally:
         os.close(descriptor)
     return leaf
@@ -1445,7 +1498,7 @@ def quarantine_path_if_unchanged(
         # invisible to the operator, since the refusal they see is about the
         # proposal, not about a directory. An empty `.consumed/` is not vault
         # content and costs nothing; a silently failing cleanup does.
-        quarantine_descriptor, _created = _open_quarantine(parent_descriptor)
+        quarantine_descriptor = _open_quarantine(parent_descriptor)
         try:
             return _quarantine_reviewed_leaf(
                 parent_descriptor, leaf, expected,
@@ -1491,9 +1544,17 @@ def restore_quarantined_leaf(
         raise InvalidTransactionPath("reviewed path is unsafe") from exc
     parent_descriptor, leaf = _walk_to_parent(vault, relative_path)
     try:
-        quarantine_descriptor = _open_checked_directory(
-            QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
-        )
+        # Opening the quarantine is inside the clause too. If `.consumed/`
+        # has been removed or swapped by the time rollback runs, the record
+        # is just as stranded as if the move itself failed — and reporting
+        # the generic recovery outcome instead would drop the one fact the
+        # operator needs, which is *where the record is*.
+        try:
+            quarantine_descriptor = _open_checked_directory(
+                QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+            )
+        except (OSError, GitTransactionError) as exc:
+            raise QuarantineRestorationBlocked(relative_path) from exc
         try:
             _move_no_replace(
                 quarantine_descriptor, quarantined_name, parent_descriptor, leaf

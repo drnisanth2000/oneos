@@ -5312,20 +5312,28 @@ def test_delete_check_again_on_an_unreviewable_proposal_offers_no_controls(
     assert not _rendered_control_ids(body), body
     assert "review_sha256" not in body
     assert "hx-post" not in body
-    if shape == "hostile-id":
-        # Item 6 (review): the id itself is what the route refuses, so no
-        # re-read of it can ever answer differently. This used to render a
-        # `Check again` built from the malformed id — a button that
-        # re-fetched the same refusal forever, whose `hx-target` was built
-        # from the same string and so frequently matched nothing at all.
-        # The untrusted id must not reach the fragment in any form.
+    if shape in {"hostile-id", "missing"}:
+        # A re-read is offered only where it could answer differently.
+        #
+        # `hostile-id`: the id itself is what the route refuses, and the
+        # untrusted string must not reach the fragment in any form — it
+        # used to be built into both the button's URL and its `hx-target`.
+        #
+        # `missing`: `propose_delete` allocates a fresh id and never
+        # reissues one, and a consumed record is quarantined rather than
+        # restored under its old name, so nothing can ever bring this id
+        # back. This case previously got a button that re-fetched the same
+        # refusal forever *and* was denied the registry link that resolves
+        # it, because the link was gated on the id also being unacceptable.
         assert "Check again" not in body, body
-        assert proposal_id not in body, body
         assert "the registry" in body
+        if shape == "hostile-id":
+            assert proposal_id not in body, body
     else:
-        # A well-formed id may become reviewable again, so the read-only
-        # re-read is offered — pointing at the delete review, never the
-        # outbox one.
+        # `malformed`: the record exists and is repairable outside the
+        # Console, which is what E-UNREADABLE instructs — so the read-only
+        # re-read stays, pointing at the delete review, never the outbox
+        # one. It is how the operator sees the repair took.
         assert "Check again" in body
         assert f"/registry/alpha/product/review/{proposal_id}" in body
 
@@ -6099,6 +6107,15 @@ def test_a_stale_delete_review_whose_current_version_has_references_shows_no_dig
     # `Check again` target, not anywhere.
     assert current not in body, body
 
+    # P1 (route review): the wrapper must not contradict the card it
+    # wraps. The current card here can never be approved and says so, so
+    # the wrapper offers neither "act again below" — there is nothing
+    # below to act with — nor a `Check again` directly underneath a card
+    # that has just said re-reading answers identically forever.
+    assert "Act again below" not in body, body
+    assert "Check again" not in body, body
+    assert "the registry" in body
+
     # Exactly one digest survives, and it is the stale one, present only to
     # name the stale control container being emptied out of band.
     digests = set(re.findall(r"[0-9a-f]{64}", body))
@@ -6216,3 +6233,86 @@ def test_a_hostile_issuance_nonce_never_reaches_the_rendered_id(
             assert re.fullmatch(r"[A-Za-z0-9_.:-]+", element_id), (
                 f"{payload!r} produced id {element_id!r}"
             )
+
+
+def test_a_missing_classification_proposal_sends_the_operator_to_triage(
+    tmp_path, monkeypatch
+):
+    """The outbox half of the same rule (route review, accepted).
+
+    A proposal id is never reissued, so once the record is gone a re-read
+    of that id is permanently inert. The useful recovery is a new
+    proposal from triage, which allocates a new id.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").unlink()
+
+    body = client.get(f"/outbox/alpha/review/{proposal_id}").text
+
+    assert 'role="alert"' in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+    assert "Check again" not in body, body
+    assert "/triage/alpha" in body
+
+
+def test_an_unreadable_classification_record_keeps_its_re_read(
+    tmp_path, monkeypatch
+):
+    """The control: a record that exists but cannot be parsed is
+    repairable outside the Console, so the re-read stays — it is how the
+    operator confirms the repair worked."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8"
+    )
+
+    body = client.get(f"/outbox/alpha/review/{proposal_id}").text
+
+    assert 'role="alert"' in body
+    assert "hx-post" not in body
+    assert "Check again" in body, body
+    assert f"/outbox/alpha/review/{proposal_id}" in body
+
+
+def test_a_blocking_condition_arising_between_the_two_reads_is_described(
+    tmp_path, monkeypatch
+):
+    """P2 (safety review): the second read was outside the guard.
+
+    `outbox_review_fragment` reads the row, and when the projection does
+    not hold the id it calls `project_outbox` a second time to describe
+    what is blocking the listing. That second call sat outside the `try`,
+    so a declared member of `_OUTBOX_CATCHES` arising *between* the two
+    reads escaped the endpoint and reached the global fallback — a 500
+    page for a condition the taxonomy can describe.
+
+    The existing totality sweeps cannot catch this: they make the
+    function raise unconditionally, so the first read raises and the
+    second is never reached. It needs a failure on the second call only.
+    """
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").unlink()
+
+    real = main.project_outbox
+    calls = []
+
+    def fail_on_the_second_read(scope):
+        calls.append(1)
+        if len(calls) >= 2:
+            raise DestinationRegistryError("registry became unreadable")
+        return real(scope)
+
+    monkeypatch.setattr(main, "project_outbox", fail_on_the_second_read)
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    assert len(calls) >= 2, "the second read never happened"
+    # 500 is E-CONFIG's *declared* status — it is an `attention` outcome —
+    # so the status alone proves nothing here. What must hold is that the
+    # response is the described fragment and not the global fallback.
+    assert "E-CONFIG" in response.text, response.text
+    assert "E-UNKNOWN" not in response.text, response.text
+    assert 'role="alert"' in response.text

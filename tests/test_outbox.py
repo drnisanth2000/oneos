@@ -2773,3 +2773,69 @@ def test_approve_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
     assert approved.dst == prop.dst, "approve chose a destination from a reread"
     assert reviewed_dst.exists()
     assert not hostile_dst.exists(), "approved a destination nobody reviewed"
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_an_unmovable_record_is_a_refusal_not_an_unhandled_error(tmp_path, action):
+    """P2 (safety review): a designed refusal must not describe as E-UNKNOWN.
+
+    Narrowing `_UNSUPPORTED_ERRNOS` so that an operand-level `EPERM` is no
+    longer `AtomicMoveUnavailable` left it as a bare `PermissionError`.
+    Approve and registry delete survive that — `_execute_locked` wraps
+    everything — but reject calls `consume_reviewed_proposal` directly and
+    caught only `GitTransactionError`, so the exception escaped the
+    declared family and reached the global fallback. The operator was told
+    "an unexpected error was not handled", `committed=unknown`,
+    `retry=stop`, for a refusal in which nothing moved at all.
+
+    Reachable without an attacker: an immutable (`chattr +i` / `uchg`)
+    record, a sticky-bit outbox holding a record this process does not
+    own, `EACCES`, or a read-only remount.
+
+    It is normalised at the quarantine boundary rather than by widening
+    the route's catch list, so every caller gets the truthful outcome.
+    """
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    before = _approval_state(vault)
+
+    real_move = gt._MOVE_NO_REPLACE
+
+    def refuse_this_record(from_fd, from_name, to_fd, to_name):
+        if from_fd < 0 or not from_name:      # the classifier's own probe
+            ctypes.set_errno(_errno.ENOENT)
+            return -1
+        ctypes.set_errno(_errno.EPERM)
+        return -1
+
+    gt._MOVE_NO_REPLACE = refuse_this_record
+    gt._MOVE_REACHABLE = None
+    try:
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+        gt._MOVE_REACHABLE = None
+
+    outcome = describe(raised.value)
+    assert outcome.code != "E-UNKNOWN", f"{action}: {raised.value!r}"
+    assert outcome.committed == "no", outcome
+
+    # And the refusal is truthful. Compared on the same terms the existing
+    # no-mutation matrices use: every Git-visible fact, plus the absence of
+    # any quarantined record. The quarantine *directory* may exist — it is
+    # opened before the move is attempted, is empty, and Git does not track
+    # empty directories, which is why `status` is identical either way.
+    after = _approval_state(vault)
+    for fact in ("head", "index", "status", "worktree"):
+        assert after[fact] == before[fact], fact
+    assert not sorted(vault.rglob(".consumed/*.yaml"))
+    assert prop.path.exists()
+    assert not (vault / prop.dst).exists()

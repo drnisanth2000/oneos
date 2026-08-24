@@ -1759,10 +1759,14 @@ def test_a_post_verification_rewrite_cannot_destroy_anything(tmp_path):
     expected = capture_path_state(vault, "outbox-record.yaml")
     real_held = gt._held_state
     fired = []
+    calls = []
 
     def rewrite_after_verifying(descriptor):
         state = real_held(descriptor)
-        if not fired:
+        # The second call is the post-move verification; the first runs on
+        # the source, when nothing is in quarantine yet.
+        calls.append(1)
+        if len(calls) == 2:
             fired.append(True)
             next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(b"LATER\n")
         return state
@@ -2011,8 +2015,21 @@ def test_any_failed_restoration_is_reported_as_stranded(tmp_path, failure):
         return -1
 
     real_held = gt._held_state
+    held_calls = []
+
+    def mismatch_after_the_move(descriptor):
+        # Verification now runs twice: once on the source before the move,
+        # once through the same descriptor after it. Only a mismatch on the
+        # second owes a restoration — a mismatch on the first refuses before
+        # anything has moved, which is a different (and already covered)
+        # outcome.
+        held_calls.append(1)
+        if len(held_calls) == 1:
+            return real_held(descriptor)
+        return PathState.regular(b"MISMATCH\n", 0o644)
+
     gt._MOVE_NO_REPLACE = forward_then_fail
-    gt._held_state = lambda descriptor: PathState.regular(b"MISMATCH\n", 0o644)
+    gt._held_state = mismatch_after_the_move
     try:
         with pytest.raises(gt.QuarantineRestorationBlocked) as raised:
             quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
@@ -2165,14 +2182,23 @@ def _refuse_all_writes(monkeypatch, root: Path):
     def guard(name, real, *, creates):
         def wrapped(*args, **kwargs):
             target = args[0] if args else None
-            inside = False
-            try:
-                candidate = Path(os.fsdecode(target))
-                inside = kwargs.get("dir_fd") is not None or candidate.is_absolute() and (
-                    root in candidate.parents or candidate == root
-                )
-            except (TypeError, ValueError):
-                inside = kwargs.get("dir_fd") is not None
+            # `os.rename` has no `dir_fd`; it has `src_dir_fd`/`dst_dir_fd`,
+            # and a probe using those passes *relative* names. Checking only
+            # `dir_fd` and absoluteness let exactly that shape through
+            # unrecorded, which made this weaker than its docstring.
+            relative_to_a_descriptor = any(
+                kwargs.get(name) is not None
+                for name in ("dir_fd", "src_dir_fd", "dst_dir_fd")
+            )
+            inside = relative_to_a_descriptor
+            if not inside:
+                try:
+                    candidate = Path(os.fsdecode(target))
+                    inside = candidate.is_absolute() and (
+                        root in candidate.parents or candidate == root
+                    )
+                except (TypeError, ValueError):
+                    inside = False
             if inside and creates(args, kwargs):
                 attempts.append((name, target))
                 raise OSError(errno.EACCES, "refused by test guard")
@@ -2357,3 +2383,52 @@ def test_eperm_on_every_file_is_still_reported_as_a_platform_limit(tmp_path, mon
         os.close(descriptor)
 
     assert {p.name for p in directory.iterdir()} == {"locked"}
+
+
+def test_a_substituted_quarantine_entry_is_refused_not_verified(tmp_path):
+    """P2 (safety review): the reviewed-object guarantee, by identity.
+
+    Verification used to open the moved record *by name* in `.consumed/`
+    after the move, and compare only contents and mode. A writer that
+    replaced that name in between had the substitute verified instead —
+    and on a contents mismatch, the substitute was moved back under the
+    reviewed record's name while the real record was gone. Design §3
+    Amendment 1 step 3 asks for "identity and contents, never a fresh
+    name lookup"; the code did the lookup and skipped the identity.
+
+    Here the entry is replaced by a *different inode with identical
+    bytes*, so a contents-and-mode comparison cannot tell the difference.
+    Only inode identity can.
+    """
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    reviewed_bytes = leaf.read_bytes()
+
+    real_move = gt._MOVE_NO_REPLACE
+    swapped = []
+
+    def move_then_substitute(from_fd, from_name, to_fd, to_name):
+        outcome = real_move(from_fd, from_name, to_fd, to_name)
+        if outcome == 0 and not swapped:
+            swapped.append(True)
+            landed = next((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+            decoy = landed.with_name(landed.name + ".decoy")
+            decoy.write_bytes(reviewed_bytes)      # same bytes...
+            decoy.chmod(landed.stat().st_mode)     # ...same mode...
+            os.replace(decoy, landed)              # ...different inode.
+        return outcome
+
+    gt._MOVE_NO_REPLACE = move_then_substitute
+    try:
+        with pytest.raises(gt.ReviewedStateConflict):
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+
+    assert swapped, "the substitution never happened"
+    # Nothing was destroyed: both objects still exist, and the refusal did
+    # not unlink to tidy up.
+    assert leaf.exists() or list((vault / gt.QUARANTINE_DIRECTORY).iterdir())

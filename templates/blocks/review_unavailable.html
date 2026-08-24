@@ -21,7 +21,7 @@
      ever return anything else. Offering one would loop forever. #}
   <p class="muted">
     This proposal cannot be reviewed, and re-reading it would say the same
-    thing every time, so no check is offered.
+    thing every time, so no check is offered. The way forward is below.
   </p>
   {% endif %}
   {% if recreatable %}
@@ -30,7 +30,7 @@
     <a href="/triage/{{ entity }}">triage</a> — that allocates a new
     proposal, and never reuses this one's id.
   </p>
-  {% elif registry_recreatable and not rereadable %}
+  {% elif registry_recreatable %}
   <p class="muted">
     If the entry still needs deleting, start a new deletion from
     <a href="/registry/{{ entity }}/products">the registry</a> — that

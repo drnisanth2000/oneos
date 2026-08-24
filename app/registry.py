@@ -55,6 +55,17 @@ class RegistryError(Exception):
     pass
 
 
+class MissingDeleteProposal(RegistryError):
+    """No delete proposal exists under this id.
+
+    Distinct from every other registry refusal because it is *permanent*:
+    `propose_delete` allocates a fresh id and never reissues one, and a
+    consumed record is quarantined rather than restored under its old name.
+    Re-reading this id can therefore never answer differently, which is
+    what the unavailable fragment needs to know before offering a re-read.
+    """
+
+
 class RegistryTransactionError(RegistryError):
     pass
 
@@ -458,7 +469,7 @@ def _capture_delete_proposal_state(
             "delete proposal record could not be read"
         ) from exc
     if state.contents is None:
-        raise RegistryError(f"no delete proposal {proposal_id!r}")
+        raise MissingDeleteProposal(f"no delete proposal {proposal_id!r}")
     return state
 
 
