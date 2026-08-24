@@ -313,11 +313,21 @@ distinct outcomes are required:
   untouched. This is an indeterminate recovery state and must be reported as
   one. It must never be described as "nothing was changed", and nothing is
   ever deleted to tidy it up.
-- **substituted** — the quarantine name no longer identifies the object that
-  was moved into it *(Amendment 2)*. A distinct outcome from restoration
-  blocked, and never folded into it: that outcome can promise both files
-  survive, and this one cannot. Nothing further is changed — the substitute
-  is left exactly where it is and is never moved under the proposal's name.
+- **substituted** — the quarantine location no longer holds the exact
+  reviewed proposal *(Amendment 2, generalised by Amendment 3)*. One outcome
+  covers all three ways that can be true, because the operator's position is
+  identical in each and splitting them invites the "one branch over" gap this
+  amendment exists to close:
+
+  - the name resolves to a **different inode** (replacement);
+  - the name resolves to **nothing** (disappearance); or
+  - the name resolves to the **same inode with different bytes** (an in-place
+    rewrite, which passes every identity check).
+
+  A distinct outcome from restoration blocked, and never folded into it: that
+  outcome can promise both files survive, and this one cannot. Nothing further
+  is changed — whatever is at the quarantine location is left exactly where it
+  is and is never moved under the proposal's name.
 
   The contract is closed here, so that no implementation has to invent it:
 
@@ -331,8 +341,13 @@ distinct outcomes are required:
   | page status | `500` |
 
   Message, verbatim: "The reviewed proposal was moved, but its quarantine
-  location was replaced before verification completed. The reviewed record
-  may no longer exist. Do not retry. Inspect vault state with git status."
+  location no longer holds it unchanged. The reviewed record may no longer
+  exist. Do not retry, and do not move files by hand. Inspect vault state
+  with git status and follow the verified recovery procedure."
+
+  The wording deliberately does not say *replaced*: that was true of only one
+  of the three conditions, and would be false for a disappearance or an
+  in-place rewrite.
 
   The observed `st_nlink` is carried on the typed exception as diagnostic
   evidence. It must not soften this message, must not vary it, and must not
@@ -466,23 +481,52 @@ Three consequences follow.
    | field | value |
    | --- | --- |
    | code | `E-RETAINED` |
-   | tier | `recovery` |
+   | tier | `integrity` |
    | severity | `attention` |
    | committed | `no` |
    | retry | `stop` |
    | page status | `500` |
 
-   Message, verbatim: "The action did not complete, and the reviewed
-   proposal is retained in the quarantine area. Its original name is empty.
-   Move it back manually before acting on it again. Do not retry. Inspect
-   vault state with git status."
+   Message, verbatim: "The action did not complete. The reviewed proposal is
+   retained unchanged in the quarantine area, and its original name is empty.
+   Do not retry, and do not move files by hand. Inspect vault state with git
+   status and follow the verified recovery procedure."
 
-   `committed` is `no` rather than `unknown` because this state is
-   determinate, unlike `E-STRANDED`: the action did not take effect, and the
-   record's location is known. Which of the two outcomes applies is decided
-   by a diagnostic *read* of the original name at rollback time — never by
-   attempting the rename — and, as with `st_nlink`, the message reports what
-   was observed at that instant and claims nothing beyond it.
+   **Tier.** An earlier draft put this in `recovery` with `committed=no`,
+   which is not merely inconsistent — `ConsoleError.__post_init__` enforces
+   that a recovery outcome reports `unknown`, so that entry could not be
+   constructed at all. Rather than weaken an invariant that earns its keep,
+   `E-RETAINED` sits in `integrity`, which already carries determinate
+   `committed=no` outcomes such as `E-UNSUPPORTED`. The recovery tier keeps
+   its meaning: indeterminate state.
+
+   **`committed=no` is a claim, and it has preconditions.** It is truthful
+   only when all three hold at rollback time:
+
+   1. the quarantine location holds the exact reviewed bytes — verified, not
+      assumed, through the descriptor still open on the record;
+   2. the original name is observed empty; and
+   3. every other change in the transaction rolled back successfully.
+
+   If any of them fails, `E-RETAINED` must not be reported. A quarantine
+   location that no longer holds the reviewed proposal is `E-SUBSTITUTED`; an
+   occupied original name is `E-STRANDED`; and **any simultaneous rollback
+   failure makes the state indeterminate, so the outcome must report
+   `committed=unknown`** and must not be downgraded to this one. Where two
+   apply, the indeterminate outcome outranks the determinate one.
+
+   Which outcome applies is decided by diagnostic *reads* — never by
+   attempting the rename — and, as with `st_nlink`, each reports what was
+   observed at that instant and claims nothing beyond it.
+
+   **No raw-move guidance.** The message must not tell the operator to move
+   the record back. A manual `mv` is the same parcel-label operation this
+   amendment forbids OneOS from performing: it resolves a name at the instant
+   it runs, can move something other than the reviewed record, and can
+   overwrite whatever holds the destination. Recovery has to be a verified
+   procedure that binds identity and contents before it moves anything.
+   Defining that procedure is out of S7's scope; until it exists, the honest
+   instruction is to inspect and not to improvise.
 
    This closes the race immediately, at the cost of turning an ordinary
    transient Git failure into manual recovery. Stage 2 exists to make that
