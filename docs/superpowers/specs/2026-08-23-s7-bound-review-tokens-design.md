@@ -78,8 +78,9 @@ the same rule one artifact later, to the proposal record itself.
 - propagation of `proposal id + review_sha256` through route, service, and
   mutation boundaries;
 - exact-state refusal before approve, reject, or delete mutates anything;
-- same-screen changed-since-review presentation with disabled old controls and
-  fresh current controls;
+- same-screen changed-since-review presentation in which the old review's
+  controls are removed and replaced by a "Previously reviewed — no longer
+  actionable" label, and only the current review carries controls;
 - a read-only `Check again` path and guidance back to existing triage when a
   missing proposal can be recreated safely;
 - truthful integration with S6's existing visible Console outcomes;
@@ -381,7 +382,8 @@ On mismatch:
 1. no source, destination, registry, proposal, Git index, or Git HEAD state is
    changed;
 2. the browser retains and labels the old card “Previously reviewed”;
-3. every old action control is disabled;
+3. no old action control remains — the container is emptied and labelled,
+   not repopulated with disabled stand-ins;
 4. the server returns a newly validated current card and fingerprint;
 5. the page presents the meaningful field differences between old and current;
    and
@@ -446,7 +448,7 @@ Presentation tests prove:
 
 - every actionable control transports exactly one id and one
   `review_sha256` using `tojson`;
-- old controls are disabled on conflict;
+- no old control survives a conflict, and none is invented in its place;
 - current values and meaningful differences render on the same screen;
 - `Check again` is read-only; and
 - missing-proposal recreation uses the existing triage action and a new id.

@@ -287,6 +287,13 @@ def test_no_domain_module_imports_the_taxonomy():
 
 # --- Task 3: the safe-read contract on `_read_no_follow_bytes` --------------
 #
+# Item 6 (review): this reader used to do its own single `os.open` with
+# `O_NOFOLLOW`, which guards only the final component — parents were
+# followed, no component was checked against `.git`, and the mode was
+# discarded. It now goes through `capture_path_state`, the same checked-
+# descriptor walk every other boundary read uses. The contract below is
+# unchanged; the guarantees underneath it are stronger.
+#
 #   missing leaf                       -> FileNotFoundError (re-raised)
 #   ELOOP / O_NOFOLLOW rejection       -> RedirectedPathError
 #   fstat says non-regular             -> RedirectedPathError
@@ -300,7 +307,7 @@ def test_safe_read_missing_leaf_raises_filenotfound(tmp_path):
     from app.outbox import _read_no_follow_bytes
 
     with pytest.raises(FileNotFoundError):
-        _read_no_follow_bytes(tmp_path / "absent.md")
+        _read_no_follow_bytes(tmp_path, "absent.md")
 
 
 def test_safe_read_symlink_raises_redirected(tmp_path):
@@ -313,7 +320,7 @@ def test_safe_read_symlink_raises_redirected(tmp_path):
     link.symlink_to(target)
 
     with pytest.raises(RedirectedPathError) as raised:
-        _read_no_follow_bytes(link)
+        _read_no_follow_bytes(tmp_path, "link.md")
     assert isinstance(raised.value, CrossScopeError)
 
 
@@ -335,10 +342,12 @@ def test_safe_read_nonregular_raises_redirected(tmp_path, monkeypatch):
             + tuple(result)[1:]
         )
 
-    monkeypatch.setattr(outbox.os, "fstat", nonregular_fstat)
+    import app.git_transaction as git_transaction
+
+    monkeypatch.setattr(git_transaction.os, "fstat", nonregular_fstat)
 
     with pytest.raises(RedirectedPathError) as raised:
-        outbox._read_no_follow_bytes(regular)
+        outbox._read_no_follow_bytes(tmp_path, "regular.md")
     assert isinstance(raised.value, CrossScopeError)
 
 
@@ -351,7 +360,7 @@ def test_safe_read_permission_error_raises_unavailable(tmp_path):
     unreadable.chmod(0)
     try:
         with pytest.raises(ProposalSourceUnavailable) as raised:
-            _read_no_follow_bytes(unreadable)
+            _read_no_follow_bytes(tmp_path, "unreadable.md")
     finally:
         unreadable.chmod(0o644)
     assert isinstance(raised.value, CrossScopeError)
@@ -366,7 +375,7 @@ def test_safe_read_replacement_race_raises_redirected(tmp_path):
     swapped.mkdir()
 
     with pytest.raises(RedirectedPathError) as raised:
-        _read_no_follow_bytes(swapped)
+        _read_no_follow_bytes(tmp_path, "swapped.md")
     assert isinstance(raised.value, CrossScopeError)
 
 
@@ -381,7 +390,7 @@ def test_safe_read_other_oserror_raises_unavailable(tmp_path):
     parent.chmod(0)
     try:
         with pytest.raises(ProposalSourceUnavailable) as raised:
-            _read_no_follow_bytes(leaf)
+            _read_no_follow_bytes(tmp_path, "sealed/receipt.md")
     finally:
         parent.chmod(0o755)
     assert isinstance(raised.value, CrossScopeError)
@@ -1928,3 +1937,46 @@ def test_no_template_gives_an_inert_control_a_live_action():
     assert not offenders, "inert controls carrying a live action:\n" + "\n".join(
         offenders
     )
+
+
+def test_safe_read_refuses_a_redirected_parent_directory(tmp_path):
+    """Item 6 (review): the guarantee the old reader did not have.
+
+    `O_NOFOLLOW` on a single `os.open` of a whole path constrains only the
+    last component. Every directory above it was followed, so a symlinked
+    parent silently redirected the read to a file outside the tree the
+    path appeared to name — while the leaf itself was a perfectly ordinary
+    regular file, so every check the reader did still passed.
+
+    The checked-descriptor walk refuses each component in turn.
+    """
+    from app.outbox import _read_no_follow_bytes
+    from app.scope import RedirectedPathError
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "receipt.md").write_text("not the reviewed file\n", encoding="utf-8")
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "active").symlink_to(elsewhere)
+
+    # The leaf is a regular file and is not itself a symlink: only the
+    # parent redirects.
+    assert (vault / "active/receipt.md").is_file()
+    assert not (vault / "active/receipt.md").is_symlink()
+
+    with pytest.raises(RedirectedPathError):
+        _read_no_follow_bytes(vault, "active/receipt.md")
+
+
+def test_safe_read_refuses_a_path_through_the_git_directory(tmp_path):
+    """The other missing component check: `.git` was never rejected."""
+    from app.outbox import _read_no_follow_bytes
+    from app.scope import RedirectedPathError
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git/config").write_text("[core]\n", encoding="utf-8")
+
+    with pytest.raises(RedirectedPathError):
+        _read_no_follow_bytes(tmp_path, ".git/config")

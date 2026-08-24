@@ -108,9 +108,9 @@ to this repository.
 | `app/console_errors.py` | Safe changed-review and invalid-token outcomes. |
 | `app/main.py` | Required token fields, bound service calls, and read-only fresh-review fragments. |
 | `templates/blocks/outbox_list.html` | Outbox token transport and card delegation. |
-| `templates/blocks/outbox_card.html` (new) | One classification review with active or disabled controls. |
+| `templates/blocks/outbox_card.html` (new) | One classification review and its controls. |
 | `templates/blocks/delete_impact.html` | Delete impact from the fingerprinted snapshot and its token. |
-| `templates/blocks/review_changed.html` (new) | Same-screen refusal, disabled old controls, and current review. |
+| `templates/blocks/review_changed.html` (new) | Same-screen refusal, removal of the old controls, and current review. |
 | `templates/blocks/review_unavailable.html` (new) | Safe no-action state, read-only check, and triage guidance. |
 | `tests/test_review_tokens.py` (new) | Shared primitive tests. |
 | `tests/test_outbox.py`, `tests/test_console_projection.py` | Classification service and projection safety. |
@@ -676,11 +676,13 @@ controls. Assert the response:
     with `swap:true`, so a 4xx would swap perfectly well; the reason is the
     taxonomy's rule;
   - leaves the old review visible;
-  - replaces its old controls with disabled controls through a hash-specific
-    HTMX out-of-band target;
+  - empties its old controls through a hash-specific HTMX out-of-band
+    target, leaving a "no longer actionable" label and inventing no
+    replacement buttons — which controls the stale card offered is a property
+    of bytes the server never saw;
   - appends a separately identified current review built from current
     server-validated bytes;
-  - gives only the current review a fresh hash and active controls;
+  - gives only the current review a fresh hash and any controls at all;
   - changes no proposal, destination, registry, or Git state; and
   - repeats correctly if the current proposal changes again.
 
@@ -831,7 +833,7 @@ independent reviews with different assignments:
      enforcement, compare-to-mutation timing, conditional reject removal,
      live-reference recount, and no-mutation proof.
   2. **Route/operator/scope reviewer:** same-screen old/current behavior,
-     disabled stale controls, HTMX token transport, safe errors, read-only
+     removal of stale controls, HTMX token transport, safe errors, read-only
      checking, declarations, and exclusion of inherited/non-S7 work.
 
 Neither reviewer may be the implementer. Each reads the approved spec, this
@@ -900,8 +902,9 @@ S7 is complete only when:
   at both service and final pre-mutation boundaries;
 - every actionable review is parsed, validated, and hashed from one exact byte
   snapshot;
-- stale controls stay visible but disabled, the current review appears on the
-  same screen, and only its fresh controls can act;
+- the stale review stays visible with its controls removed and labelled
+  rather than replaced by invented disabled ones, the current review appears
+  on the same screen, and only its fresh controls can act;
 - registry delete independently repeats the live-reference check;
 - all refusals prove complete state non-mutation;
 - deliberate mutations produce the intended red tests and exact restoration

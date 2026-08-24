@@ -25,6 +25,7 @@ import yaml
 from .console_routing import structured_reader
 from .git_transaction import (
     GitTransactionError,
+    InvalidTransactionPath,
     PathChange,
     PathState,
     ReviewedPathIntegrityError,
@@ -195,33 +196,50 @@ def _require_outbox_path(
     return candidate
 
 
-def _read_no_follow_bytes(path: Path) -> bytes:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+def _read_no_follow_bytes(root: Path, relative: str) -> bytes:
+    """One boundary read of a source receipt, on the same terms as every
+    other boundary read in S7.
+
+    This used to take a whole path and hand it to a single `os.open` with
+    `O_NOFOLLOW`. That flag protects only the *final* component: every
+    parent directory was still followed, so a symlinked parent redirected
+    the read, no component was checked against `.git`, and the file's mode
+    was discarded. `capture_path_state` walks the path one component at a
+    time through checked directory descriptors, refuses `.git`, `..` and
+    non-canonical paths, verifies the opened file is the same inode that
+    was `lstat`ed, and returns the mode alongside the bytes. Two readers
+    with different guarantees on the same kind of path is how one of them
+    ends up being the weak one nobody remembers.
+
+    The outcomes callers already handle are preserved exactly: an absent
+    leaf still raises `FileNotFoundError` for the caller to name, a
+    redirected or non-regular leaf still raises `RedirectedPathError`, and
+    anything else unreadable still raises `ProposalSourceUnavailable`.
+    """
+    state = _capture_source_state(root, relative)
+    if state.contents is None:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), relative)
+    return state.contents
+
+
+def _capture_source_state(root: Path, relative: str) -> PathState:
+    """One checked capture of a source leaf, in the outbox's vocabulary.
+
+    Absence is returned as an absent `PathState` rather than raised, so the
+    caller decides what a missing source means for it.
+    """
     try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.EMLINK}:
-            # O_NOFOLLOW rejection: ELOOP on Linux/macOS, EMLINK on some BSDs.
-            raise RedirectedPathError(
-                "source receipt is redirected or unsafe"
-            ) from exc
+        return capture_path_state(root, relative)
+    except (ReviewedPathIntegrityError, InvalidTransactionPath) as exc:
+        # A redirected leaf, or a path naming `.git`, `..`, or something
+        # non-canonical: either way not a source a proposal may name.
+        raise RedirectedPathError(
+            "source receipt is redirected or unsafe"
+        ) from exc
+    except ReviewedPathUnavailable as exc:
         raise ProposalSourceUnavailable(
             "source receipt could not be read"
         ) from exc
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise RedirectedPathError("source receipt is not a regular file")
-        with os.fdopen(descriptor, "rb", closefd=True) as stream:
-            descriptor = -1
-            return stream.read()
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def propose_classification(
@@ -243,7 +261,7 @@ def propose_classification(
     )
     created_at = datetime.now()
     try:
-        source_bytes = _read_no_follow_bytes(scope.root / destination.src)
+        source_bytes = _read_no_follow_bytes(scope.root, destination.src)
     except FileNotFoundError as exc:
         raise OutboxDestinationError("source receipt is missing") from exc
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
@@ -494,7 +512,7 @@ def _render_diff(scope: Scope, proposal: Proposal) -> str:
     button never describe different conditions for one cause."""
     src = scope.root / proposal.src
     try:
-        source_bytes = _read_no_follow_bytes(src)
+        source_bytes = _read_no_follow_bytes(scope.root, proposal.src)
     except FileNotFoundError as exc:
         raise MissingProposalSource("proposal source is missing") from exc
     # RedirectedPathError and ProposalSourceUnavailable are raised directly by
@@ -785,11 +803,20 @@ def approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
     proposal_rel, proposal_state, prop = _own_reviewed_proposal(
         scope, proposal_id, review_sha256
     )
-    src = scope.root / prop.src
-    try:
-        source_bytes = _read_no_follow_bytes(src)
-    except FileNotFoundError as exc:
-        raise MissingProposalSource("proposal source is missing") from exc
+    _require_destination(scope, prop)
+    _require_outbox_path(scope, prop.path, require_leaf=True)
+
+    # One capture of the source, as late as possible, and every check below
+    # is about *these* bytes. Approve used to read the source twice — a
+    # receipt read up front and an authoritative capture here — and then
+    # compare the two. Once both went through `capture_path_state` the
+    # second read was pure redundancy: the same primitive, on the same
+    # path, with the comparison standing in for a window that only existed
+    # because the first read happened at all.
+    source_state = _capture_source_state(vault, prop.src)
+    if source_state.contents is None:
+        raise MissingProposalSource("proposal source is missing")
+    source_bytes = source_state.contents
     actual_sha256 = hashlib.sha256(source_bytes).hexdigest()
     if actual_sha256 != prop.source_sha256:
         raise StaleProposalSource("proposal source has changed")
@@ -801,12 +828,6 @@ def approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
         raise OutboxDestinationError(
             "proposal source is not UTF-8 markdown"
         ) from exc
-
-    _require_destination(scope, prop)
-    _require_outbox_path(scope, prop.path, require_leaf=True)
-    source_state = capture_path_state(vault, prop.src)
-    if source_state.contents != source_bytes:
-        raise StaleProposalSource("proposal source has changed")
 
     # No mid-approval re-read of the proposal remains: `proposal_state` is
     # the state whose bytes the fingerprint matched and from which `prop`

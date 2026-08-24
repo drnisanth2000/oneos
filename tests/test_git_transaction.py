@@ -1,3 +1,5 @@
+import ctypes
+import errno
 import fcntl
 import hashlib
 import os
@@ -2132,3 +2134,86 @@ def test_a_directory_swapped_between_validation_and_open_is_refused(
     stashed = tmp_path / "stash-record.yaml"
     if stashed.exists():
         assert stashed.read_bytes() == reviewed
+
+
+def _eperm_mover(*, refuse):
+    """A stand-in mover that answers EPERM for names `refuse` selects."""
+    def move(from_descriptor, from_name, to_descriptor, to_name):
+        if refuse(os.fsdecode(from_name)):
+            ctypes.set_errno(errno.EPERM)
+            return -1
+        return os.rename(
+            os.fsdecode(from_name), os.fsdecode(to_name),
+            src_dir_fd=from_descriptor, dst_dir_fd=to_descriptor,
+        ) or 0
+    return move
+
+
+def test_eperm_about_one_file_is_not_reported_as_a_platform_limit(tmp_path, monkeypatch):
+    """Item 6 (review): `EPERM` was classed as "unsupported" unconditionally.
+
+    It is ambiguous. A seccomp filter that blocks `renameat2` answers
+    `EPERM` — Docker's default profile did — and that really is a
+    capability problem. But `EPERM` is equally the kernel's answer for a
+    refusal about *these files*: an immutable or append-only attribute, or
+    a sticky-bit directory holding a file this process does not own.
+
+    Collapsing both into `AtomicMoveUnavailable` told the operator "this
+    vault's filesystem cannot move files safely" — a whole-vault verdict
+    at `attention` severity, status 500 — when one file was unwritable.
+    Neither path mutates anything, so this is about the claim, not safety.
+
+    Here the probe's own files move fine, so the `EPERM` is about the
+    operand and must surface as the error it is.
+    """
+    directory = tmp_path / "d"
+    directory.mkdir()
+    (directory / "locked").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(transaction, "_EPERM_VERDICTS", {})
+    monkeypatch.setattr(
+        transaction, "_MOVE_NO_REPLACE",
+        _eperm_mover(refuse=lambda name: name == "locked"),
+    )
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        with pytest.raises(OSError) as caught:
+            transaction._move_no_replace(
+                descriptor, "locked", descriptor, "moved"
+            )
+    finally:
+        os.close(descriptor)
+
+    assert not isinstance(caught.value, transaction.AtomicMoveUnavailable)
+    assert caught.value.errno == errno.EPERM
+    # The probe cleaned up after itself: only the operand is left behind.
+    assert {p.name for p in directory.iterdir()} == {"locked"}
+
+
+def test_eperm_on_every_file_is_still_reported_as_a_platform_limit(tmp_path, monkeypatch):
+    """The other half: a blanket `EPERM` is a blocked syscall.
+
+    Without this, narrowing the classification above would turn a
+    seccomp-blocked `renameat2` into a raw `OSError` that no longer maps
+    to E-UNSUPPORTED, and Amendment 1's fail-closed refusal would lose
+    the outcome that explains itself.
+    """
+    directory = tmp_path / "d"
+    directory.mkdir()
+    (directory / "locked").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(transaction, "_EPERM_VERDICTS", {})
+    monkeypatch.setattr(
+        transaction, "_MOVE_NO_REPLACE",
+        _eperm_mover(refuse=lambda name: True),
+    )
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        with pytest.raises(transaction.AtomicMoveUnavailable):
+            transaction._move_no_replace(
+                descriptor, "locked", descriptor, "moved"
+            )
+    finally:
+        os.close(descriptor)
+
+    assert {p.name for p in directory.iterdir()} == {"locked"}

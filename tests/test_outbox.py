@@ -2247,22 +2247,26 @@ def test_approve_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
     commits_before = git_count_commits(vault)
     before = _approval_state(vault)
 
-    real_read = outbox._read_no_follow_bytes
+    real_capture = outbox._capture_source_state
     replaced = []
 
-    def rewrite_proposal_then_read(path):
-        # Fires on approve's source-receipt read, which sits between the
-        # fingerprint comparison and the transaction plan.
+    def rewrite_proposal_then_read(root, relative):
+        # Fires on approve's source capture, which sits between the
+        # fingerprint comparison and the transaction plan. This used to hook
+        # `_read_no_follow_bytes`, approve's separate source-receipt read;
+        # that read was collapsed into this capture once both went through
+        # `capture_path_state` and the second one became redundant. The
+        # window being probed is the same one.
         if not replaced:
             replaced.append(_rewrite_same_id_byte_only(prop))
-        return real_read(path)
+        return real_capture(root, relative)
 
-    outbox._read_no_follow_bytes = rewrite_proposal_then_read
+    outbox._capture_source_state = rewrite_proposal_then_read
     try:
         with pytest.raises(Exception) as raised:
             approve(scope, prop.id, review.sha256)
     finally:
-        outbox._read_no_follow_bytes = real_read
+        outbox._capture_source_state = real_capture
 
     assert replaced, "the probe never replaced the record"
     assert replaced[0] != review.contents

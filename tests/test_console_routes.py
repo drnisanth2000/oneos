@@ -6012,8 +6012,9 @@ def test_a_stale_delete_review_whose_current_version_has_references_shows_no_dig
     twice on this one path.
 
     The stale digest is a different matter: the out-of-band selector has
-    to name the element the browser is holding, which is keyed on the
-    bytes the operator actually reviewed. That one stays.
+    to name the container the browser is holding — which is keyed on the
+    bytes the operator actually reviewed — in order to empty it. That one
+    stays.
     """
     import yaml
 
@@ -6085,7 +6086,7 @@ def test_a_stale_delete_review_whose_current_version_has_references_shows_no_dig
     assert current not in body, body
 
     # Exactly one digest survives, and it is the stale one, present only to
-    # name the stale control being disabled out of band.
+    # name the stale control container being emptied out of band.
     digests = set(re.findall(r"[0-9a-f]{64}", body))
     assert digests == {stale["review_sha256"]}, digests
 
