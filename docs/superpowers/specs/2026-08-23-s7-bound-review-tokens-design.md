@@ -12,6 +12,11 @@ attempted, once the quarantine name is known to hold a different object.
 Amended clauses are marked *(Amendment 2)*. Rationale in “When restoration
 must not be attempted” below.
 
+**Amendment 3 (PROPOSED — not approved):** no quarantined record is ever
+renamed back on the strength of its name. Amendment 2 closed one of the
+three places that did so; this closes the class. Amended clauses are marked
+*(Amendment 3)*. Rationale in “Why a name is never enough” below.
+
 **Base:** merged `origin/main` at
 `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f`. Fresh public baseline:
 `uv run python -m pytest -q` → 926 passed.
@@ -259,10 +264,11 @@ and registry delete each
    no-overwrite move**;
 3. verify the quarantined file through an `O_NOFOLLOW` descriptor — identity
    and contents, never a fresh name lookup; and
-4. on a **contents** mismatch, move it back under its own name — again with
-   the atomic no-overwrite move — and refuse; but on an **identity** mismatch
-   perform no further mutation at all, and refuse with the substituted
-   outcome below *(Amendment 2)*.
+4. verify identity only, and on any mismatch — a different inode, or no
+   entry at all — perform no further mutation, and refuse with the
+   substituted outcome below *(Amendment 2, extended by Amendment 3)*. No
+   mismatch of any kind renames the record back: see “Why a name is never
+   enough”.
 
 #### The move must be one syscall *(Amendment 1)*
 
@@ -397,6 +403,72 @@ link currently preserves the held inode; greater than zero means some link
 existed then, and OneOS must not claim to know where it is or that recovering
 through it would be safe. The Console message is the conservative one either
 way.
+
+#### Why a name is never enough *(Amendment 3)*
+
+Amendment 2 stopped restoration after an *identity* mismatch. That was one
+instance of a general defect, not the defect. The general form: **check the
+parcel, then collect it by the shelf label.** Anything that renames a
+quarantined record back on the strength of its name can move an object that
+was substituted after the check, because POSIX has no rename that is bound to
+an inode. Three paths did this; Amendment 2 fixed one.
+
+Measured on the Amendment 2 implementation, substituting *after* the identity
+check passed and before the contents-mismatch restore: the proposal's own name
+held `DECOY-AFTER-IDENTITY`, the reviewed inode was not there, and the outcome
+was `E-CONFLICT` with `committed=no`. Identical to the defect Amendment 2 was
+written to remove, one branch further along. A second path,
+`restore_quarantined_leaf`, is used by transaction rollback and carries no
+identity binding at all. A third condition — the quarantine name *removed*
+rather than replaced — was not handled: `lstat` raised a bare
+`FileNotFoundError`, which resolved to `E-UNKNOWN`.
+
+So the rule is stated once, positively, and admits no exceptions:
+
+**No reviewed action may rename a quarantined record back under its own name
+on the strength of that name.** There is no primitive that fuses the identity
+check to the rename, so there is no safe way to do it, and narrowing the
+window is not a fix.
+
+Three consequences follow.
+
+1. **The post-move contents check is removed.** Contents are bound *before*
+   the move, through the descriptor, and that is the comparison the action
+   rests on; identity is bound *after* the move, and proves the object
+   consumed is the object reviewed. A further contents check after the move
+   can only report that the reviewed object's bytes changed after they were
+   read — and its sole remedy was the restoration this amendment forbids.
+   Detecting a condition in order to respond to it unsafely is worse than not
+   detecting it.
+
+2. **Disappearance is the same conservative outcome as substitution.** A
+   quarantine name that no longer resolves is no more recoverable than one
+   that resolves to something else, and must not escape as `E-UNKNOWN`.
+
+3. **Rollback stops restoring, in two stages.**
+
+   *Stage 1 (now).* A transaction that fails after a record was quarantined
+   leaves it quarantined and reports `E-STRANDED`, whose contract already
+   fits: the record is in quarantine, nothing was deleted, the state is
+   indeterminate. This closes the race immediately, at the cost of turning
+   an ordinary transient Git failure into manual recovery.
+
+   *Stage 2 (later).* Quarantining becomes the **last** mutation, after the
+   commit succeeds, so no rollback of it is ever required and stage 1's
+   stranding becomes rare rather than routine.
+
+   Stage 2 introduces one new state, and it is **not** `E-QUARANTINED`. That
+   outcome says "the proposal was consumed and set aside; only the cleanup
+   afterwards failed", and under quarantine-last the first clause is false:
+   the record was never consumed. It remains in the outbox, so it still
+   projects into listings, still renders a card, and can be approved or
+   rejected again — while the first action's commit is already in history.
+   Telling the operator "do not retry" while the interface keeps offering the
+   retry is a double-action hazard. The new state must say that the action
+   took effect and the proposal record is still pending, and the projection
+   must withhold controls from a record in that condition, so the second
+   action is prevented rather than merely discouraged. Its contract is to be
+   closed before stage 2 is implemented.
 
 #### What quarantine costs the working tree *(Amendment 1)*
 
