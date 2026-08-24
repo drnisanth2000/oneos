@@ -12,8 +12,8 @@ attempted, once the quarantine name is known to hold a different object.
 Amended clauses are marked *(Amendment 2)*. Rationale in “When restoration
 must not be attempted” below.
 
-**Amendment 3 (PROPOSED — not approved):** no quarantined record is ever
-renamed back on the strength of its name. Amendment 2 closed one of the
+**Amendment 3 (APPROVED — architecture and Stage 1; Stage 2 held):** no
+quarantined record is ever renamed back on the strength of its name. Amendment 2 closed one of the
 three places that did so; this closes the class. Amended clauses are marked
 *(Amendment 3)*. Rationale in “Why a name is never enough” below.
 
@@ -342,8 +342,9 @@ distinct outcomes are required:
 
   Message, verbatim: "The reviewed proposal was moved, but its quarantine
   location no longer holds it unchanged. The reviewed record may no longer
-  exist. Do not retry, and do not move files by hand. Inspect vault state
-  with git status and follow the verified recovery procedure."
+  exist. Do not retry or move files by hand. No automated recovery is
+  available. Inspect vault state
+  with git status and escalate for verified recovery."
 
   The wording deliberately does not say *replaced*: that was true of only one
   of the three conditions, and would be false for a disappearance or an
@@ -445,6 +446,17 @@ on the strength of that name.** There is no primitive that fuses the identity
 check to the rename, so there is no safe way to do it, and narrowing the
 window is not a fix.
 
+This has a consequence for descriptor lifetime, which is normative rather
+than an implementation detail. The descriptor opened on the record *before*
+it was quarantined **stays open for the whole transaction, including rollback
+diagnosis.** Every exact-byte verification — at the move, and again when
+deciding which outcome a failed transaction gets — reads through that
+descriptor. The quarantine name is never reopened to check bytes: reopening
+it is the parcel-label operation in read form, and would verify whatever the
+name resolves to at that moment rather than the object that was moved. The
+name may be `stat`ed as a diagnostic, to learn whether it still resolves to
+the descriptor's inode, but the bytes always come from the descriptor.
+
 Three consequences follow.
 
 1. **The post-move contents check stays; only its response changes.** An
@@ -489,8 +501,9 @@ Three consequences follow.
 
    Message, verbatim: "The action did not complete. The reviewed proposal is
    retained unchanged in the quarantine area, and its original name is empty.
-   Do not retry, and do not move files by hand. Inspect vault state with git
-   status and follow the verified recovery procedure."
+   Do not retry or move files by hand. No automated recovery is available.
+   Inspect vault state with git
+   status and escalate for verified recovery."
 
    **Tier.** An earlier draft put this in `recovery` with `committed=no`,
    which is not merely inconsistent — `ConsoleError.__post_init__` enforces
@@ -525,8 +538,12 @@ Three consequences follow.
    it runs, can move something other than the reviewed record, and can
    overwrite whatever holds the destination. Recovery has to be a verified
    procedure that binds identity and contents before it moves anything.
-   Defining that procedure is out of S7's scope; until it exists, the honest
-   instruction is to inspect and not to improvise.
+
+   S7 does **not** build one. Adding a restore command would turn a safety
+   fix into a new destructive surface needing its own design and review. So
+   the messages say plainly that no automated recovery is available and that
+   the operator should escalate, rather than naming a procedure that does not
+   exist or implying one is available here.
 
    This closes the race immediately, at the cost of turning an ordinary
    transient Git failure into manual recovery. Stage 2 exists to make that
