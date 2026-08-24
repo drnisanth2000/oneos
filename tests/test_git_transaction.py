@@ -2618,13 +2618,47 @@ def test_a_transaction_closes_every_descriptor_it_took_ownership_of(tmp_path):
     transaction.execute_transaction(vault, plan)
     assert open_descriptors() == before, "a descriptor was leaked on success"
 
-    # And on the failure path, where the descriptor is held all the way
-    # through rollback diagnosis before anything may close it.
+
+def test_a_failed_transaction_closes_the_descriptor_it_owns(tmp_path, monkeypatch):
+    """The failure path, on its own terms.
+
+    An earlier version of this reused the vault from the success case. The
+    source had already moved and the quarantine name was already taken, so
+    the second transaction refused *before* taking ownership of any
+    descriptor — it proved nothing about the failure path, and would have
+    passed with no release code at all.
+
+    A fresh vault, and the failure injected after `filesystem-applied`, so
+    the record is genuinely quarantined and its descriptor genuinely owned
+    by the time anything goes wrong.
+    """
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
     _write_proposal(vault)
-    plan_again = _approval_plan()
+
+    def open_descriptors() -> int:
+        return len(os.listdir("/dev/fd"))
+
+    owned_at_failure = []
+    real_checkpoint = transaction._checkpoint
+
+    def fail_after_ownership(name: str) -> None:
+        if name == "filesystem-applied":
+            # The record is in quarantine and its descriptor is held.
+            owned_at_failure.append(open_descriptors())
+            raise OSError("injected after ownership")
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_after_ownership)
+
     before = open_descriptors()
     with pytest.raises(transaction.GitTransactionError):
-        transaction.execute_transaction(vault, plan_again)
+        transaction.execute_transaction(vault, plan)
+
+    assert owned_at_failure, "the failure was never injected"
+    assert owned_at_failure[0] > before, (
+        "the descriptor was not yet owned when the failure was injected, so "
+        "this proves nothing about releasing it"
+    )
     assert open_descriptors() == before, "a descriptor was leaked on failure"
 
 
@@ -2704,3 +2738,51 @@ def test_an_unreadable_original_name_is_not_reported_as_stranded(tmp_path):
     assert len(seen) >= 2, "the original name was never stat'd"
     assert describe(outcome).code != "E-STRANDED", describe(outcome).code
     assert describe(outcome).committed == "unknown"
+
+
+def test_an_uninspectable_quarantine_entry_does_not_escape_diagnosis(tmp_path):
+    """P1 (review): the quarantine-entry `lstat` had no guard but FileNotFound.
+
+    A permission or I/O error there escaped `diagnose_quarantined_record`
+    entirely, abandoning every record queued behind it in the rollback
+    loop — the same totality defect as `_walk_to_parent`, one line down.
+    Removing the guard left the whole suite green, so it is pinned here.
+
+    It also must not report a stronger fact than it has: nothing is known
+    about what the entry holds, which is the condition the broadened
+    E-SUBSTITUTED wording ("cannot verify") exists to cover.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    record = quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    real_lstat = os.lstat
+    # Diagnosis stats the quarantine entry first; the record keeps its own
+    # name there, so only order distinguishes the two lookups.
+    target = record.name
+    seen = []
+
+    def refuse_the_quarantine_entry(path, *args, **kwargs):
+        if path == target and kwargs.get("dir_fd") is not None and not seen:
+            seen.append(path)
+            raise PermissionError(errno.EACCES, "refused")
+        return real_lstat(path, *args, **kwargs)
+
+    os.lstat = refuse_the_quarantine_entry
+    try:
+        outcome = gt.diagnose_quarantined_record(vault, record)
+    finally:
+        os.lstat = real_lstat
+        os.close(record.descriptor)
+
+    assert seen, "the quarantine entry was never stat'd"
+    assert isinstance(outcome, gt.QuarantineEntrySubstituted), outcome
+    assert outcome.condition == "unknown", outcome.condition
+    assert describe(outcome).code == "E-SUBSTITUTED"
+    assert describe(outcome).committed == "unknown"
+    # The message may not claim the location no longer holds the proposal.
+    assert "cannot verify" in describe(outcome).message

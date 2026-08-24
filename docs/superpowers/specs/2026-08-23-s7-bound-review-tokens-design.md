@@ -322,16 +322,24 @@ distinct outcomes are required:
   untouched. This is an indeterminate recovery state and must be reported as
   one. It must never be described as "nothing was changed", and nothing is
   ever deleted to tidy it up.
-- **substituted** — the quarantine location no longer holds the exact
-  reviewed proposal *(Amendment 2, generalised by Amendment 3)*. One outcome
-  covers all three ways that can be true, because the operator's position is
-  identical in each and splitting them invites the "one branch over" gap this
-  amendment exists to close:
+- **substituted** — OneOS cannot verify that the quarantine location still
+  holds the exact reviewed proposal *(Amendment 2, generalised by Amendment
+  3)*. One outcome covers every way that can be true, because the operator's
+  position is identical in each and splitting them invites the "one branch
+  over" gap this amendment exists to close:
 
   - the name resolves to a **different inode** (replacement);
-  - the name resolves to **nothing** (disappearance); or
+  - the name resolves to **nothing** (disappearance);
   - the name resolves to the **same inode with different bytes** (an in-place
-    rewrite, which passes every identity check).
+    rewrite, which passes every identity check); or
+  - the location **cannot be inspected at all** — the record's directory or
+    the quarantine cannot be opened, or a name cannot be `stat`ed.
+
+  The fourth is why the wording is "cannot verify" rather than "no longer
+  holds". An access failure is not evidence that the proposal is gone; it is
+  evidence that OneOS is not entitled to say it is there. Both warrant the
+  same `committed=unknown`, `retry=stop` response, and claiming the stronger
+  fact would be untrue.
 
   A distinct outcome from restoration blocked, and never folded into it: that
   outcome can promise both files survive, and this one cannot. Nothing further
@@ -349,15 +357,16 @@ distinct outcomes are required:
   | retry | `stop` |
   | page status | `500` |
 
-  Message, verbatim: "The reviewed proposal was moved, but its quarantine
-  location no longer holds it unchanged. The reviewed record may no longer
-  exist. Do not retry or move files by hand. No automated recovery is
-  available. Inspect vault state
-  with git status and escalate for verified recovery."
+  Message, verbatim: "The reviewed proposal was moved, but OneOS cannot
+  verify that its quarantine location still holds it unchanged. The reviewed
+  record may no longer exist. Do not retry or move files by hand. No
+  automated recovery is available. Inspect vault state with git status and
+  escalate for verified recovery."
 
-  The wording deliberately does not say *replaced*: that was true of only one
-  of the three conditions, and would be false for a disappearance or an
-  in-place rewrite.
+  The wording deliberately says neither *replaced* nor *no longer holds*.
+  "Replaced" was true of only one condition. "No longer holds" is true of
+  three but false of the fourth: when the location cannot be inspected,
+  nothing is known about what it holds.
 
   The observed `st_nlink` is carried on the typed exception as diagnostic
   evidence. It must not soften this message, must not vary it, and must not

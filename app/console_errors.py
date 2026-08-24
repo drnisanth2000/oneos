@@ -84,9 +84,13 @@ _CODES: dict[str, ConsoleError] = {
         ),
         ConsoleError(
             # S7 Amendment 2, generalised by Amendment 3. One outcome for
-            # every way the quarantine location can fail to hold the exact
-            # reviewed proposal: a different inode, no entry at all, or the
-            # same inode whose bytes were rewritten in place. The operator's
+            # every way OneOS can fail to verify that the quarantine
+            # location still holds the exact reviewed proposal: a different
+            # inode, no entry at all, the same inode whose bytes were
+            # rewritten in place, or a location that cannot be inspected —
+            # hence "cannot verify" rather than "no longer holds". An access
+            # failure is not evidence the proposal is gone, only that OneOS
+            # may not claim it is there. The operator's
             # position is identical in each — the reviewed record cannot be
             # shown to be there, no rename-back is safe, do not retry — and
             # separate codes would invite the "one branch over" gap that
@@ -96,11 +100,11 @@ _CODES: dict[str, ConsoleError] = {
             # Distinct from E-STRANDED and never folded into it: that
             # outcome promises both files survive, and this one cannot.
             "E-SUBSTITUTED", "recovery", "attention",
-            "The reviewed proposal was moved, but its quarantine location "
-            "no longer holds it unchanged. The reviewed record may no "
-            "longer exist. Do not retry or move files by hand. No automated "
-            "recovery is available. Inspect vault state with git status and "
-            "escalate for verified recovery.",
+            "The reviewed proposal was moved, but OneOS cannot verify that "
+            "its quarantine location still holds it unchanged. The reviewed "
+            "record may no longer exist. Do not retry or move files by hand. "
+            "No automated recovery is available. Inspect vault state with "
+            "git status and escalate for verified recovery.",
             "stop", "unknown", 500,
         ),
         ConsoleError(

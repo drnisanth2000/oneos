@@ -492,8 +492,38 @@ def _execute_locked(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
 ) -> TransactionResult:
-    applied_changes: list[tuple[PathChange, PathState]] = []
+    """Run one transaction, releasing every descriptor it takes ownership of.
+
+    Amendment 3 makes the transaction the owner of each quarantined
+    record's descriptor, held through commit and rollback diagnosis. The
+    release therefore sits in a `finally` around the whole body: outcome
+    composition and diagnosis are ordinary code that can raise, and a
+    release placed after them is skipped exactly when something has
+    already gone wrong.
+    """
     quarantined: list[tuple[PathChange, QuarantinedRecord]] = []
+    try:
+        return _execute_locked_body(
+            vault, start_head, reviewed_index, unrelated, plan, quarantined
+        )
+    finally:
+        for _change, _record in quarantined:
+            # Not guarded. These descriptors are owned here and closed
+            # exactly once, so a failure is a double-close or a corrupted
+            # handle — a defect in this file, which must surface rather
+            # than be absorbed as if it were normal ownership.
+            os.close(_record.descriptor)
+
+
+def _execute_locked_body(
+    vault: Path,
+    start_head: str,
+    reviewed_index: tuple[_IndexEntry, ...],
+    unrelated: _UnrelatedState,
+    plan: TransactionPlan,
+    quarantined: list[tuple[PathChange, QuarantinedRecord]],
+) -> TransactionResult:
+    applied_changes: list[tuple[PathChange, PathState]] = []
     temporary_index: str | None = None
     commit_oid: str | None = None
     commit_created = False
@@ -642,20 +672,6 @@ def _execute_locked(
             transaction_error = GitTransactionFailure(
                 "approval transaction failed and was rolled back"
             )
-
-    # Every descriptor the transaction took ownership of, released exactly
-    # once and only now: the outcome above is the last thing that needed to
-    # read through them. Amendment 3 requires them held through rollback
-    # diagnosis, which is what made this the only correct place — and what
-    # made leaking them possible, since the primitive no longer closes them.
-    for _change, _record in quarantined:
-        try:
-            os.close(_record.descriptor)
-        except OSError:
-            # Already closed or otherwise unusable. There is nothing to
-            # report: the descriptor's work is finished either way, and a
-            # close failure says nothing about the vault.
-            pass
 
     cleanup_error = None
     if temporary_index is not None:
@@ -1761,6 +1777,14 @@ def diagnose_quarantined_record(
             except FileNotFoundError:
                 return QuarantineEntrySubstituted(
                     record.relative_path, link_count, "absent"
+                )
+            except OSError:
+                # A permission or I/O error here says nothing about what the
+                # entry holds — only that it could not be inspected. Letting
+                # it escape would abandon the diagnosis of every record
+                # behind this one in the rollback loop.
+                return QuarantineEntrySubstituted(
+                    record.relative_path, link_count, "unknown"
                 )
             if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
                 return QuarantineEntrySubstituted(
