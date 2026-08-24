@@ -157,6 +157,109 @@ def _complete_state(
     }
 
 
+def _assert_everything_else_rolled_back(
+    vault: Path,
+    plan: TransactionPlan,
+    index_directory: Path,
+    before,
+    raised,
+    current=None,
+) -> None:
+    """Amendment 3, stage 1: the record stays, everything else is restored.
+
+    These tests were written against Amendment 1, which promised a
+    rolled-back approval returned the record to its own name. Amendment 3
+    withdraws that promise — automatic name-based restoration is never
+    safe, because no rename is bound to an inode — so the record is
+    retained in quarantine and the outcome says so.
+
+    Their original guarantee is *not* relaxed. Everything the transaction
+    touched apart from the record must still be restored byte-for-byte,
+    and that is still compared in full. Only the two facts that Amendment
+    3 deliberately changes are handled separately: the record is no longer
+    at its own path, and `git status` gains its quarantine entry.
+    """
+    from app.console_errors import describe
+    from app.git_transaction import quarantine_destination
+
+    if not any(
+        (vault / quarantine_destination(change.path)).exists()
+        for change in plan.owned_changes
+    ):
+        # Refused before anything was consumed. Nothing moved at all, so
+        # the original guarantee applies unchanged: the entire state,
+        # record included, is exactly as it was found.
+        assert (
+            current if current is not None
+            else _complete_state(vault, plan, index_directory)
+        ) == before
+        return
+
+    if isinstance(raised, transaction.GitTransactionRecoveryError):
+        # Amendment 3: a simultaneous failure to roll back some *other*
+        # path outranks E-RETAINED, because it invalidates that outcome's
+        # `committed=no`. The retained record is composed onto it as a
+        # note rather than replacing it, so both facts reach the operator.
+        assert raised.paths, raised
+        assert any(
+            "retained in quarantine" in note for note in raised.__notes__
+        ), getattr(raised, "__notes__", None)
+        assert describe(raised).committed == "unknown"
+    else:
+        assert isinstance(raised, transaction.QuarantinedRecordRetained), raised
+        outcome = describe(raised)
+        assert outcome.code == "E-RETAINED", outcome.code
+        assert outcome.committed == "no"
+
+    after = current if current is not None else _complete_state(
+        vault, plan, index_directory
+    )
+    for key in after:
+        if key in {"owned", "status"}:
+            continue
+        assert after[key] == before[key], key
+
+    owned_before = dict(before["owned"])
+    owned_after = dict(after["owned"])
+    consumed = {change.path for change in plan.owned_changes}
+    for path, state in owned_before.items():
+        if path in consumed:
+            # Gone from its own name — that is the consumption, retained.
+            assert owned_after[path] != state
+        else:
+            assert owned_after[path] == state, path
+
+    # And the record is really where the outcome says, holding the bytes
+    # that were reviewed.
+    for change in plan.owned_changes:
+        quarantined = vault / quarantine_destination(change.path)
+        assert quarantined.exists(), quarantined
+        assert quarantined.read_bytes() == change.before.contents
+
+
+def _assert_record_retained(vault: Path, proposal: Path, contents: bytes) -> None:
+    """The record was consumed and not renamed back (Amendment 3, stage 1).
+
+    Its own name is empty, and exactly one quarantined record holds the
+    reviewed bytes. These tests previously asserted the record was back
+    under its own name — the promise Amendment 3 withdrew, because no
+    rename is bound to an inode and collecting by name can move whatever
+    holds it.
+    """
+    quarantined = sorted((proposal.parent / ".consumed").glob("*.yaml"))
+    if not quarantined:
+        # Refused before the record was consumed: it is still under its own
+        # name, unchanged. This is the original assertion, unrelaxed.
+        assert proposal.read_bytes() == contents
+        return
+    # Consumed and retained. The reviewed bytes survive in exactly one
+    # place — never at the record's own name and in quarantine at once,
+    # which would mean something was copied rather than moved.
+    assert not proposal.exists(), proposal
+    assert len(quarantined) == 1, quarantined
+    assert quarantined[0].read_bytes() == contents
+
+
 def _prepared_transaction(
     tmp_path: Path, monkeypatch
 ) -> tuple[Path, TransactionPlan, Path, dict[str, object]]:
@@ -465,7 +568,7 @@ def test_approval_lock_closes_and_releases_when_unlock_fails(tmp_path, monkeypat
     monkeypatch.setattr(transaction.os, "close", record_close)
     monkeypatch.setattr(transaction.os, "open", record_lock_open)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         with transaction._approval_lock(vault):
             pass
 
@@ -599,7 +702,9 @@ def test_same_path_replacement_before_staging_is_not_committed(
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.read_bytes() == b"same-path replacement\n"
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 @pytest.mark.parametrize(
@@ -631,14 +736,16 @@ def test_hook_cannot_replace_reviewed_commit_tree_entry(
     hook.write_text("#!/bin/sh\nset -eu\n" + hook_body, encoding="utf-8")
     hook.chmod(0o755)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert type(raised.value) is transaction.QuarantinedRecordRetained
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_commit_tree_mode_uses_git_owner_execute_normalization(tmp_path):
@@ -692,7 +799,9 @@ def test_hook_same_path_replacement_after_staging_blocks_success(tmp_path):
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.read_bytes() == b"concurrent replacement\n"
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_head_advance_after_transaction_commit_blocks_success(tmp_path, monkeypatch):
@@ -732,7 +841,9 @@ def test_head_advance_after_transaction_commit_blocks_success(tmp_path, monkeypa
     assert git_head(vault) == newer_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
     assert git_head(vault) != start_head
 
 
@@ -753,7 +864,9 @@ def test_reviewed_staged_change_is_refused_before_filesystem_mutation(tmp_path):
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_reviewed_unstaged_change_is_refused_before_filesystem_mutation(tmp_path):
@@ -771,7 +884,9 @@ def test_reviewed_unstaged_change_is_refused_before_filesystem_mutation(tmp_path
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"unexpected unstaged\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_owned_proposal_mismatch_is_refused_before_filesystem_mutation(tmp_path):
@@ -788,7 +903,7 @@ def test_owned_proposal_mismatch_is_refused_before_filesystem_mutation(tmp_path)
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"different proposal\n"
+    _assert_record_retained(vault, proposal, b"different proposal\n")
 
 
 @pytest.mark.parametrize("proposal_git_state", ("staged", "tracked"))
@@ -812,7 +927,9 @@ def test_owned_proposal_must_be_absent_from_real_index_and_head(
     assert git_head(vault) == start_head
     assert git_status_bytes(vault) == status_before
     assert git_index_entries(vault) == index_before
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
     assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
     assert (vault / plan.commit_paths[1]).exists() is False
 
@@ -854,11 +971,12 @@ def test_failure_at_every_phase_restores_owned_and_unrelated_state(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_here, raising=False)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
     assert list(index_directory.iterdir()) == []
     with transaction._approval_lock(vault):
         pass
@@ -872,11 +990,12 @@ def test_rejecting_hook_restores_exact_starting_state(tmp_path, monkeypatch):
     hook.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
     hook.chmod(0o755)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
     assert _exception_chain_contains(raised.value, subprocess.CalledProcessError)
     assert list(index_directory.iterdir()) == []
     with transaction._approval_lock(vault):
@@ -951,7 +1070,9 @@ def test_head_ownership_preserves_newer_ref_during_recovery(tmp_path, monkeypatc
     assert git_head(vault) == newer_head
     current = _complete_state(vault, plan, index_directory)
     current["head"] = before["head"]
-    assert current == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value, current=current
+    )
     assert list(index_directory.iterdir()) == []
     with transaction._approval_lock(vault):
         pass
@@ -996,7 +1117,9 @@ def test_forward_index_sync_preserves_concurrent_reviewed_index_update(
         assert current[key] == before[key]
     assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
     assert (vault / destination).exists() is False
-    assert (vault / plan.owned_changes[0].path).read_bytes() == b"proposal\n"
+    _assert_record_retained(
+        vault, vault / plan.owned_changes[0].path, b"proposal\n"
+    )
     assert list(index_directory.iterdir()) == []
 
 
@@ -1096,15 +1219,19 @@ def test_forward_index_replace_then_exception_restores_exact_starting_state(
 
     monkeypatch.setattr(transaction.os, "replace", fail_after_real_index_replace)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert type(raised.value) is transaction.GitTransactionFailure
-    assert str(raised.value) == "approval transaction failed and was rolled back"
+    # Amendment 3, stage 1: a rollback that retains the record reports
+    # that, rather than the generic "rolled back" failure — the record was
+    # deliberately not moved back, and the outcome has to say so.
+    assert type(raised.value) is transaction.QuarantinedRecordRetained
     assert _exception_chain_contains(raised.value, OSError)
     assert replace_completed is True
     assert git_index_entries(vault) == starting_index
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
     assert index_lock.exists() is False
     with transaction._approval_lock(vault):
         pass
@@ -1194,13 +1321,15 @@ def test_recovery_holds_real_index_lock_across_compare_and_restore(
     monkeypatch.setattr(transaction, "_checkpoint", fail_after_index_sync)
     monkeypatch.setattr(transaction, "_git", race_restore)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert type(raised.value) is transaction.GitTransactionFailure
+    assert type(raised.value) is transaction.QuarantinedRecordRetained
     assert concurrent_attempt is not None
     assert concurrent_attempt.returncode != 0
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
 
 
 def test_unmerged_unrelated_stage_mutation_is_detected_during_recovery(
@@ -1239,7 +1368,9 @@ def test_unmerged_unrelated_stage_mutation_is_detected_during_recovery(
     assert (vault / conflict).read_bytes() == b"worktree stays constant\n"
     assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
     assert (vault / plan.commit_paths[1]).exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_failure_after_commit_returns_before_ownership_capture_restores_head(
@@ -1257,11 +1388,12 @@ def test_failure_after_commit_returns_before_ownership_capture_restores_head(
         transaction, "_checkpoint", fail_before_ownership_capture
     )
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
 
 
 def test_concurrent_head_before_ownership_capture_is_never_claimed(
@@ -1304,7 +1436,9 @@ def test_concurrent_head_before_ownership_capture_is_never_claimed(
     assert git_head(vault) == newer_head
     current = _complete_state(vault, plan, index_directory)
     current["head"] = before["head"]
-    assert current == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value, current=current
+    )
 
 
 def test_failure_after_real_mutation_before_apply_returns_restores_state(
@@ -1320,11 +1454,12 @@ def test_failure_after_real_mutation_before_apply_returns_restores_state(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_before_apply_returns)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
 
 
 def test_concurrent_replacement_before_apply_returns_is_preserved(
@@ -1375,18 +1510,19 @@ def test_pre_commit_failure_with_cleanup_failure_is_typed_and_restores_state(
     hook.chmod(0o755)
     _inject_temporary_index_cleanup_failure(monkeypatch, index_directory)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert type(raised.value) is transaction.GitTransactionFailure
+    assert type(raised.value) is transaction.QuarantinedRecordRetained
     assert str(raised.value) == (
-        "approval transaction failed and was rolled back; "
-        "temporary index cleanup failed"
+        "reviewed record is retained in quarantine"
     )
     current = _complete_state(vault, plan, index_directory)
     leaked_indexes = current["temporary_indexes"]
     current["temporary_indexes"] = before["temporary_indexes"]
-    assert current == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value, current=current
+    )
     assert leaked_indexes
     with transaction._approval_lock(vault):
         pass
@@ -1471,11 +1607,13 @@ def test_lock_teardown_failure_preserves_original_transaction_failure(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_before_commit)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert type(raised.value) is transaction.GitTransactionFailure
-    assert str(raised.value) == "approval transaction failed and was rolled back"
+    # Amendment 3, stage 1: a rollback that retains the record reports
+    # that, rather than the generic "rolled back" failure — the record was
+    # deliberately not moved back, and the outcome has to say so.
+    assert type(raised.value) is transaction.QuarantinedRecordRetained
     assert isinstance(raised.value.__cause__, OSError)
     assert str(raised.value.__cause__) == "injected transaction body failure"
     assert git_head(vault) == start_head
@@ -1520,13 +1658,17 @@ def test_sha256_post_commit_failure_restores_exact_starting_state(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_after_commit_capture)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert type(raised.value) is transaction.GitTransactionFailure
-    assert str(raised.value) == "approval transaction failed and was rolled back"
+    # Amendment 3, stage 1: a rollback that retains the record reports
+    # that, rather than the generic "rolled back" failure — the record was
+    # deliberately not moved back, and the outcome has to say so.
+    assert type(raised.value) is transaction.QuarantinedRecordRetained
     assert len(before["head"]) == 64
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
 
 
 # --- S7 Task 3c: quarantine safety, replacing the retired removal tests ----
@@ -1667,7 +1809,7 @@ def test_quarantine_moves_the_reviewed_record_and_keeps_its_bytes(tmp_path):
     name = quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
 
     assert not leaf.exists()
-    quarantined = vault / ".consumed" / name
+    quarantined = vault / ".consumed" / name.name
     assert quarantined.read_bytes() == reviewed
 
 
@@ -1708,43 +1850,6 @@ def _after_forward_move(gt, vault, action):
     return real, wrapper, fired
 
 
-def test_quarantine_refuses_a_swap_landing_before_verification(tmp_path):
-    """The seam that mattered in Task 3, now non-destructive.
-
-    A rewrite that lands after the record reaches quarantine but before it
-    is verified must refuse — and, unlike the deletion design, refusing
-    costs nothing: the record goes back under its own name and no bytes are
-    lost on any path.
-    """
-    import app.git_transaction as gt
-    from app.git_transaction import (
-        ReviewedStateConflict,
-        capture_path_state,
-        quarantine_path_if_unchanged,
-    )
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-
-    def rewrite_the_quarantined_file():
-        next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(
-            b"REWRITTEN-IN-QUARANTINE\n"
-        )
-
-    real, wrapper, fired = _after_forward_move(gt, vault, rewrite_the_quarantined_file)
-    gt._move_no_replace = wrapper
-    try:
-        with pytest.raises(ReviewedStateConflict):
-            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt._move_no_replace = real
-
-    assert fired, "the probe never fired"
-    # Nothing destroyed, nothing stranded: the record is back where it was,
-    # and the outbox is exactly as the refusal found it — including no empty
-    # quarantine directory left behind.
-    assert leaf.read_bytes() == b"REWRITTEN-IN-QUARANTINE\n"
-    assert not list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
 
 
 def test_a_post_verification_rewrite_cannot_destroy_anything(tmp_path):
@@ -1783,42 +1888,6 @@ def test_a_post_verification_rewrite_cannot_destroy_anything(tmp_path):
     assert len(quarantined) == 1                   # nothing destroyed
 
 
-def test_quarantine_reports_an_indeterminate_state_when_restoration_is_blocked(
-    tmp_path,
-):
-    """Both files must survive, nothing is deleted to tidy up, and the
-    outcome must not claim that nothing was changed."""
-    import app.git_transaction as gt
-    from app.console_errors import describe
-    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-
-    def rewrite_and_occupy_the_original_name():
-        next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(b"REWRITTEN\n")
-        leaf.write_bytes(b"SOMETHING ELSE TOOK THE NAME\n")
-
-    real, wrapper, fired = _after_forward_move(
-        gt, vault, rewrite_and_occupy_the_original_name
-    )
-    gt._move_no_replace = wrapper
-    try:
-        with pytest.raises(gt.QuarantineRestorationBlocked) as raised:
-            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt._move_no_replace = real
-
-    assert fired
-    assert leaf.read_bytes() == b"SOMETHING ELSE TOOK THE NAME\n"
-    stranded = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
-    assert len(stranded) == 1 and stranded[0].read_bytes() == b"REWRITTEN\n"
-
-    outcome = describe(raised.value)
-    assert outcome.code == "E-STRANDED"
-    assert "Nothing was changed" not in outcome.message
-    assert outcome.committed == "unknown"
-    assert outcome.retry == "stop"
 
 
 def test_quarantine_fails_closed_when_the_atomic_move_is_unavailable(tmp_path):
@@ -1983,66 +2052,6 @@ def test_a_consumption_fails_closed_end_to_end_on_an_unsupported_errno(tmp_path)
 # --- Task 3c review: restoration failure, creation race, directory swaps ----
 
 
-@pytest.mark.parametrize("failure", ["unsupported", "occupied", "oserror"])
-def test_any_failed_restoration_is_reported_as_stranded(tmp_path, failure):
-    """P1 (review): whatever stops the record returning to its own name, the
-    outcome is the same fact — it is still in quarantine. Reporting
-    `committed=no` / "Nothing was changed" while a record sits in `.consumed`
-    is a false statement to the operator."""
-    import ctypes
-    import errno as _errno
-
-    import app.git_transaction as gt
-    from app.console_errors import describe
-    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
-
-    vault, leaf = _conditional_vault(tmp_path)
-    expected = capture_path_state(vault, "outbox-record.yaml")
-
-    real_move = gt._MOVE_NO_REPLACE
-    calls = []
-
-    def forward_then_fail(from_fd, from_name, to_fd, to_name):
-        calls.append(1)
-        if len(calls) == 1:
-            return real_move(from_fd, from_name, to_fd, to_name)
-        if failure == "unsupported":
-            ctypes.set_errno(_errno.ENOTSUP)
-        elif failure == "occupied":
-            ctypes.set_errno(_errno.EEXIST)
-        else:
-            ctypes.set_errno(_errno.EIO)
-        return -1
-
-    real_held = gt._held_state
-    held_calls = []
-
-    def mismatch_after_the_move(descriptor):
-        # Verification now runs twice: once on the source before the move,
-        # once through the same descriptor after it. Only a mismatch on the
-        # second owes a restoration — a mismatch on the first refuses before
-        # anything has moved, which is a different (and already covered)
-        # outcome.
-        held_calls.append(1)
-        if len(held_calls) == 1:
-            return real_held(descriptor)
-        return PathState.regular(b"MISMATCH\n", 0o644)
-
-    gt._MOVE_NO_REPLACE = forward_then_fail
-    gt._held_state = mismatch_after_the_move
-    try:
-        with pytest.raises(gt.QuarantineRestorationBlocked) as raised:
-            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
-    finally:
-        gt._MOVE_NO_REPLACE = real_move
-        gt._held_state = real_held
-
-    outcome = describe(raised.value)
-    assert outcome.code == "E-STRANDED"
-    assert outcome.committed == "unknown"
-    assert "Nothing was changed" not in outcome.message
-    # And the record really is where the outcome says it is.
-    assert len(list((vault / gt.QUARANTINE_DIRECTORY).iterdir())) == 1
 
 
 def test_a_quarantine_creation_race_refuses_rather_than_accepting_it(tmp_path):
@@ -2478,3 +2487,105 @@ def test_a_substituted_quarantine_entry_is_refused_and_nothing_further_moves(
         and p.read_bytes() == decoy_bytes
     ]
     assert not elsewhere, elsewhere
+
+
+def test_a_rewrite_landing_in_quarantine_is_refused_and_nothing_moves_back(
+    tmp_path,
+):
+    """Amendment 3: the seam from Task 3, with the remedy withdrawn.
+
+    A rewrite that lands after the record reaches quarantine but before
+    verification must still refuse — identity alone cannot see it, which
+    is why the contents check survives Amendment 3. What does not survive
+    is the old response. This test previously asserted "the record goes
+    back under its own name and no bytes are lost on any path"; putting it
+    back meant renaming by a name that had just been proved untrustworthy,
+    which is the defect Amendment 3 closes.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    rewritten = b"REWRITTEN-IN-QUARANTINE\n"
+
+    def rewrite_the_quarantined_file():
+        next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(rewritten)
+
+    real, wrapper, fired = _after_forward_move(gt, vault, rewrite_the_quarantined_file)
+    gt._move_no_replace = wrapper
+    try:
+        with pytest.raises(gt.QuarantineEntrySubstituted) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._move_no_replace = real
+
+    assert fired, "the probe never fired"
+    assert raised.value.condition == "rewritten", raised.value.condition
+    assert describe(raised.value).code == "E-SUBSTITUTED"
+
+    # Nothing was renamed back: the record's own name is empty, and the
+    # rewritten bytes stayed exactly where the writer put them.
+    assert not leaf.exists(), leaf.read_bytes()
+    quarantined = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert [q.read_bytes() for q in quarantined] == [rewritten]
+
+
+@pytest.mark.parametrize(
+    "situation",
+    ["name-empty", "name-occupied", "entry-replaced", "entry-absent"],
+)
+def test_rollback_diagnosis_names_what_became_of_the_record(tmp_path, situation):
+    """Amendment 3, stage 1: rollback reads, and never renames.
+
+    This replaces three tests built on `restore_quarantined_leaf`, which
+    renamed the record back using only the quarantine name and so could
+    move an object substituted after verification. Diagnosis answers the
+    same questions without touching anything, so what used to be a
+    restoration outcome is now an observation.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    record = quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    landed = vault / gt.QUARANTINE_DIRECTORY / record.name
+    before = sorted(p.name for p in (vault / gt.QUARANTINE_DIRECTORY).iterdir())
+
+    if situation == "name-occupied":
+        leaf.write_bytes(b"something else took the name\n")
+    elif situation == "entry-replaced":
+        decoy = landed.with_name(landed.name + ".decoy")
+        decoy.write_bytes(landed.read_bytes())
+        os.replace(decoy, landed)
+    elif situation == "entry-absent":
+        landed.unlink()
+
+    try:
+        outcome = gt.diagnose_quarantined_record(vault, record)
+    finally:
+        os.close(record.descriptor)
+
+    expected_code = {
+        "name-empty": "E-RETAINED",
+        "name-occupied": "E-STRANDED",
+        "entry-replaced": "E-SUBSTITUTED",
+        "entry-absent": "E-SUBSTITUTED",
+    }[situation]
+    assert describe(outcome).code == expected_code, outcome
+
+    # Diagnosis mutated nothing: whatever the situation put in place is
+    # still exactly there, and nothing was renamed back.
+    if situation == "entry-absent":
+        assert not landed.exists()
+    else:
+        assert sorted(
+            p.name for p in (vault / gt.QUARANTINE_DIRECTORY).iterdir()
+        ) == before
+    if situation == "name-occupied":
+        assert leaf.read_bytes() == b"something else took the name\n"
+    else:
+        assert not leaf.exists(), leaf.read_bytes()

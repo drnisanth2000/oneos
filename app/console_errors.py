@@ -83,19 +83,43 @@ _CODES: dict[str, ConsoleError] = {
             "stop", "unknown", 500,
         ),
         ConsoleError(
-            # S7 Amendment 2. Distinct from E-STRANDED and never folded
-            # into it: E-STRANDED promises both files survive, and this
-            # outcome cannot. The quarantine name was rebound before
-            # verification, so the object under it is not the one that was
-            # moved there, and the reviewed record's own fate is unknown.
-            # Nothing further is changed — the substitute is left where it
-            # is and is never moved under the proposal's name.
+            # S7 Amendment 2, generalised by Amendment 3. One outcome for
+            # every way the quarantine location can fail to hold the exact
+            # reviewed proposal: a different inode, no entry at all, or the
+            # same inode whose bytes were rewritten in place. The operator's
+            # position is identical in each — the reviewed record cannot be
+            # shown to be there, no rename-back is safe, do not retry — and
+            # separate codes would invite the "one branch over" gap that
+            # Amendment 2 itself left. Deliberately does not say "replaced",
+            # which was true of only one of the three.
+            #
+            # Distinct from E-STRANDED and never folded into it: that
+            # outcome promises both files survive, and this one cannot.
             "E-SUBSTITUTED", "recovery", "attention",
             "The reviewed proposal was moved, but its quarantine location "
-            "was replaced before verification completed. The reviewed "
-            "record may no longer exist. Do not retry. Inspect vault state "
-            "with git status.",
+            "no longer holds it unchanged. The reviewed record may no "
+            "longer exist. Do not retry or move files by hand. No automated "
+            "recovery is available. Inspect vault state with git status and "
+            "escalate for verified recovery.",
             "stop", "unknown", 500,
+        ),
+        ConsoleError(
+            # S7 Amendment 3, stage 1. Rollback no longer renames a
+            # quarantined record back, so the ordinary outcome of a failed
+            # transaction is that the record stays put. E-STRANDED does not
+            # fit: it says another file holds the proposal name and that
+            # both were preserved, and after a plain failure the name is
+            # empty and there is no second file. `integrity` rather than
+            # `recovery` because this state is determinate: recovery outcomes
+            # must report committed=unknown, and this one truthfully reports
+            # no, under the three preconditions in design §3.
+            "E-RETAINED", "integrity", "attention",
+            "The action did not complete. The reviewed proposal is retained "
+            "unchanged in the quarantine area, and its original name is "
+            "empty. Do not retry or move files by hand. No automated "
+            "recovery is available. Inspect vault state with git status and "
+            "escalate for verified recovery.",
+            "stop", "no", 500,
         ),
         ConsoleError(
             # S7 Amendment 1. Fails closed: OneOS refuses rather than
@@ -285,6 +309,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.QuarantineCleanupError: _CODES["E-QUARANTINED"],
     _git_transaction.QuarantineRestorationBlocked: _CODES["E-STRANDED"],
     _git_transaction.QuarantineEntrySubstituted: _CODES["E-SUBSTITUTED"],
+    _git_transaction.QuarantinedRecordRetained: _CODES["E-RETAINED"],
     _git_transaction.AtomicMoveUnavailable: _CODES["E-UNSUPPORTED"],
     _git_transaction._ReviewedIndexOwnershipConflict: _CODES["E-CONFLICT"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],

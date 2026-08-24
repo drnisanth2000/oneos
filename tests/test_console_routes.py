@@ -2662,6 +2662,13 @@ def _status_lines_excluding(raw: bytes, *excluded: str) -> list[bytes]:
         path = entry[3:]  # porcelain v1: "XY path"
         if path in excluded_bytes:
             continue
+        # Amendment 3, stage 1: a rolled-back transaction retains the
+        # consumed record in quarantine rather than renaming it back, so
+        # its untracked entry is expected here for the same reason the
+        # owned path's is. Quarantine is durable infrastructure and its
+        # contents are never tracked.
+        if b"/.consumed/" in path or path.startswith(b".consumed/"):
+            continue
         kept.append(entry)
     return kept
 
@@ -2864,7 +2871,11 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
     # bytes. This is the disjunct `_state_proof_unknown` cannot exercise.
     assert destination.read_bytes() == concurrent_bytes
     assert source.read_bytes() == source_before
-    assert proposal_path.read_bytes() == proposal_before
+    # Amendment 3, stage 1: the record is retained in quarantine, with the
+    # exact bytes it had, rather than renamed back under its own name.
+    assert not proposal_path.exists(), proposal_path.read_bytes()
+    quarantined = sorted((proposal_path.parent / ".consumed").glob("*.yaml"))
+    assert [q.read_bytes() for q in quarantined] == [proposal_before]
 
 
 def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):

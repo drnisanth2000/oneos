@@ -537,8 +537,10 @@ happened.
   - if restoration is blocked because the original name is now occupied, the
     outcome is the indeterminate recovery one — both files preserved, nothing
     deleted to tidy up;
-  - a rolled-back approval leaves the proposal pending and actionable again,
-    with a fingerprint that still matches its unchanged bytes; and
+  - a rolled-back approval leaves the proposal retained in quarantine and
+    reports `E-RETAINED`, rather than moving it back — automatic name-based
+    restoration is never safe *(Amendment 3, stage 1; this clause previously
+    promised the proposal was left pending and actionable again)*; and
   - reject has no commit to roll back, so its only rollback is the mismatch
     restoration already specified.
 

@@ -651,10 +651,17 @@ def test_registry_delete_commit_failure_restores_registry_and_proposal_bytes(
     with pytest.raises(registry.RegistryTransactionError) as raised:
         execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
-    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+    # Amendment 3, stage 1: as above — the record stays in quarantine.
+    assert isinstance(
+        raised.value.__cause__, git_transaction.QuarantinedRecordRetained
+    )
     assert git_head(vault) == head_before
     assert registry_path.read_bytes() == registry_bytes
-    assert proposal.path.read_bytes() == proposal_bytes
+    # The record is retained in quarantine, unchanged, rather than
+    # renamed back (Amendment 3, stage 1).
+    assert not proposal.path.exists(), proposal.path.read_bytes()
+    quarantined = sorted((proposal.path.parent / ".consumed").glob("*.yaml"))
+    assert [q.read_bytes() for q in quarantined] == [proposal_bytes]
     _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
 
 

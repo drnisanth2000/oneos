@@ -252,9 +252,18 @@ fuses the check to the removal.
 
 So S7 stops relying on winning the race and changes what losing it costs.
 Consumption becomes an atomic rename into a quarantine area, which is
-**non-destructive**: if the wrong file is moved, it can be moved back, and
-nothing is gone. The guarantee stops being a property of timing and becomes a
-property of the construction.
+**non-destructive**: losing the race cannot delete content. The guarantee
+stops being a property of timing and becomes a property of the construction.
+
+*(Amendment 3 replaces what this clause originally claimed.)* It first read
+"if the wrong file is moved, it can be moved back, and nothing is gone" —
+resting the safety of quarantine on automatic restoration. Amendment 3
+establishes that automatic name-based restoration is never safe, so that
+justification cannot stand and is not merely qualified here. What survives,
+and is the stronger claim, is that nothing is destroyed: whatever the race
+does, the result is **retained or diagnosed, never automatically restored**.
+Stage 1 accepts that a lost race strands the record; stage 2 makes stranding
+rare.
 
 The rule: **no reviewed action may unlink a proposal record.** Approve, reject
 and registry delete each

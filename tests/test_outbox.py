@@ -1117,11 +1117,17 @@ def test_injected_transaction_failure_restores_source_destination_and_exact_prop
     with pytest.raises(outbox.OutboxTransactionError) as raised:
         approve(scope, prop.id, _fp(scope, prop.id))
 
-    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back, and reports that instead of the generic failure.
+    assert isinstance(
+        raised.value.__cause__, git_transaction.QuarantinedRecordRetained
+    )
     assert git_head(vault) == head_before
     assert source.read_bytes() == source_bytes
     assert destination.exists() is False
-    assert prop.path.read_bytes() == proposal_bytes
+    # Retained in quarantine, unchanged, rather than renamed back.
+    assert not prop.path.exists(), prop.path.read_bytes()
+    assert [q.read_bytes() for q in _quarantined(vault)] == [proposal_bytes]
     _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
 
 
@@ -2331,13 +2337,22 @@ def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
         gt._move_no_replace = real_move
 
     assert swapped, "the probe never swapped the proposal"
-    assert describe(raised.value).code in {"E-CONFLICT", "E-TAMPER"}
+    # Amendment 3. The swap here is an in-place rewrite of the quarantined
+    # file — same inode, new bytes — which every identity check passes and
+    # only the contents check can see. That is E-SUBSTITUTED's "rewritten"
+    # condition.
+    assert describe(raised.value).code == "E-SUBSTITUTED", describe(
+        raised.value
+    ).code
 
-    # Nothing was destroyed: the record is back under its own name, holding
-    # the replacement bytes, and nothing is stranded in quarantine.
-    assert prop.path.exists(), "the record was destroyed"
-    assert prop.path.read_bytes() == replacement
-    assert not _quarantined(vault), "a record was stranded in quarantine"
+    # Nothing was destroyed, and nothing was renamed back. This previously
+    # asserted the record was "back under its own name, holding the
+    # replacement bytes" — which is OneOS moving an object nobody reviewed
+    # under the reviewed record's name, the defect Amendment 3 closes. The
+    # replacement stays exactly where its writer put it.
+    assert not prop.path.exists(), prop.path.read_bytes()
+    quarantined = _quarantined(vault)
+    assert [q.read_bytes() for q in quarantined] == [replacement]
 
     # Approve moved nothing and committed nothing.
     assert git_count_commits(vault) == commits_before
@@ -2355,7 +2370,9 @@ def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
         for entry in prop.path.parent.iterdir()
         if entry.name != _gt.QUARANTINE_DIRECTORY
     )
-    assert leftovers == [prop.path.name], (
+    # Empty now, not the record's own name: the record was consumed and
+    # retained rather than renamed back.
+    assert leftovers == [], (
         f"unexpected leftovers in {proposal_rel}'s directory: {leftovers}"
     )
 

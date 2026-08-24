@@ -76,26 +76,59 @@ class AtomicMoveUnavailable(GitTransactionError):
 
 
 class QuarantineEntrySubstituted(GitTransactionError):
-    """The quarantine name no longer identifies the object moved into it.
+    """The quarantine location no longer holds the exact reviewed proposal.
 
-    S7 Amendment 2. Detected after the move, so the move is *not* undone —
-    undoing it by name would relocate the substitute under the reviewed
-    record's name, which is the one thing this outcome exists to stop
-    OneOS doing. After detection no further mutation is performed.
+    S7 Amendment 2, generalised by Amendment 3. Covers all three ways that
+    can be true, because the operator's position is identical in each:
+
+    - `"replaced"` — the name resolves to a different inode;
+    - `"absent"` — the name resolves to nothing; or
+    - `"rewritten"` — the same inode, whose bytes changed in place. Identity
+      alone cannot see this one, which is why the contents check survives
+      Amendment 3 even though its old remedy did not.
+
+    Detected after the move, so the move is *not* undone. Undoing it by name
+    would relocate whatever now holds that name under the reviewed record's
+    name — the one thing this outcome exists to stop OneOS doing. After
+    detection no further mutation is performed.
 
     `link_count` is the reviewed inode's `st_nlink` at the moment of
     detection, carried as diagnostic evidence. Zero means no filesystem
-    link preserved it then; greater than zero means some link existed,
-    with no claim about where or whether following it would be safe. It
-    does not soften or vary the operator message.
+    link preserved it then; greater than zero means some link existed, with
+    no claim about where or whether following it would be safe. It never
+    softens or varies the operator message.
     """
 
-    def __init__(self, path: str, link_count: int) -> None:
+    def __init__(self, path: str, link_count: int, condition: str) -> None:
         self.path = path
         self.link_count = link_count
+        self.condition = condition
         super().__init__(
-            "quarantined record was replaced before verification"
+            f"quarantined record is not the reviewed proposal ({condition})"
         )
+
+
+class QuarantinedRecordRetained(GitTransactionError):
+    """The action did not complete; the record is retained in quarantine.
+
+    S7 Amendment 3, stage 1. Rollback no longer renames a quarantined
+    record back — there is no rename bound to an inode, so collecting by
+    name can move something other than the record. The record therefore
+    stays where it is and this says so.
+
+    `committed=no` is a claim with preconditions (design §3): the
+    quarantine location must hold the exact reviewed bytes, verified
+    through the descriptor still open on the record; the original name
+    must be observed empty; and every other change must have rolled back.
+    The caller checks the first two before raising this and must not raise
+    it when the third fails — an accompanying rollback failure makes the
+    state indeterminate, and only this outcome is outranked by it.
+    """
+
+    def __init__(self, path: str, quarantined_name: str) -> None:
+        self.path = path
+        self.quarantined_name = quarantined_name
+        super().__init__("reviewed record is retained in quarantine")
 
 
 class QuarantineRestorationBlocked(GitTransactionError):
@@ -559,11 +592,31 @@ def _execute_locked(
         if isinstance(exc, _ReviewedIndexOwnershipConflict):
             blocked_paths.update(exc.paths)
         if stranded_records:
-            # A consumed record that could not be returned to its own name is
-            # a more specific fact than "rollback was blocked", and the only
-            # one that tells the operator both files survive and where the
-            # record is. It outranks the generic recovery outcome.
-            transaction_error = stranded_records[0]
+            # What became of the record is more specific than "rollback was
+            # blocked", and is the only fact that says where the record is.
+            # It outranks the generic recovery outcome.
+            #
+            # Amendment 3: a *simultaneous* rollback failure outranks
+            # E-RETAINED alone, because what it invalidates is that
+            # outcome's `committed=no` claim — precondition 3, that every
+            # other change rolled back. It must not replace E-SUBSTITUTED
+            # or E-STRANDED: both already report `committed=unknown`, and
+            # both say something more specific than "a rollback failed".
+            primary = _rank_quarantine_outcomes(stranded_records)
+            # `blocked_paths` now holds only genuine failures to roll back
+            # *other* owned paths, so any entry in it is the simultaneous
+            # failure that invalidates E-RETAINED's `committed=no`.
+            if isinstance(primary, QuarantinedRecordRetained) and blocked_paths:
+                transaction_error = GitTransactionRecoveryError(
+                    tuple(blocked_paths)
+                )
+                transaction_error.add_note(
+                    "The reviewed record is retained in quarantine as "
+                    f"{primary.quarantined_name!r}; other changes did not "
+                    "roll back, so the state is indeterminate."
+                )
+            else:
+                transaction_error = primary
         elif blocked_paths:
             transaction_error = GitTransactionRecoveryError(tuple(blocked_paths))
         else:
@@ -577,7 +630,14 @@ def _execute_locked(
 
     if transaction_error is not None:
         if cleanup_error is not None:
-            if isinstance(transaction_error, QuarantineRestorationBlocked):
+            if isinstance(
+                transaction_error,
+                (
+                    QuarantineRestorationBlocked,
+                    QuarantineEntrySubstituted,
+                    QuarantinedRecordRetained,
+                ),
+            ):
                 # A consumed record stranded in quarantine outranks a
                 # leftover temporary index. Replacing it here would report
                 # "the commit failed and was rolled back; nothing was
@@ -614,6 +674,26 @@ def _execute_locked(
     return result
 
 
+def _rank_quarantine_outcomes(
+    outcomes: tuple[GitTransactionError, ...],
+) -> GitTransactionError:
+    """The most specific thing that can truthfully be said.
+
+    A record whose quarantine location no longer holds it outranks one
+    whose original name is occupied, which outranks one merely retained:
+    each says strictly more about what an operator will find.
+    """
+    for kind in (
+        QuarantineEntrySubstituted,
+        QuarantineRestorationBlocked,
+        QuarantinedRecordRetained,
+    ):
+        for outcome in outcomes:
+            if isinstance(outcome, kind):
+                return outcome
+    return outcomes[0]
+
+
 def _rollback_transaction(
     vault: Path,
     start_head: str,
@@ -625,29 +705,27 @@ def _rollback_transaction(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
     applied_changes: list[tuple[PathChange, PathState]],
-    quarantined: list[tuple[PathChange, str]] = (),
-) -> tuple[tuple[str, ...], tuple[QuarantineRestorationBlocked, ...]]:
+    quarantined: list[tuple[PathChange, QuarantinedRecord]] = (),
+) -> tuple[tuple[str, ...], tuple[GitTransactionError, ...]]:
     blocked_paths: set[str] = set()
-    stranded: list[QuarantineRestorationBlocked] = []
+    stranded: list[GitTransactionError] = []
 
-    # Amendment 1: a rolled-back approval must leave the proposal pending and
-    # actionable again, with a fingerprint that still matches its unchanged
-    # bytes — so the record is moved back, not rewritten from a copy.
-    for change, quarantined_name in reversed(list(quarantined)):
-        try:
-            restore_quarantined_leaf(vault, change.path, quarantined_name)
-        except QuarantineRestorationBlocked as exc:
-            # Keep it: this is the one outcome that names what actually
-            # happened — the record is in quarantine, something else holds
-            # its name, and both survive. Collapsing it into the generic
-            # blocked-path set would report E-RECOVER ("rollback was blocked
-            # by a change made at the same time"), which describes a
-            # different situation and does not tell the operator where the
-            # record is.
-            stranded.append(exc)
-            blocked_paths.add(change.path)
-        except (OSError, GitTransactionError):
-            blocked_paths.add(change.path)
+    # Amendment 3, stage 1: a rolled-back approval no longer moves the
+    # record back. There is no rename bound to an inode, so collecting it by
+    # name can move whatever holds that name — the defect Amendment 2
+    # removed from the consumption path, reached through rollback instead.
+    # The record stays in quarantine and rollback only says what became of
+    # it, reading through the descriptor it has held since before the move.
+    for _change, record in reversed(list(quarantined)):
+        # Deliberately *not* added to `blocked_paths`. That set means
+        # "rollback was attempted on this path and blocked by an unexpected
+        # concurrent state". Amendment 3 does not attempt proposal
+        # restoration at all, so a retained record is a matter of policy,
+        # not a blocked rollback — and putting it there would silently
+        # redefine what every existing path tuple means. What became of the
+        # record is carried by its own outcome instead, which says more
+        # than the generic set ever could.
+        stranded.append(diagnose_quarantined_record(vault, record))
 
     for change, state_written in reversed(applied_changes):
         try:
@@ -1364,6 +1442,25 @@ def _open_quarantine(parent_descriptor: int) -> int:
     )
 
 
+@dataclass(frozen=True)
+class QuarantinedRecord:
+    """A consumed record, plus the descriptor that proves what it is.
+
+    The descriptor was opened on the record *before* it was quarantined and
+    stays open for the whole transaction, including rollback diagnosis
+    (design §3, Amendment 3). Every exact-byte verification reads through
+    it; the quarantine name is never reopened to check bytes, because that
+    would verify whatever the name resolves to at that moment rather than
+    the object that was moved. Its owner closes it exactly once, after the
+    final diagnosis.
+    """
+
+    relative_path: str
+    name: str
+    descriptor: int
+    expected: PathState
+
+
 def _quarantine_reviewed_leaf(
     parent_descriptor: int,
     leaf: str,
@@ -1409,7 +1506,7 @@ def _quarantine_reviewed_leaf(
 
     try:
         # The reviewed object, established before anything moves.
-        held = _held_state(descriptor)
+        held = _held_state(descriptor)  # noqa: F841 — read for its checks
         if held != expected:
             raise ReviewedStateChanged(
                 f"reviewed path changed before mutation: {path}"
@@ -1449,29 +1546,14 @@ def _quarantine_reviewed_leaf(
                 "reviewed record could not be consumed"
             ) from exc
 
-        def _restore() -> None:
-            try:
-                _move_no_replace(
-                    quarantine_descriptor, leaf, parent_descriptor, leaf
-                )
-            except (OSError, GitTransactionError) as exc:
-                # Whatever stopped it — an occupied name, an I/O failure, or
-                # a move primitive that turned out to be unavailable — the
-                # fact is the same: the record is still in quarantine.
-                # Reporting anything that says nothing changed would be a
-                # false statement about state the operator can see.
-                raise QuarantineRestorationBlocked(path) from exc
-
-        # Identity first, and on its own terms (Amendment 2). If the
-        # quarantine name no longer names the inode that was moved into
-        # it, restoring by that name would move the *substitute* under the
-        # reviewed record's name — OneOS installing an object nobody
-        # reviewed, as a step of a refusal. So nothing further is mutated
-        # here: not the substitute, not the quarantine, not the record's
-        # name. The move already happened and is not undone, which is
-        # exactly what E-SUBSTITUTED says.
-        landed = os.lstat(leaf, dir_fd=quarantine_descriptor)
-        if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
+        # Amendment 3: three ways the quarantine location can fail to hold
+        # the exact reviewed proposal, one outcome, and no rename-back in
+        # any of them. Renaming by that name would move whatever now holds
+        # it under the reviewed record's name — OneOS performing the
+        # substitution itself, as a step of a refusal. So nothing further
+        # is mutated here. The move already happened and is not undone,
+        # which is exactly what E-SUBSTITUTED says.
+        def _substituted(condition: str) -> QuarantineEntrySubstituted:
             # Diagnostic only: whether any name still refers to the
             # reviewed inode at this instant. It does not change the
             # outcome or the message.
@@ -1479,23 +1561,36 @@ def _quarantine_reviewed_leaf(
                 link_count = os.fstat(descriptor).st_nlink
             except OSError:
                 link_count = -1
-            raise QuarantineEntrySubstituted(path, link_count)
+            return QuarantineEntrySubstituted(path, link_count, condition)
 
-        # Contents, through the descriptor still held, so an in-place
-        # rewrite during the move is caught too. Here the object under the
-        # name *is* the one that was moved, so restoring by name returns
-        # the reviewed record and nothing else.
         try:
-            if _held_state(descriptor) != expected:
-                raise ReviewedStateChanged(
-                    f"reviewed path changed before mutation: {path}"
-                )
-        except BaseException:
-            _restore()
-            raise
-    finally:
+            landed = os.lstat(leaf, dir_fd=quarantine_descriptor)
+        except FileNotFoundError as exc:
+            # Removed rather than replaced. Just as unrecoverable, and it
+            # must not escape as a bare OSError resolving to E-UNKNOWN.
+            raise _substituted("absent") from exc
+        if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
+            raise _substituted("replaced")
+
+        # Contents, read through the descriptor held across the move —
+        # never by reopening the quarantine name, which would verify
+        # whatever that name resolves to now rather than the object moved.
+        #
+        # This check survives Amendment 3 while its old remedy does not.
+        # Identity and contents are independent: an in-place rewrite keeps
+        # the same device, inode and name, so every identity check above
+        # passes while the bytes are no longer the reviewed bytes. Dropping
+        # it would let OneOS act on the reviewed version while consuming a
+        # changed one — the substitution S7 exists to prevent, reached
+        # without any rename at all.
+        if _held_state(descriptor) != expected:
+            raise _substituted("rewritten")
+    except BaseException:
         os.close(descriptor)
-    return leaf
+        raise
+    # Deliberately still open: the caller owns it from here, and closes it
+    # once the transaction's outcome is decided.
+    return leaf, descriptor
 
 
 def _walk_to_parent(vault: Path, relative_path: str) -> tuple[int, str]:
@@ -1516,8 +1611,13 @@ def _walk_to_parent(vault: Path, relative_path: str) -> tuple[int, str]:
 
 def quarantine_path_if_unchanged(
     vault: Path, relative_path: str, expected: PathState
-) -> str:
-    """Consume one reviewed regular leaf by moving it into quarantine."""
+) -> QuarantinedRecord:
+    """Consume one reviewed regular leaf by moving it into quarantine.
+
+    Returns a handle whose descriptor is **still open**. The caller owns it
+    and must close it exactly once, after the outcome is decided — see
+    `QuarantinedRecord`.
+    """
     try:
         _validate_transaction_path(relative_path)
     except ValueError as exc:
@@ -1535,12 +1635,13 @@ def quarantine_path_if_unchanged(
         # content and costs nothing; a silently failing cleanup does.
         quarantine_descriptor = _open_quarantine(parent_descriptor)
         try:
-            return _quarantine_reviewed_leaf(
+            name, descriptor = _quarantine_reviewed_leaf(
                 parent_descriptor, leaf, expected,
                 quarantine_descriptor, relative_path,
             )
         finally:
             os.close(quarantine_descriptor)
+        return QuarantinedRecord(relative_path, name, descriptor, expected)
     finally:
         os.close(parent_descriptor)
 
@@ -1556,48 +1657,92 @@ def consume_reviewed_proposal(
     same record, so it takes the lock itself.
     """
     root = Path(os.path.abspath(os.fspath(vault)))
-    quarantined: str | None = None
+    record: QuarantinedRecord | None = None
     try:
-        with _approval_lock(root):
-            quarantined = quarantine_path_if_unchanged(root, relative_path, expected)
-    except _ApprovalLockCleanupFailure as exc:
-        # Mirrors `execute_transaction`: once the work has happened, a cleanup
-        # failure may not be reported as "nothing was changed".
-        if quarantined is None:
-            raise
-        raise QuarantineCleanupError(exc.cleanup_error) from exc.cleanup_error
-    return quarantined
+        try:
+            with _approval_lock(root):
+                record = quarantine_path_if_unchanged(root, relative_path, expected)
+        except _ApprovalLockCleanupFailure as exc:
+            # Mirrors `execute_transaction`: once the work has happened, a
+            # cleanup failure may not be reported as "nothing was changed".
+            if record is None:
+                raise
+            raise QuarantineCleanupError(exc.cleanup_error) from exc.cleanup_error
+        return record.name
+    finally:
+        # Reject runs no transaction and therefore has no rollback to
+        # diagnose, so the descriptor's work is finished the moment the
+        # consumption is. Closed on every path, exactly once.
+        if record is not None:
+            os.close(record.descriptor)
 
 
-def restore_quarantined_leaf(
-    vault: Path, relative_path: str, quarantined_name: str
-) -> None:
-    """Move a quarantined record back under its own name (rollback)."""
+def diagnose_quarantined_record(
+    vault: Path, record: QuarantinedRecord
+) -> GitTransactionError:
+    """Say what became of one quarantined record. Mutates nothing.
+
+    S7 Amendment 3, stage 1. This replaces `restore_quarantined_leaf`,
+    which renamed the record back using only the quarantine name and so
+    could move an object substituted after verification — the same defect
+    Amendment 2 removed from the consumption path, reached through
+    rollback instead.
+
+    Every question is answered by reading: the bytes through the
+    descriptor held since before the move, and the two names by `stat`.
+    Nothing is renamed, created or removed.
+    """
+    # Does the quarantine location still hold the exact reviewed proposal?
+    # Identity by name, bytes by descriptor — never bytes by name.
+    parent_descriptor, leaf = _walk_to_parent(vault, record.relative_path)
     try:
-        _validate_transaction_path(relative_path)
-    except ValueError as exc:
-        raise InvalidTransactionPath("reviewed path is unsafe") from exc
-    parent_descriptor, leaf = _walk_to_parent(vault, relative_path)
-    try:
-        # Opening the quarantine is inside the clause too. If `.consumed/`
-        # has been removed or swapped by the time rollback runs, the record
-        # is just as stranded as if the move itself failed — and reporting
-        # the generic recovery outcome instead would drop the one fact the
-        # operator needs, which is *where the record is*.
+        try:
+            identity = os.fstat(record.descriptor)
+            link_count = identity.st_nlink
+        except OSError:
+            return QuarantineEntrySubstituted(record.relative_path, -1, "absent")
+
         try:
             quarantine_descriptor = _open_checked_directory(
                 QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
             )
-        except (OSError, GitTransactionError) as exc:
-            raise QuarantineRestorationBlocked(relative_path) from exc
-        try:
-            _move_no_replace(
-                quarantine_descriptor, quarantined_name, parent_descriptor, leaf
+        except (OSError, GitTransactionError):
+            return QuarantineEntrySubstituted(
+                record.relative_path, link_count, "absent"
             )
-        except (OSError, GitTransactionError) as exc:
-            raise QuarantineRestorationBlocked(relative_path) from exc
+        try:
+            try:
+                landed = os.lstat(record.name, dir_fd=quarantine_descriptor)
+            except FileNotFoundError:
+                return QuarantineEntrySubstituted(
+                    record.relative_path, link_count, "absent"
+                )
+            if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
+                return QuarantineEntrySubstituted(
+                    record.relative_path, link_count, "replaced"
+                )
+            try:
+                if _held_state(record.descriptor) != record.expected:
+                    return QuarantineEntrySubstituted(
+                        record.relative_path, link_count, "rewritten"
+                    )
+            except (OSError, GitTransactionError):
+                return QuarantineEntrySubstituted(
+                    record.relative_path, link_count, "rewritten"
+                )
         finally:
             os.close(quarantine_descriptor)
+
+        # The record is intact and where we left it. Is its own name free?
+        try:
+            os.lstat(leaf, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            return QuarantinedRecordRetained(record.relative_path, record.name)
+        except OSError:
+            return QuarantineRestorationBlocked(record.relative_path)
+        # Something occupies it. Both files were observed and neither was
+        # touched, which is exactly what E-STRANDED says.
+        return QuarantineRestorationBlocked(record.relative_path)
     finally:
         os.close(parent_descriptor)
 
