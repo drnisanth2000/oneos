@@ -264,11 +264,11 @@ and registry delete each
    no-overwrite move**;
 3. verify the quarantined file through an `O_NOFOLLOW` descriptor — identity
    and contents, never a fresh name lookup; and
-4. verify identity only, and on any mismatch — a different inode, or no
-   entry at all — perform no further mutation, and refuse with the
-   substituted outcome below *(Amendment 2, extended by Amendment 3)*. No
-   mismatch of any kind renames the record back: see “Why a name is never
-   enough”.
+4. verify **both** identity and contents through the descriptor held across
+   the move, and on any mismatch — a different inode, no entry at all, or
+   the same inode with different bytes — perform no further mutation and
+   refuse *(Amendment 2, extended by Amendment 3)*. No mismatch of any kind
+   renames the record back: see “Why a name is never enough”.
 
 #### The move must be one syscall *(Amendment 1)*
 
@@ -432,14 +432,19 @@ window is not a fix.
 
 Three consequences follow.
 
-1. **The post-move contents check is removed.** Contents are bound *before*
-   the move, through the descriptor, and that is the comparison the action
-   rests on; identity is bound *after* the move, and proves the object
-   consumed is the object reviewed. A further contents check after the move
-   can only report that the reviewed object's bytes changed after they were
-   read — and its sole remedy was the restoration this amendment forbids.
-   Detecting a condition in order to respond to it unsafely is worse than not
-   detecting it.
+1. **The post-move contents check stays; only its response changes.** An
+   earlier draft of this amendment proposed removing it, on the reasoning
+   that identity after the move already proves the object consumed is the
+   object reviewed. That reasoning was wrong, and the error is worth
+   recording: identity and contents are independent. A writer can rewrite a
+   file *in place* — same device, same inode, same name — and every identity
+   check still passes while the bytes are no longer the reviewed bytes.
+   Removing the check would let OneOS act on the reviewed version while
+   consuming a changed one, which is the exact substitution S7 exists to
+   prevent, achieved without any rename at all.
+
+   So the check remains. What changes is what happens when it fails: stop,
+   leave the record in quarantine, and report — never rename it back.
 
 2. **Disappearance is the same conservative outcome as substitution.** A
    quarantine name that no longer resolves is no more recoverable than one
@@ -448,10 +453,40 @@ Three consequences follow.
 3. **Rollback stops restoring, in two stages.**
 
    *Stage 1 (now).* A transaction that fails after a record was quarantined
-   leaves it quarantined and reports `E-STRANDED`, whose contract already
-   fits: the record is in quarantine, nothing was deleted, the state is
-   indeterminate. This closes the race immediately, at the cost of turning
-   an ordinary transient Git failure into manual recovery.
+   leaves it quarantined and reports a new outcome. `E-STRANDED` does **not**
+   fit and must not be reused: its message says another file now holds the
+   proposal's name and that both files are preserved. After a plain
+   transaction failure the original name is simply *empty* — there is no
+   second file — so that message would be false in both of its claims.
+   `E-STRANDED` keeps its existing meaning, for the case where something
+   does occupy the original name.
+
+   The stage-1 contract is closed here:
+
+   | field | value |
+   | --- | --- |
+   | code | `E-RETAINED` |
+   | tier | `recovery` |
+   | severity | `attention` |
+   | committed | `no` |
+   | retry | `stop` |
+   | page status | `500` |
+
+   Message, verbatim: "The action did not complete, and the reviewed
+   proposal is retained in the quarantine area. Its original name is empty.
+   Move it back manually before acting on it again. Do not retry. Inspect
+   vault state with git status."
+
+   `committed` is `no` rather than `unknown` because this state is
+   determinate, unlike `E-STRANDED`: the action did not take effect, and the
+   record's location is known. Which of the two outcomes applies is decided
+   by a diagnostic *read* of the original name at rollback time — never by
+   attempting the rename — and, as with `st_nlink`, the message reports what
+   was observed at that instant and claims nothing beyond it.
+
+   This closes the race immediately, at the cost of turning an ordinary
+   transient Git failure into manual recovery. Stage 2 exists to make that
+   rare.
 
    *Stage 2 (later).* Quarantining becomes the **last** mutation, after the
    commit succeeds, so no rollback of it is ever required and stage 1's
