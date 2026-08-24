@@ -7,6 +7,11 @@ quarantined rather than deleted. Amended clauses are marked
 *(Amendment 1)*. Rationale in “Why deletion cannot satisfy criterion 4”
 below.
 
+**Amendment 2 (PROPOSED — not approved):** restoration is abandoned, not
+attempted, once the quarantine name is known to hold a different object.
+Amended clauses are marked *(Amendment 2)*. Rationale in “When restoration
+must not be attempted” below.
+
 **Base:** merged `origin/main` at
 `d7ad86b651c5f5f7c1adad8af94a0b767fb30a8f`. Fresh public baseline:
 `uv run python -m pytest -q` → 926 passed.
@@ -254,8 +259,10 @@ and registry delete each
    no-overwrite move**;
 3. verify the quarantined file through an `O_NOFOLLOW` descriptor — identity
    and contents, never a fresh name lookup; and
-4. on any mismatch, move it back under its own name — again with the atomic
-   no-overwrite move — and refuse.
+4. on a **contents** mismatch, move it back under its own name — again with
+   the atomic no-overwrite move — and refuse; but on an **identity** mismatch
+   perform no further mutation at all, and refuse with the substituted
+   outcome below *(Amendment 2)*.
 
 #### The move must be one syscall *(Amendment 1)*
 
@@ -300,11 +307,22 @@ distinct outcomes are required:
   untouched. This is an indeterminate recovery state and must be reported as
   one. It must never be described as "nothing was changed", and nothing is
   ever deleted to tidy it up.
+- **substituted** — the quarantine name no longer identifies the object that
+  was moved into it *(Amendment 2)*. This is a distinct outcome from
+  restoration blocked, and must not be folded into it: restoration blocked
+  can promise that both files survive, and this cannot. It is reported with
+  `committed=unknown` and `retry=stop`, and states plainly that the reviewed
+  record was moved for consumption, that the quarantine name was then
+  replaced, and that the reviewed record may no longer exist. Nothing further
+  is changed: the substitute is left exactly where it is and is never moved
+  under the proposal's name.
 - **unsupported** — the atomic no-overwrite move is unavailable here. Nothing
   was changed, and no action is possible on this vault until it is resolved.
 
 A refusal that completes restoration leaves every proposal record exactly as
 it found it. A refusal that cannot complete restoration does not, and says so.
+A refusal that discovers a substitution can promise neither, and says that
+*(Amendment 2)*.
 
 The quarantine directory itself is the one exception, and deliberately so:
 it is durable infrastructure, created on first use and never removed. A
@@ -312,6 +330,44 @@ refusal may therefore leave an empty `.consumed/` behind. Removing it again
 would add a cleanup step whose failure the operator could not see — the
 refusal they are shown is about the proposal, not about a directory — and a
 silently failing cleanup is a worse thing to own than an empty directory.
+
+#### When restoration must not be attempted *(Amendment 2)*
+
+Step 3 verifies identity because the quarantine name can be rebound between
+the move and the verification. Step 4 originally restored on *any* mismatch,
+which is correct for a contents mismatch — the object under the name is still
+the object that was moved — and actively harmful for an identity mismatch,
+where it is known not to be.
+
+Restoring by name after an identity mismatch moves the **substitute** under
+the reviewed record's name. OneOS thereby installs an object nobody reviewed
+where the reviewed record used to be, and does it as a deliberate step of a
+refusal. Meanwhile the reviewed inode, unlinked by whatever rebound the name,
+survives only as long as the descriptor OneOS still holds, and is destroyed
+when that descriptor closes. Measured on the pre-amendment implementation: the
+reviewed inode had no remaining link anywhere in the vault, the proposal's own
+name held the substitute's bytes, and the outcome reported was `E-CONFLICT`
+with `committed=no` — "nothing was changed" — which was false in both
+directions at once.
+
+The reviewed object cannot be saved portably once another writer has unlinked
+it. Re-linking an open descriptor into a directory requires
+`linkat(AT_EMPTY_PATH)`, which is Linux-only and privileged, and has no macOS
+equivalent. Reconstructing the record from the verified bytes still held would
+produce a *different* inode and would write during a recovery path, which is
+reconstruction — forbidden by decision 8's principle that OneOS never rebuilds
+a record it could not read.
+
+So S7 stops trying. **After detecting an identity mismatch, no further
+mutation is performed.** The quarantine move has already happened and is not
+undone; that is precisely what the outcome must say, rather than claiming
+either that nothing changed or that both files survive.
+
+`st_nlink` on the held descriptor is recorded as diagnostic evidence at the
+moment of detection, and is not a recovery signal: zero means no filesystem
+link currently preserves the held inode; greater than zero means some link
+exists, and OneOS must not claim to know where it is or that recovering
+through it would be safe.
 
 #### What quarantine costs the working tree *(Amendment 1)*
 
