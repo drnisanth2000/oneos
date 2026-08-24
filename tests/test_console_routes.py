@@ -2662,13 +2662,6 @@ def _status_lines_excluding(raw: bytes, *excluded: str) -> list[bytes]:
         path = entry[3:]  # porcelain v1: "XY path"
         if path in excluded_bytes:
             continue
-        # Amendment 3, stage 1: a rolled-back transaction retains the
-        # consumed record in quarantine rather than renaming it back, so
-        # its untracked entry is expected here for the same reason the
-        # owned path's is. Quarantine is durable infrastructure and its
-        # contents are never tracked.
-        if b"/.consumed/" in path or path.startswith(b".consumed/"):
-            continue
         kept.append(entry)
     return kept
 
@@ -2863,9 +2856,37 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
     # appear as a new untracked entry in status — excluded from the
     # comparison rather than asserted byte-identical, the same "excluding
     # the reviewed/owned path" shape I1's registry fix uses.
+    # Amendment 3, stage 1: the record is retained in quarantine rather
+    # than renamed back, so its own quarantine destination is expected in
+    # status too. Excluded by exact path, never by pattern — a blanket
+    # `.consumed/` skip would also hide unrelated entities' records, wrong
+    # suffixes and nested files, and this proof exists to catch those.
+    from app.git_transaction import quarantine_destination
+
+    retained = quarantine_destination(
+        f"alpha/outbox/{proposal_id}.yaml"
+    )
     assert _status_lines_excluding(
-        git_status_bytes(vault), destination_relative
-    ) == _status_lines_excluding(status_before, destination_relative)
+        git_status_bytes(vault), destination_relative, retained
+    ) == _status_lines_excluding(status_before, destination_relative, retained)
+
+    # And the exclusion is exact: a decoy alongside it, and one under
+    # another entity, must both still be seen.
+    decoy = vault / "alpha/outbox/.consumed/not-this-record.yaml"
+    decoy.write_bytes(b"decoy\n")
+    other = vault / "beta/outbox/.consumed"
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "another-entity.yaml").write_bytes(b"decoy\n")
+    try:
+        seen = _status_lines_excluding(
+            git_status_bytes(vault), destination_relative, retained
+        )
+        assert any(b"not-this-record.yaml" in line for line in seen), seen
+        assert any(b"another-entity.yaml" in line for line in seen), seen
+    finally:
+        decoy.unlink()
+        (other / "another-entity.yaml").unlink()
+        other.rmdir()
 
     # The owned path — the destination — matches the CONCURRENT WRITER's
     # bytes. This is the disjunct `_state_proof_unknown` cannot exercise.

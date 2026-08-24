@@ -199,7 +199,14 @@ def _assert_everything_else_rolled_back(
         # Amendment 3: a simultaneous failure to roll back some *other*
         # path outranks E-RETAINED, because it invalidates that outcome's
         # `committed=no`. The retained record is composed onto it as a
-        # note rather than replacing it, so both facts reach the operator.
+        # note rather than being dropped.
+        #
+        # The note is diagnostic, not operator-facing: nothing in the
+        # Console reads `__notes__`, so it reaches logs and tracebacks
+        # only. What the operator sees is the primary outcome, whose
+        # message directs them to inspect vault state — which is where the
+        # retained record is visible. This comment previously claimed both
+        # facts reached the operator, which was untrue.
         assert raised.paths, raised
         assert any(
             "retained in quarantine" in note for note in raised.__notes__
@@ -2589,3 +2596,111 @@ def test_rollback_diagnosis_names_what_became_of_the_record(tmp_path, situation)
         assert leaf.read_bytes() == b"something else took the name\n"
     else:
         assert not leaf.exists(), leaf.read_bytes()
+
+
+def test_a_transaction_closes_every_descriptor_it_took_ownership_of(tmp_path):
+    """P1 (review): Amendment 3 made the transaction the descriptor's owner.
+
+    `_quarantine_reviewed_leaf` used to close the descriptor itself. Stage
+    1 requires it held through commit and rollback diagnosis, so ownership
+    moved up — and nothing closed it. Every approve and every registry
+    delete leaked one descriptor, on success and on failure alike;
+    measured at one per successful approve before the fix.
+    """
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+
+    def open_descriptors() -> int:
+        return len(os.listdir("/dev/fd"))
+
+    before = open_descriptors()
+    transaction.execute_transaction(vault, plan)
+    assert open_descriptors() == before, "a descriptor was leaked on success"
+
+    # And on the failure path, where the descriptor is held all the way
+    # through rollback diagnosis before anything may close it.
+    _write_proposal(vault)
+    plan_again = _approval_plan()
+    before = open_descriptors()
+    with pytest.raises(transaction.GitTransactionError):
+        transaction.execute_transaction(vault, plan_again)
+    assert open_descriptors() == before, "a descriptor was leaked on failure"
+
+
+def test_an_unreachable_record_directory_does_not_abandon_the_diagnosis(tmp_path):
+    """P1 (review): diagnosis runs per record during rollback.
+
+    `_walk_to_parent` opens directories and can raise. It sat outside the
+    guard, so a failure there escaped `diagnose_quarantined_record`,
+    abandoning every record queued behind it — and turning a diagnosis
+    into an exception the rollback loop never expected.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    record = quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    real_walk = gt._walk_to_parent
+
+    def refuse_to_walk(vault_arg, relative_path):
+        raise gt.ReviewedPathUnavailable("cannot reach the record's directory")
+
+    gt._walk_to_parent = refuse_to_walk
+    try:
+        outcome = gt.diagnose_quarantined_record(vault, record)
+    finally:
+        gt._walk_to_parent = real_walk
+        os.close(record.descriptor)
+
+    # A diagnosis, not an exception — and not E-STRANDED, which would claim
+    # another file holds the name and that both survive.
+    assert isinstance(outcome, gt.GitTransactionError)
+    assert describe(outcome).code == "E-SUBSTITUTED", describe(outcome).code
+    assert describe(outcome).committed == "unknown"
+
+
+def test_an_unreadable_original_name_is_not_reported_as_stranded(tmp_path):
+    """P1 (review): E-STRANDED asserts a second file was observed.
+
+    Any `OSError` from the original name's `lstat` used to become
+    E-STRANDED — "something else now holds its name. Both it and that file
+    are preserved." A permission or I/O error proves neither half, and
+    equally does not prove the record is safely retained, so
+    E-RETAINED's `committed=no` cannot be claimed either.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    record = quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    real_lstat = os.lstat
+    # The record keeps its own name inside quarantine, so both lookups pass
+    # the same string; only their order tells them apart. Diagnosis stats
+    # the quarantine entry first, the original name second.
+    target = Path(record.relative_path).name
+    seen = []
+
+    def refuse_the_original_name(path, *args, **kwargs):
+        if path == target and kwargs.get("dir_fd") is not None:
+            seen.append(path)
+            if len(seen) >= 2:
+                raise PermissionError(errno.EACCES, "refused")
+        return real_lstat(path, *args, **kwargs)
+
+    os.lstat = refuse_the_original_name
+    try:
+        outcome = gt.diagnose_quarantined_record(vault, record)
+    finally:
+        os.lstat = real_lstat
+        os.close(record.descriptor)
+
+    assert len(seen) >= 2, "the original name was never stat'd"
+    assert describe(outcome).code != "E-STRANDED", describe(outcome).code
+    assert describe(outcome).committed == "unknown"

@@ -493,7 +493,7 @@ def _execute_locked(
     plan: TransactionPlan,
 ) -> TransactionResult:
     applied_changes: list[tuple[PathChange, PathState]] = []
-    quarantined: list[tuple[PathChange, str]] = []
+    quarantined: list[tuple[PathChange, QuarantinedRecord]] = []
     temporary_index: str | None = None
     commit_oid: str | None = None
     commit_created = False
@@ -513,7 +513,10 @@ def _execute_locked(
             )
         # Amendment 1: owned changes are proposal records, and a proposal
         # record is consumed by moving it into quarantine — never unlinked.
-        # A rollback moves it back under its own name.
+        # Amendment 3, stage 1: a rollback does *not* move it back. There is
+        # no rename bound to an inode, so collecting it by name could move
+        # whatever holds that name; rollback diagnoses instead, and the
+        # record stays where it is.
         for change in plan.owned_changes:
             quarantined.append(
                 (
@@ -617,12 +620,42 @@ def _execute_locked(
                 )
             else:
                 transaction_error = primary
+                if blocked_paths:
+                    # Composed, never discarded. These outcomes stay primary
+                    # because they already report `committed=unknown` and say
+                    # more than "a rollback failed" — but the paths that did
+                    # not roll back are still part of what happened, and were
+                    # previously dropped on the floor here.
+                    #
+                    # This note is *diagnostic*: nothing in the Console reads
+                    # `__notes__`, so it reaches logs and tracebacks, not the
+                    # operator. What reaches the operator is the primary
+                    # outcome, whose message already directs them to inspect
+                    # vault state — which is where these paths show up.
+                    transaction_error.add_note(
+                        "these paths also did not roll back: "
+                        + ", ".join(sorted(blocked_paths))
+                    )
         elif blocked_paths:
             transaction_error = GitTransactionRecoveryError(tuple(blocked_paths))
         else:
             transaction_error = GitTransactionFailure(
                 "approval transaction failed and was rolled back"
             )
+
+    # Every descriptor the transaction took ownership of, released exactly
+    # once and only now: the outcome above is the last thing that needed to
+    # read through them. Amendment 3 requires them held through rollback
+    # diagnosis, which is what made this the only correct place — and what
+    # made leaking them possible, since the primitive no longer closes them.
+    for _change, _record in quarantined:
+        try:
+            os.close(_record.descriptor)
+        except OSError:
+            # Already closed or otherwise unusable. There is nothing to
+            # report: the descriptor's work is finished either way, and a
+            # close failure says nothing about the vault.
+            pass
 
     cleanup_error = None
     if temporary_index is not None:
@@ -1467,7 +1500,7 @@ def _quarantine_reviewed_leaf(
     expected: PathState,
     quarantine_descriptor: int,
     path: str,
-) -> str:
+) -> tuple[str, int]:
     """Move one reviewed leaf into quarantine, or leave everything as found.
 
     The move is atomic and cannot overwrite. Verification runs through a
@@ -1694,7 +1727,19 @@ def diagnose_quarantined_record(
     """
     # Does the quarantine location still hold the exact reviewed proposal?
     # Identity by name, bytes by descriptor — never bytes by name.
-    parent_descriptor, leaf = _walk_to_parent(vault, record.relative_path)
+    #
+    # Totality matters here: this runs during rollback, once per quarantined
+    # record, and an exception escaping it would abandon the diagnosis of
+    # every record after it. `_walk_to_parent` opens directories and can
+    # raise, so it is inside the guard, not before it.
+    try:
+        parent_descriptor, leaf = _walk_to_parent(vault, record.relative_path)
+    except (OSError, GitTransactionError):
+        # The record's own directory cannot even be reached, so nothing can
+        # be established about either location. `committed=unknown` is the
+        # only truthful shape, and E-STRANDED is the wrong one — it would
+        # claim another file occupies the name and that both survive.
+        return QuarantineEntrySubstituted(record.relative_path, -1, "unknown")
     try:
         try:
             identity = os.fstat(record.descriptor)
@@ -1737,9 +1782,19 @@ def diagnose_quarantined_record(
         try:
             os.lstat(leaf, dir_fd=parent_descriptor)
         except FileNotFoundError:
+            # Observed empty. With the bytes verified above and the caller
+            # checking that everything else rolled back, E-RETAINED's three
+            # preconditions hold.
             return QuarantinedRecordRetained(record.relative_path, record.name)
         except OSError:
-            return QuarantineRestorationBlocked(record.relative_path)
+            # An I/O or permission error is not evidence that another file
+            # holds the name, and E-STRANDED would assert exactly that —
+            # "something else now holds its name. Both it and that file are
+            # preserved." Nothing here proves either half. It also does not
+            # prove the record is safely retained, so E-RETAINED's
+            # `committed=no` cannot be claimed. What is true is that the
+            # original name could not be established at all.
+            return QuarantineEntrySubstituted(record.relative_path, link_count, "unknown")
         # Something occupies it. Both files were observed and neither was
         # touched, which is exactly what E-STRANDED says.
         return QuarantineRestorationBlocked(record.relative_path)
