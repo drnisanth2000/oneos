@@ -1223,66 +1223,41 @@ _MOVE_NO_REPLACE = _atomic_mover()
 #: this process does not own. Treating both as unsupported told the operator
 #: "this vault's filesystem cannot move files safely" — a whole-vault verdict
 #: at `attention` severity — when the truth was one unwritable file.
-#:
-#: Neither outcome mutates anything, so this is a truthfulness fix, not a
-#: safety one. `_eperm_is_a_capability_problem` distinguishes them by asking
-#: the filesystem directly.
 _UNSUPPORTED_ERRNOS = {
     errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP,
 }
 
-#: Probe verdicts, keyed by `st_dev`. A seccomp block is process-wide, but a
-#: filesystem restriction is not, so a verdict may not be shared across
-#: devices.
-_EPERM_VERDICTS: dict[int, bool] = {}
+#: Whether the move syscall itself is reachable, resolved at most once.
+_MOVE_REACHABLE: bool | None = None
 
 
-def _eperm_is_a_capability_problem(to_descriptor: int) -> bool:
-    """Is `EPERM` here about the syscall, or about the files?
+def _move_syscall_is_blocked() -> bool:
+    """Is `EPERM` from the mover about the syscall, or about the files?
 
-    Ask the same filesystem, through the same code path, using a pair of
-    files this process just created and therefore certainly owns: if a
-    no-overwrite move of *those* is also refused with `EPERM`, nothing about
-    the operands explains it and the operation itself is unavailable. If the
-    probe succeeds, the original `EPERM` was a genuine refusal about the
-    caller's own files.
+    Answered without touching the filesystem at all. A seccomp filter acts
+    at syscall entry, before the kernel looks at any argument, so a call
+    with deliberately invalid descriptors and empty names separates the two
+    cases: a *blocked* syscall still answers `EPERM`, while a reachable one
+    gets as far as validating its arguments and answers `EBADF` (or another
+    argument error). Either way the call cannot succeed and cannot name a
+    real file, so there is nothing to create, move, or clean up.
 
-    A probe that cannot be set up at all answers nothing, so it declines to
-    claim a capability problem — the caller then reports the `EPERM` it
-    actually received rather than inventing a platform verdict.
+    An earlier version of this probed by creating a file in the target
+    directory and moving it. That put writes inside the vault on a refusal
+    path, outside the Git transaction, with the cleanup swallowing `OSError`
+    so an artifact could survive — which is exactly the invariant S5 and S7
+    exist to hold. A classification is not worth a write.
+
+    Anything other than `EPERM` means the syscall ran, so the answer is no.
     """
-    try:
-        device = os.fstat(to_descriptor).st_dev
-    except OSError:
-        return False
-    if device in _EPERM_VERDICTS:
-        return _EPERM_VERDICTS[device]
-
-    source = f".oneos-probe-{os.getpid()}-{secrets.token_hex(6)}"
-    target = f"{source}-moved"
-    try:
-        descriptor = os.open(
-            source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
-            dir_fd=to_descriptor,
-        )
-    except OSError:
-        return False
-    os.close(descriptor)
-    try:
+    global _MOVE_REACHABLE
+    if _MOVE_REACHABLE is None:
         ctypes.set_errno(0)
-        outcome = _MOVE_NO_REPLACE(
-            to_descriptor, os.fsencode(source),
-            to_descriptor, os.fsencode(target),
-        )
-        blocked = outcome != 0 and ctypes.get_errno() == errno.EPERM
-    finally:
-        for leaf in (source, target):
-            try:
-                os.unlink(leaf, dir_fd=to_descriptor)
-            except OSError:
-                pass
-    _EPERM_VERDICTS[device] = blocked
-    return blocked
+        outcome = _MOVE_NO_REPLACE(-1, b"", -1, b"")
+        # A success here would mean the call did something with no valid
+        # operands, which cannot happen; treat it as reachable regardless.
+        _MOVE_REACHABLE = outcome == 0 or ctypes.get_errno() != errno.EPERM
+    return not _MOVE_REACHABLE
 
 
 def _move_no_replace(
@@ -1307,7 +1282,7 @@ def _move_no_replace(
     if code == errno.EEXIST:
         raise FileExistsError(code, os.strerror(code), to_name)
     if code in _UNSUPPORTED_ERRNOS or (
-        code == errno.EPERM and _eperm_is_a_capability_problem(to_descriptor)
+        code == errno.EPERM and _move_syscall_is_blocked()
     ):
         raise AtomicMoveUnavailable(
             "this filesystem has no atomic no-overwrite move"

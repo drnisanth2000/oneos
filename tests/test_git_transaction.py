@@ -2136,10 +2136,134 @@ def test_a_directory_swapped_between_validation_and_open_is_refused(
         assert stashed.read_bytes() == reviewed
 
 
-def _eperm_mover(*, refuse):
-    """A stand-in mover that answers EPERM for names `refuse` selects."""
+def _vault_snapshot(root: Path):
+    """Every name, mode and byte under `root`, for proving nothing changed."""
+    entries = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        entries[relative] = (
+            stat.S_IFMT(info.st_mode),
+            stat.S_IMODE(info.st_mode),
+            path.read_bytes() if path.is_file() and not path.is_symlink() else None,
+        )
+    return entries
+
+
+def _refuse_all_writes(monkeypatch, root: Path):
+    """Make any attempt to create or remove anything under `root` fail loudly.
+
+    A snapshot comparison proves no *surviving* artifact. It cannot prove no
+    write happened: a probe that creates a file and deletes it again leaves
+    the tree identical. This closes that gap, and it is also the
+    cleanup-failure condition — `unlink` here raises, so a classifier that
+    created something could not tidy it away even if it tried.
+    """
+    attempts = []
+    real_open, real_unlink, real_rename = os.open, os.unlink, os.rename
+
+    def guard(name, real, *, creates):
+        def wrapped(*args, **kwargs):
+            target = args[0] if args else None
+            inside = False
+            try:
+                candidate = Path(os.fsdecode(target))
+                inside = kwargs.get("dir_fd") is not None or candidate.is_absolute() and (
+                    root in candidate.parents or candidate == root
+                )
+            except (TypeError, ValueError):
+                inside = kwargs.get("dir_fd") is not None
+            if inside and creates(args, kwargs):
+                attempts.append((name, target))
+                raise OSError(errno.EACCES, "refused by test guard")
+            return real(*args, **kwargs)
+        return wrapped
+
+    monkeypatch.setattr(
+        os, "open",
+        guard("open", real_open,
+              creates=lambda a, k: bool((a[1] if len(a) > 1 else 0) & os.O_CREAT)),
+    )
+    monkeypatch.setattr(
+        os, "unlink", guard("unlink", real_unlink, creates=lambda a, k: True)
+    )
+    monkeypatch.setattr(
+        os, "rename", guard("rename", real_rename, creates=lambda a, k: True)
+    )
+    return attempts
+
+
+@pytest.mark.parametrize(
+    "blocked", [False, True], ids=["eperm-about-one-file", "syscall-blocked"]
+)
+def test_eperm_classification_writes_nothing_into_the_vault(
+    tmp_path, monkeypatch, blocked
+):
+    """P1 (review): classifying `EPERM` must not touch the vault.
+
+    An earlier version answered the "syscall or operands?" question by
+    creating a file in the *target directory* and moving it. That is a
+    write inside the vault on a refusal path, outside the Git transaction,
+    and its cleanup suppressed `OSError` so an artifact could survive —
+    the exact invariant S5 and S7 hold. The claim "neither path mutates
+    anything" was false while that probe existed.
+
+    Both classifications are driven here, under a guard that fails any
+    create, unlink or rename under the vault — which is simultaneously the
+    cleanup-failure condition, since a classifier that created something
+    could not remove it. The tree is compared byte-for-byte as well, so
+    neither a surviving artifact nor a create-then-delete passes.
+    """
+    vault = tmp_path / "vault"
+    (vault / "outbox").mkdir(parents=True)
+    (vault / "outbox/locked").write_text("reviewed\n", encoding="utf-8")
+    directory = vault / "outbox"
+
+    monkeypatch.setattr(transaction, "_MOVE_REACHABLE", None)
+    monkeypatch.setattr(
+        transaction, "_MOVE_NO_REPLACE", _eperm_mover(blocked=blocked)
+    )
+
+    before = _vault_snapshot(vault)
+    attempts = _refuse_all_writes(monkeypatch, vault)
+
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        with pytest.raises(Exception) as caught:
+            transaction._move_no_replace(
+                descriptor, "locked", descriptor, "moved"
+            )
+    finally:
+        os.close(descriptor)
+
+    if blocked:
+        assert isinstance(caught.value, transaction.AtomicMoveUnavailable)
+    else:
+        assert not isinstance(caught.value, transaction.AtomicMoveUnavailable)
+        assert caught.value.errno == errno.EPERM
+
+    assert attempts == [], f"classification attempted vault writes: {attempts}"
+    assert _vault_snapshot(vault) == before
+
+
+def _eperm_mover(*, blocked):
+    """A stand-in mover modelling the two ways `EPERM` can arise.
+
+    `blocked=True` is a seccomp-filtered syscall: it answers `EPERM` to
+    everything, argument-validity included, because the filter runs before
+    the kernel reads any argument. `blocked=False` is a reachable syscall
+    that refuses one particular operand — so the classifier's no-operand
+    call reaches argument validation and gets `EBADF`, exactly as the real
+    syscall does.
+    """
     def move(from_descriptor, from_name, to_descriptor, to_name):
-        if refuse(os.fsdecode(from_name)):
+        if blocked:
+            ctypes.set_errno(errno.EPERM)
+            return -1
+        if from_descriptor < 0 or not from_name:
+            ctypes.set_errno(errno.EBADF)
+            return -1
+        if os.fsdecode(from_name) == "locked":
             ctypes.set_errno(errno.EPERM)
             return -1
         return os.rename(
@@ -2170,10 +2294,10 @@ def test_eperm_about_one_file_is_not_reported_as_a_platform_limit(tmp_path, monk
     directory.mkdir()
     (directory / "locked").write_text("x", encoding="utf-8")
 
-    monkeypatch.setattr(transaction, "_EPERM_VERDICTS", {})
+    monkeypatch.setattr(transaction, "_MOVE_REACHABLE", None)
     monkeypatch.setattr(
         transaction, "_MOVE_NO_REPLACE",
-        _eperm_mover(refuse=lambda name: name == "locked"),
+        _eperm_mover(blocked=False),
     )
     descriptor = os.open(directory, os.O_RDONLY)
     try:
@@ -2202,10 +2326,10 @@ def test_eperm_on_every_file_is_still_reported_as_a_platform_limit(tmp_path, mon
     directory.mkdir()
     (directory / "locked").write_text("x", encoding="utf-8")
 
-    monkeypatch.setattr(transaction, "_EPERM_VERDICTS", {})
+    monkeypatch.setattr(transaction, "_MOVE_REACHABLE", None)
     monkeypatch.setattr(
         transaction, "_MOVE_NO_REPLACE",
-        _eperm_mover(refuse=lambda name: True),
+        _eperm_mover(blocked=True),
     )
     descriptor = os.open(directory, os.O_RDONLY)
     try:

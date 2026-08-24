@@ -434,10 +434,23 @@ operations and does not compose into one guarantee — another writer can take
 the reservation in between, and the rename destroys what took it. Do not
 reintroduce that shape.
 
-Availability depends on the kernel *and* the filesystem, so probe by
-attempting the operation and translating `ENOSYS`/`EINVAL`/`EOPNOTSUPP` into
-the unsupported outcome. **Fail closed**: refuse the action, change nothing,
-never degrade to a destructive path.
+Availability depends on the kernel *and* the filesystem, so learn it by
+attempting the real operation and translating `ENOSYS`/`EINVAL`/`EOPNOTSUPP`
+into the unsupported outcome. **Fail closed**: refuse the action, change
+nothing, never degrade to a destructive path.
+
+`EPERM` is not in that set, because it is ambiguous: a seccomp filter that
+blocks the syscall answers `EPERM`, and so does a refusal about these
+particular files. It is disambiguated by calling the mover with invalid
+descriptors and empty names — a blocked syscall still answers `EPERM`, while
+a reachable one gets as far as argument validation and answers `EBADF`.
+
+No classification may write anywhere in the vault. A refusal path that
+created even a temporary file would be vault state changed outside the Git
+transaction, which is the invariant S5 and S7 exist to hold; an in-vault
+probe was written and withdrawn for exactly this reason, and the regression
+that caught it guards any create, unlink or rename under the vault during
+classification.
 
 - [ ] **GREEN — the consumption primitive.** Add one narrow public API beside
 `remove_path_if_unchanged`, which it replaces for proposal consumption:
