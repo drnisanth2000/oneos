@@ -522,11 +522,18 @@ Three consequences follow.
    3. every other change in the transaction rolled back successfully.
 
    If any of them fails, `E-RETAINED` must not be reported. A quarantine
-   location that no longer holds the reviewed proposal is `E-SUBSTITUTED`; an
-   occupied original name is `E-STRANDED`; and **any simultaneous rollback
-   failure makes the state indeterminate, so the outcome must report
-   `committed=unknown`** and must not be downgraded to this one. Where two
-   apply, the indeterminate outcome outranks the determinate one.
+   location that no longer holds the reviewed proposal is `E-SUBSTITUTED`;
+   an occupied original name is `E-STRANDED`.
+
+   A simultaneous rollback failure outranks **`E-RETAINED` only**, because
+   the thing it invalidates is precondition 3, and therefore the
+   `committed=no` claim. It must not replace either of the others: both
+   already report `committed=unknown`, and both say something more specific
+   than "a rollback failed" — that the exact reviewed bytes could not be
+   verified, or that two files were observed. Replacing them would trade a
+   precise description for a vaguer one and hide what the operator most
+   needs. Where a rollback failure accompanies them it is **composed** onto
+   the primary outcome, never substituted for it.
 
    Which outcome applies is decided by diagnostic *reads* — never by
    attempting the rename — and, as with `st_nlink`, each reports what was
