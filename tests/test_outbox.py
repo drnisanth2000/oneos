@@ -2856,3 +2856,176 @@ def test_an_unmovable_record_is_a_refusal_not_an_unhandled_error(tmp_path, actio
     assert not sorted(vault.rglob(".consumed/*.yaml"))
     assert prop.path.exists()
     assert not (vault / prop.dst).exists()
+
+
+@pytest.mark.parametrize(
+    "condition", ["replaced", "absent", "rewritten"]
+)
+def test_reject_refuses_every_post_move_quarantine_condition(tmp_path, condition):
+    """Amendment 3, through the action that has no rollback.
+
+    Reject consumes directly under the approval lock — no transaction, no
+    rollback — so its only exposure to a substituted quarantine entry is
+    the window inside the consumption primitive itself. All three
+    conditions must reach the operator as E-SUBSTITUTED, and none may
+    rename anything back.
+    """
+    import ctypes
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    reviewed_bytes = prop.path.read_bytes()
+    before = _approval_state(vault)
+    decoy = b"NOT-THE-REVIEWED-RECORD\n"
+
+    real_move = gt._MOVE_NO_REPLACE
+    fired = []
+
+    def act_after_the_move(ffd, fname, tfd, tname):
+        outcome = real_move(ffd, fname, tfd, tname)
+        if outcome != 0 or fired:
+            return outcome
+        fired.append(True)
+        landed = next((vault / "demo/outbox" / gt.QUARANTINE_DIRECTORY).iterdir())
+        if condition == "replaced":
+            other = landed.with_name(landed.name + ".other")
+            other.write_bytes(decoy)
+            os.replace(other, landed)          # different inode
+        elif condition == "absent":
+            landed.unlink()
+        else:
+            landed.write_bytes(decoy)          # same inode, new bytes
+        return outcome
+
+    gt._MOVE_NO_REPLACE = act_after_the_move
+    try:
+        with pytest.raises(Exception) as raised:
+            outbox.reject(scope, prop.id, review.sha256)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+
+    assert fired, "the probe never fired"
+    outcome = describe(raised.value)
+    assert outcome.code == "E-SUBSTITUTED", outcome.code
+    assert outcome.committed == "unknown"
+    assert outcome.retry == "stop"
+
+    # Nothing renamed back: the record's own name is empty in every case,
+    # and whatever the writer left is exactly where they left it.
+    assert not prop.path.exists(), prop.path.read_bytes()
+    quarantined = _quarantined(vault)
+    if condition == "absent":
+        assert quarantined == []
+    else:
+        assert [q.read_bytes() for q in quarantined] == [decoy]
+        assert reviewed_bytes not in [q.read_bytes() for q in quarantined]
+
+    # And reject touched nothing else. Compared on tracked state only:
+    # untracked output legitimately differs here, because the probe itself
+    # removed or replaced a file in the outbox, and that is the writer's
+    # doing rather than reject's.
+    after = _approval_state(vault)
+    for fact in ("head", "index", "worktree"):
+        assert after[fact] == before[fact], fact
+    assert (vault / prop.src).exists(), "reject moved the source"
+    assert not (vault / prop.dst).exists(), "reject created the destination"
+
+
+def test_approve_reports_a_substitution_that_lands_before_rollback(tmp_path, monkeypatch):
+    """Amendment 3: the seam that only a *transaction* has.
+
+    Consumption succeeds, the transaction then fails, and a writer
+    replaces the quarantine entry in between. Rollback used to rename that
+    entry back under the reviewed record's name; it now diagnoses, and the
+    diagnosis must see the substitution rather than reporting the record
+    safely retained.
+
+    The distinction matters: E-RETAINED asserts `committed=no` on the
+    strength of the reviewed bytes being verifiably in quarantine. Here
+    they are not, so that claim is unavailable.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    head_before = git_head(vault)
+    decoy = b"SUBSTITUTED-BEFORE-ROLLBACK\n"
+    substituted = []
+
+    def substitute_then_fail(name: str) -> None:
+        # After `filesystem-applied` the record is quarantined and its
+        # descriptor is held; rollback has not yet run.
+        if name != "filesystem-applied":
+            return
+        landed = next((vault / "demo/outbox" / gt.QUARANTINE_DIRECTORY).iterdir())
+        other = landed.with_name(landed.name + ".other")
+        other.write_bytes(decoy)
+        os.replace(other, landed)
+        substituted.append(landed.name)
+        raise OSError("injected after consumption")
+
+    monkeypatch.setattr(gt, "_checkpoint", substitute_then_fail)
+
+    with pytest.raises(Exception) as raised:
+        approve(scope, prop.id, review.sha256)
+
+    assert substituted, "the substitution never happened"
+    outcome = describe(raised.value)
+    assert outcome.code == "E-SUBSTITUTED", outcome.code
+    assert outcome.committed == "unknown"
+
+    # Nothing renamed back, nothing committed, and the source is untouched.
+    assert not prop.path.exists(), prop.path.read_bytes()
+    assert [q.read_bytes() for q in _quarantined(vault)] == [decoy]
+    assert git_head(vault) == head_before
+    assert (vault / prop.src).exists()
+    assert not (vault / prop.dst).exists()
+
+
+def test_a_rollback_failure_composes_onto_the_retained_record(tmp_path, monkeypatch):
+    """Amendment 3: a simultaneous failure outranks E-RETAINED alone.
+
+    E-RETAINED claims `committed=no`, whose third precondition is that
+    every other change rolled back. When one did not, that claim is not
+    available and the indeterminate outcome takes over — with the retained
+    record composed onto it rather than dropped.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    real_capture = gt.capture_path_state
+
+    def fail_to_roll_back_the_source(vault_arg, relative_path):
+        if relative_path == prop.src:
+            raise OSError("cannot re-read the source during rollback")
+        return real_capture(vault_arg, relative_path)
+
+    def fail_after_consumption(name: str) -> None:
+        if name == "filesystem-applied":
+            monkeypatch.setattr(gt, "capture_path_state", fail_to_roll_back_the_source)
+            raise OSError("injected after consumption")
+
+    monkeypatch.setattr(gt, "_checkpoint", fail_after_consumption)
+
+    with pytest.raises(Exception) as raised:
+        approve(scope, prop.id, review.sha256)
+
+    cause = raised.value.__cause__
+    assert isinstance(cause, gt.GitTransactionRecoveryError), cause
+    assert describe(cause).committed == "unknown"
+    # Composed, not discarded: the retained record is still named.
+    assert any(
+        "retained in quarantine" in note for note in getattr(cause, "__notes__", [])
+    ), getattr(cause, "__notes__", None)
+    # The record really is retained, unchanged.
+    assert [q.read_bytes() for q in _quarantined(vault)] == [review.contents]

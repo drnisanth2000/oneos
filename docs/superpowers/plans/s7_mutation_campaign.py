@@ -196,6 +196,58 @@ MUTATIONS = [
           "assert [] == ['outbox-record.yaml']")],
     ),
     (
+        # Amendment 3. Rollback diagnosis must see a substitution that
+        # landed after consumption; without the identity check it reports
+        # the record safely retained and claims committed=no.
+        "M18", "app/git_transaction.py",
+        "            if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):",
+        "            if False:  # MUTANT M18: rollback ignores identity",
+        ["tests/test_outbox.py"],
+        [("tests/test_outbox.py::test_approve_reports_a_substitution_that_lands_before_rollback",
+          "assert 'E-RETAINED' == 'E-SUBSTITUTED'")],
+    ),
+    (
+        # Amendment 3. A simultaneous failure to roll back another path
+        # invalidates E-RETAINED's committed=no and must outrank it.
+        "M19", "app/git_transaction.py",
+        "            if isinstance(primary, QuarantinedRecordRetained) and blocked_paths:",
+        "            if False:  # MUTANT M19: retained outranks a rollback failure",
+        ["tests/test_outbox.py"],
+        [("tests/test_outbox.py::test_a_rollback_failure_composes_onto_the_retained_record",
+          "QuarantinedRecordRetained")],
+    ),
+    (
+        # Amendment 3. The transaction owns each quarantined record's
+        # descriptor and must release it on every path.
+        "M20", "app/git_transaction.py",
+        "        for _change, _record in quarantined:\n            # Not guarded.",
+        "        for _change, _record in []:  # MUTANT M20: descriptors leak\n            # Not guarded.",
+        ["tests/test_git_transaction.py"],
+        [("tests/test_git_transaction.py::test_a_failed_transaction_closes_the_descriptor_it_owns",
+          "a descriptor was leaked on failure")],
+    ),
+    (
+        # Amendment 2/3. `st_nlink` is diagnostic evidence and must be
+        # observed, not assumed.
+        "M21", "app/git_transaction.py",
+        "                link_count = os.fstat(descriptor).st_nlink",
+        "                link_count = 0  # MUTANT M21: evidence hardcoded",
+        ["tests/test_git_transaction.py"],
+        [("tests/test_git_transaction.py::test_link_count_evidence_reports_both_outcomes_without_changing_the_message[True]",
+          "assert 0 > 0")],
+    ),
+    (
+        # Amendment 3. Reject has no transaction and no rollback, so the
+        # consumption primitive is its only exposure. A disappeared
+        # quarantine entry must not escape as a bare FileNotFoundError.
+        "M22", "app/git_transaction.py",
+        '            raise _substituted("absent") from exc',
+        "            raise  # MUTANT M22: disappearance escapes unclassified",
+        ["tests/test_outbox.py"],
+        [("tests/test_outbox.py::test_reject_refuses_every_post_move_quarantine_condition[absent]",
+          "assert 'E-UNKNOWN' == 'E-SUBSTITUTED'")],
+    ),
+    (
         "M11", "app/main.py",
         "        prop = execute_delete(scope, id, review_sha256)",
         '        _unused = review_sha256  # MUTANT M11\n        prop = execute_delete(scope, id, "0" * 64)',

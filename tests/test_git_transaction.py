@@ -2786,3 +2786,64 @@ def test_an_uninspectable_quarantine_entry_does_not_escape_diagnosis(tmp_path):
     assert describe(outcome).committed == "unknown"
     # The message may not claim the location no longer holds the proposal.
     assert "cannot verify" in describe(outcome).message
+
+
+@pytest.mark.parametrize("extra_link", [False, True])
+def test_link_count_evidence_reports_both_outcomes_without_changing_the_message(
+    tmp_path, extra_link
+):
+    """Amendment 2/3: `st_nlink` is evidence, and only evidence.
+
+    The design specifies both readings — zero means no filesystem link
+    preserved the reviewed inode at detection; positive means some link
+    existed, with no claim about where or whether following it is safe.
+    Only the zero case was covered, so a mutant that behaved differently
+    when `link_count > 0` would have survived.
+
+    Whichever it is, the operator message must be identical: the design
+    forbids the evidence from softening or varying it.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    if extra_link:
+        # A second name for the same inode, so unlinking the quarantine
+        # entry cannot reduce the link count to zero.
+        os.link(leaf, vault / "second-name.yaml")
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    real_move = gt._MOVE_NO_REPLACE
+    substituted = []
+
+    def replace_after_the_move(from_fd, from_name, to_fd, to_name):
+        outcome = real_move(from_fd, from_name, to_fd, to_name)
+        if outcome == 0 and not substituted:
+            landed = next((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+            decoy = landed.with_name(landed.name + ".decoy")
+            decoy.write_bytes(b"DECOY\n")
+            os.replace(decoy, landed)
+            substituted.append(True)
+        return outcome
+
+    gt._MOVE_NO_REPLACE = replace_after_the_move
+    try:
+        with pytest.raises(gt.QuarantineEntrySubstituted) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+
+    assert substituted, "the substitution never happened"
+    if extra_link:
+        assert raised.value.link_count > 0, raised.value.link_count
+    else:
+        assert raised.value.link_count == 0, raised.value.link_count
+
+    # Identical operator-facing outcome either way.
+    outcome = describe(raised.value)
+    assert outcome.code == "E-SUBSTITUTED"
+    assert outcome.committed == "unknown"
+    assert outcome.retry == "stop"
+    assert "cannot verify" in outcome.message
+    assert str(raised.value.link_count) not in outcome.message
