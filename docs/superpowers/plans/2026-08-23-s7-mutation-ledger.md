@@ -128,19 +128,23 @@ above; the script asserts that before substituting.
 
 - **file** `app/outbox.py`
 - **selection** `tests/test_outbox.py`
-- **result** RED — `test_actions_refuse_a_malformed_fingerprint_without_mutation[None-approve]`
+- **result** RED — both nodes, as the committed runner requires:
+  - `test_actions_refuse_a_malformed_fingerprint_without_mutation[None-approve]`
+    — `DID NOT RAISE InvalidReviewToken`
+  - `test_actions_refuse_a_malformed_fingerprint_without_mutation[None-reject]`
+    — `DID NOT RAISE InvalidReviewToken`
 
 ```diff
 -    require_review_match(proposal_state.contents, review_sha256)
 +    pass  # MUTANT M1
 ```
 
-### M1 requires both nodes
-
 M1 breaks the comparison in `_own_reviewed_proposal`, which approve and
-reject share, so the ledger requires **both** `[None-approve]` and
-`[None-reject]` to go red. Requiring only one would leave half the shared
-protection unproven.
+reject share, so **both** nodes must go red. Requiring only one would leave
+half the shared protection unproven. This was previously a separate `### M1
+requires both nodes` heading, which made the document appear to hold a second
+M1 mutation and threw off the count of mutation headings; the row itself
+listed only the approve node while the runner required both.
 
 ### M2 — reject's bypass is M1
 
