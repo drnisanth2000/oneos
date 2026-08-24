@@ -83,6 +83,21 @@ _CODES: dict[str, ConsoleError] = {
             "stop", "unknown", 500,
         ),
         ConsoleError(
+            # S7 Amendment 2. Distinct from E-STRANDED and never folded
+            # into it: E-STRANDED promises both files survive, and this
+            # outcome cannot. The quarantine name was rebound before
+            # verification, so the object under it is not the one that was
+            # moved there, and the reviewed record's own fate is unknown.
+            # Nothing further is changed — the substitute is left where it
+            # is and is never moved under the proposal's name.
+            "E-SUBSTITUTED", "recovery", "attention",
+            "The reviewed proposal was moved, but its quarantine location "
+            "was replaced before verification completed. The reviewed "
+            "record may no longer exist. Do not retry. Inspect vault state "
+            "with git status.",
+            "stop", "unknown", 500,
+        ),
+        ConsoleError(
             # S7 Amendment 1. Fails closed: OneOS refuses rather than
             # degrading to an ordinary rename, which overwrites silently.
             "E-UNSUPPORTED", "integrity", "attention",
@@ -269,6 +284,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction._ApprovalLockCleanupFailure: _CODES["E-GIT"],
     _git_transaction.QuarantineCleanupError: _CODES["E-QUARANTINED"],
     _git_transaction.QuarantineRestorationBlocked: _CODES["E-STRANDED"],
+    _git_transaction.QuarantineEntrySubstituted: _CODES["E-SUBSTITUTED"],
     _git_transaction.AtomicMoveUnavailable: _CODES["E-UNSUPPORTED"],
     _git_transaction._ReviewedIndexOwnershipConflict: _CODES["E-CONFLICT"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],

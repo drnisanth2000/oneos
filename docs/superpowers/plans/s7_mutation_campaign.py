@@ -185,6 +185,17 @@ MUTATIONS = [
           "delete chose a target from a reread")],
     ),
     (
+        # Amendment 2. Restoring by name after an identity mismatch moves
+        # the *substitute* under the reviewed record's name — OneOS
+        # installing an object nobody reviewed, as a step of a refusal.
+        "M17", "app/git_transaction.py",
+        "            raise QuarantineEntrySubstituted(path, link_count)",
+        "            _restore()  # MUTANT M17\n            raise QuarantineEntrySubstituted(path, link_count)",
+        ["tests/test_git_transaction.py"],
+        [("tests/test_git_transaction.py::test_a_substituted_quarantine_entry_is_refused_and_nothing_further_moves",
+          "assert [] == ['outbox-record.yaml']")],
+    ),
+    (
         "M11", "app/main.py",
         "        prop = execute_delete(scope, id, review_sha256)",
         '        _unused = review_sha256  # MUTANT M11\n        prop = execute_delete(scope, id, "0" * 64)',

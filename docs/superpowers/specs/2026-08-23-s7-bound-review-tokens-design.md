@@ -7,7 +7,7 @@ quarantined rather than deleted. Amended clauses are marked
 *(Amendment 1)*. Rationale in “Why deletion cannot satisfy criterion 4”
 below.
 
-**Amendment 2 (PROPOSED — not approved):** restoration is abandoned, not
+**Amendment 2 (APPROVED at 0492d94):** restoration is abandoned, not
 attempted, once the quarantine name is known to hold a different object.
 Amended clauses are marked *(Amendment 2)*. Rationale in “When restoration
 must not be attempted” below.

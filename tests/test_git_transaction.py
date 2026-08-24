@@ -2385,50 +2385,96 @@ def test_eperm_on_every_file_is_still_reported_as_a_platform_limit(tmp_path, mon
     assert {p.name for p in directory.iterdir()} == {"locked"}
 
 
-def test_a_substituted_quarantine_entry_is_refused_not_verified(tmp_path):
-    """P2 (safety review): the reviewed-object guarantee, by identity.
+def test_a_substituted_quarantine_entry_is_refused_and_nothing_further_moves(
+    tmp_path,
+):
+    """P1 (review) / Amendment 2: the substitution outcome, in full.
 
     Verification used to open the moved record *by name* in `.consumed/`
-    after the move, and compare only contents and mode. A writer that
-    replaced that name in between had the substitute verified instead —
-    and on a contents mismatch, the substitute was moved back under the
-    reviewed record's name while the real record was gone. Design §3
-    Amendment 1 step 3 asks for "identity and contents, never a fresh
-    name lookup"; the code did the lookup and skipped the identity.
+    and compare only contents and mode, so a writer who replaced that name
+    had the substitute verified. Adding the identity check caught the
+    substitution — and then `_restore()` moved the substitute back under
+    the *reviewed record's* name, while the reviewed inode, unlinked by
+    the substitution, died when the descriptor closed. Measured on that
+    implementation: no link to the reviewed inode anywhere in the vault,
+    the proposal's own name holding the decoy's bytes, and an outcome of
+    `E-CONFLICT` / `committed=no` — "nothing was changed".
 
-    Here the entry is replaced by a *different inode with identical
-    bytes*, so a contents-and-mode comparison cannot tell the difference.
-    Only inode identity can.
+    The earlier version of this test asserted `leaf.exists() or ...`,
+    which the decoy satisfied. It proved nothing about *which* object
+    survived, which is the only question that matters here.
+
+    So: name every inode, and assert exactly what is where afterwards.
     """
     import app.git_transaction as gt
+    from app.console_errors import describe
     from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
 
     vault, leaf = _conditional_vault(tmp_path)
     expected = capture_path_state(vault, "outbox-record.yaml")
     reviewed_bytes = leaf.read_bytes()
+    reviewed_inode = leaf.stat().st_ino
+    decoy_bytes = b"DECOY-SUBSTITUTE\n"
+    assert decoy_bytes != reviewed_bytes
 
     real_move = gt._MOVE_NO_REPLACE
-    swapped = []
+    substitution = {}
 
     def move_then_substitute(from_fd, from_name, to_fd, to_name):
         outcome = real_move(from_fd, from_name, to_fd, to_name)
-        if outcome == 0 and not swapped:
-            swapped.append(True)
+        if outcome == 0 and not substitution:
             landed = next((vault / gt.QUARANTINE_DIRECTORY).iterdir())
             decoy = landed.with_name(landed.name + ".decoy")
-            decoy.write_bytes(reviewed_bytes)      # same bytes...
-            decoy.chmod(landed.stat().st_mode)     # ...same mode...
-            os.replace(decoy, landed)              # ...different inode.
+            decoy.write_bytes(decoy_bytes)
+            decoy.chmod(landed.stat().st_mode)
+            os.replace(decoy, landed)          # unlinks the reviewed inode
+            substitution["name"] = landed.name
+            substitution["inode"] = landed.stat().st_ino
         return outcome
 
     gt._MOVE_NO_REPLACE = move_then_substitute
     try:
-        with pytest.raises(gt.ReviewedStateConflict):
+        with pytest.raises(gt.QuarantineEntrySubstituted) as raised:
             quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
     finally:
         gt._MOVE_NO_REPLACE = real_move
 
-    assert swapped, "the substitution never happened"
-    # Nothing was destroyed: both objects still exist, and the refusal did
-    # not unlink to tidy up.
-    assert leaf.exists() or list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert substitution, "the substitution never happened"
+    assert substitution["inode"] != reviewed_inode
+
+    # 1. The exact outcome Amendment 2 closes.
+    outcome = describe(raised.value)
+    assert outcome.code == "E-SUBSTITUTED", outcome.code
+    assert outcome.committed == "unknown"
+    assert outcome.retry == "stop"
+    assert "may no longer exist" in outcome.message
+    assert "Nothing was changed" not in outcome.message
+    # Never the outcome that promises both files survive.
+    assert outcome.code != "E-STRANDED"
+
+    # 2. `st_nlink` is carried as evidence, and is the truth here: the
+    #    substitution unlinked the reviewed inode's only name.
+    assert raised.value.link_count == 0, raised.value.link_count
+
+    # 3. Nothing further moved. The substitute is exactly where the writer
+    #    put it, under the name it took, with its own bytes.
+    quarantined = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert [p.name for p in quarantined] == [substitution["name"]]
+    assert quarantined[0].stat().st_ino == substitution["inode"]
+    assert quarantined[0].read_bytes() == decoy_bytes
+
+    # 4. And above all: the decoy was NOT installed under the reviewed
+    #    record's name. That name is empty — the move happened and is not
+    #    undone — rather than holding an object nobody reviewed.
+    assert not leaf.exists(), leaf.read_bytes()
+    # And it is nowhere else in the vault either — quarantine is the one
+    # place it belongs, because that is where its writer put it.
+    elsewhere = [
+        p
+        for p in vault.rglob("*")
+        if p.is_file()
+        and gt.QUARANTINE_DIRECTORY not in p.parts
+        and ".git" not in p.parts
+        and p.read_bytes() == decoy_bytes
+    ]
+    assert not elsewhere, elsewhere

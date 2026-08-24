@@ -75,6 +75,29 @@ class AtomicMoveUnavailable(GitTransactionError):
     """
 
 
+class QuarantineEntrySubstituted(GitTransactionError):
+    """The quarantine name no longer identifies the object moved into it.
+
+    S7 Amendment 2. Detected after the move, so the move is *not* undone —
+    undoing it by name would relocate the substitute under the reviewed
+    record's name, which is the one thing this outcome exists to stop
+    OneOS doing. After detection no further mutation is performed.
+
+    `link_count` is the reviewed inode's `st_nlink` at the moment of
+    detection, carried as diagnostic evidence. Zero means no filesystem
+    link preserved it then; greater than zero means some link existed,
+    with no claim about where or whether following it would be safe. It
+    does not soften or vary the operator message.
+    """
+
+    def __init__(self, path: str, link_count: int) -> None:
+        self.path = path
+        self.link_count = link_count
+        super().__init__(
+            "quarantined record was replaced before verification"
+        )
+
+
 class QuarantineRestorationBlocked(GitTransactionError):
     """A consumed record could not be returned to its own name.
 
@@ -1439,18 +1462,30 @@ def _quarantine_reviewed_leaf(
                 # false statement about state the operator can see.
                 raise QuarantineRestorationBlocked(path) from exc
 
+        # Identity first, and on its own terms (Amendment 2). If the
+        # quarantine name no longer names the inode that was moved into
+        # it, restoring by that name would move the *substitute* under the
+        # reviewed record's name — OneOS installing an object nobody
+        # reviewed, as a step of a refusal. So nothing further is mutated
+        # here: not the substitute, not the quarantine, not the record's
+        # name. The move already happened and is not undone, which is
+        # exactly what E-SUBSTITUTED says.
+        landed = os.lstat(leaf, dir_fd=quarantine_descriptor)
+        if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
+            # Diagnostic only: whether any name still refers to the
+            # reviewed inode at this instant. It does not change the
+            # outcome or the message.
+            try:
+                link_count = os.fstat(descriptor).st_nlink
+            except OSError:
+                link_count = -1
+            raise QuarantineEntrySubstituted(path, link_count)
+
+        # Contents, through the descriptor still held, so an in-place
+        # rewrite during the move is caught too. Here the object under the
+        # name *is* the one that was moved, so restoring by name returns
+        # the reviewed record and nothing else.
         try:
-            # Identity: the quarantined name must be this inode, not a
-            # look-alike that arrived in the meantime.
-            landed = os.lstat(leaf, dir_fd=quarantine_descriptor)
-            if (landed.st_dev, landed.st_ino) != (
-                identity.st_dev, identity.st_ino
-            ):
-                raise ReviewedStateChanged(
-                    f"reviewed path changed before mutation: {path}"
-                )
-            # Contents: re-read through the descriptor still held, so an
-            # in-place rewrite during the move is caught too.
             if _held_state(descriptor) != expected:
                 raise ReviewedStateChanged(
                     f"reviewed path changed before mutation: {path}"
