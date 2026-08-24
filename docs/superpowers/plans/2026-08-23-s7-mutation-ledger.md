@@ -91,12 +91,14 @@ M5   RED then GREEN   M5b  RED then GREEN   M6   RED then GREEN
 M7   RED then GREEN   M7b  RED then GREEN   M8   RED then GREEN
 M9   RED then GREEN   M10  RED then GREEN   M12  RED then GREEN
 M13  RED then GREEN   M14  RED then GREEN   M15  RED then GREEN
-M16  RED then GREEN   M17  RED then GREEN   M11  RED then GREEN
+M16  RED then GREEN   M17  RED then GREEN   M18  RED then GREEN
+M19  RED then GREEN   M20  RED then GREEN   M21  RED then GREEN
+M22  RED then GREEN   M23  RED then GREEN   M11  RED then GREEN
 
-all 18 mutations: red under mutation, green once restored
+all 24 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1272 passed in 91.40s (0:01:31)
+  1285 passed in 99.06s (0:01:39)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -434,6 +436,121 @@ in `assert leaf.exists() or list(...)`, which the decoy satisfied — it could
 not distinguish the reviewed record surviving from a substitute standing in
 its place, which is the only question the scenario asks. The replacement
 names every inode and asserts which object is where.
+
+### M18 — rollback diagnosis ignores identity
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_outbox.py tests/test_registry.py`
+- **result** RED — both transactional actions:
+  - `test_approve_reports_a_substitution_that_lands_before_rollback`
+    — `assert 'E-RETAINED' == 'E-SUBSTITUTED'`
+  - `test_delete_reports_a_substitution_that_lands_before_rollback`
+    — `assert 'E-RETAINED' == 'E-SUBSTITUTED'`
+
+```diff
+-            if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
++            if False:  # MUTANT M18: rollback ignores identity
+```
+
+The seam only a transaction has: consumption succeeds, the transaction then
+fails, and a writer replaces the quarantine entry before rollback diagnoses
+it. Without the identity check the diagnosis reports the record safely
+retained and claims `committed=no` — a claim resting on the reviewed bytes
+being verifiably in quarantine, which they are not. Both nodes are required,
+because the row asserts the guarantee for approve *and* registry delete.
+
+### M19 — a rollback failure stops outranking the retained record
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED — `test_a_rollback_failure_composes_onto_the_retained_record`
+  — `QuarantinedRecordRetained`
+
+```diff
+-            if isinstance(primary, QuarantinedRecordRetained) and blocked_paths:
++            if False:  # MUTANT M19: retained outranks a rollback failure
+```
+
+`E-RETAINED`'s third precondition is that every other change rolled back.
+When one did not, `committed=no` is unavailable and the indeterminate outcome
+must take over, with the retained record composed onto it rather than dropped.
+
+### M20 — transaction-owned descriptors are never released
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_git_transaction.py`
+- **result** RED — both paths:
+  - `test_a_transaction_closes_every_descriptor_it_took_ownership_of`
+    — `a descriptor was leaked on success`
+  - `test_a_failed_transaction_closes_the_descriptor_it_owns`
+    — `a descriptor was leaked on failure`
+
+```diff
+-        for _change, _record in quarantined:
++        for _change, _record in []:  # MUTANT M20: descriptors leak
+             # Not guarded.
+```
+
+Amendment 3 makes the transaction the owner of each record's descriptor,
+held through commit and rollback diagnosis. Both nodes are required: the
+release must happen on success and on failure, and the failure path is the
+one where an exception could otherwise skip it.
+
+### M21 — `st_nlink` evidence is assumed rather than observed
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_git_transaction.py`
+- **result** RED —
+  `test_link_count_evidence_reports_both_outcomes_without_changing_the_message[True]`
+  — `assert 0 > 0`
+
+```diff
+-                link_count = os.fstat(descriptor).st_nlink
++                link_count = 0  # MUTANT M21: evidence hardcoded
+```
+
+The design specifies both readings. Only the zero case was covered, so a
+mutant behaving differently above zero survived. The `[True]` node drives the
+positive reading via a second hard link to the reviewed inode, and asserts the
+operator message is identical either way — the evidence may not vary it.
+
+### M22 — a disappeared quarantine entry escapes unclassified
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED —
+  `test_reject_refuses_every_post_move_quarantine_condition[absent]`
+  — `assert 'E-UNKNOWN' == 'E-SUBSTITUTED'`
+
+```diff
+-            raise _substituted("absent") from exc
++            raise  # MUTANT M22: disappearance escapes unclassified
+```
+
+Reject runs no transaction and has no rollback, so the consumption primitive
+is its only exposure. A removed entry previously escaped as a bare
+`FileNotFoundError`, resolving to E-UNKNOWN — "an unexpected error was not
+handled" for a condition the taxonomy describes exactly.
+
+### M23 — an in-place rewrite goes unnoticed
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_outbox.py`
+- **result** RED —
+  `test_reject_refuses_every_post_move_quarantine_condition[rewritten]`
+  — `DID NOT RAISE`
+
+```diff
+-        if _held_state(descriptor) != expected:
++        if False:  # MUTANT M23: in-place rewrite goes unnoticed
+             raise _substituted("rewritten")
+```
+
+The post-move contents check is the only thing that can see this: an in-place
+rewrite keeps the same device, inode and name, so every identity check passes
+while the bytes are no longer the reviewed bytes. Bypassing it lets OneOS
+consume bytes nobody reviewed with no rename involved at all. This is why the
+check survived Amendment 3 even though its old remedy did not.
 
 ## M6 — a survivor, and what it cost
 
