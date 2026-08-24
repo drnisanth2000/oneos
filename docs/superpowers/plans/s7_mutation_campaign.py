@@ -157,8 +157,8 @@ MUTATIONS = [
     ),
     (
         "M14", "app/git_transaction.py",
-        "            if isinstance(transaction_error, QuarantineRestorationBlocked):",
-        "            if False:  # MUTANT M14: cleanup overwrites the stranded outcome",
+        "                    QuarantinedRecordRetained,\n                ),\n            ):",
+        "                    QuarantinedRecordRetained,\n                ),\n            ) and False:  # MUTANT M14",
         ["tests/test_outbox.py"],
         [("tests/test_outbox.py::test_a_stranded_record_survives_a_simultaneous_cleanup_failure",
           "the stranded outcome was overwritten")],
@@ -188,12 +188,25 @@ MUTATIONS = [
         # Amendment 2. Restoring by name after an identity mismatch moves
         # the *substitute* under the reviewed record's name — OneOS
         # installing an object nobody reviewed, as a step of a refusal.
+        # Re-expressed for Amendment 3. M17 used to reinstate a `_restore()`
+        # call; that helper no longer exists, because no rename-back
+        # survives anywhere in the consumption path. The defect it guards
+        # against is now reachable only by inlining the move — which is
+        # exactly the shape a future edit would take if someone decided a
+        # mismatch should "just put it back".
         "M17", "app/git_transaction.py",
-        "            raise QuarantineEntrySubstituted(path, link_count)",
-        "            _restore()  # MUTANT M17\n            raise QuarantineEntrySubstituted(path, link_count)",
-        ["tests/test_git_transaction.py"],
-        [("tests/test_git_transaction.py::test_a_substituted_quarantine_entry_is_refused_and_nothing_further_moves",
-          "assert [] == ['outbox-record.yaml']")],
+        '            raise _substituted("replaced")',
+        '            _move_no_replace(\n'
+        '                quarantine_descriptor, leaf, parent_descriptor, leaf\n'
+        '            )  # MUTANT M17: rename back after an identity mismatch\n'
+        '            raise _substituted("replaced")',
+        ["tests/test_git_transaction.py", "tests/test_outbox.py"],
+        [
+            ("tests/test_git_transaction.py::test_a_substituted_quarantine_entry_is_refused_and_nothing_further_moves",
+             "assert [] == ['outbox-record.yaml']"),
+            ("tests/test_outbox.py::test_reject_refuses_every_post_move_quarantine_condition[replaced]",
+             "a substitute was renamed back under the record's name"),
+        ],
     ),
     (
         # Amendment 3. Rollback diagnosis must see a substitution that
@@ -202,9 +215,13 @@ MUTATIONS = [
         "M18", "app/git_transaction.py",
         "            if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):",
         "            if False:  # MUTANT M18: rollback ignores identity",
-        ["tests/test_outbox.py"],
-        [("tests/test_outbox.py::test_approve_reports_a_substitution_that_lands_before_rollback",
-          "assert 'E-RETAINED' == 'E-SUBSTITUTED'")],
+        ["tests/test_outbox.py", "tests/test_registry.py"],
+        [
+            ("tests/test_outbox.py::test_approve_reports_a_substitution_that_lands_before_rollback",
+             "assert 'E-RETAINED' == 'E-SUBSTITUTED'"),
+            ("tests/test_registry.py::test_delete_reports_a_substitution_that_lands_before_rollback",
+             "assert 'E-RETAINED' == 'E-SUBSTITUTED'"),
+        ],
     ),
     (
         # Amendment 3. A simultaneous failure to roll back another path
@@ -223,8 +240,12 @@ MUTATIONS = [
         "        for _change, _record in quarantined:\n            # Not guarded.",
         "        for _change, _record in []:  # MUTANT M20: descriptors leak\n            # Not guarded.",
         ["tests/test_git_transaction.py"],
-        [("tests/test_git_transaction.py::test_a_failed_transaction_closes_the_descriptor_it_owns",
-          "a descriptor was leaked on failure")],
+        [
+            ("tests/test_git_transaction.py::test_a_transaction_closes_every_descriptor_it_took_ownership_of",
+             "a descriptor was leaked on success"),
+            ("tests/test_git_transaction.py::test_a_failed_transaction_closes_the_descriptor_it_owns",
+             "a descriptor was leaked on failure"),
+        ],
     ),
     (
         # Amendment 2/3. `st_nlink` is diagnostic evidence and must be
@@ -246,6 +267,18 @@ MUTATIONS = [
         ["tests/test_outbox.py"],
         [("tests/test_outbox.py::test_reject_refuses_every_post_move_quarantine_condition[absent]",
           "assert 'E-UNKNOWN' == 'E-SUBSTITUTED'")],
+    ),
+    (
+        # Amendment 3. The post-move contents check is the only thing that
+        # can see an in-place rewrite: identity is unchanged, so every
+        # other check passes. Bypassing it lets OneOS consume bytes nobody
+        # reviewed without any rename being involved.
+        "M23", "app/git_transaction.py",
+        "        if _held_state(descriptor) != expected:\n            raise _substituted(\"rewritten\")",
+        "        if False:  # MUTANT M23: in-place rewrite goes unnoticed\n            raise _substituted(\"rewritten\")",
+        ["tests/test_outbox.py"],
+        [("tests/test_outbox.py::test_reject_refuses_every_post_move_quarantine_condition[rewritten]",
+          "DID NOT RAISE")],
     ),
     (
         "M11", "app/main.py",

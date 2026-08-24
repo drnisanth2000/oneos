@@ -2915,8 +2915,13 @@ def test_reject_refuses_every_post_move_quarantine_condition(tmp_path, condition
     assert outcome.retry == "stop"
 
     # Nothing renamed back: the record's own name is empty in every case,
-    # and whatever the writer left is exactly where they left it.
-    assert not prop.path.exists(), prop.path.read_bytes()
+    # and whatever the writer left is exactly where they left it. The
+    # message is unique so `--tb=line` can bind a mutation to this exact
+    # assertion rather than to a bare bytes repr.
+    assert not prop.path.exists(), (
+        "a substitute was renamed back under the record's name: "
+        f"{prop.path.read_bytes()!r}"
+    )
     quarantined = _quarantined(vault)
     if condition == "absent":
         assert quarantined == []
