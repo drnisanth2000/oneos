@@ -106,7 +106,7 @@ M43b RED then GREEN   M44  RED then GREEN   M45  RED then GREEN
 all 48 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1473 passed in 110.35s
+  1475 passed in 107.56s
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -1104,9 +1104,18 @@ rather than by adjusting the mutation:
   is available, and is recorded as a known Linux limitation in the design. The
   campaign therefore certifies nothing about Linux, and no row should be read
   as doing so.
-- **Private boundaries are outside the mutation campaign.** They were verified
-  separately at the trusted local boundary: 37 private tests passed,
-  `check_v2` reported 0 errors/0 warnings, the combined repo+vault history
-  audit was clean, and the captured HEAD, porcelain-v2 status, binary worktree
-  diff, and binary cached diff were byte-identical before and after. The
-  campaign itself makes no claim about those private checks.
+- **Private boundaries are outside the mutation campaign.** Prior trusted-local
+  evidence recorded 37 private tests, `check_v2` at 0 errors/0 warnings, a
+  clean combined repo+vault history audit, and byte-identical HEAD,
+  porcelain-v2 status, binary worktree diff, and binary cached diff before and
+  after. The final post-cross-vault private rerun is pending. The campaign
+  itself makes no claim about those private checks.
+
+### Focused cross-vault rename-plan proof — outside this campaign
+
+This is not a forty-ninth campaign row. A focused mutation made the rename plan
+accept two distinct repositories at the same `HEAD`; the focused test went RED,
+then GREEN after correction. The correction now refuses that cross-vault plan
+before lock acquisition, Git activity, or mutation. Same-root relative and
+absolute aliases remain valid. Independent scoped review PASS found no Critical
+or Important finding; its report-scope minor was resolved in `bce4617`.

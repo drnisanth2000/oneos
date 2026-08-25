@@ -33,15 +33,17 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 **Where `conventions.md` v2 and anything in `docs/` disagree, v2 wins.**
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
-The **Safety Foundation S1-S7 is complete** at its gate-certified branch tip:
-the exact-head public suite recorded 1,473 passed in 130.03s; all 48 mutation
-rows went RED then GREEN; Gitleaks scanned 343 reachable commits with no leaks;
-current-tree and history public audits were clean; and the private gates
-recorded `check_v2` 0/0 and 37 tests in 0.194s. The combined repo-plus-vault
-history audit was clean and Grey Matter's HEAD, status, worktree diff, and
-cached diff were byte-identical before and after, preserving pre-existing
-edits. Independent scoped reviews found no Critical, Important, or Minor
-findings. The macOS no-overwrite path was exercised;
+The **Safety Foundation S1-S7 is complete** at its gate-certified branch tip.
+The current cross-vault correction checkpoint's public suite recorded 1,475
+passed; all 48 campaign rows went RED then GREEN; its restored closing suite
+recorded 1,475 passed in 107.56s; Gitleaks found no leaks; and current-tree and
+history public audits were clean. The most recent private-gate evidence,
+recorded before this correction, was `check_v2` 0/0, 37 tests in 0.194s, a clean
+combined repo-plus-vault history audit, and byte-identical Grey Matter HEAD,
+status, worktree diff, and cached diff preserving pre-existing edits. The final
+post-cross-vault private rerun remains pending. Independent scoped review PASS
+found no Critical or Important findings; its report-scope minor was resolved.
+The macOS no-overwrite path was exercised;
 Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
 user/platform limitation. The separately sequenced inherited items 2–4 in
 `docs/STATUS.md` remain required before live Phase 1 gate trials.

@@ -26,19 +26,23 @@ trials. Phase 2 is not authorized.
 | S4 — proposal identity and freshness | **COMPLETE** | Collision-safe proposal IDs, exact-byte source SHA-256, no-follow snapshots, and visible stale/missing refusals are merged. |
 | S5 — Git transaction and audit | **COMPLETE** | Classification approval and registry deletion use exact-path alternate-index transactions with ownership-aware rollback; Gate 3 validates action-specific messages, paths, and dirty-state fingerprints. |
 | S6 — Console failures | **COMPLETE** | Every typed Command Center refusal reaches the operator as a specific, safe, actionable message; no route swallows a failure or returns a raw server fault. Public suite 603 → 832. All public and private gates pass, including the combined repo+vault history audit; Grey Matter fingerprints identical before and after. Per-task review record: `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`. |
-| S7 — bound review tokens | **COMPLETE** | Exact-byte review fingerprints bind approve, reject, and registry delete; quarantine-last and tracked HEAD receipts protect transactional actions from destructive rollback and repeated ids; reject safely quarantines its reviewed record; receipt-backed cards remain non-actionable. Final evidence: 1,473 public tests, all 48 mutation rows RED then GREEN, 37 private tests in 0.194s, `check_v2` 0/0, Gitleaks clean across 343 reachable commits, clean public current-tree/history and combined history audits, byte-identical Grey Matter HEAD/status/worktree/cached proof, and no Critical, Important, or Minor scoped-review finding. The macOS no-overwrite path was exercised; Linux `renameat2` is an accepted unexercised user/platform limitation. |
+| S7 — bound review tokens | **COMPLETE** | Exact-byte review fingerprints bind approve, reject, and registry delete; quarantine-last and tracked HEAD receipts protect transactional actions from destructive rollback and repeated ids; reject safely quarantines its reviewed record; receipt-backed cards remain non-actionable. Current public evidence: 1,475 public tests, all 48 campaign rows RED then GREEN, and a 1,475-pass restored closing suite in 107.56s; Gitleaks found no leaks; and public current-tree/history audits are clean. The focused cross-vault proof refuses two distinct same-HEAD repositories before lock, Git, or mutation while same-root relative/absolute aliases remain valid. Prior private evidence is retained; the post-correction rerun is pending. Independent scoped review PASS found no Critical or Important finding and resolved its report-scope minor. The macOS no-overwrite path was exercised; Linux `renameat2` is an accepted unexercised user/platform limitation. |
 
 Merged S5 baseline: `0f71cd3`. S6 is complete. S7 began from the fresh
 merged-S6 baseline `d7ad86b` with 926 public tests.
-Final verification records 1,473 public tests in 130.03s, all 48 mutation
-rows RED then GREEN, 37 private tests in 0.194s, `check_v2` at 0 errors/0
-warnings, Gitleaks clean across 343 reachable commits, clean public
-current-tree/history and combined repo+vault history audits, and byte-identical
-Grey Matter HEAD/status/worktree/cached before/after proof preserving
-pre-existing edits. Independent scoped reviews found no Critical, Important, or
-Minor findings. Supported writers cooperate through OneOS interfaces and the
-shared action lock; deliberate post-final-check ancestor relocation is outside
-that boundary.
+Current public verification records 1,475 public tests, all 48 campaign rows
+RED then GREEN, and a 1,475-pass restored closing suite in 107.56s. Gitleaks
+found no leaks and public current-tree/history audits are clean. A separate
+focused cross-vault rename-plan mutation went RED then GREEN: two distinct
+repositories at the same HEAD refuse before lock, Git, or mutation, while
+same-root relative/absolute aliases remain valid. The prior private-gate record
+remains 37 tests in 0.194s, `check_v2` at 0 errors/0 warnings, a clean combined
+repo+vault history audit, and byte-identical Grey Matter
+HEAD/status/worktree/cached proof preserving pre-existing edits; the final
+post-correction private rerun is pending. Independent scoped review PASS found
+no Critical or Important finding and resolved its report-scope minor. Supported
+writers cooperate through OneOS interfaces and the shared action lock;
+deliberate post-final-check ancestor relocation is outside that boundary.
 
 ### Exit gates (spec §11)
 
@@ -88,6 +92,10 @@ unless they demonstrate a reproducible defect in those guarantees.
   broke historical-tree audit replay. The audit now uses an explicit immutable
   parent OID builder; the correction was developed test-first and independently
   reviewed.
+- **Cross-vault rename-plan correction** — two distinct repositories at the
+  same HEAD now refuse before lock, Git, or mutation. Same-root relative and
+  absolute aliases remain valid. Its focused mutation went RED then GREEN and
+  was independently reviewed; it is separate from the 48-row campaign.
 - **Publication gates** — pinned Gitleaks owns general credential and reachable
   history scanning. `tools/public_repo_audit.py` owns finite OneOS privacy
   rules; trusted local review adds private registry-derived terms.
