@@ -106,7 +106,7 @@ M43b RED then GREEN   M44  RED then GREEN   M45  RED then GREEN
 all 48 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1463 passed in 113.31s (0:01:53)
+  1470 passed in 144.43s (0:02:24)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
