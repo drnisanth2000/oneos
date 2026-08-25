@@ -6,6 +6,10 @@ bundle's flags only. No slug, path, or module list is hardcoded here.
 """
 from __future__ import annotations
 
+import json
+import re
+import secrets
+
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
@@ -19,6 +23,14 @@ from fastapi.templating import Jinja2Templates
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .action_receipts import (
+    ActionReceipt,
+    InvalidActionReceipt,
+    ReceiptStoreIntegrityError,
+    ReceiptStoreUnavailable,
+    SpentAction,
+    resolve_head_receipt,
+)
 from .classifier import Classifier
 from .config import build_catalog, build_scope
 from .console_errors import ConsoleError, describe
@@ -34,17 +46,26 @@ from .inbox import read_inbox
 from .outbox import (
     OutboxDestinationError,
     OutboxError,
+    OutboxRow,
     UnreadableProposalRecord,
     approve,
+    pending_proposal_entry_exists,
     preview_diff,
     project_outbox,
     propose_classification,
     reject,
 )
+from .proposal_identity import ProposalIdentityError, require_proposal_id
+from .review_tokens import (
+    ReviewedProposalChanged,
+    ReviewTokenError,
+    require_review_sha256,
+)
 from .registry import (
+    MissingDeleteProposal,
     RegistryError,
     execute_delete,
-    get_delete_proposal,
+    get_delete_receipt_or_review,
     products_for,
     propose_delete,
     reference_count,
@@ -54,6 +75,45 @@ from .vault import DestinationRegistryError, Vault
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
+
+#: S7: a DOM id must name one *issuance* of a review, not one version of it.
+#: `(proposal id, digest)` recurs — an editor undo or an idempotent
+#: regenerator returns a file to earlier bytes and reissues the same digest —
+#: and two elements sharing an id make `HX-Retarget` resolve to whichever
+#: came first, anchoring the comparison against the wrong "old" card.
+_ISSUE = re.compile(r"[0-9a-f]{12}\Z")
+
+
+def _new_issue() -> str:
+    return secrets.token_hex(6)
+
+
+def _require_issue(value: str | None) -> str:
+    """Accept a browser-supplied issuance nonce, or mint a fresh one.
+
+    **The nonce is untrusted presentation data.** It is checked for syntax
+    only; nothing here proves OneOS ever issued it, and no server-side
+    record of issued nonces exists — approved decision 6 rules out review
+    sessions and temporary review storage, so there is nothing to check a
+    nonce against. Replaying a valid one can therefore select a *different*
+    same-version DOM anchor than the operator's own, or name no element at
+    all.
+
+    That is the whole of its authority. The nonce reaches only element ids
+    and swap selectors: it does not choose the service action, does not
+    select which proposal or which stored bytes the server reads, is not
+    part of the fingerprint, and is not consulted in the comparison that
+    decides whether a mutation is permitted. Every one of those is derived
+    server-side from the current record. Mispointing a swap misplaces
+    markup on one operator's screen; it cannot approve, reject, or delete
+    anything, and it cannot make a stale review pass as current.
+    """
+    if isinstance(value, str) and _ISSUE.fullmatch(value):
+        return value
+    return _new_issue()
+
+
+templates.env.globals["new_issue"] = _new_issue
 
 app = FastAPI(title="OneOS")
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
@@ -147,7 +207,11 @@ _SIDEBAR_CATCHES = (DestinationRegistryError, EntityManifestError)
 
 
 def _render_console_error(
-    request: Request, error, *, force_page_status: bool = False
+    request: Request,
+    error,
+    *,
+    force_page_status: bool = False,
+    action_error=None,
 ) -> HTMLResponse:
     """Shared renderer for every described Console error (design §5): route
     shape first, then HX-Request, decides fragment vs. page; status follows
@@ -162,6 +226,15 @@ def _render_console_error(
     fragment = is_fragment(request, endpoint)
     status = error.page_status if force_page_status else status_for(error, fragment)
     if fragment:
+        if action_error is not None:
+            # design §5: when one response carries several codes the status
+            # is the refusal's, and neither outcome may be dropped.
+            return templates.TemplateResponse(
+                request,
+                "blocks/alerts.html",
+                {"error": error, "action_error": action_error},
+                status_code=status_for(action_error, fragment),
+            )
         return templates.TemplateResponse(
             request, "blocks/alert.html", {"error": error}, status_code=status,
         )
@@ -508,9 +581,15 @@ def propose(
 #: (the Task 11 pattern). `load_proposals` raises bare `CrossScopeError` for a
 #: redirected outbox or proposal leaf, which today escapes `except OutboxError:
 #: pass` entirely — design §5 names this exact gap for the outbox routes.
+#: `ReviewTokenError` (S7): a stale or malformed review fingerprint is a
+#: declared outcome of these routes, not an escape. Without it a rewritten
+#: proposal reaches the global fallback as an unhandled error instead of the
+#: approved refusal, and the operator is never offered the current review.
 _OUTBOX_CATCHES = (
     OutboxError, CrossScopeError, DestinationRegistryError,
     SystemRegistryPathError,  # see _TRIAGE_CATCHES
+    ReviewTokenError,
+    InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
 
 
@@ -522,9 +601,9 @@ def _outbox_rows(listing):
 
     Returns `(rows, blocked_notice)`: `rows` pairs each `OutboxRow` with its
     described error (`None` when the row has none); `blocked_notice` is the
-    single listing-level `ConsoleError` for a blocked listing — every
-    unreadable row describes to the same `E-UNREADABLE` code (mro), so any one
-    of them carries the notice.
+    single listing-level `ConsoleError` selected from the raw unreadable-record
+    row that caused blocking. Other proposal-less rows can carry unrelated
+    per-id errors and must not masquerade as the listing-wide reason.
     """
     rows = [
         (row, describe(row.error) if row.error is not None else None)
@@ -533,10 +612,67 @@ def _outbox_rows(listing):
     blocked_notice = None
     if listing.blocked:
         blocked_notice = next(
-            (error for row, error in rows if row.proposal is None and error is not None),
+            (
+                error
+                for row, error in rows
+                if isinstance(row.error, UnreadableProposalRecord)
+            ),
             None,
         )
     return rows, blocked_notice
+
+
+def _with_action_receipt_row(
+    rows: list[tuple[OutboxRow, ConsoleError | None]],
+    scope: Scope,
+    receipt: ActionReceipt | None,
+) -> list[tuple[OutboxRow, ConsoleError | None]]:
+    """Keep the acted-on spent card even when its proposal no longer lists.
+
+    A successful quarantine removes the pending ``*.yaml`` leaf, so a fresh
+    projection has nothing from which to build this row. The action result (or
+    the committed receipt resolved for E-APPLIED) is still authoritative for
+    the response being rendered. Siblings remain the projection's own rows;
+    this appends only the missing acted-on id and never parses its record.
+    """
+    if receipt is None or any(
+        row.proposal_id == receipt.proposal_id for row, _error in rows
+    ):
+        return rows
+    return [
+        *rows,
+        (
+            OutboxRow(
+                proposal=None,
+                diff=None,
+                error=None,
+                can_approve=False,
+                can_reject=False,
+                proposal_id=receipt.proposal_id,
+                receipt=receipt,
+                record_present=pending_proposal_entry_exists(
+                    scope, receipt.proposal_id
+                ),
+            ),
+            None,
+        ),
+    ]
+
+
+def _require_committed_action_receipt(
+    scope: Scope, proposal_id: str
+) -> ActionReceipt:
+    """Resolve the receipt an E-APPLIED response must display from HEAD."""
+    resolution = resolve_head_receipt(
+        scope.root, scope.current_entity(), require_proposal_id(proposal_id)
+    )
+    if resolution.error is not None:
+        raise resolution.error
+    if resolution.receipt is None:
+        raise ReceiptStoreUnavailable(
+            "committed action receipt could not be resolved"
+        )
+    return resolution.receipt
 
 
 def _outbox_list(
@@ -544,6 +680,8 @@ def _outbox_list(
     scope: Scope,
     *,
     approval_error: ConsoleError | None = None,
+    approval_error_id: str | None = None,
+    action_receipt: ActionReceipt | None = None,
 ) -> HTMLResponse:
     """Fragment renderer shared by approve and reject (design §8: both swap
     `#outbox-list` `outerHTML`, so the fragment reproduces that root).
@@ -558,6 +696,21 @@ def _outbox_list(
     fragment = is_fragment(request, endpoint)
     listing = project_outbox(scope)
     rows, blocked_notice = _outbox_rows(listing)
+    rows = _with_action_receipt_row(rows, scope, action_receipt)
+    if approval_error is not None:
+        rows = [
+            (
+                row,
+                None
+                if (
+                    error is not None
+                    and error.code == approval_error.code
+                    and row.proposal_id == approval_error_id
+                )
+                else error,
+            )
+            for row, error in rows
+        ]
     if (
         blocked_notice is not None
         and approval_error is not None
@@ -627,6 +780,7 @@ def _outbox_list_error(
     exc: BaseException,
     *,
     action_error: ConsoleError | None = None,
+    action_receipt: ActionReceipt | None = None,
 ) -> HTMLResponse:
     """Fallback fragment for the rare double-failure where even the
     re-rendered listing itself fails to build (`project_outbox`, called from
@@ -664,12 +818,13 @@ def _outbox_list_error(
     endpoint = _endpoint_for(request)
     fragment = is_fragment(request, endpoint)
     status_source = action_error if action_error is not None else listing_error
+    rows = _with_action_receipt_row([], scope, action_receipt)
     return templates.TemplateResponse(
         request,
         "blocks/outbox_list.html",
         {
             "entity": scope.current_entity(),
-            "rows": (),
+            "rows": rows,
             "blocked": False,
             "blocked_notice": None,
             "approval_error": action_error,
@@ -680,10 +835,476 @@ def _outbox_list_error(
     )
 
 
+def _review_row(scope: Scope, proposal_id: str):
+    """The current projected row for one proposal, or `None`.
+
+    Read-only, and deliberately taken from the same projection the listing
+    uses: a fresh review must be the listing's own view of the record, not a
+    second opinion assembled elsewhere.
+    """
+    for row in project_outbox(scope).rows:
+        if (
+            (row.proposal is not None and row.proposal.id == proposal_id)
+            or row.proposal_id == proposal_id
+        ):
+            return row
+    return None
+
+
+def _action_receipt_response(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    *,
+    receipt: ActionReceipt | None,
+    receipt_error: ConsoleError | None = None,
+    issue: str | None = None,
+    status_code: int | None = None,
+    retarget: str | None = None,
+    record_present: bool | None = None,
+) -> HTMLResponse:
+    """Render the shared non-actionable spent/malformed receipt card."""
+    canonical_id = require_proposal_id(proposal_id)
+    if record_present is None:
+        record_present = pending_proposal_entry_exists(scope, canonical_id)
+    fragment = is_fragment(request, _endpoint_for(request))
+    status = (
+        status_code
+        if status_code is not None
+        else (
+            status_for(receipt_error, fragment)
+            if receipt_error is not None
+            else 200
+        )
+    )
+    response = templates.TemplateResponse(
+        request,
+        "blocks/action_receipt_card.html",
+        {
+            "entity": scope.current_entity(),
+            "proposal_id": canonical_id,
+            "receipt": receipt,
+            "receipt_error": receipt_error,
+            "record_present": record_present,
+            "issue": issue or _new_issue(),
+        },
+        status_code=status,
+    )
+    if retarget is not None:
+        response.headers["HX-Retarget"] = retarget
+        response.headers["HX-Reswap"] = "outerHTML"
+    return response
+
+
+def _review_card_selector(
+    proposal_id: str, review_sha256: object, issue: object
+) -> str | None:
+    """Name a card the browser could actually hold, without reflecting junk."""
+    if not isinstance(issue, str) or _ISSUE.fullmatch(issue) is None:
+        return None
+    try:
+        digest = require_review_sha256(review_sha256)
+    except ReviewTokenError:
+        return None
+    return f"#review-card-{require_proposal_id(proposal_id)}-{digest}-{issue}"
+
+
+#: How each compared field is named to an operator, and how its value is
+#: rendered. A 64-character digest tells nobody anything, so it is named in
+#: words and abbreviated — enough to identify the value, short enough to read.
+_FIELD_LABELS = {
+    "module": "module",
+    "sub": "sub",
+    "block": "block",
+    "src": "source path",
+    "dst": "destination path",
+    "source_sha256": "source contents",
+    "kind": "kind",
+    "slug": "value",
+    "total": "total references",
+    "impact": "impact breakdown",
+}
+
+
+def _field_label(field: str) -> str:
+    return _FIELD_LABELS.get(field, field)
+
+
+#: Fields whose value tells an operator nothing. A digest identifies a state
+#: of a file, not anything a person can read or check — abbreviated or not.
+#: The field is named as changed and no value is offered for it.
+_OPAQUE_FIELDS = frozenset({"source_sha256"})
+
+
+def _display_value(field: str, value: str) -> str | None:
+    return None if field in _OPAQUE_FIELDS else value
+
+
+def _uncompared_fields(
+    reviewed: dict[str, str | None], current: dict[str, str]
+) -> list[str]:
+    """Fields the browser did not report, so nothing can be said about them.
+
+    Partial evidence is not complete evidence: if every field that *was*
+    reported happens to match, calling the versions identical claims a
+    comparison of fields OneOS never saw.
+    """
+    return [
+        _field_label(field)
+        for field in current
+        if reviewed.get(field) is None
+    ]
+
+
+def _meaningful_differences(
+    reviewed: dict[str, str | None], current: dict[str, str]
+) -> list[tuple[str, str | None]]:
+    """Which fields differ from what the browser was showing, and what they
+    are now.
+
+    `reviewed` comes from the browser — the server never saw those bytes and
+    may not infer them (approved decision 8) — so it is used to *decide*
+    which fields differ and is never rendered. Rule 8 (design §6) forbids
+    reflecting a submitted value, and there is no need to: the version the
+    operator reviewed is still on screen directly above, so naming the
+    changed fields and their current, server-derived values tells them
+    exactly what changed without echoing anything they sent.
+
+    A field the browser did not send is simply not compared, so a missing or
+    hostile value can withhold or add a line of explanation and nothing more.
+    """
+    return [
+        (_field_label(field), _display_value(field, current[field]))
+        for field in current
+        if reviewed.get(field) is not None and reviewed[field] != current[field]
+    ]
+
+
+def _review_changed_response(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    stale_review_sha256: str,
+    stale_issue: str,
+    error: ConsoleError,
+    *,
+    current_card: str,
+    current_context,
+    current_actionable,
+    reviewed: dict[str, str | None],
+    current_fields,
+    check_again_url: str,
+) -> HTMLResponse:
+    """Reconfirm on the same screen (spec §Presentation).
+
+    The response is appended *beside* the card the operator acted from —
+    `HX-Retarget` plus `HX-Reswap: afterend` — rather than swapping the whole
+    list, so the version they reviewed stays on screen to compare against,
+    with the differing values named explicitly.
+
+    Status is 200, not E-REVIEW's 409, because S6 states normatively that a
+    fragment refusal renders at 200 (`status_for`), and the S7 spec preserves
+    that behaviour. It is not a workaround for HTMX: this app configures
+    `[45]..` with `swap:true` (`templates/_head.html`), so a 4xx would swap
+    perfectly well — the reason is the taxonomy's rule, not the client's.
+    """
+    context = current_context()
+    current = current_fields(context)
+    response = templates.TemplateResponse(
+        request,
+        "blocks/review_changed.html",
+        {
+            "entity": scope.current_entity(),
+            "proposal_id": proposal_id,
+            "review_sha256": context["review_sha256"],
+            "stale_review_sha256": stale_review_sha256,
+            "stale_issue": stale_issue,
+            # One issuance for the whole appended fragment — its wrapper,
+            # its current card, and the target `Check again` swaps — so a
+            # recurring digest cannot produce a recurring element id.
+            "current_issue": _new_issue(),
+            "review_error": error,
+            "check_again_url": check_again_url,
+            "differences": _meaningful_differences(reviewed, current),
+            # What could not be compared, because the browser did not report
+            # it. With nothing reported back, or only part of it, "the values
+            # look identical" would assert a comparison that never happened.
+            "uncompared": _uncompared_fields(reviewed, current),
+            "current_card_template": current_card,
+            # Whether the *current* card issued any control. It can be
+            # non-actionable and permanently so — a delete reviewed at zero
+            # references whose record now records some — and then "act
+            # again below" names a control that is not there, and a
+            # `Check again` sits directly under a card that has just said
+            # re-reading it would answer identically forever. Both claims
+            # are the card's to make or withhold, not the wrapper's.
+            "current_actionable": current_actionable(context),
+            **context,
+        },
+        # Derived, not restated: E-REVIEW is a `refusal`, and S6's rule
+        # makes a fragment refusal 200. Hardcoding the answer meant a
+        # change to E-REVIEW's severity would leave this one response
+        # disagreeing with every other fragment, with nothing to catch it.
+        status_code=status_for(error, True),
+    )
+    response.headers["HX-Retarget"] = (
+        f"#review-card-{proposal_id}-{stale_review_sha256}-{stale_issue}"
+    )
+    response.headers["HX-Reswap"] = "afterend"
+    return response
+
+
+def _outbox_review_changed(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    stale_review_sha256: str,
+    stale_issue: str,
+    error: ConsoleError,
+    reviewed: dict[str, str | None],
+) -> HTMLResponse:
+    current_row = _review_row(scope, proposal_id)
+    if current_row is not None and current_row.proposal_id is not None:
+        if current_row.receipt is None:
+            if current_row.error is not None:
+                raise current_row.error
+            raise OutboxError("receipt-backed row has no receipt outcome")
+        return _action_receipt_response(
+            request,
+            scope,
+            current_row.proposal_id,
+            receipt=current_row.receipt,
+            receipt_error=error,
+            retarget=_review_card_selector(
+                current_row.proposal_id,
+                stale_review_sha256,
+                stale_issue,
+            ),
+        )
+
+    def context():
+        row = current_row
+        if row is None:
+            raise OutboxError("no pending proposal for this entity")
+        return {
+            "row": row,
+            "error": describe(row.error) if row.error is not None else None,
+            "review_sha256": row.review_sha256,
+        }
+
+    def fields(ctx):
+        proposal = ctx["row"].proposal
+        # Every action-relevant value, including the source: a proposal
+        # rewritten to move a *different* file is exactly the change an
+        # operator most needs named.
+        return {
+            "module": proposal.module,
+            "sub": proposal.sub or "",
+            "block": proposal.block,
+            "src": proposal.src,
+            "dst": proposal.dst,
+            # The record's claim about the source's *contents*. A proposal
+            # rewritten to approve a different state of the same file changes
+            # nothing else — same module, same paths — and would otherwise be
+            # refused with nothing named.
+            "source_sha256": proposal.source_sha256,
+        }
+
+    return _review_changed_response(
+        request, scope, proposal_id, stale_review_sha256, stale_issue, error,
+        current_card="blocks/outbox_card.html",
+        current_context=context,
+        # A listing that became blocked between the refusal and this
+        # re-render yields a row with no fingerprint and no controls.
+        current_actionable=lambda ctx: bool(
+            ctx["row"].can_approve or ctx["row"].can_reject
+        ),
+        reviewed=reviewed,
+        current_fields=fields,
+        check_again_url=(
+            f"/outbox/{scope.current_entity()}/review/{proposal_id}"
+        ),
+    )
+
+
+def _reported_review(reviewed_values: str | None) -> dict[str, str | None]:
+    """What the browser reported it was showing, as evidence only.
+
+    One JSON field rather than several form fields: an empty form value
+    arrives as `None`, which would make "reviewed as empty" indistinguishable
+    from "not reported at all" — and that distinction is the whole point of
+    saying what could not be compared.
+
+    Anything malformed is treated as nothing reported. It can only ever
+    withhold or add a line of explanation; it never reaches the action, and
+    it is never rendered.
+    """
+    if not reviewed_values:
+        return {}
+    try:
+        reported = json.loads(reviewed_values)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(reported, dict):
+        return {}
+    return {
+        name: value
+        for name, value in reported.items()
+        if isinstance(name, str) and isinstance(value, str)
+    }
+
+
+def _review_unavailable_response(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    error: ConsoleError,
+    *,
+    review_path: str = "outbox",
+    record_missing: bool = False,
+) -> HTMLResponse:
+    """A safe no-action state: no controls, no fingerprint, no guessing."""
+    entity = scope.current_entity()
+    # `Check again` re-reads a URL built from this id, so it can only help
+    # when the id is one a review route will accept. A malformed id — the
+    # very thing E-INVALID reports — produced a button that re-fetched the
+    # same refusal forever, and whose `hx-target` named an element id built
+    # from the same malformed string, so it often resolved to nothing at
+    # all. An affordance that cannot succeed is worse than no affordance.
+    try:
+        require_proposal_id(proposal_id)
+    except ProposalIdentityError:
+        id_is_reviewable = False
+    else:
+        id_is_reviewable = True
+    # A re-read is offered only when it could genuinely answer differently.
+    # Two things make it permanently inert: an id no review route will
+    # accept, and a record that is *absent* — ids are never reissued and a
+    # consumed record is quarantined, so nothing can restore this one. A
+    # record that exists but cannot currently be read is the opposite case:
+    # repairing it outside the Console is exactly what the error instructs,
+    # and the re-read is how the operator sees that it worked.
+    rereadable = id_is_reviewable and not record_missing
+    check_again = (
+        (
+            f"/registry/{entity}/product/review/{proposal_id}"
+            if review_path == "registry"
+            else f"/outbox/{entity}/review/{proposal_id}"
+        )
+        if rereadable
+        else None
+    )
+    return templates.TemplateResponse(
+        request,
+        "blocks/review_unavailable.html",
+        {
+            "entity": entity,
+            # The element id is keyed on a server-minted issuance, never on
+            # the untrusted id: an id that cannot pass validation must not
+            # become part of a selector.
+            "issue": _new_issue(),
+            "review_error": error,
+            "check_again_url": check_again,
+            "rereadable": rereadable,
+            # Only a classification can be re-proposed from triage; a delete
+            # is recreated from the registry screen, so no triage link is
+            # offered for one.
+            "recreatable": review_path == "outbox"
+            and (record_missing or error.code in {"E-INVALID", "E-MISSING"}),
+            # Always, on the delete path. This used to be gated on the id
+            # also being unacceptable, which in practice meant a
+            # hand-typed URL — so the ordinary case, a delete proposal
+            # whose record is gone, was offered a re-read that could never
+            # succeed and denied the one link that resolves it.
+            "registry_recreatable": review_path == "registry",
+        },
+        # Both callers are `surface="fragment-only"`.
+        status_code=status_for(error, True),
+    )
+
+
+@app.get("/outbox/{entity}/review/{proposal_id}", response_class=HTMLResponse)
+@console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
+def outbox_review_fragment(
+    request: Request, scope: EntityScope, proposal_id: str
+) -> HTMLResponse:
+    """`Check again`: read, validate, render. It writes nothing.
+
+    A missing, malformed, redirected or cross-scope record renders the safe
+    unavailable state rather than an error page, so the operator keeps a
+    place to check again from.
+    """
+    try:
+        row = _review_row(scope, proposal_id)
+        # The second read has to sit inside the same guard. It calls
+        # `project_outbox` again, and a declared member of the family can
+        # arise between the two reads — a destination registry that became
+        # unreadable in between, say. Outside the guard that is the global
+        # fallback and a 500 page for a describable condition. The existing
+        # totality sweeps cannot see it, because they make the function
+        # raise unconditionally and so never get past the first read.
+        blocking = None
+        if row is None:
+            blocking = next(
+                (
+                    r.error
+                    for r in project_outbox(scope).rows
+                    if r.proposal is None and r.error
+                ),
+                None,
+            )
+    except _OUTBOX_CATCHES as exc:
+        return _review_unavailable_response(
+            request, scope, proposal_id, describe(exc)
+        )
+    if row is not None and row.proposal_id is not None:
+        return _action_receipt_response(
+            request,
+            scope,
+            row.proposal_id,
+            receipt=row.receipt,
+            receipt_error=(
+                describe(row.error) if row.error is not None else None
+            ),
+        )
+    if row is None:
+        # An id the projection does not hold names no *readable* proposal.
+        # Which of those two words applies matters to the operator: if the
+        # entity holds an unreadable record, "create a new proposal" is the
+        # wrong instruction — the existing one has to be repaired or removed
+        # outside the Console. Describe the blocking condition when there is
+        # one, rather than choosing a code here.
+        return _review_unavailable_response(
+            request, scope, proposal_id,
+            describe(
+                blocking
+                if blocking is not None
+                else OutboxError("no pending proposal for this entity")
+            ),
+            # No blocking record means no record: permanently inert.
+            record_missing=blocking is None,
+        )
+    return templates.TemplateResponse(
+        request,
+        "blocks/outbox_card.html",
+        {
+            "entity": scope.current_entity(),
+            "row": row,
+            "error": describe(row.error) if row.error is not None else None,
+            "label": "Current version",
+        },
+    )
+
+
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
 @console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
 def outbox_approve(
-    request: Request, scope: EntityScope, id: str = Form(...)
+    request: Request,
+    scope: EntityScope,
+    id: str = Form(...),
+    review_sha256: str = Form(...),
+    reviewed_values: str | None = Form(None),
+    review_issue: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_approve_response`, which catches `approve` itself refusing and,
@@ -699,27 +1320,97 @@ def outbox_approve(
     structural check and no measured outcome; an earlier revision kept one
     and had to invent a reason, which is why it is gone.
     """
-    return _outbox_approve_response(request, scope, id)
+    return _outbox_approve_response(
+        request, scope, id, review_sha256,
+        _reported_review(reviewed_values),
+        review_issue,
+    )
 
 
-def _outbox_approve_response(request: Request, scope: Scope, id: str) -> HTMLResponse:
+def _outbox_approve_response(
+    request: Request,
+    scope: Scope,
+    id: str,
+    review_sha256: str,
+    reviewed: dict[str, str | None],
+    review_issue: str | None,
+) -> HTMLResponse:
     approval_error = None
+    action_receipt = None
     try:
-        approve(scope, id)
+        # S7: the operator's own fingerprint, passed through untouched. The
+        # route must never derive one — recomputing here would rebind the
+        # action to whatever is on disk now, which is the defect S7 closes.
+        result = approve(scope, id, review_sha256)
+    except ReviewedProposalChanged as exc:
+        # Not a list re-render: the operator keeps the version they reviewed
+        # on screen and reconfirms against the current one beside it.
+        review_error = describe(exc)
+        try:
+            return _outbox_review_changed(
+                request, scope, id, review_sha256,
+                _require_issue(review_issue), review_error, reviewed,
+            )
+        except _OUTBOX_CATCHES as render_exc:
+            # S6 composition: the refusal and the re-render's own failure are
+            # both real. Dropping the E-REVIEW here would tell the operator
+            # their action failed for an unrelated reason and hide that their
+            # proposal was rewritten.
+            return _outbox_list_error(
+                request, scope, render_exc, action_error=review_error
+            )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
+        if approval_error.code == "E-APPLIED":
+            try:
+                action_receipt = _require_committed_action_receipt(scope, id)
+            except _OUTBOX_CATCHES as render_exc:
+                return _outbox_list_error(
+                    request, scope, render_exc, action_error=approval_error
+                )
+    else:
+        if isinstance(result, SpentAction):
+            # The button targets the whole listing. Re-project from HEAD so
+            # the matching pending id becomes the shared spent card while
+            # every sibling remains present; never reinterpret the receipt
+            # as an ordinary successful approval.
+            try:
+                return _outbox_list(
+                    request, scope, action_receipt=result.receipt
+                )
+            except _OUTBOX_CATCHES as exc:
+                return _outbox_list_error(
+                    request, scope, exc, action_receipt=result.receipt
+                )
     try:
-        return _outbox_list(request, scope, approval_error=approval_error)
+        return _outbox_list(
+            request,
+            scope,
+            approval_error=approval_error,
+            approval_error_id=id,
+            action_receipt=action_receipt,
+        )
     except _OUTBOX_CATCHES as exc:
         # I1: the re-render's own failure must not discard approve()'s own
         # refusal — both are carried into the fallback fragment.
-        return _outbox_list_error(request, scope, exc, action_error=approval_error)
+        return _outbox_list_error(
+            request,
+            scope,
+            exc,
+            action_error=approval_error,
+            action_receipt=action_receipt,
+        )
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
 @console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
 def outbox_reject(
-    request: Request, scope: EntityScope, id: str = Form(...)
+    request: Request,
+    scope: EntityScope,
+    id: str = Form(...),
+    review_sha256: str = Form(...),
+    reviewed_values: str | None = Form(None),
+    review_issue: str | None = Form(None),
 ) -> HTMLResponse:
     """The route's declared family is answered inside
     `_outbox_reject_response`, which catches `reject` itself refusing and,
@@ -735,21 +1426,80 @@ def outbox_reject(
     structural check and no measured outcome; an earlier revision kept one
     and had to invent a reason, which is why it is gone.
     """
-    return _outbox_reject_response(request, scope, id)
+    return _outbox_reject_response(
+        request, scope, id, review_sha256,
+        _reported_review(reviewed_values),
+        review_issue,
+    )
 
 
-def _outbox_reject_response(request: Request, scope: Scope, id: str) -> HTMLResponse:
+def _outbox_reject_response(
+    request: Request,
+    scope: Scope,
+    id: str,
+    review_sha256: str,
+    reviewed: dict[str, str | None],
+    review_issue: str | None,
+) -> HTMLResponse:
     approval_error = None
+    action_receipt = None
     try:
-        reject(scope, id)
+        # S7: same contract as approve — passed through, never derived.
+        result = reject(scope, id, review_sha256)
+    except ReviewedProposalChanged as exc:
+        # Not a list re-render: the operator keeps the version they reviewed
+        # on screen and reconfirms against the current one beside it.
+        review_error = describe(exc)
+        try:
+            return _outbox_review_changed(
+                request, scope, id, review_sha256,
+                _require_issue(review_issue), review_error, reviewed,
+            )
+        except _OUTBOX_CATCHES as render_exc:
+            # S6 composition: the refusal and the re-render's own failure are
+            # both real. Dropping the E-REVIEW here would tell the operator
+            # their action failed for an unrelated reason and hide that their
+            # proposal was rewritten.
+            return _outbox_list_error(
+                request, scope, render_exc, action_error=review_error
+            )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
+        if approval_error.code == "E-APPLIED":
+            try:
+                action_receipt = _require_committed_action_receipt(scope, id)
+            except _OUTBOX_CATCHES as render_exc:
+                return _outbox_list_error(
+                    request, scope, render_exc, action_error=approval_error
+                )
+    else:
+        if isinstance(result, SpentAction):
+            try:
+                return _outbox_list(
+                    request, scope, action_receipt=result.receipt
+                )
+            except _OUTBOX_CATCHES as exc:
+                return _outbox_list_error(
+                    request, scope, exc, action_receipt=result.receipt
+                )
     try:
-        return _outbox_list(request, scope, approval_error=approval_error)
+        return _outbox_list(
+            request,
+            scope,
+            approval_error=approval_error,
+            approval_error_id=id,
+            action_receipt=action_receipt,
+        )
     except _OUTBOX_CATCHES as exc:
         # I1: same as approve — the re-render's own failure must not discard
         # reject()'s own refusal.
-        return _outbox_list_error(request, scope, exc, action_error=approval_error)
+        return _outbox_list_error(
+            request,
+            scope,
+            exc,
+            action_error=approval_error,
+            action_receipt=action_receipt,
+        )
 
 
 #: Declared once so the decorator and every route's own `except` cannot
@@ -776,8 +1526,13 @@ _REGISTRY_PRODUCTS_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError,
     SystemRegistryPathError,  # see _TRIAGE_CATCHES
 )
+#: `ReviewTokenError` (S7): a stale or malformed review fingerprint is a
+#: declared outcome of delete-execute, not an escape — the same addition the
+#: outbox actions needed.
 _REGISTRY_DELETE_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError, UnreadableProposalRecord,
+    ReviewTokenError,
+    InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
 
 
@@ -813,38 +1568,225 @@ def registry_delete_preview(
 ) -> HTMLResponse:
     try:
         selected = scope.current_entity()
-        prop = propose_delete(scope, "product", slug)
+        written = propose_delete(scope, "product", slug)
         # propose_delete has already written the proposal file by this
         # point (design §8: "the domain action succeeded, and S6 must not
         # roll back a successful write merely because rendering failed"), so
         # a failure from here on is `(committed=no, persistence=
         # proposal-written)`, not `persistence=none`.
-        report = reference_count(scope, "product", slug)
+        #
+        # S7: everything on this screen comes from one review snapshot of
+        # the just-written record — the displayed kind and value, the impact,
+        # and the fingerprint the button carries. A second live count taken
+        # here would describe state the button is not bound to, so the
+        # operator would review one thing and act on another.
+        review_or_receipt = get_delete_receipt_or_review(scope, written.id)
     except _REGISTRY_DELETE_CATCHES as exc:
         return _render_console_error(request, describe(exc))
+    if isinstance(review_or_receipt, ActionReceipt):
+        return _action_receipt_response(
+            request,
+            scope,
+            review_or_receipt.proposal_id,
+            receipt=review_or_receipt,
+        )
+    review = review_or_receipt
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
-        {"entity": selected, "slug": slug, "prop": prop, "report": report},
+        # No submitted value reaches the fragment: the slug on screen is the
+        # one inside the fingerprint, so the screen cannot describe one
+        # product while the button is bound to a proposal naming another.
+        {"entity": selected, "prop": review.value,
+         "review_sha256": review.sha256,
+         "impact_signature": _impact_signature(review.value.sources)},
+    )
+
+
+def _delete_review_changed(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    stale_review_sha256: str,
+    stale_issue: str,
+    error: ConsoleError,
+    reviewed: dict[str, str | None],
+) -> HTMLResponse:
+    review_or_receipt = get_delete_receipt_or_review(scope, proposal_id)
+    if isinstance(review_or_receipt, ActionReceipt):
+        return _action_receipt_response(
+            request,
+            scope,
+            review_or_receipt.proposal_id,
+            receipt=review_or_receipt,
+            receipt_error=error,
+            retarget=_review_card_selector(
+                review_or_receipt.proposal_id,
+                stale_review_sha256,
+                stale_issue,
+            ),
+        )
+    current_review = review_or_receipt
+
+    def context():
+        return {
+            "prop": current_review.value,
+            "review_sha256": current_review.sha256,
+            "impact_signature": _impact_signature(current_review.value.sources),
+        }
+
+    def fields(ctx):
+        prop = ctx["prop"]
+        # The breakdown, not only the total: an impact that moved between
+        # sources while summing the same is still a different impact.
+        return {
+            "kind": prop.kind,
+            "slug": prop.slug,
+            "total": str(prop.total),
+            "impact": _impact_signature(prop.sources),
+        }
+
+
+    return _review_changed_response(
+        request, scope, proposal_id, stale_review_sha256, stale_issue, error,
+        current_card="blocks/delete_impact.html",
+        current_context=context,
+        # `delete_impact.html` withholds every control, and the fingerprint
+        # with it, when the reviewed impact records references.
+        current_actionable=lambda ctx: not ctx["prop"].total,
+        reviewed=reviewed,
+        current_fields=fields,
+        check_again_url=(
+            f"/registry/{scope.current_entity()}/product/review/{proposal_id}"
+        ),
+    )
+
+
+def _impact_signature(sources) -> str:
+    """A stable, comparable rendering of an impact breakdown."""
+    return ", ".join(f"{name}={count}" for name, count in sorted(sources.items()))
+
+
+@app.get(
+    "/registry/{entity}/product/review/{proposal_id}", response_class=HTMLResponse
+)
+@console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
+def registry_delete_review_fragment(
+    request: Request, scope: EntityScope, proposal_id: str
+) -> HTMLResponse:
+    """`Check again` for a delete review: read, validate, render.
+
+    It writes nothing — no proposal, no registry, no Git. A record that
+    cannot be reviewed renders the safe no-action state rather than an error
+    page, so the operator keeps somewhere to check again from.
+    """
+    try:
+        review_or_receipt = get_delete_receipt_or_review(scope, proposal_id)
+    except InvalidActionReceipt as exc:
+        return _action_receipt_response(
+            request,
+            scope,
+            require_proposal_id(proposal_id),
+            receipt=None,
+            receipt_error=describe(exc),
+        )
+    except _REGISTRY_DELETE_CATCHES as exc:
+        return _review_unavailable_response(
+            request, scope, proposal_id, describe(exc), review_path="registry",
+            record_missing=isinstance(exc, MissingDeleteProposal),
+        )
+    if isinstance(review_or_receipt, ActionReceipt):
+        return _action_receipt_response(
+            request,
+            scope,
+            review_or_receipt.proposal_id,
+            receipt=review_or_receipt,
+        )
+    review = review_or_receipt
+    return templates.TemplateResponse(
+        request,
+        "blocks/delete_impact.html",
+        {
+            "entity": scope.current_entity(),
+            "prop": review.value,
+            "review_sha256": review.sha256,
+            "impact_signature": _impact_signature(review.value.sources),
+            "label": "Current version",
+        },
     )
 
 
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
 @console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
 def registry_delete_execute(
-    request: Request, scope: EntityScope, id: str = Form(...)
+    request: Request,
+    scope: EntityScope,
+    id: str = Form(...),
+    review_sha256: str = Form(...),
+    reviewed_values: str | None = Form(None),
+    review_issue: str | None = Form(None),
 ) -> HTMLResponse:
     # Rule 8 (design §6): the success copy must name the SERVER-derived
-    # slug, never the submitted one. `execute_delete` returns `None` and
-    # removes the proposal file as an owned change (app/registry.py:292,
-    # :346), so the record cannot be read afterwards — the validated slug is
-    # therefore held from a `get_delete_proposal` call made BEFORE
-    # `execute_delete`, and the route no longer even declares a `slug` form
-    # field (item D: it is unused for display and must not be submitted).
+    # slug, never the submitted one.
+    #
+    # S7: `execute_delete` now returns the bound `DeleteProposal` it actually
+    # executed, so the validated slug comes from the execution itself. The
+    # earlier `get_delete_proposal` read is gone — it was an unbound read of
+    # a record the action had not yet compared, and using it for display
+    # could describe bytes the deletion never consumed.
     try:
-        prop = get_delete_proposal(scope, id)
-        execute_delete(scope, id)
+        prop = execute_delete(scope, id, review_sha256)
+    except ReviewedProposalChanged as exc:
+        # Registry delete is a reviewed action and reconfirms exactly as the
+        # classification actions do.
+        review_error = describe(exc)
+        try:
+            return _delete_review_changed(
+                request, scope, id, review_sha256,
+                _require_issue(review_issue), review_error,
+                _reported_review(reviewed_values),
+            )
+        except _REGISTRY_DELETE_CATCHES as render_exc:
+            # S6 composition: both outcomes survive.
+            return _render_console_error(
+                request, describe(render_exc), action_error=review_error
+            )
     except _REGISTRY_DELETE_CATCHES as exc:
-        return _render_console_error(request, describe(exc))
+        action_error = describe(exc)
+        if action_error.code == "E-APPLIED":
+            try:
+                receipt_or_review = get_delete_receipt_or_review(scope, id)
+                if not isinstance(receipt_or_review, ActionReceipt):
+                    raise ReceiptStoreUnavailable(
+                        "committed action receipt could not be resolved"
+                    )
+            except _REGISTRY_DELETE_CATCHES as render_exc:
+                return _render_console_error(
+                    request, describe(render_exc), action_error=action_error
+                )
+            return _action_receipt_response(
+                request,
+                scope,
+                receipt_or_review.proposal_id,
+                receipt=receipt_or_review,
+                receipt_error=action_error,
+                status_code=action_error.page_status,
+                retarget=_review_card_selector(
+                    receipt_or_review.proposal_id,
+                    review_sha256,
+                    review_issue,
+                ),
+            )
+        return _render_console_error(request, action_error)
+    if isinstance(prop, SpentAction):
+        return _action_receipt_response(
+            request,
+            scope,
+            prop.receipt.proposal_id,
+            receipt=prop.receipt,
+            retarget=_review_card_selector(
+                prop.receipt.proposal_id, review_sha256, review_issue
+            ),
+        )
     return templates.TemplateResponse(
         request, "blocks/delete_success.html",
         {"kind": prop.kind, "slug": prop.slug},

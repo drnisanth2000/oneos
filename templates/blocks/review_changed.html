@@ -1,0 +1,88 @@
+{# Same-screen reconfirmation after a changed review (spec §Presentation).
+
+   Appended beside the card the operator acted from, which the browser still
+   holds. Nothing here re-serves the old review: the server never saw those
+   bytes and must not infer them (approved decision 8). What it does is
+   (a) name exactly which values differ, using the reviewed values the
+   browser sent back purely as evidence, (b) disable exactly the controls
+   issued for the stale bytes, out-of-band, and (c) offer the current,
+   server-validated review with a fresh fingerprint. #}
+{# The digest is deliberately absent from this id. A changed review can
+   land on a *current* proposal that is itself non-actionable — a delete
+   reviewed at zero references that now has some — and such a card is
+   required to carry no fingerprint anywhere. Keying the wrapper on the
+   current digest put it back on screen twice on exactly that path. The
+   pair `(proposal id, issuance)` is already unique, so nothing is lost. #}
+<div class="review-changed" id="review-changed-{{ proposal_id }}-{{ current_issue }}">
+  {% with error=review_error %}{% include "blocks/alert.html" %}{% endwith %}
+  {% if differences %}
+  {# Only the field name and the server's own current value: Rule 8 forbids
+     reflecting a submitted value, and the version the operator reviewed is
+     still on screen directly above for them to compare against. #}
+  <p class="muted">What changed since you reviewed it:</p>
+  <ul class="impact-list review-differences">
+    {% for field, now in differences %}
+    {% if now is none %}
+    <li><code>{{ field }}</code> changed</li>
+    {% else %}
+    <li><code>{{ field }}</code> is now <em>{{ now }}</em></li>
+    {% endif %}
+    {% endfor %}
+  </ul>
+  {% elif not uncompared %}
+  <p class="muted">
+    The stored record changed, even though the values you reviewed look
+    identical. OneOS refuses on the stored bytes, so this still needs a
+    fresh review.
+  </p>
+  {% endif %}
+  {% if uncompared %}
+  {# Partial evidence is not complete evidence. Whatever was compared, these
+     fields were not reported back, so nothing is claimed about them. #}
+  <p class="muted">
+    {% if not differences %}The stored record changed. {% endif %}
+    These values could not be compared, because the version you reviewed did
+    not report them back — OneOS never sees the earlier bytes itself:
+    {% for field in uncompared %}<code>{{ field }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    Compare the version above with the current one below before acting.
+  </p>
+  {% endif %}
+  <p class="muted">
+    The version you reviewed is shown above, marked
+    <em>Previously reviewed</em>, and its controls are no longer active.
+    {% if current_actionable %}Act again below if you still want to.{% endif %}
+  </p>
+  {% with label="Current version — review this before acting",
+          issue=current_issue %}
+  {% include current_card_template %}
+  {% endwith %}
+  {% if current_actionable %}
+  <div class="prop-actions">
+    {% with check_again_target = "#review-changed-" ~ proposal_id ~ "-" ~ current_issue %}
+    {% include "blocks/check_again.html" %}
+    {% endwith %}
+  </div>
+  {% endif %}
+  {# When the current card is not actionable it has already said why, and
+     said what to do instead. Adding a re-read here would contradict it:
+     the card's whole point is that re-reading answers identically. #}
+</div>
+
+{# Out-of-band: the stale card's controls are *removed* in place, and no
+   replacement buttons are invented.
+
+   This used to render one disabled button per caption from a hardcoded
+   `stale_controls` tuple — `("Approve → move + commit", "Reject")` for the
+   outbox, unconditionally. But which controls the stale card offered is a
+   property of the bytes the operator reviewed, and the server never saw
+   those bytes (approved decision 8). A row whose stale version offered only
+   Reject was shown a greyed "Approve" it had never been given, which is a
+   false statement about what was on screen. Rule 8 rules out reading it back
+   off the submission, and there is nothing else to read it from.
+
+   Emptying the container says only what is true: whatever was here is no
+   longer actionable. The live controls are on the current card above. #}
+<div class="prop-actions" hx-swap-oob="true"
+     id="review-controls-{{ proposal_id }}-{{ stale_review_sha256 }}-{{ stale_issue }}">
+  <p class="muted review-label">Previously reviewed — no longer actionable.</p>
+</div>

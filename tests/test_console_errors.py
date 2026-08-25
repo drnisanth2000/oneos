@@ -49,10 +49,60 @@ def _committed_error():
     )
 
 
+def _post_commit_consumption_error():
+    from app.git_transaction import PostCommitConsumptionError, TransactionResult
+
+    return PostCommitConsumptionError(
+        TransactionResult("a" * 64, ("probe/path.md",)), OSError("probe")
+    )
+
+
 # One test per row of the design's normative class map.
 
 def test_map_GitTransactionCommittedError():
     assert _code_of(_committed_error()) == "E-COMMITTED"
+
+
+def test_map_PostCommitConsumptionError():
+    assert _code_of(_post_commit_consumption_error()) == "E-APPLIED"
+
+
+def test_e_applied_contract_is_exact_and_committed():
+    from app.console_errors import describe
+
+    outcome = describe(_post_commit_consumption_error())
+    assert outcome == ConsoleError(
+        "E-APPLIED",
+        "committed",
+        "attention",
+        "The action completed, but OneOS could not verify that its proposal "
+        "was safely consumed. Its receipt prevents this proposal ID from "
+        "being used again. Do not retry or move files by hand. Inspect vault "
+        "state with git status.",
+        "stop",
+        "yes",
+        500,
+    )
+
+
+def test_e_tamper_contract_gives_moved_folder_recovery_guidance():
+    from app.console_errors import ConsoleError, describe
+    from app.git_transaction import ReviewedPathIntegrityError
+
+    assert describe(ReviewedPathIntegrityError("probe")) == ConsoleError(
+        "E-TAMPER",
+        "integrity",
+        "attention",
+        "Refused: a managed file or folder is missing, moved, replaced, or "
+        "redirected. Reviewed actions for the affected entity are read-only. "
+        "Stop OneOS and every connected writer. Restore the item to its "
+        "expected location. If the whole vault intentionally moved, update "
+        "ONEOS_VAULT, restart OneOS, and rerun verification. Do not use a "
+        "symlink or retry while this warning remains.",
+        "stop",
+        "no",
+        409,
+    )
 
 
 def test_map_GitTransactionRecoveryError():
@@ -103,10 +153,10 @@ def test_map_GitTransactionError():
     assert _code_of(GitTransactionError("probe")) == "E-GIT"
 
 
-def test_map_ApprovalLockCleanupFailure():
-    from app.git_transaction import _ApprovalLockCleanupFailure
+def test_map_ActionLockCleanupFailure():
+    from app.git_transaction import ActionLockCleanupFailure
 
-    assert _code_of(_ApprovalLockCleanupFailure(OSError("probe"))) == "E-GIT"
+    assert _code_of(ActionLockCleanupFailure(OSError("probe"))) == "E-GIT"
 
 
 def test_map_ReviewedIndexOwnershipConflict():
@@ -321,6 +371,13 @@ RECEIPT = textwrap.dedent(
 )
 
 
+def _fp(scope, proposal_id: str) -> str:
+    """The fingerprint of the proposal exactly as it now stands (S7)."""
+    from app.outbox import get_proposal_review
+
+    return get_proposal_review(scope, proposal_id).sha256
+
+
 def _outbox_fixture(tmp_path):
     from app.outbox import propose_classification
     from app.scope import Scope
@@ -343,6 +400,13 @@ def _outbox_fixture(tmp_path):
         sub="kb",
     )
     return vault, scope, proposal
+
+
+def _fp_delete(scope, proposal_id: str) -> str:
+    """The fingerprint of the delete proposal as it now stands (S7)."""
+    from app.registry import get_delete_review
+
+    return get_delete_review(scope, proposal_id).sha256
 
 
 def _registry_fixture(tmp_path):
@@ -406,7 +470,7 @@ def test_committed_outcome_survives_the_domain_wrapper(tmp_path, monkeypatch):
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        outbox.approve(scope, proposal.id)
+        outbox.approve(scope, proposal.id, _fp(scope, proposal.id))
 
     assert _code_of(raised.value) == "E-COMMITTED"
 
@@ -422,13 +486,13 @@ def test_recovery_outcome_survives_both_wrappers(tmp_path, monkeypatch):
     _vault, scope, proposal = _outbox_fixture(tmp_path / "outbox-vault")
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction)
     with pytest.raises(outbox.OutboxTransactionError) as via_outbox:
-        outbox.approve(scope, proposal.id)
+        outbox.approve(scope, proposal.id, _fp(scope, proposal.id))
     assert _code_of(via_outbox.value) == "E-RECOVER"
 
     _vault, scope, proposal = _registry_fixture(tmp_path / "registry-vault")
     monkeypatch.setattr(registry, "execute_transaction", fail_transaction)
     with pytest.raises(registry.RegistryTransactionError) as via_registry:
-        registry.execute_delete(scope, proposal.id)
+        registry.execute_delete(scope, proposal.id, _fp_delete(scope, proposal.id))
     assert _code_of(via_registry.value) == "E-RECOVER"
 
 
@@ -446,7 +510,7 @@ def test_all_five_s5_outcomes_via_registry_wrapper(
     monkeypatch.setattr(registry, "execute_transaction", fail_transaction)
 
     with pytest.raises(registry.RegistryTransactionError) as raised:
-        registry.execute_delete(scope, proposal.id)
+        registry.execute_delete(scope, proposal.id, _fp_delete(scope, proposal.id))
 
     assert _code_of(raised.value) == expected
 
@@ -465,7 +529,7 @@ def test_all_five_s5_outcomes_via_outbox_wrapper(
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        outbox.approve(scope, proposal.id)
+        outbox.approve(scope, proposal.id, _fp(scope, proposal.id))
 
     assert _code_of(raised.value) == expected
 
@@ -559,6 +623,7 @@ def test_closed_family_synthetic_subclass_is_unknown():
 
 def test_abstract_bases_resolve_nowhere_and_are_never_raised():
     from app.console_errors import _EXACT, _MRO
+    from app.action_receipts import ReceiptError
     from app.destinations import InvalidSourceLeaf, UnsafeDestinationPath
     from app.git_transaction import ReviewedStateConflict
     from app.scope import CrossScopeError
@@ -568,6 +633,7 @@ def test_abstract_bases_resolve_nowhere_and_are_never_raised():
         ReviewedStateConflict,
         UnsafeDestinationPath,
         InvalidSourceLeaf,
+        ReceiptError,
     ):
         assert base not in _EXACT
         assert base not in _MRO
@@ -590,3 +656,122 @@ def test_no_attention_message_invites_a_retry():
         if error.severity == "attention":
             assert error.retry in {"stop", "none"}
             assert "Try again" not in error.message
+
+
+# --- S7 Task 1: the bound-review outcomes ------------------------------------
+
+
+def test_map_ReviewedProposalChanged():
+    from app.review_tokens import ReviewedProposalChanged
+
+    assert _code_of(ReviewedProposalChanged("probe")) == "E-REVIEW"
+
+
+def test_map_InvalidReviewToken():
+    from app.review_tokens import InvalidReviewToken
+
+    assert _code_of(InvalidReviewToken("probe")) == "E-REQUEST"
+
+
+def test_map_ReviewTokenError_base_is_an_internal_defect():
+    # The base is never raised deliberately; if it ever surfaces it is a
+    # defect in OneOS, not a problem with the operator's data.
+    from app.review_tokens import ReviewTokenError
+
+    assert _code_of(ReviewTokenError("probe")) == "E-INTERNAL"
+
+
+def test_map_ReviewContractViolation():
+    from app.review_tokens import ReviewContractViolation
+
+    assert _code_of(ReviewContractViolation("probe")) == "E-INTERNAL"
+
+
+def test_review_outcomes_do_not_inherit_each_others_codes():
+    from app.review_tokens import InvalidReviewToken, ReviewedProposalChanged
+
+    class SyntheticChanged(ReviewedProposalChanged):
+        pass
+
+    class SyntheticInvalid(InvalidReviewToken):
+        pass
+
+    # Exact entries never pass through MRO. A subclass degrading to the
+    # base's internal-defect code is the safe runtime backstop, not the
+    # intended end state: the closed-family walk in
+    # tests/test_console_invariants.py fails until any new application
+    # subclass declares its own exact outcome.
+    assert _code_of(SyntheticChanged("probe")) == "E-INTERNAL"
+    assert _code_of(SyntheticInvalid("probe")) == "E-INTERNAL"
+
+
+def test_changed_review_message_is_the_approved_wording_verbatim():
+    from app.console_errors import _CODES
+
+    error = _CODES["E-REVIEW"]
+    assert error.message == (
+        "Proposal changed since your review. Nothing was changed."
+    )
+    assert error.severity == "refusal"
+    assert error.committed == "no"
+    assert error.page_status == 409
+    assert error.retry == "reload"
+
+
+def test_changed_review_is_a_distinct_outcome_from_reviewed_state_changed():
+    # S5's E-CONFLICT describes reviewed *files* changing under a
+    # transaction. S7's E-REVIEW describes the proposal record itself
+    # changing since the operator reviewed it. Collapsing them would make
+    # the Console tell the operator the wrong thing to do.
+    from app.console_errors import _CODES
+
+    assert _CODES["E-REVIEW"].message != _CODES["E-CONFLICT"].message
+    assert _CODES["E-REVIEW"].code != _CODES["E-CONFLICT"].code
+
+
+def test_changed_review_message_names_no_bytes_and_promises_no_change():
+    from app.console_errors import _CODES
+
+    message = _CODES["E-REVIEW"].message
+    assert "Nothing was changed." in message
+    assert "sha" not in message.lower()
+    assert "/" not in message
+
+
+# --- S7 Amendment 3 Stage 2: committed action receipt outcomes --------------
+
+
+def test_map_InvalidActionReceipt():
+    from app.action_receipts import InvalidActionReceipt
+
+    assert _code_of(InvalidActionReceipt("probe")) == "E-RECEIPT"
+
+
+def test_map_ReceiptStoreIntegrityError():
+    from app.action_receipts import ReceiptStoreIntegrityError
+
+    assert _code_of(ReceiptStoreIntegrityError("probe")) == "E-TAMPER"
+
+
+def test_map_ReceiptStoreUnavailable():
+    from app.action_receipts import ReceiptStoreUnavailable
+
+    assert _code_of(ReceiptStoreUnavailable("probe")) == "E-UNAVAILABLE"
+
+
+def test_invalid_receipt_message_is_the_approved_wording_verbatim():
+    from app.console_errors import _CODES
+
+    error = _CODES["E-RECEIPT"]
+    assert error.message == (
+        "OneOS found an invalid action receipt for this proposal ID. It "
+        "cannot safely tell what completed action the receipt represents, "
+        "so the ID is disabled. Do not retry, and do not move or delete "
+        "files by hand. No automated recovery is available. Inspect vault "
+        "state with git status and escalate for verified recovery."
+    )
+    assert error.tier == "integrity"
+    assert error.severity == "attention"
+    assert error.committed == "no"
+    assert error.retry == "stop"
+    assert error.page_status == 500

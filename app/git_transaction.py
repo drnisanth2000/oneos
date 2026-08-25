@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import ctypes
+import ctypes.util
 from dataclasses import dataclass
 import errno
+import platform
+import sys
 import fcntl
 import hashlib
 import os
@@ -57,10 +61,88 @@ class GitTransactionCommittedError(GitTransactionError):
         super().__init__("approval transaction committed but cleanup failed")
 
 
-class _ApprovalLockCleanupFailure(GitTransactionFailure):
+class PostCommitConsumptionError(GitTransactionError):
+    """The action committed, but its proposal was not verifiably consumed.
+
+    `applied` in the operator taxonomy means committed here. It is distinct
+    from the pre-commit `applied_changes` vocabulary used later in this file.
+    The durable result is retained so callers can never roll the action back
+    or report that nothing changed merely because quarantine failed.
+    """
+
+    def __init__(
+        self, result: TransactionResult, cause: BaseException
+    ) -> None:
+        self.result = result
+        self.commit_oid = result.commit_oid
+        self.consumption_error = cause
+        super().__init__("action committed but proposal consumption failed")
+
+
+class ActionLockCleanupFailure(GitTransactionFailure):
+    """The action-lock body completed, but unlock or close failed."""
+
     def __init__(self, cleanup_error: OSError) -> None:
         self.cleanup_error = cleanup_error
         super().__init__("approval lock cleanup failed")
+
+
+_ApprovalLockCleanupFailure = ActionLockCleanupFailure
+
+
+class AtomicMoveUnavailable(GitTransactionError):
+    """This kernel or filesystem has no atomic no-overwrite move.
+
+    S7 fails closed here rather than degrading to an ordinary rename, which
+    silently overwrites its destination (design §3, Amendment 1).
+    """
+
+
+class QuarantineEntrySubstituted(GitTransactionError):
+    """The quarantine location no longer holds the exact reviewed proposal.
+
+    S7 Amendment 2, generalised by Amendment 3. Covers every way that
+    can be true, because the operator's position is identical in each:
+
+    - `"replaced"` — the name resolves to a different inode;
+    - `"absent"` — the name resolves to nothing; or
+    - `"rewritten"` — the same inode, whose bytes changed in place. Identity
+      alone cannot see this one, which is why the contents check survives
+      Amendment 3 even though its old remedy did not; or
+    - `"unavailable"` — OneOS cannot complete either check reliably.
+
+    Detected after the move, so the move is *not* undone. Undoing it by name
+    would relocate whatever now holds that name under the reviewed record's
+    name — the one thing this outcome exists to stop OneOS doing. After
+    detection no further mutation is performed.
+
+    `link_count` is the reviewed inode's `st_nlink` at the moment of
+    detection, carried as diagnostic evidence. Zero means no filesystem
+    link preserved it then; greater than zero means some link existed, with
+    no claim about where or whether following it would be safe. It never
+    softens or varies the operator message.
+    """
+
+    def __init__(self, path: str, link_count: int, condition: str) -> None:
+        self.path = path
+        self.link_count = link_count
+        self.condition = condition
+        super().__init__(
+            f"quarantined record is not the reviewed proposal ({condition})"
+        )
+
+
+class QuarantineCleanupError(GitTransactionFailure):
+    """The record was quarantined; only the cleanup afterwards failed.
+
+    Distinct from `ActionLockCleanupFailure`, which reaches the operator
+    as "nothing was changed and it was rolled back". After a completed
+    consumption that sentence is simply false.
+    """
+
+    def __init__(self, cleanup_error: OSError) -> None:
+        self.cleanup_error = cleanup_error
+        super().__init__("reviewed record was quarantined but cleanup failed")
 
 
 class _ReviewedIndexOwnershipConflict(GitTransactionFailure):
@@ -106,6 +188,20 @@ class PathChange:
     path: str
     before: PathState
     after: PathState
+    create_parent: bool = False
+
+
+@dataclass(frozen=True)
+class TransactionPreconditionRefused:
+    reason: object
+
+
+Precondition = Callable[[], object | None]
+
+
+_RECEIPT_CREATION_PATH = re.compile(
+    r"[^/]+/outbox/\.receipts/[^/]+\.yaml\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -114,6 +210,13 @@ class TransactionPlan:
     changes: tuple[PathChange, ...]
     commit_paths: tuple[str, ...]
     owned_changes: tuple[PathChange, ...] = ()
+    #: Checks that must hold **under the approval lock, immediately before
+    #: any mutation**. A precondition whose truth depends on state this
+    #: transaction does not own — a live reference count, say — cannot be
+    #: evaluated before the lock: another approval can commit between the
+    #: check and the lock, and the transaction's own expected states would
+    #: still match. Each callable raises to refuse; none may mutate.
+    preconditions: tuple[Precondition, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.message, str) or not self.message or "\n" in self.message:
@@ -122,6 +225,8 @@ class TransactionPlan:
             raise ValueError("transaction requires reviewed changes")
         if not isinstance(self.commit_paths, tuple) or not self.commit_paths:
             raise ValueError("transaction requires commit paths")
+        if not isinstance(self.preconditions, tuple):
+            raise ValueError("preconditions must be a tuple")
         if not isinstance(self.owned_changes, tuple):
             raise ValueError("owned changes must be a tuple")
 
@@ -135,6 +240,17 @@ class TransactionPlan:
             raise ValueError("commit paths must be duplicate-free")
         if set(self.commit_paths) != {change.path for change in self.changes}:
             raise ValueError("commit paths must equal reviewed change paths")
+        for change in self.changes + self.owned_changes:
+            if not change.create_parent:
+                continue
+            if (
+                change.before.contents is not None
+                or change.after.contents is None
+                or _RECEIPT_CREATION_PATH.fullmatch(change.path) is None
+            ):
+                raise ValueError(
+                    "only an absent action receipt may create its parent"
+                )
 
 
 @dataclass(frozen=True)
@@ -249,13 +365,6 @@ def _unsafe_open_failure(exc: OSError, message: str) -> ReviewedStateConflict:
 def _open_checked_directory(
     path: str | Path, description: str, *, dir_fd: int | None = None
 ) -> int:
-    try:
-        checked_stat = os.lstat(path, dir_fd=dir_fd)
-    except OSError as exc:
-        raise ReviewedPathUnavailable(f"{description} is unavailable") from exc
-    if stat.S_ISLNK(checked_stat.st_mode) or not stat.S_ISDIR(checked_stat.st_mode):
-        raise ReviewedPathIntegrityError(f"{description} is not a directory")
-
     flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
@@ -264,15 +373,45 @@ def _open_checked_directory(
     try:
         descriptor = os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.EMLINK, errno.ENOTDIR}:
+            raise ReviewedPathIntegrityError(
+                f"{description} is not a directory"
+            ) from exc
         raise _unsafe_open_failure(
             exc, f"{description} could not be opened safely"
         ) from exc
     try:
+        try:
+            checked_stat = os.lstat(path, dir_fd=dir_fd)
+        except FileNotFoundError as exc:
+            raise ReviewedPathIntegrityError(
+                f"{description} changed while being captured"
+            ) from exc
+        except OSError as exc:
+            raise ReviewedPathUnavailable(f"{description} is unavailable") from exc
         opened_stat = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(opened_stat.st_mode)
+            or opened_stat.st_nlink == 0
+            or stat.S_ISLNK(checked_stat.st_mode)
+            or not stat.S_ISDIR(checked_stat.st_mode)
             or (opened_stat.st_dev, opened_stat.st_ino)
             != (checked_stat.st_dev, checked_stat.st_ino)
+        ):
+            raise ReviewedPathIntegrityError(f"{description} changed while being captured")
+        try:
+            final_stat = os.lstat(path, dir_fd=dir_fd)
+        except FileNotFoundError as exc:
+            raise ReviewedPathIntegrityError(
+                f"{description} changed while being captured"
+            ) from exc
+        except OSError as exc:
+            raise ReviewedPathUnavailable(f"{description} is unavailable") from exc
+        if (
+            stat.S_ISLNK(final_stat.st_mode)
+            or not stat.S_ISDIR(final_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (final_stat.st_dev, final_stat.st_ino)
         ):
             raise ReviewedPathIntegrityError(f"{description} changed while being captured")
         return descriptor
@@ -282,8 +421,8 @@ def _open_checked_directory(
 
 
 @contextmanager
-def _approval_lock(vault: Path) -> Iterator[None]:
-    """Acquire the per-vault approval lock without waiting."""
+def action_lock(vault: Path) -> Iterator[None]:
+    """Acquire the shared per-vault OneOS action lock without waiting."""
     try:
         git_dir_output = subprocess.run(
             ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
@@ -335,27 +474,41 @@ def _approval_lock(vault: Path) -> Iterator[None]:
                     f"approval lock cleanup also failed: {cleanup_error}"
                 )
             else:
-                raise _ApprovalLockCleanupFailure(cleanup_error) from cleanup_error
+                raise ActionLockCleanupFailure(cleanup_error) from cleanup_error
 
 
-def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult:
+# Kept as a compatibility alias for existing callers that imported the old
+# private name. Supported OneOS writers use the public interface above.
+_approval_lock = action_lock
+
+
+def execute_transaction(
+    vault: Path, plan: TransactionPlan
+) -> TransactionResult | TransactionPreconditionRefused:
     """Commit exactly the reviewed paths while preserving unrelated Git state."""
     vault = Path(vault).resolve()
     result: TransactionResult | None = None
     try:
-        with _approval_lock(vault):
+        with action_lock(vault):
             start_head = _git_text(vault, "rev-parse", "HEAD").strip()
             reviewed_index = _capture_reviewed_index(vault, plan.commit_paths)
             _require_owned_paths_untracked(vault, start_head, plan.owned_changes)
             unrelated = _capture_unrelated_state(vault, plan)
             _require_expected_states(vault, plan)
+            # Under the lock, before anything is applied: the last moment at
+            # which a refusal still costs nothing.
+            for precondition in plan.preconditions:
+                reason = precondition()
+                if reason is not None:
+                    return TransactionPreconditionRefused(reason)
+            _require_receipt_creation_states(vault, plan)
             _require_reviewed_index_matches_head(
                 vault, start_head, plan.commit_paths
             )
             result = _execute_locked(
                 vault, start_head, reviewed_index, unrelated, plan
             )
-    except _ApprovalLockCleanupFailure as exc:
+    except ActionLockCleanupFailure as exc:
         if result is None:
             raise
         raise GitTransactionCommittedError(result, exc.cleanup_error) from exc.cleanup_error
@@ -376,6 +529,37 @@ def _execute_locked(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
 ) -> TransactionResult:
+    """Run one transaction, releasing every descriptor it takes ownership of.
+
+    Amendment 3 makes the transaction the owner of each quarantined
+    record's descriptor, held through commit and rollback diagnosis. The
+    release therefore sits in a `finally` around the whole body: outcome
+    composition and diagnosis are ordinary code that can raise, and a
+    release placed after them is skipped exactly when something has
+    already gone wrong.
+    """
+    quarantined: list[tuple[PathChange, QuarantinedRecord]] = []
+    try:
+        return _execute_locked_body(
+            vault, start_head, reviewed_index, unrelated, plan, quarantined
+        )
+    finally:
+        for _change, _record in quarantined:
+            # Not guarded. These descriptors are owned here and closed
+            # exactly once, so a failure is a double-close or a corrupted
+            # handle — a defect in this file, which must surface rather
+            # than be absorbed as if it were normal ownership.
+            os.close(_record.descriptor)
+
+
+def _execute_locked_body(
+    vault: Path,
+    start_head: str,
+    reviewed_index: tuple[_IndexEntry, ...],
+    unrelated: _UnrelatedState,
+    plan: TransactionPlan,
+    quarantined: list[tuple[PathChange, QuarantinedRecord]],
+) -> TransactionResult:
     applied_changes: list[tuple[PathChange, PathState]] = []
     temporary_index: str | None = None
     commit_oid: str | None = None
@@ -386,7 +570,7 @@ def _execute_locked(
     transaction_error: GitTransactionError | None = None
     transaction_cause: Exception | None = None
     try:
-        for change in plan.changes + plan.owned_changes:
+        for change in plan.changes:
             _apply_state(
                 vault,
                 change,
@@ -443,25 +627,24 @@ def _execute_locked(
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
         _checkpoint("real-index-synchronized")
         _require_unrelated_state_unchanged(vault, unrelated, plan)
-        _require_final_states(vault, plan)
+        _require_committed_states(vault, plan)
         _require_head_matches(vault, commit_oid)
         result = TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
     except Exception as exc:
         transaction_cause = exc
-        blocked_paths = set(
-            _rollback_transaction(
-                vault,
-                start_head,
-                commit_oid,
-                commit_created,
-                commit_output,
-                reviewed_index,
-                transaction_index,
-                unrelated,
-                plan,
-                applied_changes,
-            )
+        rolled_back_paths = _rollback_transaction(
+            vault,
+            start_head,
+            commit_oid,
+            commit_created,
+            commit_output,
+            reviewed_index,
+            transaction_index,
+            unrelated,
+            plan,
+            applied_changes,
         )
+        blocked_paths = set(rolled_back_paths)
         if isinstance(exc, _ReviewedIndexOwnershipConflict):
             blocked_paths.update(exc.paths)
         if blocked_paths:
@@ -489,14 +672,39 @@ def _execute_locked(
                 )
         raise transaction_error from transaction_cause
 
-    if cleanup_error is not None:
-        if result is None:
-            raise GitTransactionFailure(
-                "approval transaction cleanup failed without a result"
-            ) from cleanup_error
-        raise GitTransactionCommittedError(result, cleanup_error) from cleanup_error
     if result is None:
         raise GitTransactionFailure("approval transaction produced no result")
+
+    # Stage 2: the action and its receipt are already committed. Proposal
+    # consumption is the final vault mutation under this same approval lock.
+    # Any failure here preserves the commit and receipt and never invokes
+    # rollback or a name-based rename-back.
+    try:
+        _checkpoint("before-proposal-quarantine")
+        for change in plan.owned_changes:
+            quarantined.append(
+                (
+                    change,
+                    quarantine_path_if_unchanged(vault, change.path, change.before),
+                )
+            )
+        _require_final_states(vault, plan)
+        _require_unrelated_state_unchanged(vault, unrelated, plan)
+        _require_head_matches(vault, result.commit_oid)
+        for _change, record in quarantined:
+            _require_quarantined_record_unchanged(vault, record)
+        _require_head_matches(vault, result.commit_oid)
+    except Exception as exc:
+        applied = PostCommitConsumptionError(result, exc)
+        if cleanup_error is not None:
+            applied.add_note(
+                "the transaction's temporary index could not be removed "
+                f"either: {cleanup_error}"
+            )
+        raise applied from exc
+
+    if cleanup_error is not None:
+        raise GitTransactionCommittedError(result, cleanup_error) from cleanup_error
     return result
 
 
@@ -892,6 +1100,10 @@ def _capture_unrelated_state(vault: Path, plan: TransactionPlan) -> _UnrelatedSt
     unrelated_entries = tuple(
         entry for entry in all_entries if entry.path not in reviewed
     )
+    # Amendment 1: an owned proposal is consumed by moving it into
+    # quarantine, so its destination is part of the transaction's own effect,
+    # not unrelated state that changed underneath it.
+    owned |= {quarantine_destination(path) for path in owned}
     dirty_paths = _capture_dirty_paths(vault, reviewed | owned)
     return _UnrelatedState(unrelated_entries, dirty_paths)
 
@@ -1007,12 +1219,62 @@ def _fingerprint_path(
         os.close(directory_descriptor)
 
 
-def _require_expected_states(vault: Path, plan: TransactionPlan) -> None:
+def _require_expected_states(
+    vault: Path,
+    plan: TransactionPlan,
+) -> None:
     for change in plan.changes + plan.owned_changes:
-        if capture_path_state(vault, change.path) != change.before:
+        if change.create_parent:
+            continue
+        if _capture_change_state(vault, change) != change.before:
             raise ReviewedStateChanged(
                 f"reviewed path does not match expected state: {change.path}"
             )
+
+
+def _require_receipt_creation_states(vault: Path, plan: TransactionPlan) -> None:
+    """Check new receipt leaves only after HEAD-backed preconditions pass.
+
+    A committed receipt must win even when its working-tree copy was removed.
+    Checking a receipt creation path before the HEAD lookup would instead
+    turn that spent action into a generic working-tree conflict. Once the
+    lookup proves the id unspent, this second gate refuses any untracked or
+    raced working-tree object before mutation.
+    """
+    for change in plan.changes:
+        if not change.create_parent:
+            continue
+        if _capture_change_state(vault, change) != change.before:
+            raise ReviewedStateChanged(
+                f"reviewed path does not match expected state: {change.path}"
+            )
+
+
+def _capture_change_state(vault: Path, change: PathChange) -> PathState:
+    """Capture a change, admitting only its declared absent receipt parent."""
+    if not change.create_parent:
+        return capture_path_state(vault, change.path)
+
+    parts = PurePosixPath(change.path).parts
+    directory_descriptor = _open_checked_directory(vault, "vault root")
+    try:
+        for part in parts[:-2]:
+            next_descriptor = _open_checked_directory(
+                part, "reviewed parent", dir_fd=directory_descriptor
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        try:
+            os.lstat(parts[-2], dir_fd=directory_descriptor)
+        except FileNotFoundError:
+            return PathState.absent()
+        except OSError as exc:
+            raise ReviewedPathUnavailable(
+                "receipt parent is unavailable"
+            ) from exc
+    finally:
+        os.close(directory_descriptor)
+    return capture_path_state(vault, change.path)
 
 
 def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
@@ -1050,6 +1312,508 @@ def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
             os.close(descriptor)
 
 
+#: The single kernel operation Amendment 1 rests on: move a leaf and fail if
+#: the destination exists. Reserving a name and renaming onto it later is two
+#: operations and does not compose into one guarantee — another writer can
+#: take the reservation in between, and an ordinary rename destroys what took
+#: it. `ctypes` is stdlib, so this adds no dependency.
+_RENAME_EXCL = 0x4          # macOS renameatx_np
+_RENAME_NOREPLACE = 0x1     # Linux renameat2
+_SYS_RENAMEAT2 = {"x86_64": 316, "aarch64": 276, "arm64": 276, "i686": 353, "armv7l": 382}
+
+
+def _atomic_mover():
+    """Resolve the platform's atomic no-overwrite move, or `None`."""
+    library = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    if sys.platform == "darwin":
+        entry = getattr(library, "renameatx_np", None)
+        if entry is None:
+            return None
+        entry.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint
+        ]
+        entry.restype = ctypes.c_int
+        return lambda ffd, f, tfd, t: entry(ffd, f, tfd, t, _RENAME_EXCL)
+    if sys.platform.startswith("linux"):
+        entry = getattr(library, "renameat2", None)
+        if entry is not None:
+            entry.argtypes = [
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            entry.restype = ctypes.c_int
+            return lambda ffd, f, tfd, t: entry(ffd, f, tfd, t, _RENAME_NOREPLACE)
+        number = _SYS_RENAMEAT2.get(platform.machine())
+        if number is None:
+            return None
+        library.syscall.restype = ctypes.c_long
+        return lambda ffd, f, tfd, t: library.syscall(
+            ctypes.c_long(number),
+            ctypes.c_int(ffd), ctypes.c_char_p(f),
+            ctypes.c_int(tfd), ctypes.c_char_p(t),
+            ctypes.c_uint(_RENAME_NOREPLACE),
+        )
+    return None
+
+
+_MOVE_NO_REPLACE = _atomic_mover()
+
+#: Errnos that mean "this kernel or filesystem cannot do it", as opposed to
+#: "it refused for a reason about these files".
+#:
+#: `EPERM` is deliberately absent, and used to be here. It is ambiguous: a
+#: seccomp filter that blocks `renameat2` reports `EPERM` (Docker's default
+#: profile did exactly this), which is a capability problem — but `EPERM` is
+#: also the kernel's answer for a refusal about *these files*, such as an
+#: immutable or append-only attribute, or a sticky-bit directory whose file
+#: this process does not own. Treating both as unsupported told the operator
+#: "this vault's filesystem cannot move files safely" — a whole-vault verdict
+#: at `attention` severity — when the truth was one unwritable file.
+_UNSUPPORTED_ERRNOS = {
+    errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP,
+}
+
+#: Whether the move syscall itself is reachable, resolved at most once.
+_MOVE_REACHABLE: bool | None = None
+
+
+def _move_syscall_is_blocked() -> bool:
+    """Is `EPERM` from the mover about the syscall, or about the files?
+
+    Answered without touching the filesystem at all. A seccomp filter acts
+    at syscall entry, before the kernel looks at any argument, so a call
+    with deliberately invalid descriptors and empty names separates the two
+    cases: a *blocked* syscall still answers `EPERM`, while a reachable one
+    gets as far as validating its arguments and answers some non-`EPERM`
+    argument error — `EBADF` on some platforms, `ENOENT` on macOS. Which one
+    is deliberately not relied on; only "not `EPERM`" is. Either way the call
+    cannot succeed and cannot name a real file, so there is nothing to
+    create, move, or clean up.
+
+    An earlier version of this probed by creating a file in the target
+    directory and moving it. That put writes inside the vault on a refusal
+    path, outside the Git transaction, with the cleanup swallowing `OSError`
+    so an artifact could survive — which is exactly the invariant S5 and S7
+    exist to hold. A classification is not worth a write.
+
+    Anything other than `EPERM` means the syscall ran, so the answer is no.
+    """
+    global _MOVE_REACHABLE
+    if _MOVE_REACHABLE is None:
+        ctypes.set_errno(0)
+        outcome = _MOVE_NO_REPLACE(-1, b"", -1, b"")
+        # A success here would mean the call did something with no valid
+        # operands, which cannot happen; treat it as reachable regardless.
+        _MOVE_REACHABLE = outcome == 0 or ctypes.get_errno() != errno.EPERM
+    return not _MOVE_REACHABLE
+
+
+def _move_no_replace(
+    from_descriptor: int, from_name: str, to_descriptor: int, to_name: str
+) -> None:
+    """Atomically move a leaf, raising `FileExistsError` if the destination exists.
+
+    Never falls back to an ordinary rename: overwriting is the exact harm
+    this exists to prevent.
+    """
+    if _MOVE_NO_REPLACE is None:
+        raise AtomicMoveUnavailable(
+            "this platform has no atomic no-overwrite move"
+        )
+    ctypes.set_errno(0)
+    outcome = _MOVE_NO_REPLACE(
+        from_descriptor, os.fsencode(from_name), to_descriptor, os.fsencode(to_name)
+    )
+    if outcome == 0:
+        return
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        raise FileExistsError(code, os.strerror(code), to_name)
+    if code in _UNSUPPORTED_ERRNOS or (
+        code == errno.EPERM and _move_syscall_is_blocked()
+    ):
+        raise AtomicMoveUnavailable(
+            "this filesystem has no atomic no-overwrite move"
+        )
+    raise OSError(code, os.strerror(code), from_name)
+
+
+#: Amendment 1: a proposal record is consumed by moving it here, never by
+#: unlinking it. Outside the outbox's `*.yaml` glob, so quarantined records
+#: never appear in a listing and no reviewed action can reach them.
+QUARANTINE_DIRECTORY = ".consumed"
+
+
+def quarantine_destination(relative_path: str) -> str:
+    """Where a consumed record lands: `<parent>/.consumed/<name>`."""
+    leaf = PurePosixPath(relative_path)
+    return (leaf.parent / QUARANTINE_DIRECTORY / leaf.name).as_posix()
+
+
+def _quarantine_substitution(
+    record: QuarantinedRecord, condition: str
+) -> QuarantineEntrySubstituted:
+    """Describe a failed held-record check without resolving another name."""
+    try:
+        link_count = os.fstat(record.descriptor).st_nlink
+    except OSError:
+        link_count = -1
+    return QuarantineEntrySubstituted(
+        record.relative_path, link_count, condition
+    )
+
+
+def _require_quarantined_record_unchanged(
+    vault: Path, record: QuarantinedRecord
+) -> None:
+    """Reverify the consumed name and held bytes at the final success gate.
+
+    The quarantine name supplies identity only. Contents are always read
+    through the descriptor opened before the move, so a replacement can
+    never become the object OneOS verifies. This is deliberately the last
+    post-commit check before success is returned.
+    """
+    try:
+        parent_descriptor, _leaf = _walk_to_parent(vault, record.relative_path)
+    except (OSError, GitTransactionError) as exc:
+        raise _quarantine_substitution(record, "unavailable") from exc
+    try:
+        try:
+            quarantine_descriptor = _open_checked_directory(
+                QUARANTINE_DIRECTORY,
+                "quarantine",
+                dir_fd=parent_descriptor,
+            )
+        except (OSError, GitTransactionError) as exc:
+            raise _quarantine_substitution(record, "unavailable") from exc
+        try:
+            try:
+                landed = os.lstat(record.name, dir_fd=quarantine_descriptor)
+                held_identity = os.fstat(record.descriptor)
+            except FileNotFoundError as exc:
+                raise _quarantine_substitution(record, "absent") from exc
+            except OSError as exc:
+                raise _quarantine_substitution(record, "unavailable") from exc
+            if (landed.st_dev, landed.st_ino) != (
+                held_identity.st_dev,
+                held_identity.st_ino,
+            ):
+                raise _quarantine_substitution(record, "replaced")
+            try:
+                held_state = _held_state(record.descriptor)
+            except (OSError, GitTransactionError) as exc:
+                raise _quarantine_substitution(record, "unavailable") from exc
+            if held_state != record.expected:
+                raise _quarantine_substitution(record, "rewritten")
+        finally:
+            os.close(quarantine_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _open_quarantine(parent_descriptor: int) -> int:
+    """Open the quarantine directory, creating it only when it is absent.
+
+    Opened through `_open_checked_directory` and relative to the
+    parent's descriptor, so
+    neither the parent nor the quarantine can be swapped between validation
+    and use.
+
+    `mkdir` is the only thing that establishes ownership, and it does so
+    atomically: a `FileExistsError` means something appeared between the
+    check and the creation. That is refused rather than adopted — whatever
+    appeared was not established here, and silently accepting it would be
+    trusting a directory this call never validated as its own.
+    """
+    # One lookup, not two: probing for existence separately from opening
+    # would add a window of this function's own making between the two.
+    try:
+        return _open_checked_directory(
+            QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+        )
+    except ReviewedPathUnavailable as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+
+    try:
+        os.mkdir(QUARANTINE_DIRECTORY, 0o700, dir_fd=parent_descriptor)
+    except FileExistsError as exc:
+        raise ReviewedPathIntegrityError(
+            "quarantine appeared while it was being created"
+        ) from exc
+    except OSError as exc:
+        raise ReviewedPathUnavailable("quarantine is unavailable") from exc
+    return _open_checked_directory(
+        QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
+    )
+
+
+@dataclass(frozen=True)
+class QuarantinedRecord:
+    """A consumed record, plus the descriptor that proves what it is.
+
+    The descriptor was opened on the record *before* it was quarantined and
+    stays open for the whole transaction, including rollback diagnosis
+    (design §3, Amendment 3). Every exact-byte verification reads through
+    it; the quarantine name is never reopened to check bytes, because that
+    would verify whatever the name resolves to at that moment rather than
+    the object that was moved. Its owner closes it exactly once, after the
+    final diagnosis.
+    """
+
+    relative_path: str
+    name: str
+    descriptor: int
+    expected: PathState
+
+
+def _quarantine_reviewed_leaf(
+    parent_descriptor: int,
+    leaf: str,
+    expected: PathState,
+    quarantine_descriptor: int,
+    path: str,
+) -> tuple[str, int]:
+    """Move one reviewed leaf into quarantine, or leave everything as found.
+
+    The move is atomic and cannot overwrite. Verification runs through a
+    descriptor opened on the **source**, before the move, and held across
+    it: a descriptor is bound to one inode for its lifetime, so the object
+    verified is provably the object consumed (design §3, Amendment 1 step
+    3 — "identity and contents, never a fresh name lookup").
+
+    This previously opened the descriptor *after* the move, by name, in the
+    quarantine directory. That is a fresh name lookup, and it verified
+    contents and mode but never identity, so a writer that replaced
+    `.consumed/<leaf>` between the move and the open had the substitute
+    verified — and, on mismatch, moved back under the reviewed record's
+    name while the real record was gone. The docstring claimed the
+    guarantee the code did not implement.
+
+    The name lookup has the opposite job: confirming
+    that the quarantined name resolves to the very inode held open. If it
+    does not, something other than the reviewed object is sitting there.
+    Nothing is moved back; the caller reports the conservative outcome.
+
+    No step unlinks anything, so losing a race costs a refusal rather than
+    a file.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError as exc:
+        raise ReviewedStateChanged(
+            f"reviewed path changed before mutation: {path}"
+        ) from exc
+    except OSError as exc:
+        raise _unsafe_open_failure(
+            exc, "reviewed path could not be opened safely"
+        ) from exc
+
+    try:
+        # The reviewed object, established before anything moves.
+        held = _held_state(descriptor)  # noqa: F841 — read for its checks
+        if held != expected:
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
+            )
+        identity = os.fstat(descriptor)
+
+        try:
+            _move_no_replace(
+                parent_descriptor, leaf, quarantine_descriptor, leaf
+            )
+        except FileNotFoundError as exc:
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
+            ) from exc
+        except FileExistsError as exc:
+            # A record under this id is already quarantined: this one was
+            # consumed already, so the state is not what was reviewed.
+            raise ReviewedStateChanged(
+                f"reviewed path changed before mutation: {path}"
+            ) from exc
+        except OSError as exc:
+            # An operand-level refusal: `EPERM` on an immutable record or a
+            # sticky-bit outbox, `EACCES`, `EROFS`, an I/O error. Nothing
+            # moved, so this is a plain refusal and must be described as
+            # one. It is normalised *here*, at the boundary that knows what
+            # the operation meant, rather than by widening a route's catch
+            # list — a raw `OSError` reaching a route would resolve to
+            # E-UNKNOWN ("an unexpected error was not handled",
+            # committed=unknown, retry=stop) for a designed refusal in
+            # which the vault is provably untouched.
+            #
+            # Reject reaches this path without an `except Exception` above
+            # it, unlike approve and delete, so before this clause existed
+            # a `chattr +i` record produced E-UNKNOWN there and a truthful
+            # refusal everywhere else.
+            raise ReviewedPathUnavailable(
+                "reviewed record could not be consumed"
+            ) from exc
+
+        # Amendment 3: three ways the quarantine location can fail to hold
+        # the exact reviewed proposal, one outcome, and no rename-back in
+        # any of them. Renaming by that name would move whatever now holds
+        # it under the reviewed record's name — OneOS performing the
+        # substitution itself, as a step of a refusal. So nothing further
+        # is mutated here. The move already happened and is not undone,
+        # which is exactly what E-SUBSTITUTED says.
+        def _substituted(condition: str) -> QuarantineEntrySubstituted:
+            # Diagnostic only: whether any name still refers to the
+            # reviewed inode at this instant. It does not change the
+            # outcome or the message.
+            try:
+                link_count = os.fstat(descriptor).st_nlink
+            except OSError:
+                link_count = -1
+            return QuarantineEntrySubstituted(path, link_count, condition)
+
+        try:
+            landed = os.lstat(leaf, dir_fd=quarantine_descriptor)
+        except FileNotFoundError as exc:
+            # Removed rather than replaced. Just as unrecoverable, and it
+            # must not escape as a bare OSError resolving to E-UNKNOWN.
+            raise _substituted("absent") from exc
+        if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
+            raise _substituted("replaced")
+
+        # Contents, read through the descriptor held across the move —
+        # never by reopening the quarantine name, which would verify
+        # whatever that name resolves to now rather than the object moved.
+        #
+        # This check survives Amendment 3 while its old remedy does not.
+        # Identity and contents are independent: an in-place rewrite keeps
+        # the same device, inode and name, so every identity check above
+        # passes while the bytes are no longer the reviewed bytes. Dropping
+        # it would let OneOS act on the reviewed version while consuming a
+        # changed one — the substitution S7 exists to prevent, reached
+        # without any rename at all.
+        if _held_state(descriptor) != expected:
+            raise _substituted("rewritten")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    # Deliberately still open: the caller owns it from here, and closes it
+    # once the transaction's outcome is decided.
+    return leaf, descriptor
+
+
+def _walk_to_parent(vault: Path, relative_path: str) -> tuple[int, str]:
+    """Open the leaf's parent through checked, no-follow descriptors."""
+    root = Path(os.path.abspath(os.fspath(vault)))
+    parts = PurePosixPath(relative_path).parts
+    descriptor = _open_checked_directory(root, "vault root")
+    try:
+        for part in parts[:-1]:
+            nxt = _open_checked_directory(part, "reviewed parent", dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = nxt
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, parts[-1]
+
+
+def quarantine_path_if_unchanged(
+    vault: Path, relative_path: str, expected: PathState
+) -> QuarantinedRecord:
+    """Consume one reviewed regular leaf by moving it into quarantine.
+
+    Returns a handle whose descriptor is **still open**. The caller owns it
+    and must close it exactly once, after the outcome is decided — see
+    `QuarantinedRecord`.
+    """
+    try:
+        _validate_transaction_path(relative_path)
+    except ValueError as exc:
+        raise InvalidTransactionPath("reviewed path is unsafe") from exc
+    if expected.contents is None:
+        raise ValueError("quarantine requires a regular expected state")
+
+    parent_descriptor, leaf = _walk_to_parent(vault, relative_path)
+    try:
+        # The quarantine directory is durable infrastructure: created on
+        # first use and never removed. Removing it again after a refusal
+        # would add a cleanup step that can fail — and a failure there is
+        # invisible to the operator, since the refusal they see is about the
+        # proposal, not about a directory. An empty `.consumed/` is not vault
+        # content and costs nothing; a silently failing cleanup does.
+        quarantine_descriptor = _open_quarantine(parent_descriptor)
+        try:
+            name, descriptor = _quarantine_reviewed_leaf(
+                parent_descriptor, leaf, expected,
+                quarantine_descriptor, relative_path,
+            )
+        finally:
+            os.close(quarantine_descriptor)
+        return QuarantinedRecord(relative_path, name, descriptor, expected)
+    finally:
+        os.close(parent_descriptor)
+
+
+def consume_reviewed_proposal(
+    vault: Path,
+    relative_path: str,
+    expected: PathState,
+    *,
+    preconditions: tuple[Precondition, ...] = (),
+) -> str | TransactionPreconditionRefused:
+    """Quarantine one reviewed record under the per-vault approval lock.
+
+    The lock is taken here rather than inside `quarantine_path_if_unchanged`
+    because the transaction already holds it when it consumes owned changes.
+    A standalone consumer — reject — must not race an approval that owns the
+    same record, so it takes the lock itself.
+    """
+    root = Path(os.path.abspath(os.fspath(vault)))
+    record: QuarantinedRecord | None = None
+    try:
+        try:
+            with action_lock(root):
+                for precondition in preconditions:
+                    reason = precondition()
+                    if reason is not None:
+                        return TransactionPreconditionRefused(reason)
+                record = quarantine_path_if_unchanged(root, relative_path, expected)
+        except ActionLockCleanupFailure as exc:
+            # Mirrors `execute_transaction`: once the work has happened, a
+            # cleanup failure may not be reported as "nothing was changed".
+            if record is None:
+                raise
+            raise QuarantineCleanupError(exc.cleanup_error) from exc.cleanup_error
+        return record.name
+    finally:
+        # Reject runs no transaction and therefore has no rollback to
+        # diagnose, so the descriptor's work is finished the moment the
+        # consumption is. Closed on every path, exactly once.
+        if record is not None:
+            os.close(record.descriptor)
+
+
+def _read_open_file(descriptor: int) -> bytes:
+    """Read a descriptor's full contents from the start.
+
+    Reads go through the descriptor, never through a fresh lookup: a
+    descriptor is bound to one inode for its lifetime, so nothing can
+    substitute a different file underneath it.
+    """
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1 << 20)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _held_state(descriptor: int) -> PathState:
+    opened = os.fstat(descriptor)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ReviewedPathIntegrityError("reviewed path is not a regular file")
+    return PathState.regular(_read_open_file(descriptor), stat.S_IMODE(opened.st_mode))
+
+
 def _apply_state(
     vault: Path,
     change: PathChange,
@@ -1059,10 +1823,33 @@ def _apply_state(
     parts = PurePosixPath(change.path).parts
     directory_descriptor = _open_checked_directory(vault, "vault root")
     try:
-        for part in parts[:-1]:
-            next_descriptor = _open_checked_directory(
-                part, "reviewed parent", dir_fd=directory_descriptor
-            )
+        parents = parts[:-1]
+        for index, part in enumerate(parents):
+            try:
+                next_descriptor = _open_checked_directory(
+                    part, "reviewed parent", dir_fd=directory_descriptor
+                )
+            except ReviewedPathUnavailable as exc:
+                may_create = (
+                    change.create_parent
+                    and index == len(parents) - 1
+                    and isinstance(exc.__cause__, FileNotFoundError)
+                )
+                if not may_create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=directory_descriptor)
+                except FileExistsError as race:
+                    raise ReviewedPathIntegrityError(
+                        "receipt parent changed while being created"
+                    ) from race
+                except OSError as failure:
+                    raise ReviewedPathUnavailable(
+                        "receipt parent could not be created"
+                    ) from failure
+                next_descriptor = _open_checked_directory(
+                    part, "receipt parent", dir_fd=directory_descriptor
+                )
             os.close(directory_descriptor)
             directory_descriptor = next_descriptor
 
@@ -1073,10 +1860,17 @@ def _apply_state(
             )
         if change.after.contents is None:
             if change.before.contents is not None:
+                # Not a proposal record: this branch serves approve's
+                # source-to-destination move, whose removal is the intended,
+                # committed, Git-revertible effect (Amendment 1 scopes the
+                # no-deletion rule to proposal records). The state was
+                # compared immediately above, under this same descriptor.
                 try:
                     os.unlink(leaf, dir_fd=directory_descriptor)
                 except OSError as exc:
-                    raise GitTransactionFailure("could not remove reviewed file") from exc
+                    raise GitTransactionFailure(
+                        "could not remove reviewed file"
+                    ) from exc
                 if on_applied is not None:
                     on_applied(change.after)
                     _checkpoint("filesystem-path-applied")
@@ -1242,6 +2036,15 @@ def _require_final_states(vault: Path, plan: TransactionPlan) -> None:
         if capture_path_state(vault, change.path) != change.after:
             raise GitTransactionFailure(
                 f"transaction-owned path changed before success: {change.path}"
+            )
+
+
+def _require_committed_states(vault: Path, plan: TransactionPlan) -> None:
+    """Verify only the action and receipt before proposal consumption."""
+    for change in plan.changes:
+        if capture_path_state(vault, change.path) != change.after:
+            raise GitTransactionFailure(
+                f"committed path changed before consumption: {change.path}"
             )
 
 

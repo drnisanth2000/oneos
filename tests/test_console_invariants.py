@@ -18,7 +18,7 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 AMBIGUOUS = {"CrossScopeError", "ReviewedStateConflict",
-             "UnsafeDestinationPath", "InvalidSourceLeaf"}
+             "UnsafeDestinationPath", "InvalidSourceLeaf", "ReceiptError"}
 
 
 def test_no_direct_raise_of_an_ambiguous_base():
@@ -107,6 +107,7 @@ def _probe(cls):
 
 
 def _abstract_bases():
+    from app.action_receipts import ReceiptError
     from app.destinations import InvalidSourceLeaf, UnsafeDestinationPath
     from app.git_transaction import ReviewedStateConflict
     from app.scope import CrossScopeError
@@ -116,6 +117,7 @@ def _abstract_bases():
         ReviewedStateConflict,
         UnsafeDestinationPath,
         InvalidSourceLeaf,
+        ReceiptError,
     }
 
 
@@ -123,6 +125,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
     from fastapi.exceptions import RequestValidationError
 
     from app import (
+        action_receipts,
         destinations,
         entities,
         git_transaction,
@@ -130,6 +133,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         proposal_identity,
         registry,
         rename,
+        review_tokens,
         scope,
         vault,
     )
@@ -163,6 +167,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
     # a *wrong* non-unknown code fails here.
     expected = {
         git_transaction.GitTransactionCommittedError: "E-COMMITTED",
+        git_transaction.PostCommitConsumptionError: "E-APPLIED",
         git_transaction.GitTransactionRecoveryError: "E-RECOVER",
         git_transaction.ReviewedPathIntegrityError: "E-TAMPER",
         git_transaction.ReviewedPathUnavailable: "E-UNAVAILABLE",
@@ -171,7 +176,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         git_transaction.VaultBusyError: "E-BUSY",
         git_transaction.GitTransactionFailure: "E-GIT",
         git_transaction.GitTransactionError: "E-GIT",
-        git_transaction._ApprovalLockCleanupFailure: "E-GIT",
+        git_transaction.ActionLockCleanupFailure: "E-GIT",
         git_transaction._ReviewedIndexOwnershipConflict: "E-CONFLICT",
         scope.RedirectedPathError: "E-TAMPER",
         outbox.ProposalSourceUnavailable: "E-UNAVAILABLE",
@@ -198,7 +203,15 @@ def test_every_application_exception_resolves_to_its_designed_code():
         entities.EntitySelectionError: "E-ENTITY",
         registry.RegistryTransactionError: "E-GIT",
         registry.RegistryError: "E-REGISTRY",
+        action_receipts.InvalidActionReceipt: "E-RECEIPT",
+        action_receipts.ReceiptStoreIntegrityError: "E-TAMPER",
+        action_receipts.ReceiptStoreUnavailable: "E-UNAVAILABLE",
+        review_tokens.ReviewedProposalChanged: "E-REVIEW",
+        review_tokens.InvalidReviewToken: "E-REQUEST",
+        review_tokens.ReviewContractViolation: "E-INTERNAL",
+        review_tokens.ReviewTokenError: "E-INTERNAL",
         ingest_base.IngestError: "E-INGEST",
+        rename.RenameCommittedError: "E-COMMITTED",
         rename.RenameError: "E-ADMIN",
         RequestValidationError: "E-REQUEST",
     }
@@ -240,6 +253,1039 @@ def test_closed_family_every_subclass_has_exact_entry():
         assert cls in ALLOWLIST, f"{cls.__qualname__} is not allowlisted"
 
 
+def _reachable_call_names(sources: dict[str, str]) -> set[str]:
+    """Conservatively walk qualified calls from application entry points.
+
+    Function names are not process-global. A bare-name graph merged
+    ``live.helper`` and ``dead.helper`` into one node, so reaching the former
+    made exception constructors in the latter look executable. Keep modules,
+    imports and class methods in the node identity instead.
+    """
+
+    def module_name(relative: str) -> str:
+        parts = list(pathlib.PurePosixPath(relative).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        return ".".join(parts)
+
+    parsed = {
+        module_name(relative): ast.parse(source)
+        for relative, source in sources.items()
+    }
+    definitions: dict[str, set[str]] = {}
+    imports: dict[str, dict[str, str]] = {}
+    classes: set[str] = set()
+
+    for module, tree in parsed.items():
+        names: set[str] = set()
+        aliases: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.add(node.name)
+                if isinstance(node, ast.ClassDef):
+                    classes.add(f"{module}.{node.name}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    parent = module.split(".")[:-node.level]
+                    imported_module = ".".join(
+                        [*parent, *([node.module] if node.module else [])]
+                    )
+                else:
+                    imported_module = node.module or ""
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    aliases[local] = ".".join(
+                        part for part in (imported_module, alias.name) if part
+                    )
+        definitions[module] = names
+        imports[module] = aliases
+
+    def resolve(
+        module: str,
+        expression: ast.expr,
+        *,
+        class_name: str | None = None,
+        local_types: dict[str, str] | None = None,
+        local_symbols: dict[str, str] | None = None,
+    ) -> str | None:
+        if isinstance(expression, ast.Name):
+            if local_symbols is not None and expression.id in local_symbols:
+                return local_symbols[expression.id]
+            if local_types is not None and expression.id in local_types:
+                return local_types[expression.id]
+            if expression.id in imports[module]:
+                return imports[module][expression.id]
+            if expression.id in definitions[module]:
+                return f"{module}.{expression.id}"
+            return None
+        if not isinstance(expression, ast.Attribute):
+            return None
+        if (
+            isinstance(expression.value, ast.Name)
+            and expression.value.id in {"self", "cls"}
+            and class_name is not None
+        ):
+            qualified_class = (
+                class_name
+                if class_name.startswith(f"{module}.")
+                else f"{module}.{class_name}"
+            )
+            return f"{qualified_class}.{expression.attr}"
+        if isinstance(expression.value, ast.Call):
+            base = resolve(
+                module,
+                expression.value.func,
+                class_name=class_name,
+                local_types=local_types,
+                local_symbols=local_symbols,
+            )
+        else:
+            base = resolve(
+                module,
+                expression.value,
+                class_name=class_name,
+                local_types=local_types,
+                local_symbols=local_symbols,
+            )
+        return f"{base}.{expression.attr}" if base is not None else None
+
+    def local_types_in(
+        module: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        class_name: str | None = None,
+    ) -> dict[str, str]:
+        inferred: dict[str, str] = {}
+        arguments = (
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        )
+        for argument in arguments:
+            if argument.annotation is None:
+                continue
+            annotation = resolve(module, argument.annotation, class_name=class_name)
+            if annotation in classes:
+                inferred[argument.arg] = annotation
+        for assignment in ast.walk(node):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = assignment.value
+            if not isinstance(value, ast.Call):
+                continue
+            called = resolve(
+                module, value.func, class_name=class_name, local_types=inferred
+            )
+            inferred_type = None
+            if called in classes:
+                inferred_type = called
+            elif isinstance(value.func, ast.Attribute):
+                owner = resolve(
+                    module,
+                    value.func.value,
+                    class_name=class_name,
+                    local_types=inferred,
+                )
+                if owner in classes:
+                    inferred_type = owner
+            if inferred_type is None:
+                continue
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else (assignment.target,)
+            )
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    inferred[target.id] = inferred_type
+        return inferred
+
+    functions: dict[str, set[str]] = {}
+
+    def calls_in(
+        module: str,
+        node: ast.AST,
+        *,
+        owner: str,
+        class_name: str | None = None,
+        local_types: dict[str, str] | None = None,
+    ) -> set[str]:
+        body = getattr(node, "body", ())
+        statements = body if isinstance(body, list) else (node,)
+        local_symbols: dict[str, str] = {}
+        lambda_nodes: dict[int, str] = {}
+        nested_classes: dict[int, str] = {}
+
+        class LocalSymbols(ast.NodeVisitor):
+            def visit_FunctionDef(self, nested: ast.FunctionDef) -> None:
+                local_symbols[nested.name] = (
+                    f"{owner}.<locals>.{nested.name}"
+                )
+                # A nested callable is its own graph node. Its body cannot
+                # contribute more symbols to the enclosing callable.
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, nested: ast.ClassDef) -> None:
+                qualified = f"{owner}.<locals>.{nested.name}"
+                local_symbols[nested.name] = qualified
+                nested_classes[id(nested)] = qualified
+                # Methods are separate graph nodes, just like nested
+                # functions. Do not merge their bodies into this scope.
+
+            def _record_lambda(
+                self, targets: tuple[ast.expr, ...], value: ast.expr | None
+            ) -> None:
+                if not isinstance(value, ast.Lambda):
+                    return
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        qualified = f"{owner}.<lambda@{value.lineno}>"
+                        local_symbols[target.id] = qualified
+                        lambda_nodes[id(value)] = qualified
+
+            def visit_Assign(self, assignment: ast.Assign) -> None:
+                self._record_lambda(tuple(assignment.targets), assignment.value)
+                self.generic_visit(assignment)
+
+            def visit_AnnAssign(self, assignment: ast.AnnAssign) -> None:
+                self._record_lambda((assignment.target,), assignment.value)
+                self.generic_visit(assignment)
+
+            def visit_Lambda(self, nested: ast.Lambda) -> None:
+                # The lambda's defaults execute here; its body does not.
+                for default in (
+                    *nested.args.defaults,
+                    *(value for value in nested.args.kw_defaults if value is not None),
+                ):
+                    self.visit(default)
+
+        symbol_visitor = LocalSymbols()
+        for statement in statements:
+            symbol_visitor.visit(statement)
+        effective_local_types = dict(local_types or {})
+
+        collected: set[str] = set()
+
+        def visit_definition_expressions(
+            visitor: ast.NodeVisitor,
+            definition: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        ) -> None:
+            for default in (
+                *definition.args.defaults,
+                *(value for value in definition.args.kw_defaults if value is not None),
+            ):
+                visitor.visit(default)
+            if not isinstance(definition, ast.Lambda):
+                for decorator in definition.decorator_list:
+                    visitor.visit(decorator)
+
+        class Calls(ast.NodeVisitor):
+            def _record_assigned_type(
+                self, targets: tuple[ast.expr, ...], value: ast.expr | None
+            ) -> None:
+                if not isinstance(value, ast.Call):
+                    return
+                called = resolve(
+                    module,
+                    value.func,
+                    class_name=class_name,
+                    local_types=effective_local_types,
+                    local_symbols=local_symbols,
+                )
+                if called not in nested_classes.values() and called not in classes:
+                    return
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        effective_local_types[target.id] = called
+
+            def visit_Assign(self, assignment: ast.Assign) -> None:
+                self._record_assigned_type(
+                    tuple(assignment.targets), assignment.value
+                )
+                self.generic_visit(assignment)
+
+            def visit_AnnAssign(self, assignment: ast.AnnAssign) -> None:
+                self._record_assigned_type((assignment.target,), assignment.value)
+                self.generic_visit(assignment)
+
+            def visit_Call(self, call: ast.Call) -> None:
+                target = resolve(
+                    module,
+                    call.func,
+                    class_name=class_name,
+                    local_types=effective_local_types,
+                    local_symbols=local_symbols,
+                )
+                if target is not None:
+                    collected.add(target)
+                # watchdog calls ``on_created`` after a handler instance is
+                # passed to Observer.schedule. Model that known registration
+                # explicitly; constructing an arbitrary local class does not
+                # make all of its methods executable.
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "schedule"
+                    and call.args
+                    and isinstance(call.args[0], ast.Call)
+                ):
+                    handler_class = resolve(
+                        module,
+                        call.args[0].func,
+                        class_name=class_name,
+                        local_types=effective_local_types,
+                        local_symbols=local_symbols,
+                    )
+                    callback = (
+                        f"{handler_class}.on_created"
+                        if handler_class is not None
+                        else None
+                    )
+                    if callback in functions:
+                        collected.add(callback)
+                self.generic_visit(call)
+
+            def visit_FunctionDef(self, nested: ast.FunctionDef) -> None:
+                visit_definition_expressions(self, nested)
+                qualified = local_symbols[nested.name]
+                functions[qualified] = calls_in(
+                    module,
+                    nested,
+                    owner=qualified,
+                    class_name=class_name,
+                    local_types=local_types_in(
+                        module, nested, class_name=class_name
+                    ),
+                )
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, nested: ast.ClassDef) -> None:
+                for expression in (
+                    *nested.decorator_list,
+                    *nested.bases,
+                    *(keyword.value for keyword in nested.keywords),
+                ):
+                    self.visit(expression)
+                qualified_class = nested_classes[id(nested)]
+                methods = {
+                    f"{qualified_class}.{member.name}"
+                    for member in nested.body
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and member.name in {"__init__", "__post_init__"}
+                }
+                functions[qualified_class] = methods
+                for member in nested.body:
+                    if not isinstance(
+                        member, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        continue
+                    qualified = f"{qualified_class}.{member.name}"
+                    functions[qualified] = calls_in(
+                        module,
+                        member,
+                        owner=qualified,
+                        class_name=qualified_class,
+                        local_types=local_types_in(
+                            module, member, class_name=qualified_class
+                        ),
+                    )
+
+            def visit_Lambda(self, nested: ast.Lambda) -> None:
+                visit_definition_expressions(self, nested)
+                qualified = lambda_nodes.get(id(nested))
+                if qualified is None:
+                    return
+                functions[qualified] = calls_in(
+                    module,
+                    nested.body,
+                    owner=qualified,
+                    class_name=class_name,
+                    local_types=local_types,
+                )
+
+        visitor = Calls()
+        for statement in statements:
+            visitor.visit(statement)
+        return collected
+
+    seeds: set[str] = set()
+    for module, tree in parsed.items():
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{module}.{node.name}"
+                functions[qualified] = calls_in(
+                    module,
+                    node,
+                    owner=qualified,
+                    local_types=local_types_in(module, node),
+                )
+                if any(
+                    isinstance(decorator, ast.Call)
+                    and getattr(decorator.func, "attr", "")
+                    in {"get", "post", "exception_handler"}
+                    for decorator in node.decorator_list
+                ):
+                    seeds.add(qualified)
+            elif isinstance(node, ast.ClassDef):
+                initializers = {
+                    f"{module}.{node.name}.{member.name}"
+                    for member in node.body
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and member.name in {"__init__", "__post_init__"}
+                }
+                functions[f"{module}.{node.name}"] = initializers
+                for member in node.body:
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        qualified = f"{module}.{node.name}.{member.name}"
+                        functions[qualified] = calls_in(
+                            module,
+                            member,
+                            owner=qualified,
+                            class_name=node.name,
+                            local_types=local_types_in(
+                                module, member, class_name=node.name
+                            ),
+                        )
+            else:
+                seeds.update(calls_in(module, node, owner=module))
+
+    # The supported folder-ingest process entry point is not an HTTP route.
+    folder_watch = "app.ingest.adapters.folder.watch"
+    if folder_watch in functions:
+        seeds.add(folder_watch)
+
+    reachable = set(seeds)
+    while True:
+        discovered = {
+            called
+            for function in reachable
+            for called in functions.get(function, ())
+        } - reachable
+        if not discovered:
+            return reachable
+        reachable.update(discovered)
+
+
+def _executable_operator_outcomes() -> set[str]:
+    """Return codes whose exception constructors are entry-point reachable."""
+    from app.console_errors import _EXACT, _MRO
+
+    sources = {
+        path.relative_to(_REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in (_REPO_ROOT / "app").rglob("*.py")
+        if path.name != "console_errors.py"
+    }
+    called_names = _reachable_call_names(sources)
+    produced = {
+        outcome.code
+        for exception_class, outcome in _EXACT.items()
+        if f"{exception_class.__module__}.{exception_class.__name__}" in called_names
+    }
+    produced.update(
+        outcome.code
+        for exception_class, outcome in _MRO.items()
+        if f"{exception_class.__module__}.{exception_class.__name__}" in called_names
+        or any(
+            f"{subtype.__module__}.{subtype.__name__}" in called_names
+            for subtype in _transitive_subclasses(exception_class)
+        )
+    )
+    return produced
+
+
+def _orphan_operator_outcomes() -> list[str]:
+    from app.console_errors import _CODES
+
+    # E-UNKNOWN is the deliberate global fallback. E-REQUEST is also
+    # framework-produced rather than constructed directly by application
+    # code. Every other row needs an executable application producer.
+    return sorted(
+        set(_CODES)
+        - _executable_operator_outcomes()
+        - {"E-UNKNOWN", "E-REQUEST"}
+    )
+
+
+def test_every_operator_outcome_has_an_executable_producer():
+    """A live taxonomy row may not outlast every path that can produce it."""
+    orphaned = _orphan_operator_outcomes()
+    assert not orphaned, f"orphan operator outcome: {', '.join(orphaned)}"
+
+
+def test_stage2_retired_outcomes_are_historical_evidence_only():
+    runner_path = (
+        _REPO_ROOT / "docs/superpowers/plans/s7_mutation_campaign.py"
+    )
+    ledger_path = (
+        _REPO_ROOT
+        / "docs/superpowers/plans/2026-08-23-s7-mutation-ledger.md"
+    )
+    runner = runner_path.read_text(encoding="utf-8")
+    ledger = ledger_path.read_text(encoding="utf-8")
+    tree = ast.parse(runner)
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "MUTATIONS"
+            for target in node.targets
+        )
+    )
+    mutations = ast.literal_eval(assignment.value)
+    live_ids = [mutation[0] for mutation in mutations]
+
+    retired_headings = re.findall(
+        r"^### (M\w+) — RETIRED \(historical\)", ledger, re.MULTILINE
+    )
+    retired_counts = {
+        retired: retired_headings.count(retired)
+        for retired in set(retired_headings)
+    }
+    assert retired_counts, "the ledger no longer records any retired evidence"
+    assert all(count == 1 for count in retired_counts.values()), (
+        f"retired mutation headings are missing or duplicated: {retired_counts}"
+    )
+    for retired in sorted(retired_counts):
+        assert retired not in live_ids, f"{retired} returned to the live campaign"
+    # A Stage 2 mutation may deliberately put a retired name in its NEW
+    # text to prove that the orphan guard catches resurrection. What must
+    # stay absent is a live anchor: no current implementation text or test
+    # selection may claim that the retired path still exists.
+    live_anchors = "\n".join(
+        str((mutation[1], mutation[2], mutation[4]))
+        for mutation in mutations
+    )
+    for removed in (
+        "E-RETAINED",
+        "E-STRANDED",
+        "diagnose_quarantined_record",
+    ):
+        assert removed not in live_anchors, (
+            f"a live mutation still claims the retired {removed} path"
+        )
+
+
+def _source_function(relative: str, name: str) -> ast.FunctionDef:
+    tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+    matches = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    assert len(matches) == 1, f"expected one {relative}:{name}, saw {len(matches)}"
+    return matches[0]
+
+
+def _single_named_call(function: ast.FunctionDef, name: str) -> ast.Call:
+    matches = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
+    ]
+    assert len(matches) == 1, (
+        f"expected one {name} call in {function.name}, saw {len(matches)}"
+    )
+    return matches[0]
+
+
+@pytest.mark.parametrize(
+    ("relative", "function_name", "label"),
+    (
+        ("app/outbox.py", "approve", "approval"),
+        ("app/registry.py", "execute_delete", "registry deletion"),
+    ),
+    ids=("approve", "registry-delete"),
+)
+def test_stage2_receipt_has_exact_transaction_roles(
+    relative, function_name, label
+):
+    """A tracked receipt is a change and exact commit path, never owned state."""
+    function = _source_function(relative, function_name)
+    plan = _single_named_call(function, "TransactionPlan")
+    keywords = {keyword.arg: keyword.value for keyword in plan.keywords}
+
+    changes = ast.unparse(keywords["changes"])
+    commit_paths = ast.unparse(keywords["commit_paths"])
+    owned_changes = ast.unparse(keywords["owned_changes"])
+    assert "receipt_rel" in changes, (
+        f"{label} receipt is not a filesystem change"
+    )
+    assert "receipt_rel" in commit_paths, (
+        f"{label} receipt is not an exact commit path"
+    )
+    assert "receipt_rel" not in owned_changes, (
+        "tracked receipt was misclassified as an untracked owned change"
+    )
+    assert "proposal_rel" in owned_changes, (
+        f"{label} proposal stopped being the transaction-owned record"
+    )
+
+
+@pytest.mark.parametrize(
+    ("relative", "function_name", "acting_call", "expected", "label"),
+    (
+        (
+            "app/outbox.py",
+            "approve",
+            "TransactionPlan",
+            ("_require_unspent_id",),
+            "approve",
+        ),
+        (
+            "app/registry.py",
+            "execute_delete",
+            "TransactionPlan",
+            ("_require_unspent_id", "_require_no_live_references"),
+            "registry delete",
+        ),
+        (
+            "app/outbox.py",
+            "reject",
+            "consume_reviewed_proposal",
+            ("_require_unspent_id",),
+            "reject",
+        ),
+    ),
+    ids=("approve", "registry-delete", "reject"),
+)
+def test_stage2_spent_id_checks_are_locked_preconditions(
+    relative, function_name, acting_call, expected, label
+):
+    function = _source_function(relative, function_name)
+    action = _single_named_call(function, acting_call)
+    keyword = next(
+        (keyword.value for keyword in action.keywords if keyword.arg == "preconditions"),
+        None,
+    )
+    direct_checks = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_require_unspent_id"
+    ]
+    assert not direct_checks, f"{label} receipt check no longer runs only under the lock"
+
+    names = (
+        tuple(
+            element.id if isinstance(element, ast.Name) else ""
+            for element in keyword.elts
+        )
+        if isinstance(keyword, ast.Tuple)
+        else ()
+    )
+    assert names == expected, f"{label} omitted its locked spent-id check"
+
+
+def test_stage2_receipt_authority_comes_only_from_git_head():
+    function = _source_function("app/action_receipts.py", "resolve_head_receipts")
+    joined_literals = {
+        value.value
+        for node in ast.walk(function)
+        if isinstance(node, ast.JoinedStr)
+        for value in node.values
+        if isinstance(value, ast.Constant) and isinstance(value.value, str)
+    }
+    forbidden_readers = {
+        "open",
+        "read_bytes",
+        "read_text",
+        "lstat",
+        "stat",
+    }
+    readers = {
+        node.func.attr
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in forbidden_readers
+    }
+    readers.update(
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "open"
+    )
+
+    assert "HEAD:" in joined_literals and not readers, (
+        "receipt authority no longer comes from Git HEAD"
+    )
+
+
+def test_stage2_receipt_digest_remains_audit_only():
+    offenders = []
+    for relative in ("app/outbox.py", "app/registry.py", "app/main.py"):
+        tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "review_sha256":
+                base = ast.unparse(node.value)
+                if "receipt" in base:
+                    offenders.append(f"{relative}:{node.lineno}:{base}")
+    assert not offenders, f"audit-only receipt digest entered a decision: {offenders}"
+
+
+def test_stage2_non_tree_receipt_root_fails_closed():
+    function = _source_function("app/action_receipts.py", "_head_root_exists")
+    guarded_raises = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and "object_type != b'tree'" in ast.unparse(node.test)
+        and any(
+            isinstance(child, ast.Raise)
+            and isinstance(child.exc, ast.Call)
+            and isinstance(child.exc.func, ast.Name)
+            and child.exc.func.id == "ReceiptStoreIntegrityError"
+            for child in node.body
+        )
+    ]
+    assert guarded_raises, "non-tree receipt root was treated as an empty store"
+
+
+def test_stage2_malformed_receipt_projection_stays_per_id():
+    function = _source_function("app/outbox.py", "project_outbox")
+    error_branches = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and "resolution.error is not None" in ast.unparse(node.test)
+        and any(
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+            and statement.value.func.attr == "append"
+            for statement in node.body
+        )
+    ]
+    assert len(error_branches) == 1
+    writes_listing_block = any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == "blocked"
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else (node.target,)
+            )
+        )
+        for node in ast.walk(error_branches[0])
+    )
+    assert not writes_listing_block, (
+        "malformed matching receipt became entity-wide blocking"
+    )
+
+
+def test_stage2_postcommit_consumption_failure_has_no_rollback_path():
+    function = _source_function("app/git_transaction.py", "_execute_locked_body")
+    applied_handlers = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.ExceptHandler)
+        and any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "PostCommitConsumptionError"
+            for child in ast.walk(node)
+        )
+    ]
+    assert len(applied_handlers) == 1
+    forbidden = {
+        node.func.id
+        for node in ast.walk(applied_handlers[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"_git", "_rollback_transaction", "_apply_state"}
+    }
+    assert not forbidden, (
+        "post-commit consumption failure can roll back action and receipt"
+    )
+
+
+def test_stage2_proposal_quarantine_stays_after_the_action_commit():
+    function = _source_function("app/git_transaction.py", "_execute_locked_body")
+    commit_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_git"
+        and any(
+            isinstance(argument, ast.Constant) and argument.value == "commit"
+            for argument in node.args
+        )
+    ]
+    quarantine_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "quarantine_path_if_unchanged"
+    ]
+    assert len(commit_calls) == 1 and quarantine_calls
+    assert min(node.lineno for node in quarantine_calls) > commit_calls[0].lineno, (
+        "a proposal was quarantined before its action committed"
+    )
+
+
+def test_a_dead_mapping_cannot_impersonate_an_executable_producer(monkeypatch):
+    import app.console_errors as errors
+    from app.git_transaction import PostCommitConsumptionError
+
+    class DeadOutcome(Exception):
+        pass
+
+    monkeypatch.delitem(errors._EXACT, PostCommitConsumptionError)
+    monkeypatch.setitem(
+        errors._EXACT, DeadOutcome, errors._CODES["E-APPLIED"]
+    )
+
+    assert "E-APPLIED" in _orphan_operator_outcomes(), (
+        "orphan guard allowed E-APPLIED to impersonate a live outcome"
+    )
+
+
+def test_action_receipt_card_has_no_review_or_mutation_transport():
+    source = (_REPO_ROOT / "templates/blocks/action_receipt_card.html").read_text(
+        encoding="utf-8"
+    )
+
+    for forbidden in (
+        "review_sha256",
+        "hx-post",
+        "hx-put",
+        "hx-delete",
+        "<button",
+        "Check again",
+        "reconfirm",
+    ):
+        assert forbidden not in source, (
+            f"receipt card regained action/review transport: {forbidden}"
+        )
+    assert "receipt-card-{{ proposal_id }}-{{ issue }}" in source
+    assert "receipt.review_sha256" not in source
+    assert "If the item still needs classifying" in source
+    assert "If the entry still needs deleting" in source
+
+
+def test_receipt_attention_fragments_remain_swappable_at_500():
+    source = (_REPO_ROOT / "templates/_head.html").read_text(encoding="utf-8")
+
+    assert '"code":"[45]..","swap":true,"error":true' in source, (
+        "E-APPLIED 500 fragment no longer swaps"
+    )
+
+
+def test_full_receipt_store_enumeration_is_offline_audit_only():
+    validators = {"validate_head_receipt_store", "validate_all_head_receipt_stores"}
+
+    def uses_validator(relative: str) -> bool:
+        tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+        return any(
+            isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Name) and node.func.id in validators
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr in validators
+            )
+            for node in ast.walk(tree)
+        )
+
+    def imports_validator(relative: str) -> bool:
+        tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+        return any(
+            isinstance(node, ast.ImportFrom)
+            and (
+                node.module == "app.action_receipts"
+                or node.level == 1 and node.module == "action_receipts"
+            )
+            and any(alias.name in validators for alias in node.names)
+            for node in ast.walk(tree)
+        )
+
+    for relative in ("app/main.py", "app/outbox.py", "app/registry.py"):
+        assert not uses_validator(relative), (
+            f"request path enumerates the accumulated receipt store: {relative}"
+        )
+        assert not imports_validator(relative), (
+            f"request path imports the offline receipt validator: {relative}"
+        )
+
+    for relative in (
+        "tools/gate3_audit.py",
+        "tools/public_repo_audit.py",
+    ):
+        assert imports_validator(relative) and uses_validator(relative), (
+            f"offline audit pattern does not run the receipt validator: {relative}"
+        )
+
+
+def test_an_unreachable_constructor_cannot_impersonate_a_live_producer():
+    reachable = _reachable_call_names(
+        {
+            "app/synthetic.py": """
+class LiveOutcome(Exception):
+    pass
+
+class DeadOutcome(Exception):
+    pass
+
+def live_helper():
+    raise LiveOutcome()
+
+def dead_diagnosis():
+    raise DeadOutcome()
+
+@app.get('/synthetic')
+def route():
+    live_helper()
+"""
+        }
+    )
+
+    assert "app.synthetic.LiveOutcome" in reachable
+    assert "app.synthetic.DeadOutcome" not in reachable
+
+
+def test_same_named_helper_in_another_module_does_not_become_reachable():
+    reachable = _reachable_call_names(
+        {
+            "app/live.py": """
+class LiveOutcome(Exception):
+    pass
+
+def helper():
+    raise LiveOutcome()
+
+@app.get('/live')
+def route():
+    helper()
+""",
+            "app/dead.py": """
+class DeadOutcome(Exception):
+    pass
+
+def helper():
+    raise DeadOutcome()
+""",
+        }
+    )
+
+    assert "app.live.LiveOutcome" in reachable
+    assert "app.dead.DeadOutcome" not in reachable, (
+        "a reachable helper name leaked across module boundaries"
+    )
+
+
+def test_uncalled_nested_callable_bodies_do_not_produce_live_outcomes():
+    reachable = _reachable_call_names(
+        {
+            "app/nested.py": """
+class DefaultOutcome(Exception):
+    pass
+
+class DecoratorOutcome(Exception):
+    pass
+
+class NestedBodyOutcome(Exception):
+    pass
+
+class LambdaBodyOutcome(Exception):
+    pass
+
+class CalledNestedBodyOutcome(Exception):
+    pass
+
+class CalledLambdaBodyOutcome(Exception):
+    pass
+
+def decorate(value):
+    return lambda function: function
+
+@app.get('/nested')
+def route():
+    @decorate(DecoratorOutcome())
+    def never_called(value=DefaultOutcome()):
+        raise NestedBodyOutcome()
+
+    unused = lambda value=DefaultOutcome(): LambdaBodyOutcome()
+
+    def called():
+        raise CalledNestedBodyOutcome()
+
+    used = lambda: CalledLambdaBodyOutcome()
+    called()
+    used()
+    return None
+"""
+        }
+    )
+
+    assert "app.nested.DefaultOutcome" in reachable
+    assert "app.nested.DecoratorOutcome" in reachable
+    assert "app.nested.NestedBodyOutcome" not in reachable
+    assert "app.nested.LambdaBodyOutcome" not in reachable
+    assert "app.nested.CalledNestedBodyOutcome" in reachable
+    assert "app.nested.CalledLambdaBodyOutcome" in reachable
+
+
+def test_local_class_construction_reaches_only_called_methods_and_initializers():
+    reachable = _reachable_call_names(
+        {
+            "app/local_class.py": """
+class LiveOutcome(Exception):
+    pass
+
+class DeadOutcome(Exception):
+    pass
+
+@app.get('/local-class')
+def route():
+    class Ordinary:
+        def __init__(self):
+            return None
+
+        def called(self):
+            raise LiveOutcome()
+
+        def never_called(self):
+            raise DeadOutcome()
+
+    ordinary = Ordinary()
+    ordinary.called()
+"""
+        }
+    )
+
+    assert "app.local_class.LiveOutcome" in reachable
+    assert "app.local_class.DeadOutcome" not in reachable, (
+        "constructing a local class made every method look executable"
+    )
+
+
+def test_review_token_family_every_subclass_has_exact_entry():
+    """S7's outcome family is closed the same way S5's is.
+
+    `ReviewTokenError` is documented as never raised directly, so its base
+    entry is a runtime backstop, not a home for real outcomes. Without this
+    walk a future subclass would degrade silently to E-INTERNAL — a
+    stop-and-inspect 500 — for what may in fact be an ordinary refusal that
+    changed nothing. Declaring an outcome must be deliberate.
+    """
+    from app.console_errors import _EXACT
+    from app.review_tokens import ReviewTokenError
+
+    for cls in _transitive_subclasses(ReviewTokenError):
+        assert cls in _EXACT, f"{cls.__qualname__} lacks its own exact entry"
+
+
 def test_no_domain_module_imports_the_taxonomy():
     forbidden = {"console_errors", "console_render"}
     offenders = []
@@ -266,6 +1312,13 @@ def test_no_domain_module_imports_the_taxonomy():
 
 # --- Task 3: the safe-read contract on `_read_no_follow_bytes` --------------
 #
+# Item 6 (review): this reader used to do its own single `os.open` with
+# `O_NOFOLLOW`, which guards only the final component — parents were
+# followed, no component was checked against `.git`, and the mode was
+# discarded. It now goes through `capture_path_state`, the same checked-
+# descriptor walk every other boundary read uses. The contract below is
+# unchanged; the guarantees underneath it are stronger.
+#
 #   missing leaf                       -> FileNotFoundError (re-raised)
 #   ELOOP / O_NOFOLLOW rejection       -> RedirectedPathError
 #   fstat says non-regular             -> RedirectedPathError
@@ -279,7 +1332,7 @@ def test_safe_read_missing_leaf_raises_filenotfound(tmp_path):
     from app.outbox import _read_no_follow_bytes
 
     with pytest.raises(FileNotFoundError):
-        _read_no_follow_bytes(tmp_path / "absent.md")
+        _read_no_follow_bytes(tmp_path, "absent.md")
 
 
 def test_safe_read_symlink_raises_redirected(tmp_path):
@@ -292,7 +1345,7 @@ def test_safe_read_symlink_raises_redirected(tmp_path):
     link.symlink_to(target)
 
     with pytest.raises(RedirectedPathError) as raised:
-        _read_no_follow_bytes(link)
+        _read_no_follow_bytes(tmp_path, "link.md")
     assert isinstance(raised.value, CrossScopeError)
 
 
@@ -314,10 +1367,12 @@ def test_safe_read_nonregular_raises_redirected(tmp_path, monkeypatch):
             + tuple(result)[1:]
         )
 
-    monkeypatch.setattr(outbox.os, "fstat", nonregular_fstat)
+    import app.git_transaction as git_transaction
+
+    monkeypatch.setattr(git_transaction.os, "fstat", nonregular_fstat)
 
     with pytest.raises(RedirectedPathError) as raised:
-        outbox._read_no_follow_bytes(regular)
+        outbox._read_no_follow_bytes(tmp_path, "regular.md")
     assert isinstance(raised.value, CrossScopeError)
 
 
@@ -330,7 +1385,7 @@ def test_safe_read_permission_error_raises_unavailable(tmp_path):
     unreadable.chmod(0)
     try:
         with pytest.raises(ProposalSourceUnavailable) as raised:
-            _read_no_follow_bytes(unreadable)
+            _read_no_follow_bytes(tmp_path, "unreadable.md")
     finally:
         unreadable.chmod(0o644)
     assert isinstance(raised.value, CrossScopeError)
@@ -345,7 +1400,7 @@ def test_safe_read_replacement_race_raises_redirected(tmp_path):
     swapped.mkdir()
 
     with pytest.raises(RedirectedPathError) as raised:
-        _read_no_follow_bytes(swapped)
+        _read_no_follow_bytes(tmp_path, "swapped.md")
     assert isinstance(raised.value, CrossScopeError)
 
 
@@ -360,7 +1415,7 @@ def test_safe_read_other_oserror_raises_unavailable(tmp_path):
     parent.chmod(0)
     try:
         with pytest.raises(ProposalSourceUnavailable) as raised:
-            _read_no_follow_bytes(leaf)
+            _read_no_follow_bytes(tmp_path, "sealed/receipt.md")
     finally:
         parent.chmod(0o755)
     assert isinstance(raised.value, CrossScopeError)
@@ -1594,3 +2649,359 @@ def test_c2_no_registered_route_calls_resolve_without_any_symlink_guard(
     main = _load_console_app(tmp_path, monkeypatch)
     offenders = _route_level_resolve_offenders(main.app)
     assert offenders == [], f"stage 5 found an unguarded route-level resolve(): {offenders}"
+
+
+def test_the_quarantine_status_filter_hides_only_quarantine_records(tmp_path):
+    """S7 Amendment 1: verification may exclude exactly
+    `<entity>/outbox/.consumed/*.yaml` and nothing broader. A filter that
+    hid any path containing `.consumed` would conceal real regressions
+    elsewhere in the vault."""
+    from tests.conftest import git_status_apart_from_quarantine, git_vault
+
+    vault = git_vault(tmp_path, {"tracked.md": "tracked\n"})
+    hidden = vault / "demo/outbox/.consumed"
+    hidden.mkdir(parents=True)
+    (hidden / "20260101T000000-aa.yaml").write_text("record\n", encoding="utf-8")
+
+    # None of these are quarantine records, and none may be hidden.
+    decoys = {
+        "demo/outbox/.consumed/notes.md": "wrong suffix",
+        "demo/outbox/.consumed/nested/deep.yaml": "nested below quarantine",
+        "demo/.consumed/stray.yaml": "not under an outbox",
+        "elsewhere/.consumed-ish/thing.yaml": "lookalike directory",
+        "top-level.consumed.yaml": "lookalike filename",
+    }
+    for relative in decoys:
+        path = vault / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("decoy\n", encoding="utf-8")
+
+    remaining = git_status_apart_from_quarantine(vault).decode()
+
+    assert "20260101T000000-aa.yaml" not in remaining, "a real record leaked through"
+    for relative, why in decoys.items():
+        assert relative in remaining, f"{why} was wrongly hidden: {relative}"
+
+
+def _executable_source(function) -> str:
+    """A function's code with comments and docstrings removed.
+
+    Matching raw source would let a *comment* — for instance one explaining
+    that a reader was deliberately removed — fail a "must not call" check,
+    and would equally let a commented-out call pass one. Only executable
+    code is evidence.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body.pop(0)
+    return ast.unparse(tree)
+
+
+# --- S7 Task 6: structural proof of the bound-review surface -----------------
+#
+# These cover only S7's changed surface. They are deliberately NOT the
+# separately sequenced global route-declaration audit.
+
+_S7_ACTIONS = ("approve", "reject", "execute_delete")
+_S7_ROUTES = ("outbox_approve", "outbox_reject", "registry_delete_execute")
+_S7_ACTION_TEMPLATES = (
+    "templates/blocks/outbox_card.html",
+    "templates/blocks/delete_impact.html",
+)
+
+
+def _main_module():
+    import app.main as main
+
+    return main
+
+
+def test_every_reviewed_service_requires_the_fingerprint():
+    import inspect
+
+    import app.outbox as outbox
+    import app.registry as registry
+
+    for name in _S7_ACTIONS:
+        service = getattr(outbox, name, None) or getattr(registry, name)
+        parameters = inspect.signature(service).parameters
+        assert list(parameters)[-1] == "review_sha256", name
+        assert parameters["review_sha256"].default is inspect.Parameter.empty, name
+
+
+def test_every_reviewed_route_requires_and_passes_the_fingerprint(
+    tmp_path, monkeypatch
+):
+    import ast
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    for name in _S7_ROUTES:
+        route = getattr(main, name)
+        parameters = inspect.signature(route).parameters
+        assert "review_sha256" in parameters, name
+        # Present is not enough: `Form(None)` would keep the parameter and
+        # every forwarding check below green while quietly restoring the
+        # id-only path the Global Constraints forbid.
+        field = parameters["review_sha256"].default
+        assert getattr(field, "is_required", lambda: False)(), (
+            f"{name} does not REQUIRE review_sha256"
+        )
+        source = _executable_source(route)
+        tree = ast.parse(source)
+        # A parameter is an `arg` node, not a `Name`; a `Name` is a *use*.
+        declared = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.arg) and node.arg == "review_sha256"
+        ]
+        assert declared, f"{name} does not declare review_sha256"
+
+        # "Used somewhere" is far weaker than this test's name: a route could
+        # log it, or pass it to something harmless, and still hand the action
+        # nothing. Require it to be an *argument of the call that acts*.
+        acting = {
+            "outbox_approve": ("_outbox_approve_response", "approve"),
+            "outbox_reject": ("_outbox_reject_response", "reject"),
+            "registry_delete_execute": ("execute_delete",),
+        }[name]
+        forwarded = [
+            call
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            and getattr(call.func, "id", getattr(call.func, "attr", ""))
+            in acting
+            and any(
+                isinstance(argument, ast.Name)
+                and argument.id == "review_sha256"
+                for argument in list(call.args) + [
+                    keyword.value for keyword in call.keywords
+                ]
+            )
+        ]
+        assert forwarded, (
+            f"{name} never passes review_sha256 to {' or '.join(acting)}"
+        )
+        assert "get_proposal_review(" not in source, name
+        assert "get_delete_review(" not in source, name
+
+
+def test_no_reviewed_action_route_reads_through_a_value_only_reader(
+    tmp_path, monkeypatch
+):
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    forbidden = ("get_proposal(", "get_delete_proposal(", "load_proposals(")
+    for name in _S7_ROUTES:
+        source = _executable_source(getattr(main, name))
+        helper = f"_{name}_response"
+        if hasattr(main, helper):
+            source += _executable_source(getattr(main, helper))
+        for reader in forbidden:
+            assert reader not in source, f"{name} reads through {reader}"
+
+
+def test_delete_success_copy_comes_from_the_bound_execution(tmp_path, monkeypatch):
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    source = _executable_source(main.registry_delete_execute)
+    assert "execute_delete(scope, id, review_sha256)" in source
+    assert "get_delete_proposal" not in source
+    # Nor any *other* read for display: the route acts and renders what the
+    # action returned. A pre-read here would describe bytes the deletion
+    # never consumed, whichever reader produced them.
+    assert "get_delete_review" not in source, (
+        "the execute route reads a review for display instead of using the "
+        "proposal its own execution returned"
+    )
+    # The returned proposal is what the success fragment renders.
+    success = source.split("delete_success.html", 1)[1]
+    assert "prop.kind" in success and "prop.slug" in success
+
+
+def test_every_action_template_carries_the_fingerprint_through_tojson():
+    import re as _re
+
+    for relative in _S7_ACTION_TEMPLATES:
+        source = (_REPO_ROOT / relative).read_text(encoding="utf-8")
+        values = _re.findall(r"hx-vals='([^']*)'", source)
+        assert values, f"{relative} renders no hx-vals"
+        for value in values:
+            assert value.strip().startswith("{{"), relative
+            assert "| tojson" in value, relative
+        assert "review_sha256" in source, relative
+
+
+def test_no_row_without_controls_can_carry_a_fingerprint():
+    """The projection's own invariant, restated where the templates rely on
+    it: controls and fingerprint are issued together or not at all."""
+    from app.outbox import OutboxRow
+
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=False, can_reject=False,
+                  review_sha256="a" * 64)
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=True, can_reject=False,
+                  review_sha256=None)
+
+
+def test_every_review_fragment_route_declares_its_family(tmp_path, monkeypatch):
+    main = _load_console_main(tmp_path, monkeypatch)
+    for name in ("outbox_review_fragment", "registry_delete_review_fragment"):
+        declaration = getattr(main, name).__console_route__
+        assert declaration.surface == "fragment-only", name
+        assert declaration.catches, name
+        assert Exception not in declaration.catches, name
+        assert BaseException not in declaration.catches, name
+
+
+def test_every_review_fragment_route_is_read_only(tmp_path, monkeypatch):
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    mutating = (
+        "approve(", "reject(", "execute_delete(", "propose_classification(",
+        "propose_delete(", "unlink", "write_text", "write_bytes", "mkdir",
+        "execute_transaction(", "quarantine_path_if_unchanged(",
+    )
+    for name in ("outbox_review_fragment", "registry_delete_review_fragment"):
+        source = _executable_source(getattr(main, name))
+        for call in mutating:
+            assert call not in source, f"{name} reaches {call}"
+
+
+def _load_console_main(tmp_path, monkeypatch):
+    import importlib
+
+    from tests.conftest import scaffold_modules, write_vault
+
+    write_vault(
+        tmp_path,
+        '\nversion: "1.0"\nentities:\n  alpha: { label: Alpha, flags: [] }\n',
+    )
+    scaffold_modules(tmp_path, "alpha", ["00-intake", "01-core", "02-work"])
+    monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
+    import app.main as main
+
+    return importlib.reload(main)
+
+
+def test_no_module_level_definition_is_shadowed_by_a_later_one():
+    """A second `def` of the same name silently replaces the first.
+
+    Python does not warn, and pytest collects only the survivor — so an
+    edit that appends a strengthened test beside the weak original runs
+    the *original*, reports green, and proves nothing. That has now
+    happened twice in this branch's history, both times undetected until
+    a mutation refused to turn red. A cheap parse catches it at once.
+    """
+    import ast
+    import collections
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    shadowed = {}
+    for path in sorted(
+        [*(root / "app").rglob("*.py"), *(root / "tests").rglob("*.py")]
+    ):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        seen = collections.Counter(
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
+        repeats = {name: n for name, n in seen.items() if n > 1}
+        if repeats:
+            shadowed[str(path.relative_to(root))] = repeats
+
+    assert not shadowed, f"module-level names defined more than once: {shadowed}"
+
+
+def test_no_template_gives_an_inert_control_a_live_action():
+    """Item 6 (review): a greyed button must not still be able to post.
+
+    `delete_impact.html` used to render `disabled` on its Approve button
+    while leaving `hx-post`, `hx-vals` and the fingerprint in place, so
+    the control was inert only cosmetically — `disabled` is a client-side
+    attribute, and anything that cleared it, or any trigger that did not
+    route through a click, had a live mutation bound to stale reviewed
+    bytes. `outbox_card.html` guarded the same attributes correctly, and
+    the two drifting apart is what hid it.
+
+    Both branches are gone now. This keeps them gone: within one tag, a
+    `disabled` attribute and an `hx-` action attribute may not coexist.
+    Jinja conditionals are deliberately not evaluated — the check is on
+    the source, so a branch that *could* emit both fails whether or not
+    any caller currently reaches it.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "templates"
+    actions = ("hx-post", "hx-put", "hx-patch", "hx-delete", "hx-get")
+    offenders = []
+    for path in sorted(root.rglob("*.html")):
+        source = path.read_text(encoding="utf-8")
+        for tag in re.findall(r"<(?:button|a|form|input)\b[^>]*>", source, re.S):
+            if "disabled" in tag and any(action in tag for action in actions):
+                offenders.append(f"{path.relative_to(root)}: {tag[:120]}")
+
+    assert not offenders, "inert controls carrying a live action:\n" + "\n".join(
+        offenders
+    )
+
+
+def test_safe_read_refuses_a_redirected_parent_directory(tmp_path):
+    """Item 6 (review): the guarantee the old reader did not have.
+
+    `O_NOFOLLOW` on a single `os.open` of a whole path constrains only the
+    last component. Every directory above it was followed, so a symlinked
+    parent silently redirected the read to a file outside the tree the
+    path appeared to name — while the leaf itself was a perfectly ordinary
+    regular file, so every check the reader did still passed.
+
+    The checked-descriptor walk refuses each component in turn.
+    """
+    from app.outbox import _read_no_follow_bytes
+    from app.scope import RedirectedPathError
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "receipt.md").write_text("not the reviewed file\n", encoding="utf-8")
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "active").symlink_to(elsewhere)
+
+    # The leaf is a regular file and is not itself a symlink: only the
+    # parent redirects.
+    assert (vault / "active/receipt.md").is_file()
+    assert not (vault / "active/receipt.md").is_symlink()
+
+    with pytest.raises(RedirectedPathError):
+        _read_no_follow_bytes(vault, "active/receipt.md")
+
+
+def test_safe_read_refuses_a_path_through_the_git_directory(tmp_path):
+    """The other missing component check: `.git` was never rejected."""
+    from app.outbox import _read_no_follow_bytes
+    from app.scope import RedirectedPathError
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git/config").write_text("[core]\n", encoding="utf-8")
+
+    with pytest.raises(RedirectedPathError):
+        _read_no_follow_bytes(tmp_path, ".git/config")

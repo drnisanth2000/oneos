@@ -1,0 +1,10 @@
+{# Two described outcomes in one fragment (design §5 composition).
+
+   Used where an action's own refusal and a subsequent rendering failure are
+   both real: dropping either would tell the operator something untrue about
+   what happened. The action's refusal comes first, because it is the one
+   they asked for. #}
+{% if action_error %}
+{% with error=action_error %}{% include "blocks/alert.html" %}{% endwith %}
+{% endif %}
+{% with error=error %}{% include "blocks/alert.html" %}{% endwith %}

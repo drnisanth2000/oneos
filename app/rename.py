@@ -33,6 +33,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .console_routing import structured_reader
+from .git_transaction import (
+    ActionLockCleanupFailure,
+    GitTransactionFailure,
+    VaultBusyError,
+    action_lock,
+)
 
 # Mirror of oneos_wizard.SLUG_RE / RESERVED — the app cannot import from the
 # vault (it is public and vault-path-free), so the grammar is restated and the
@@ -55,12 +61,31 @@ class RenameError(Exception):
     pass
 
 
+class RenameCommittedError(Exception):
+    """The rename committed, but post-commit confirmation or cleanup failed."""
+
+    def __init__(
+        self, commit_oid: str | None, cleanup_error: OSError | None = None
+    ) -> None:
+        self.commit_oid = commit_oid
+        self.cleanup_error = cleanup_error
+        commit_id = commit_oid if commit_oid is not None else "unknown/unavailable"
+        detail = (
+            "; action-lock cleanup failed" if cleanup_error is not None else ""
+        )
+        super().__init__(
+            f"rename committed (commit id: {commit_id}){detail}; do not retry"
+        )
+
+
 @dataclass
 class RenamePlan:
     axis: str
     old: str
     new: str
     vault: Path
+    #: Exact Git state against which the planned edits were reviewed.
+    planned_head: str
     moves: list[tuple[Path, Path]] = field(default_factory=list)
     edits: dict[Path, str] = field(default_factory=dict)  # current path -> new text
     reports: list[str] = field(default_factory=list)
@@ -382,18 +407,60 @@ _PLANNERS = {
 
 # --- public API ------------------------------------------------------------
 
-def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
-    vault = Path(vault)
+def build_rename_plan(
+    vault: Path | str,
+    axis: str,
+    old: str,
+    new: str,
+    *,
+    planned_head: str,
+) -> RenamePlan:
+    """Build from tree bytes explicitly identified by ``planned_head``.
+
+    This constructor does not inspect Git. The live planner supplies current
+    HEAD; offline history audits supply the immutable parent commit whose tree
+    they materialized.
+    """
+    try:
+        vault = Path(vault).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RenameError("rename vault root could not be resolved") from exc
     if axis not in AXES:
         raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
     if old == new:
         raise RenameError("old and new slug are identical")
     _validate_new_slug(new)
-    plan = RenamePlan(axis=axis, old=old, new=new, vault=vault)
+    plan = RenamePlan(
+        axis=axis,
+        old=old,
+        new=new,
+        vault=vault,
+        planned_head=planned_head,
+    )
     _PLANNERS[axis](plan)
     if not plan.moves and not plan.edits:
         raise RenameError(f"{axis} {old!r} not found — nothing to rename")
     return plan
+
+
+def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
+    try:
+        vault = Path(vault).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RenameError("rename vault root could not be resolved") from exc
+    if axis not in AXES:
+        raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
+    if old == new:
+        raise RenameError("old and new slug are identical")
+    _validate_new_slug(new)
+    planned_head = _git(vault, "rev-parse", "HEAD").strip()
+    return build_rename_plan(
+        vault,
+        axis,
+        old,
+        new,
+        planned_head=planned_head,
+    )
 
 
 def render_diff(plan: RenamePlan) -> str:
@@ -433,29 +500,87 @@ DEFAULT_VALIDATORS = [_validate_check_v2]
 
 
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
-    vault = Path(vault)
-    if not _git_clean(vault):
-        raise RenameError("vault has uncommitted changes; commit or stash first")
-    validators = DEFAULT_VALIDATORS if validators is None else validators
+    execution_vault = Path(vault)
     try:
-        for p, new_text in plan.edits.items():
-            p.write_text(new_text, encoding="utf-8")
-        for src, dst in plan.moves:
-            _git(vault, "mv", str(src.relative_to(vault)), str(dst.relative_to(vault)))
+        planned_root = Path(plan.vault).resolve(strict=True)
+        execution_root = execution_vault.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RenameError("rename vault root could not be resolved") from exc
+    if planned_root != execution_root:
+        raise RenameError("rename plan belongs to a different vault")
+    # Plans store their canonical root, so a symlink alias used by the caller
+    # cannot be retargeted after this comparison to redirect the lock, Git
+    # commands, or the already-planned edit/move paths into another vault.
+    vault = planned_root
+    commit_completed = False
+    commit_oid: str | None = None
+    lock_body_entered = False
+    try:
+        with action_lock(vault):
+            lock_body_entered = True
+            if not _git_clean(vault):
+                raise RenameError(
+                    "vault has uncommitted changes; commit or stash first"
+                )
+            if _git(vault, "rev-parse", "HEAD").strip() != plan.planned_head:
+                raise RenameError(
+                    "HEAD changed since this rename was planned; create and "
+                    "review a fresh plan"
+                )
+            validators = DEFAULT_VALIDATORS if validators is None else validators
+            try:
+                for p, new_text in plan.edits.items():
+                    p.write_text(new_text, encoding="utf-8")
+                for src, dst in plan.moves:
+                    _git(
+                        vault,
+                        "mv",
+                        str(src.relative_to(vault)),
+                        str(dst.relative_to(vault)),
+                    )
 
-        residual = grep_gate(vault, plan.old)
-        if residual:
-            raise RenameError(f"residual old slug after rename: {residual[:5]}")
+                residual = grep_gate(vault, plan.old)
+                if residual:
+                    raise RenameError(
+                        f"residual old slug after rename: {residual[:5]}"
+                    )
 
-        for v in validators:
-            v(vault, plan)
+                for v in validators:
+                    v(vault, plan)
 
-        _git(vault, "add", "-A")
-        _git(vault, "commit", "-q", "-m", f"rename: {plan.old} → {plan.new}")
-        return f"rename: {plan.old} → {plan.new}"
-    except Exception:
-        _git(vault, "reset", "-q", "--hard", "HEAD")
-        _git(vault, "clean", "-qfd")
+                _git(vault, "add", "-A")
+                _git(
+                    vault,
+                    "commit",
+                    "-q",
+                    "-m",
+                    f"rename: {plan.old} → {plan.new}",
+                )
+                commit_completed = True
+            except Exception:
+                _git(vault, "reset", "-q", "--hard", "HEAD")
+                _git(vault, "clean", "-qfd")
+                raise
+            try:
+                commit_oid = _git(vault, "rev-parse", "HEAD").strip()
+            except Exception as exc:
+                raise RenameCommittedError(None) from exc
+            return f"rename: {plan.old} → {plan.new}"
+    except ActionLockCleanupFailure as exc:
+        if not commit_completed:
+            raise RenameError(
+                "shared action lock cleanup failed before the rename committed"
+            ) from exc
+        raise RenameCommittedError(commit_oid, exc.cleanup_error) from exc
+    except VaultBusyError as exc:
+        raise RenameError(
+            "vault is busy; another OneOS action is already running"
+        ) from exc
+    except GitTransactionFailure as exc:
+        if not lock_body_entered:
+            raise RenameError(
+                "shared action lock is unavailable; the rename was not started"
+            ) from exc
         raise
 
 
@@ -478,6 +603,18 @@ def main(argv=None) -> int:
         msg = apply_rename(vault, plan)
         print(f"[DONE] {msg}")
         return 0
+    except RenameCommittedError as e:
+        commit_id = e.commit_oid if e.commit_oid is not None else "unknown/unavailable"
+        cleanup_detail = (
+            ", and shared action-lock cleanup failed"
+            if e.cleanup_error is not None
+            else ""
+        )
+        print(
+            f"[COMMITTED] Rename committed (commit id: {commit_id})"
+            f"{cleanup_detail}. Do not retry this rename."
+        )
+        return 2
     except RenameError as e:
         print(f"[ABORTED] {e}")
         return 1

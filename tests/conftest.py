@@ -5,6 +5,8 @@ count from the actual vault ever appears in this repo (AGENTS.md, "the one
 rule"). Every test builds its own throwaway vault with invented slugs, so the
 same code that drives the real system drives these.
 """
+import os
+import re
 from pathlib import Path
 import json
 import subprocess
@@ -131,6 +133,37 @@ def git_entity_vault(
 
 def git_head_message(root: Path) -> str:
     return _git(root, "log", "-1", "--pretty=%s").strip()
+
+
+#: Exactly `<entity>/outbox/.consumed/<name>.yaml` and nothing else. A looser
+#: match would hide any path containing `.consumed`, which is precisely how a
+#: real regression elsewhere in the vault would go unnoticed.
+_QUARANTINE_RECORD = re.compile(r"[^/]+/outbox/\.consumed/[^/]+\.yaml")
+
+
+def quarantine_records(root: Path) -> list[Path]:
+    """Consumed proposal records held in quarantine (S7 Amendment 1)."""
+    return sorted(root.rglob(".consumed/*.yaml"))
+
+
+def git_status_apart_from_quarantine(root: Path) -> bytes:
+    """`git status`, minus quarantined records.
+
+    Amendment 1 consumes a proposal by moving it into `.consumed/` instead of
+    deleting it. Those records are untracked by design, so a vault is never
+    byte-empty in `git status` after a consumption; everything else must
+    still be unchanged.
+    """
+    kept = [
+        record
+        for record in git_status_bytes(root).split(b"\0")
+        if record and not _QUARANTINE_RECORD.fullmatch(os.fsdecode(record[3:]))
+    ]
+    return b"".join(record + b"\0" for record in kept)
+
+
+def git_is_clean_apart_from_quarantine(root: Path) -> bool:
+    return git_status_apart_from_quarantine(root) == b""
 
 
 def git_is_clean(root: Path) -> bool:

@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from app.action_receipts import ReceiptError, validate_all_head_receipt_stores
+
 
 ALLOWLIST_PATH = ".oneos-public-binary-allowlist"
 TEXT_FIELDS = frozenset(
@@ -41,6 +43,7 @@ MESSAGES = {
     "absolute-private-path": "absolute private path detected",
     "forbidden-data-artifact": "forbidden data artifact detected",
     "unapproved-binary": "unapproved non-text blob or allowlist entry detected",
+    "receipt-integrity": "accumulated action receipt audit failed",
 }
 
 
@@ -61,6 +64,13 @@ def audit_repository(
         findings.extend(
             scan_revision(repo, revision, long_terms, short_terms, allowlist)
         )
+    if vault is not None:
+        try:
+            validate_all_head_receipt_stores(vault)
+        except ReceiptError:
+            findings.append(
+                finding("receipt-integrity", "vault:HEAD:receipt-store")
+            )
     return sorted(set(findings), key=lambda item: (item.location, item.category))
 
 

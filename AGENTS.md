@@ -33,23 +33,39 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 **Where `conventions.md` v2 and anything in `docs/` disagree, v2 wins.**
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
-Current task: the remaining **Safety Foundation** work marked in `BUILD.md`,
-required before live Phase 1 gate trials. **S1-S6 are complete** — every
-public and private gate passes, including the combined repo+vault history
-audit. **S7 — bound review tokens — is next.** A branch's merge/PR state is
+The **Safety Foundation S1-S7 is complete** at its gate-certified branch tip.
+The final rename-root correction checkpoint's public suite recorded 1,476
+passed; all 48 campaign rows went RED then GREEN; its restored closing suite
+recorded 1,476 passed in 107.32s; Gitleaks found no leaks; and current-tree and
+history public audits were clean. The final private-gate evidence was
+`check_v2` 0/0, 37 tests in 0.174s, a clean combined repo-plus-vault history
+audit, and byte-identical Grey Matter HEAD, status, worktree diff, and cached
+diff preserving pre-existing edits. Independent scoped review PASS found no
+Critical, Important, or Minor findings on the final rename-root correction.
+The macOS no-overwrite path was exercised;
+Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
+user/platform limitation. The separately sequenced inherited items 2–4 in
+`docs/STATUS.md` remain required before live Phase 1 gate trials.
+A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
 moment the request exists. Check it live instead: `git log
 origin/main..<branch>` and the hosting UI's pull-request list name the actual
 state.
 
+S7 was developed sequentially from the fresh merged-S6 baseline recorded in its
+plan. It binds every reviewed action to exact proposal bytes; transactional
+actions retain committed receipts, while reject safely quarantines its record.
+Supported writers cooperate through OneOS interfaces and the shared action
+lock. Deliberate ancestor-directory relocation after the final check is outside
+that cooperative-writer boundary. Spent ids are refused. Its inherited items
+are recorded in `docs/STATUS.md`; do not silently claim those separately
+sequenced items done.
+
+The satisfied historical sequence rule remains part of the audit record:
 **Do not begin S7 until S6 is merged into `origin/main` and a fresh
-merged-`main` baseline passes.** Safety Foundation steps are sequential
-integration boundaries (see "Repository and task hygiene" below); starting S7
-against an unmerged predecessor breaks that rule. What S7 inherits from S6 is
-recorded in `docs/STATUS.md`, and the central item is that the approval gate
-does not bind reviewed bytes — a proposal id names a mutable file, not the bytes
-an operator reviewed.
+merged-`main` baseline passes.** Future Safety Foundation steps follow the same
+sequential-integration rule in "Repository and task hygiene" below.
 
 This hardening does not unlock a new phase or authorize deferred screens.
 

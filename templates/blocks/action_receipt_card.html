@@ -1,0 +1,41 @@
+{% set issue = issue | default(new_issue()) %}
+{# A committed receipt is authority about the id, never about the bytes that
+   currently occupy the pending-record name. This card therefore accepts no
+   proposal value or review digest and offers no mutating or re-review action. #}
+<div class="proposal action-receipt"
+     id="receipt-card-{{ proposal_id }}-{{ issue }}">
+  {% if receipt_error %}
+  {% with error=receipt_error %}{% include "blocks/alert.html" %}{% endwith %}
+  {% endif %}
+
+  {% if receipt %}
+    {% if receipt.action_kind == "approval" %}
+  <p>An approval has already completed for this proposal ID, so it cannot be used again.</p>
+    {% else %}
+  <p>A registry deletion has already completed for this proposal ID, so it cannot be used again.</p>
+    {% endif %}
+  {% endif %}
+
+  {% if record_present %}
+  <p class="muted">A record with this ID is still present. OneOS will not act on it. Do not move or delete it by hand.</p>
+  {% endif %}
+
+  {% if receipt %}
+    {% if receipt.action_kind == "approval" %}
+  <p class="muted">
+    If the item still needs classifying, start again from
+    <a href="/triage/{{ entity }}">triage</a> — that allocates a new proposal.
+  </p>
+    {% else %}
+  <p class="muted">
+    If the entry still needs deleting, start a new deletion from
+    <a href="/registry/{{ entity }}/products">the registry</a>.
+  </p>
+    {% endif %}
+  {% else %}
+  <p class="muted">
+    No automated recovery is available. Inspect vault state with git status
+    and escalate for verified recovery.
+  </p>
+  {% endif %}
+</div>

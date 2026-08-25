@@ -22,21 +22,42 @@ from pathlib import Path
 
 import yaml
 
+from .action_receipts import (
+    ActionReceipt,
+    SpentAction,
+    make_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
+    resolve_head_receipt,
+    resolve_head_receipts,
+)
 from .console_routing import structured_reader
 from .git_transaction import (
     GitTransactionError,
+    InvalidTransactionPath,
     PathChange,
     PathState,
+    ReviewedPathIntegrityError,
+    ReviewedPathUnavailable,
     TransactionPlan,
+    TransactionPreconditionRefused,
+    _open_checked_directory,
     capture_path_state,
     execute_transaction,
+    consume_reviewed_proposal,
 )
 from .inbox import split_front_matter
 from .destinations import DestinationError, resolve_classification_destination
 from .proposal_identity import (
     ProposalIdentityError,
     proposal_id_candidates,
+    require_proposal_id,
     require_proposal_identity,
+)
+from .review_tokens import (
+    ReviewSnapshot,
+    make_review_snapshot,
+    require_review_match,
 )
 from .scope import CrossScopeError, OutOfScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError
@@ -95,6 +116,9 @@ class Proposal:
     status: str = "pending"
 
 
+ClassificationActionResult = Proposal | SpentAction
+
+
 @dataclass(frozen=True)
 class OutboxRow:
     """One outbox entry as the Console can safely present it. Rows carry
@@ -105,6 +129,42 @@ class OutboxRow:
     error: BaseException | None
     can_approve: bool
     can_reject: bool
+    #: S7. The SHA-256 of the exact stored bytes this row was built from —
+    #: the fingerprint its controls must carry and the action boundary will
+    #: compare. It is a change detector, not a secret or a capability: it
+    #: authorises nothing on its own (threat model, design §Threat model).
+    #: `None` means no action is offered.
+    review_sha256: str | None = None
+    #: The scan-validated proposal id, carried separately because a matching
+    #: receipt must short-circuit parsing the working-tree proposal entirely.
+    #: A malformed matching receipt likewise needs a safe per-id card without
+    #: opening the proposal record to reconstruct an id from its contents.
+    proposal_id: str | None = None
+    #: A valid committed receipt makes this id permanently non-actionable at
+    #: the current HEAD. It is presentation authority only; its digest is
+    #: deliberately never copied into ``review_sha256``.
+    receipt: ActionReceipt | None = None
+    #: Presentation evidence only: whether the pending-record name currently
+    #: holds a real regular leaf. Receipt authority is still HEAD; this flag
+    #: controls only the truthful lingering-record sentence on a spent card.
+    record_present: bool = False
+
+    def __post_init__(self) -> None:
+        # Controls and fingerprint are issued together or not at all. A
+        # button without a fingerprint could not be bound to what was
+        # reviewed; a fingerprint on a row with no buttons is an
+        # action-binding value for an action this listing has already
+        # decided must not be offered — meaningless at best, misleading at
+        # worst.
+        actionable = self.can_approve or self.can_reject
+        if actionable and self.review_sha256 is None:
+            raise ValueError("an actionable row must carry its review fingerprint")
+        if not actionable and self.review_sha256 is not None:
+            raise ValueError("a row without controls must not carry a fingerprint")
+        if self.proposal is not None and self.receipt is not None:
+            raise ValueError("a row cannot present a proposal and receipt together")
+        if self.receipt is not None and self.proposal_id != self.receipt.proposal_id:
+            raise ValueError("a receipt row must carry its validated proposal id")
 
 
 @dataclass(frozen=True)
@@ -168,33 +228,96 @@ def _require_outbox_path(
     return candidate
 
 
-def _read_no_follow_bytes(path: Path) -> bytes:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+def pending_proposal_entry_exists(scope: Scope, proposal_id: str) -> bool:
+    """Report whether a real pending-record leaf is present, without reading it.
+
+    This is presentation evidence only.  A committed receipt remains the sole
+    authority for whether the id is spent; this check merely keeps the
+    receipt card's lingering-file sentence truthful.  ``lstat`` deliberately
+    does not follow a redirected leaf and no proposal bytes are parsed.
+    """
+    canonical_id = require_proposal_id(proposal_id)
+    descriptors: list[int] = []
+    present = False
     try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.EMLINK}:
-            # O_NOFOLLOW rejection: ELOOP on Linux/macOS, EMLINK on some BSDs.
-            raise RedirectedPathError(
-                "source receipt is redirected or unsafe"
-            ) from exc
+        # Retain the established lexical checks, then bind every subsequent
+        # lookup to checked directory descriptors.  ``lstat(path)`` would
+        # protect only the final leaf: an outbox swapped for a symlink after
+        # validation could otherwise make an outside file prove "present".
+        _require_outbox_path(scope)
+        descriptor = _open_checked_directory(scope.root, "vault root")
+        descriptors.append(descriptor)
+        for part in (scope.current_entity(), "outbox"):
+            descriptor = _open_checked_directory(
+                part, "pending-record parent", dir_fd=descriptor
+            )
+            descriptors.append(descriptor)
+        state = os.lstat(
+            f"{canonical_id}.yaml", dir_fd=descriptors[-1]
+        )
+    except (OSError, CrossScopeError, ReviewedPathUnavailable, ReviewedPathIntegrityError):
+        # If presence cannot be proved, omit the sentence.  This read is not
+        # an authorization gate and must never weaken the HEAD receipt.
+        present = False
+    else:
+        present = stat.S_ISREG(state.st_mode)
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                # Cleanup belongs to optional presentation evidence too.  A
+                # close failure must not replace the receipt-backed outcome
+                # with an unrelated exception or make the lingering sentence
+                # claim evidence whose acquisition did not finish cleanly.
+                present = False
+    return present
+
+
+def _read_no_follow_bytes(root: Path, relative: str) -> bytes:
+    """One boundary read of a source receipt, on the same terms as every
+    other boundary read in S7.
+
+    This used to take a whole path and hand it to a single `os.open` with
+    `O_NOFOLLOW`. That flag protects only the *final* component: every
+    parent directory was still followed, so a symlinked parent redirected
+    the read, no component was checked against `.git`, and the file's mode
+    was discarded. `capture_path_state` walks the path one component at a
+    time through checked directory descriptors, refuses `.git`, `..` and
+    non-canonical paths, verifies the opened file is the same inode that
+    was `lstat`ed, and returns the mode alongside the bytes. Two readers
+    with different guarantees on the same kind of path is how one of them
+    ends up being the weak one nobody remembers.
+
+    The outcomes callers already handle are preserved exactly: an absent
+    leaf still raises `FileNotFoundError` for the caller to name, a
+    redirected or non-regular leaf still raises `RedirectedPathError`, and
+    anything else unreadable still raises `ProposalSourceUnavailable`.
+    """
+    state = _capture_source_state(root, relative)
+    if state.contents is None:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), relative)
+    return state.contents
+
+
+def _capture_source_state(root: Path, relative: str) -> PathState:
+    """One checked capture of a source leaf, in the outbox's vocabulary.
+
+    Absence is returned as an absent `PathState` rather than raised, so the
+    caller decides what a missing source means for it.
+    """
+    try:
+        return capture_path_state(root, relative)
+    except (ReviewedPathIntegrityError, InvalidTransactionPath) as exc:
+        # A redirected leaf, or a path naming `.git`, `..`, or something
+        # non-canonical: either way not a source a proposal may name.
+        raise RedirectedPathError(
+            "source receipt is redirected or unsafe"
+        ) from exc
+    except ReviewedPathUnavailable as exc:
         raise ProposalSourceUnavailable(
             "source receipt could not be read"
         ) from exc
-    try:
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise RedirectedPathError("source receipt is not a regular file")
-        with os.fdopen(descriptor, "rb", closefd=True) as stream:
-            descriptor = -1
-            return stream.read()
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def propose_classification(
@@ -216,7 +339,7 @@ def propose_classification(
     )
     created_at = datetime.now()
     try:
-        source_bytes = _read_no_follow_bytes(scope.root / destination.src)
+        source_bytes = _read_no_follow_bytes(scope.root, destination.src)
     except FileNotFoundError as exc:
         raise OutboxDestinationError("source receipt is missing") from exc
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
@@ -306,19 +429,18 @@ def _to_proposal(path: Path, record: dict) -> Proposal:
 
 
 @structured_reader(category="proposal")
-def _read_record(path: Path) -> object:
-    """Read and parse a stored proposal record. A `proposal`-category
-    structured read (design §7 invariant 4): every way reading or shaping it
-    can fail becomes `UnreadableProposalRecord`, never a raw stdlib type."""
+def _parse_record_bytes(contents: bytes) -> object:
+    """Parse a proposal record from bytes already in hand.
+
+    S7's single-read rule lives on this seam: a caller that has captured
+    exact bytes must be able to parse *those* bytes, never re-open the path
+    and parse whatever is there now.
+    """
     try:
-        text = path.read_text(encoding="utf-8")
+        text = contents.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise UnreadableProposalRecord(
             "proposal record is not valid UTF-8"
-        ) from exc
-    except OSError as exc:
-        raise UnreadableProposalRecord(
-            "proposal record could not be read"
         ) from exc
     try:
         return yaml.safe_load(text) or {}
@@ -326,7 +448,6 @@ def _read_record(path: Path) -> object:
         raise UnreadableProposalRecord(
             "proposal record is invalid YAML"
         ) from exc
-
 
 def _validate_record(path: Path, record: object) -> Proposal | None:
     """Schema and identity only (design §3 phase 1) — never touches the
@@ -354,16 +475,51 @@ def _validate_record(path: Path, record: object) -> Proposal | None:
         ) from exc
 
 
-def load_proposals(scope: Scope) -> list[Proposal]:
+def review_snapshot_for(
+    scope: Scope, leaf: Path
+) -> ReviewSnapshot[Proposal] | None:
+    """The one place a classification review snapshot is ever constructed.
+
+    Capture once, parse *those* bytes, validate the value they produced,
+    fingerprint the same bytes. `None` for a well-formed `action: delete`
+    record, which both callers skip identically.
+
+    There is exactly one of these on purpose. When the strict loader and the
+    projection each built their own snapshot, the digest an operator's button
+    carried came from the projection while every test bound against the
+    loader's — so a mutation of the operator-facing one changed nothing any
+    test could see. One construction site means production and tests cannot
+    drift apart again.
+    """
+    contents = _capture_proposal_contents(scope, leaf)
+    proposal = _validate_record(leaf, _parse_record_bytes(contents))
+    if proposal is None:
+        return None
+    return make_review_snapshot(_require_destination(scope, proposal), contents)
+
+
+def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
+    """The strict loader, as review snapshots — one safe scan, one read each.
+
+    Every record is captured through the same no-follow boundary the actions
+    use, then parsed, validated and destination-checked *from those captured
+    bytes*. So a record is never read twice, a leaf swapped for a symlink
+    after its lexical check is refused rather than followed, and the value a
+    caller receives is paired with the fingerprint of the bytes it came from.
+
+    The loader's all-or-nothing refusal is unchanged and deliberately
+    complete: an unreadable record and a record whose destination no longer
+    canonicalises both refuse every proposal in the entity, because both are
+    conditions under which no action here can be trusted.
+    """
     outbox = _require_outbox_path(scope)
     if not outbox.exists():
         return []
-    props = []
+    reviews: list[ReviewSnapshot[Proposal]] = []
     for discovered in sorted(outbox.glob("*.yaml")):
-        p = _require_outbox_path(scope, discovered, require_leaf=True)
+        leaf = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
-            record = _read_record(p)
-            proposal = _validate_record(p, record)
+            review = review_snapshot_for(scope, leaf)
         except UnreadableProposalRecord as exc:
             # D1 (ledger): re-narrow to the strict loader's existing escaping
             # type, so every `except OutboxDestinationError` clause and every
@@ -371,10 +527,14 @@ def load_proposals(scope: Scope) -> list[Proposal]:
             raise OutboxDestinationError(
                 "proposal record could not be read"
             ) from exc
-        if proposal is None:
+        if review is None:
             continue
-        props.append(_require_destination(scope, proposal))
-    return props
+        reviews.append(review)
+    return reviews
+
+
+def load_proposals(scope: Scope) -> list[Proposal]:
+    return [review.value for review in _load_proposal_reviews(scope)]
 
 
 def _apply_sub(text: str, sub: str | None) -> str:
@@ -414,7 +574,7 @@ def _render_diff(scope: Scope, proposal: Proposal) -> str:
     button never describe different conditions for one cause."""
     src = scope.root / proposal.src
     try:
-        source_bytes = _read_no_follow_bytes(src)
+        source_bytes = _read_no_follow_bytes(scope.root, proposal.src)
     except FileNotFoundError as exc:
         raise MissingProposalSource("proposal source is missing") from exc
     # RedirectedPathError and ProposalSourceUnavailable are raised directly by
@@ -486,52 +646,114 @@ def project_outbox(scope: Scope) -> OutboxListing:
     if not outbox.exists():
         return OutboxListing(rows=(), blocked=False)
 
+    discovered_paths = sorted(outbox.glob("*.yaml"))
+    canonical_ids: dict[Path, str] = {}
+    for discovered in discovered_paths:
+        try:
+            canonical_ids[discovered] = require_proposal_id(discovered.stem)
+        except ProposalIdentityError:
+            # Preserve the existing unreadable-record handling for a leaf
+            # whose filename is not an id. It cannot have a matching receipt,
+            # and its unvalidated stem must never reach Git or the template.
+            continue
+    receipts = resolve_head_receipts(
+        scope.root, scope.current_entity(), canonical_ids.values()
+    )
+
     rows: list[OutboxRow] = []
     blocked = False
-    for discovered in sorted(outbox.glob("*.yaml")):
+    for discovered in discovered_paths:
+        canonical_id = canonical_ids.get(discovered)
+        if canonical_id is not None:
+            resolution = receipts[canonical_id]
+            record_present = False
+            if resolution.error is not None or (
+                resolution.receipt is not None
+                and resolution.receipt.action_kind != "registry deletion"
+            ):
+                record_present = pending_proposal_entry_exists(
+                    scope, canonical_id
+                )
+            if resolution.error is not None:
+                rows.append(
+                    OutboxRow(
+                        proposal=None,
+                        diff=None,
+                        error=resolution.error,
+                        can_approve=False,
+                        can_reject=False,
+                        proposal_id=canonical_id,
+                        record_present=record_present,
+                    )
+                )
+                continue
+            if resolution.receipt is not None:
+                # Registry deletion receipts belong on the registry surface,
+                # not in the classification listing. Both kinds still stop
+                # before any pending-record path check or byte read.
+                if resolution.receipt.action_kind == "registry deletion":
+                    continue
+                rows.append(
+                    OutboxRow(
+                        proposal=None,
+                        diff=None,
+                        error=None,
+                        can_approve=False,
+                        can_reject=False,
+                        proposal_id=canonical_id,
+                        receipt=resolution.receipt,
+                        record_present=record_present,
+                    )
+                )
+                continue
         path = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
-            record = _read_record(path)
-            proposal = _validate_record(path, record)
+            # S7: the shared constructor — the same snapshot the strict
+            # loader gets, so the digest on this row's buttons is the one
+            # every test binds against. Phase 2 (`_require_destination`,
+            # inside it) still propagates and aborts the projection.
+            review = review_snapshot_for(scope, path)
         except UnreadableProposalRecord as exc:
             blocked = True
             rows.append(
                 OutboxRow(
                     proposal=None, diff=None, error=exc,
                     can_approve=False, can_reject=False,
+                    review_sha256=None,
                 )
             )
             continue
-        if proposal is None:
+        if review is None:
             # A well-formed `action: delete` record — skipped exactly as
             # `load_proposals` skips it: renders nothing, blocks nothing.
             continue
 
-        # Phase 2 — propagates. `_require_destination` is the same
-        # destination-canonicalization the strict loader applies; left
-        # uncaught here, its exception aborts this function entirely.
-        proposal = _require_destination(scope, proposal)
-
         try:
-            diff = _render_diff(scope, proposal)
+            diff = _render_diff(scope, review.value)
         except (
             MissingProposalSource,
             RedirectedPathError,
             OutboxDestinationError,
             ProposalSourceUnavailable,
         ) as exc:
+            # An unavailable *source* says nothing about the proposal
+            # record, which is still well-formed and still safely
+            # rejectable — so its review fingerprint survives (design
+            # §Architecture-1).
             rows.append(
                 OutboxRow(
-                    proposal=proposal, diff=None, error=exc,
+                    proposal=review.value, diff=None, error=exc,
                     can_approve=False, can_reject=True,
+                    review_sha256=review.sha256,
                 )
             )
             continue
 
         rows.append(
             OutboxRow(
-                proposal=proposal, diff=diff, error=None,
+                proposal=review.value, diff=diff, error=None,
                 can_approve=True, can_reject=True,
+                review_sha256=review.sha256,
             )
         )
 
@@ -543,6 +765,15 @@ def project_outbox(scope: Scope) -> OutboxListing:
             OutboxRow(
                 row.proposal, row.diff, row.error,
                 can_approve=False, can_reject=False,
+                # The fingerprint goes with the controls. It grants nothing
+                # by itself, but it is the value that binds an action to
+                # reviewed bytes, and shipping one for an action this
+                # listing has refused to offer would describe a review that
+                # is not on offer.
+                review_sha256=None,
+                proposal_id=row.proposal_id,
+                receipt=row.receipt,
+                record_present=row.record_present,
             )
             for row in rows
         ]
@@ -576,25 +807,175 @@ def _require_destination(scope: Scope, proposal: Proposal) -> Proposal:
     return proposal
 
 
-def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
+def _capture_proposal_state(scope: Scope, relative_path: str) -> PathState:
+    """One no-follow capture of a proposal leaf, in the outbox's vocabulary.
+
+    Missing and unreadable states become the outbox's existing safe
+    outcomes. Integrity outcomes are deliberately *not* flattened into
+    them: a leaf that turned into a symlink or a non-regular file between
+    the lexical check and this capture is a tamper finding, and saying
+    "could not be read" would tell the operator the wrong thing to do.
+
+    Every reader and every action goes through here, so one translation
+    table serves the projection, the strict scan and the mutation boundary
+    alike — they cannot describe the same physical condition differently.
+    """
+    try:
+        state = capture_path_state(scope.root, relative_path)
+    except ReviewedPathIntegrityError as exc:
+        # Re-narrowed to the outbox's own redirection type so route
+        # declarations stay truthful; the operator outcome (E-TAMPER) is
+        # identical either way, and the redirected target is never read.
+        raise RedirectedPathError("proposal leaf is redirected") from exc
+    except ReviewedPathUnavailable as exc:
+        raise UnreadableProposalRecord(
+            "proposal record could not be read"
+        ) from exc
+    if state.contents is None:
+        raise UnreadableProposalRecord("proposal record no longer exists")
+    return state
+
+
+def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
+    """The bytes of one no-follow proposal capture."""
+    relative = path.relative_to(scope.root).as_posix()
+    return _capture_proposal_state(scope, relative).contents
+
+
+def get_proposal_review(scope: Scope, proposal_id: str) -> ReviewSnapshot[Proposal]:
+    """The reviewable state of one classification proposal.
+
+    The sequence is fixed (design §Architecture-1): capture one byte
+    snapshot, parse *those* bytes, validate the value they produced, and
+    fingerprint the same bytes. A second read may never supply either the
+    value or the digest, so a replacement landing immediately after the
+    capture cannot make the two disagree.
+
+    The id is matched against what the strict scan found rather than joined
+    to a path, so a caller-supplied id can never become a path fragment, and
+    the scan's listing-wide refusals apply here exactly as they do to
+    `load_proposals`.
+    """
     entity = scope.current_entity()
-    for p in load_proposals(scope):
-        if p.id == proposal_id:
-            return p
+    for review in _load_proposal_reviews(scope):
+        if review.value.id == proposal_id:
+            return review
     raise OutboxError(f"no pending proposal {proposal_id!r} for {entity}")
 
 
-@structured_reader(category="proposal")
-def approve(scope: Scope, proposal_id: str) -> Proposal:
-    """Perform the proposed move and commit it — exactly one revertible commit.
-    The proposal is transaction-owned but never enters the approval commit."""
-    prop = _require_destination(scope, get_proposal(scope, proposal_id))
+def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
+    """The validated value alone, for callers that will not act on it.
+
+    No action may use this: an action needs the fingerprint that came from
+    the same bytes, which only `get_proposal_review` can supply.
+    """
+    return get_proposal_review(scope, proposal_id).value
+
+
+def _locate_proposal(scope: Scope, proposal_id: str) -> str:
+    """The vault-relative leaf of one pending proposal.
+
+    Runs the strict scan, so an action inherits every listing-wide refusal
+    the loader applies. Its *value* is deliberately discarded: only the
+    state captured afterwards may authorise a mutation.
+    """
+    review = get_proposal_review(scope, proposal_id)
+    return review.value.path.relative_to(scope.root).as_posix()
+
+
+def _own_reviewed_proposal(
+    scope: Scope,
+    proposal_id: str,
+    review_sha256: object,
+) -> tuple[str, PathState, Proposal, str]:
+    """Take ownership of the exact proposal state the operator reviewed.
+
+    This is S7's boundary, and the order is normative (design §3):
+
+    1. locate the leaf under the scan's listing-wide refusals;
+    2. capture that leaf's state **once** — this state, and no later read,
+       is what the mutation will own;
+    3. compare its bytes against the submitted fingerprint; and
+    4. parse and validate *those same bytes* into the value the action acts on.
+
+    The captured `PathState` is returned so the caller can hand the very
+    same object to the mutation. A reread anywhere after step 2 would
+    reopen the window this exists to close.
+    """
     vault = scope.root
-    src = scope.root / prop.src
+    proposal_rel = _locate_proposal(scope, proposal_id)
+
+    proposal_state = _capture_proposal_state(scope, proposal_rel)
+    review_digest = require_review_match(proposal_state.contents, review_sha256)
+    record = _parse_record_bytes(proposal_state.contents)
+    proposal = _require_destination(scope, _to_proposal(vault / proposal_rel, record))
+    return proposal_rel, proposal_state, proposal, review_digest
+
+
+def _head_action_receipt(
+    scope: Scope, proposal_id: str
+) -> ActionReceipt | None:
+    """Resolve one spent-id fact from committed history, never the worktree."""
     try:
-        source_bytes = _read_no_follow_bytes(src)
-    except FileNotFoundError as exc:
-        raise MissingProposalSource("proposal source is missing") from exc
+        canonical_id = require_proposal_id(proposal_id)
+    except ProposalIdentityError as exc:
+        raise OutboxError("proposal id is not canonical") from exc
+    resolution = resolve_head_receipt(
+        scope.root, scope.current_entity(), canonical_id
+    )
+    if resolution.error is not None:
+        raise resolution.error
+    return resolution.receipt
+
+
+def _spent_action_before_review(
+    scope: Scope, proposal_id: str
+) -> SpentAction | None:
+    receipt = _head_action_receipt(scope, proposal_id)
+    return None if receipt is None else SpentAction(receipt)
+
+
+def _spent_action_from_refusal(
+    refusal: TransactionPreconditionRefused, proposal_id: str
+) -> SpentAction:
+    reason = refusal.reason
+    if not isinstance(reason, ActionReceipt) or reason.proposal_id != proposal_id:
+        raise RuntimeError("receipt precondition returned an invalid reason")
+    return SpentAction(reason)
+
+
+@structured_reader(category="proposal")
+def approve(
+    scope: Scope, proposal_id: str, review_sha256: object
+) -> ClassificationActionResult:
+    """Perform the proposed move and commit it — exactly one revertible commit.
+    The proposal is transaction-owned but never enters the approval commit.
+
+    The move is bound to the reviewed proposal bytes: `review_sha256` is
+    required, is compared against the state the transaction will own, and
+    has no default or id-only fallback.
+    """
+    spent = _spent_action_before_review(scope, proposal_id)
+    if spent is not None:
+        return spent
+    vault = scope.root
+    proposal_rel, proposal_state, prop, review_digest = _own_reviewed_proposal(
+        scope, proposal_id, review_sha256
+    )
+    _require_destination(scope, prop)
+    _require_outbox_path(scope, prop.path, require_leaf=True)
+
+    # One capture of the source, as late as possible, and every check below
+    # is about *these* bytes. Approve used to read the source twice — a
+    # receipt read up front and an authoritative capture here — and then
+    # compare the two. Once both went through `capture_path_state` the
+    # second read was pure redundancy: the same primitive, on the same
+    # path, with the comparison standing in for a window that only existed
+    # because the first read happened at all.
+    source_state = _capture_source_state(vault, prop.src)
+    if source_state.contents is None:
+        raise MissingProposalSource("proposal source is missing")
+    source_bytes = source_state.contents
     actual_sha256 = hashlib.sha256(source_bytes).hexdigest()
     if actual_sha256 != prop.source_sha256:
         raise StaleProposalSource("proposal source has changed")
@@ -607,34 +988,16 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
             "proposal source is not UTF-8 markdown"
         ) from exc
 
-    _require_destination(scope, prop)
-    _require_outbox_path(scope, prop.path, require_leaf=True)
-    source_state = capture_path_state(vault, prop.src)
-    if source_state.contents != source_bytes:
-        raise StaleProposalSource("proposal source has changed")
+    # No mid-approval re-read of the proposal remains: `proposal_state` is
+    # the state whose bytes the fingerprint matched and from which `prop`
+    # was parsed, and it is handed to the transaction unchanged. Replacing
+    # it here with a fresh capture would mean approving bytes nobody
+    # reviewed — the exact defect S7 closes.
+    receipt = make_action_receipt(prop.id, review_digest, "approval")
+    receipt_rel = receipt_relative_path(prop.entity, prop.id)
 
-    proposal_rel = prop.path.relative_to(vault).as_posix()
-    proposal_state = capture_path_state(vault, proposal_rel)
-    # Mid-approval re-read, mirroring execute_delete: a vanished file makes
-    # safe_load(None) raise AttributeError, and corrupted bytes raise
-    # YAMLError. Both escape as E-UNKNOWN at the highest-stakes moment. A
-    # non-mapping is already OutboxDestinationError inside _to_proposal, and a
-    # blanket AttributeError/TypeError here would mask programmer errors —
-    # Rule 5 forbids it.
-    if proposal_state.contents is None:
-        raise UnreadableProposalRecord(
-            "proposal record could not be re-read before approval"
-        )
-    try:
-        record = yaml.safe_load(proposal_state.contents)
-    except yaml.YAMLError as exc:
-        raise UnreadableProposalRecord(
-            "proposal record could not be re-read before approval"
-        ) from exc
-    persisted = _to_proposal(prop.path, record)
-    persisted = _require_destination(scope, persisted)
-    if persisted != prop:
-        raise OutboxDestinationError("proposal changed since it was loaded")
+    def _require_unspent_id() -> ActionReceipt | None:
+        return _head_action_receipt(scope, prop.id)
 
     plan = TransactionPlan(
         message=f"outbox: approve {prop.id} ({prop.src} → {prop.dst})",
@@ -645,24 +1008,68 @@ def approve(scope: Scope, proposal_id: str) -> Proposal:
                 PathState.absent(),
                 PathState.regular(approved_bytes, source_state.mode),
             ),
+            PathChange(
+                receipt_rel,
+                PathState.absent(),
+                PathState.regular(render_action_receipt(receipt), 0o644),
+                create_parent=True,
+            ),
         ),
-        commit_paths=(prop.src, prop.dst),
+        commit_paths=(prop.src, prop.dst, receipt_rel),
         owned_changes=(
             PathChange(proposal_rel, proposal_state, PathState.absent()),
         ),
+        preconditions=(_require_unspent_id,),
     )
     try:
-        execute_transaction(vault, plan)
+        result = execute_transaction(vault, plan)
     except GitTransactionError as exc:
         raise OutboxTransactionError(
             "classification approval transaction failed"
         ) from exc
+    if isinstance(result, TransactionPreconditionRefused):
+        return _spent_action_from_refusal(result, prop.id)
     return prop
 
 
-def reject(scope: Scope, proposal_id: str) -> Proposal:
+def reject(
+    scope: Scope, proposal_id: str, review_sha256: object
+) -> ClassificationActionResult:
     """Discard the proposal. No move, no commit — the proposal was never
-    tracked."""
-    prop = get_proposal(scope, proposal_id)
-    _require_outbox_path(scope, prop.path, require_leaf=True).unlink()
+    tracked.
+
+    Bound to the reviewed bytes exactly as approve is, and consumed by
+    moving the reviewed record into quarantine rather than deleting it
+    (Amendment 1). A rewrite, type swap, redirection or disappearance before
+    the move is a refusal, never permission to consume whatever took its
+    place — and refusing costs nothing, because no step deletes.
+    """
+    spent = _spent_action_before_review(scope, proposal_id)
+    if spent is not None:
+        return spent
+    proposal_rel, proposal_state, prop, _review_digest = _own_reviewed_proposal(
+        scope, proposal_id, review_sha256
+    )
+    _require_outbox_path(scope, prop.path, require_leaf=True)
+
+    def _require_unspent_id() -> ActionReceipt | None:
+        return _head_action_receipt(scope, prop.id)
+
+    try:
+        result = consume_reviewed_proposal(
+            scope.root,
+            proposal_rel,
+            proposal_state,
+            preconditions=(_require_unspent_id,),
+        )
+    except GitTransactionError as exc:
+        # Reject takes the approval lock now, so lock outcomes are reachable
+        # through it. Wrapped the way approve wraps its transaction, so the
+        # routes' declared family still holds and the described outcome
+        # survives through the cause chain.
+        raise OutboxTransactionError(
+            "proposal rejection could not complete"
+        ) from exc
+    if isinstance(result, TransactionPreconditionRefused):
+        return _spent_action_from_refusal(result, prop.id)
     return prop

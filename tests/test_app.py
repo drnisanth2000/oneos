@@ -492,7 +492,8 @@ def test_approval_route_visibly_refuses_unfresh_source(
     proposal_before = proposal_path.read_bytes()
 
     refusal = client.post(
-        "/outbox/alpha/approve", data={"id": record["id"]}
+        "/outbox/alpha/approve",
+        data=_outbox_action_data(client.vault, record["id"]),
     )
 
     assert refusal.status_code == 200
@@ -526,7 +527,8 @@ def test_approval_route_transaction_error_is_not_a_500_or_general_error_panel(
     route_client = TestClient(client.app, raise_server_exceptions=False)
 
     response = route_client.post(
-        "/outbox/alpha/approve", data={"id": proposal_id}
+        "/outbox/alpha/approve",
+        data=_outbox_action_data(client.vault, proposal_id),
     )
 
     # Task 12 / design §8 regression table, first row: this asserted
@@ -565,6 +567,34 @@ def test_unknown_route_entity_is_404_without_entity_directory_read(client, monke
     assert response.status_code == 404
 
 
+#: A well-formed fingerprint that binds nothing, for ids that name no
+#: reviewable proposal in the bound scope — the refusal under test is
+#: reached before any comparison against stored bytes.
+_UNBOUND_FINGERPRINT = "0" * 64
+
+
+def _delete_fingerprint(vault, proposal_id, entity="alpha") -> str:
+    """The fingerprint of a delete proposal as it now stands (S7)."""
+    from app.registry import get_delete_review
+    from app.scope import Scope
+
+    return get_delete_review(Scope(vault, entity), proposal_id).sha256
+
+
+def _outbox_action_data(vault, proposal_id, entity="alpha"):
+    """Form data for an outbox action, carrying the proposal's own
+    fingerprint exactly as a rendered button would (S7)."""
+    from app.outbox import get_proposal_review
+    from app.scope import Scope
+
+    return {
+        "id": proposal_id,
+        "review_sha256": get_proposal_review(
+            Scope(vault, entity), proposal_id
+        ).sha256,
+    }
+
+
 @pytest.mark.parametrize("action", ["approve", "reject"])
 def test_alpha_outbox_action_cannot_touch_beta_proposal(client, action):
     beta_id = "20260815T090703-" + "22" * 16
@@ -573,8 +603,11 @@ def test_alpha_outbox_action_cannot_touch_beta_proposal(client, action):
     proposal_before = beta_proposal.read_bytes()
     source_before = beta_source.read_bytes()
 
+    # The scope refusal is independent of the fingerprint and must come
+    # first: alpha can offer no review of a beta proposal at all.
     response = client.post(
-        f"/outbox/alpha/{action}", data={"id": beta_id}
+        f"/outbox/alpha/{action}",
+        data={"id": beta_id, "review_sha256": _UNBOUND_FINGERPRINT},
     )
 
     assert response.status_code == 200
@@ -623,7 +656,8 @@ def test_registry_transaction_error_is_a_registry_error(client, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id, "slug": "alpha-only"},
+        data={"id": proposal.id, "slug": "alpha-only",
+              "review_sha256": _delete_fingerprint(client.vault, proposal.id)},
     )
 
     # design §6 regression table, second row: this asserted the raw internal

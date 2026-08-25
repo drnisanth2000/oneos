@@ -11,36 +11,28 @@
   {% if not rows and not listing_unavailable %}
   <p class="muted">No pending proposals. Approve or reject clears them from here.</p>
   {% endif %}
+  {% if blocked %}
+  {# An unreadable record has no validated id — its filename is not a
+     proposal id, and S6 Rule 9 forbids echoing it — so there is nothing to
+     re-read individually. The listing itself is what the operator can
+     re-read, and this writes nothing. #}
+  <div class="prop-actions">
+    {% with check_again_url = "/outbox/" ~ entity,
+            check_again_target = "#outbox-list" %}
+    {% include "blocks/check_again.html" %}
+    {% endwith %}
+  </div>
+  {% endif %}
   {% for row, error in rows %}
   {% if row.proposal %}
-  {% set outbox_values = {"id": row.proposal.id} %}
-  <div class="proposal">
-    <div class="prop-head">
-      <code class="prop-id">{{ row.proposal.id }}</code>
-      <span class="prop-route">{{ row.proposal.module }} / {{ row.proposal.sub }} <span class="block-tag">{{ row.proposal.block }}</span></span>
-    </div>
-    {% if row.diff is not none %}
-    <pre class="diff-body">{{ row.diff }}</pre>
-    {% elif error %}
-    {% include "blocks/alert.html" %}
-    {% endif %}
-    {% if row.can_approve or row.can_reject %}
-    <div class="prop-actions">
-      {% if row.can_approve %}
-      <button class="approve"
-              hx-post="/outbox/{{ entity }}/approve"
-              hx-vals='{{ outbox_values | tojson }}'
-              hx-target="#outbox-list" hx-swap="outerHTML">Approve → move + commit</button>
-      {% endif %}
-      {% if row.can_reject %}
-      <button class="reject"
-              hx-post="/outbox/{{ entity }}/reject"
-              hx-vals='{{ outbox_values | tojson }}'
-              hx-target="#outbox-list" hx-swap="outerHTML">Reject</button>
-      {% endif %}
-    </div>
-    {% endif %}
-  </div>
+  {% include "blocks/outbox_card.html" %}
+  {% elif row.proposal_id %}
+  {% with proposal_id=row.proposal_id,
+          receipt=row.receipt,
+          receipt_error=error,
+          record_present=row.record_present %}
+  {% include "blocks/action_receipt_card.html" %}
+  {% endwith %}
   {% else %}
   <div class="proposal proposal-unreadable">
     <p class="muted">An item in this outbox could not be read as a proposal.</p>

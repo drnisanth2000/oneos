@@ -57,6 +57,64 @@ _CODES: dict[str, ConsoleError] = {
             "stop", "yes", 500,
         ),
         ConsoleError(
+            # Stage 2. `applied` means committed here, despite the
+            # pre-commit `applied_changes` vocabulary in git_transaction.
+            # The action and receipt are durable; proposal consumption is
+            # the unresolved post-commit step, so retrying could act twice.
+            "E-APPLIED", "committed", "attention",
+            "The action completed, but OneOS could not verify that its "
+            "proposal was safely consumed. Its receipt prevents this "
+            "proposal ID from being used again. Do not retry or move files "
+            "by hand. Inspect vault state with git status.",
+            "stop", "yes", 500,
+        ),
+        ConsoleError(
+            # S7 Amendment 1. Reject makes no Git commit, so E-COMMITTED's
+            # "the commit succeeded" would be untrue — but the consumption
+            # itself is done, which is the fact the operator has to act on.
+            # That is what the `committed` tier encodes here: the effect took
+            # hold, so do not retry. It does NOT say the record is gone;
+            # under quarantine it is retained and recoverable.
+            "E-QUARANTINED", "committed", "attention",
+            "The proposal was consumed and set aside; only the cleanup "
+            "afterwards failed. Do not retry — the action already took "
+            "effect, and the record is retained. Inspect vault state with "
+            "git status.",
+            "stop", "yes", 500,
+        ),
+        ConsoleError(
+            # S7 Amendment 2, generalised by Amendment 3. One outcome for
+            # every way OneOS can fail to verify that the quarantine
+            # location still holds the exact reviewed proposal: a different
+            # inode, no entry at all, the same inode whose bytes were
+            # rewritten in place, or a location that cannot be inspected —
+            # hence "cannot verify" rather than "no longer holds". An access
+            # failure is not evidence the proposal is gone, only that OneOS
+            # may not claim it is there. The operator's
+            # position is identical in each — the reviewed record cannot be
+            # shown to be there, no rename-back is safe, do not retry — and
+            # separate codes would invite the "one branch over" gap that
+            # Amendment 2 itself left. Deliberately does not say "replaced",
+            # which was true of only one of the three.
+            #
+            "E-SUBSTITUTED", "recovery", "attention",
+            "The reviewed proposal was moved, but OneOS cannot verify that "
+            "its quarantine location still holds it unchanged. The reviewed "
+            "record may no longer exist. Do not retry or move files by hand. "
+            "No automated recovery is available. Inspect vault state with "
+            "git status and escalate for verified recovery.",
+            "stop", "unknown", 500,
+        ),
+        ConsoleError(
+            # S7 Amendment 1. Fails closed: OneOS refuses rather than
+            # degrading to an ordinary rename, which overwrites silently.
+            "E-UNSUPPORTED", "integrity", "attention",
+            "This vault's filesystem cannot move files safely, so proposals "
+            "cannot be approved, rejected or deleted here. Nothing was "
+            "changed.",
+            "none", "no", 500,
+        ),
+        ConsoleError(
             "E-RECOVER", "recovery", "attention",
             "Rollback was blocked by a change made at the same time. "
             "Do not retry. Inspect vault state with git status and resolve "
@@ -70,14 +128,32 @@ _CODES: dict[str, ConsoleError] = {
             "none", "no", 500,
         ),
         ConsoleError(
+            # S7 Amendment 3 Stage 2. A matching receipt disables only its
+            # proposal id, but malformed content cannot truthfully select an
+            # action-specific recovery link. `committed` describes this
+            # request, which refused before mutation, not the earlier action
+            # the invalid receipt may represent.
+            "E-RECEIPT", "integrity", "attention",
+            "OneOS found an invalid action receipt for this proposal ID. It "
+            "cannot safely tell what completed action the receipt represents, "
+            "so the ID is disabled. Do not retry, and do not move or delete "
+            "files by hand. No automated recovery is available. Inspect vault "
+            "state with git status and escalate for verified recovery.",
+            "stop", "no", 500,
+        ),
+        ConsoleError(
             "E-SCOPE", "integrity", "refusal",
             "Refused: the request resolved outside the selected entity.",
             "none", "no", 404,
         ),
         ConsoleError(
             "E-TAMPER", "integrity", "attention",
-            "Refused: a file involved in this action is not where it should "
-            "be. Do not retry. Inspect the vault before continuing.",
+            "Refused: a managed file or folder is missing, moved, replaced, or "
+            "redirected. Reviewed actions for the affected entity are read-only. "
+            "Stop OneOS and every connected writer. Restore the item to its "
+            "expected location. If the whole vault intentionally moved, update "
+            "ONEOS_VAULT, restart OneOS, and rerun verification. Do not use a "
+            "symlink or retry while this warning remains.",
             "stop", "no", 409,
         ),
         ConsoleError(
@@ -138,6 +214,16 @@ _CODES: dict[str, ConsoleError] = {
             "reload", "no", 409,
         ),
         ConsoleError(
+            # S7. Distinct from E-CONFLICT: that one describes reviewed
+            # *files* moving under a transaction, this one describes the
+            # proposal record itself being rewritten since the operator
+            # reviewed it. The wording is normative — the approved design
+            # fixes this sentence verbatim.
+            "E-REVIEW", "refusal", "refusal",
+            "Proposal changed since your review. Nothing was changed.",
+            "reload", "no", 409,
+        ),
+        ConsoleError(
             "E-GIT", "refusal", "refusal",
             "The commit failed and was rolled back. Nothing was changed.",
             "retry", "no", 500,
@@ -193,12 +279,14 @@ MAX_DEPTH = 4
 
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 
+from . import action_receipts as _action_receipts  # noqa: E402
 from . import destinations as _destinations  # noqa: E402
 from . import entities as _entities  # noqa: E402
 from . import git_transaction as _git_transaction  # noqa: E402
 from . import outbox as _outbox  # noqa: E402
 from . import proposal_identity as _proposal_identity  # noqa: E402
 from . import registry as _registry  # noqa: E402
+from . import review_tokens as _review_tokens  # noqa: E402
 from . import rename as _rename  # noqa: E402
 from . import scope as _scope  # noqa: E402
 from . import vault as _vault  # noqa: E402
@@ -211,7 +299,9 @@ CLOSED_FAMILY = _git_transaction.GitTransactionError
 
 #: `exact` — the entry applies to that class only, never through MRO.
 _EXACT: dict[type[BaseException], ConsoleError] = {
+    _rename.RenameCommittedError: _CODES["E-COMMITTED"],
     _git_transaction.GitTransactionCommittedError: _CODES["E-COMMITTED"],
+    _git_transaction.PostCommitConsumptionError: _CODES["E-APPLIED"],
     _git_transaction.GitTransactionRecoveryError: _CODES["E-RECOVER"],
     _git_transaction.ReviewedPathIntegrityError: _CODES["E-TAMPER"],
     _git_transaction.ReviewedPathUnavailable: _CODES["E-UNAVAILABLE"],
@@ -220,8 +310,14 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.VaultBusyError: _CODES["E-BUSY"],
     _git_transaction.GitTransactionFailure: _CODES["E-GIT"],
     _git_transaction.GitTransactionError: _CODES["E-GIT"],
-    _git_transaction._ApprovalLockCleanupFailure: _CODES["E-GIT"],
+    _git_transaction.ActionLockCleanupFailure: _CODES["E-GIT"],
+    _git_transaction.QuarantineCleanupError: _CODES["E-QUARANTINED"],
+    _git_transaction.QuarantineEntrySubstituted: _CODES["E-SUBSTITUTED"],
+    _git_transaction.AtomicMoveUnavailable: _CODES["E-UNSUPPORTED"],
     _git_transaction._ReviewedIndexOwnershipConflict: _CODES["E-CONFLICT"],
+    _action_receipts.InvalidActionReceipt: _CODES["E-RECEIPT"],
+    _action_receipts.ReceiptStoreIntegrityError: _CODES["E-TAMPER"],
+    _action_receipts.ReceiptStoreUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.StaleProposalSource: _CODES["E-STALE"],
     _outbox.MissingProposalSource: _CODES["E-MISSING"],
@@ -235,6 +331,9 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _entities.SystemRegistryPathError: _CODES["E-TAMPER"],
     _entities.RecipientConfigurationError: _CODES["E-CONFIG"],
     _registry.RegistryTransactionError: _CODES["E-GIT"],
+    _review_tokens.ReviewedProposalChanged: _CODES["E-REVIEW"],
+    _review_tokens.InvalidReviewToken: _CODES["E-REQUEST"],
+    _review_tokens.ReviewContractViolation: _CODES["E-INTERNAL"],
     RequestValidationError: _CODES["E-REQUEST"],
 }
 
@@ -252,6 +351,10 @@ _MRO: dict[type[BaseException], ConsoleError] = {
     _entities.EntityManifestError: _CODES["E-CONFIG"],
     _entities.EntitySelectionError: _CODES["E-ENTITY"],
     _registry.RegistryError: _CODES["E-REGISTRY"],
+    # The S7 base is never raised deliberately. If it surfaces — or if a
+    # future subclass forgets its own exact entry — that is a defect in
+    # OneOS, not a problem with the operator's data.
+    _review_tokens.ReviewTokenError: _CODES["E-INTERNAL"],
     _ingest_base.IngestError: _CODES["E-INGEST"],
     _rename.RenameError: _CODES["E-ADMIN"],
 }
@@ -266,7 +369,8 @@ ALLOWLIST: frozenset[type[BaseException]] = frozenset(
         _registry.RegistryTransactionError,
         _outbox.OutboxDestinationError,
         _git_transaction.GitTransactionFailure,
-        _git_transaction._ApprovalLockCleanupFailure,
+        _git_transaction.ActionLockCleanupFailure,
+        _git_transaction.QuarantineCleanupError,
         _git_transaction._ReviewedIndexOwnershipConflict,
     }
 )

@@ -7,6 +7,11 @@ import sys
 import pytest
 import yaml
 
+from app.action_receipts import (
+    make_action_receipt,
+    render_action_receipt,
+    validate_head_receipt_store,
+)
 from tools.public_repo_audit import audit_repository
 
 
@@ -77,6 +82,11 @@ def synthetic_vault(path: Path, entity: str) -> Path:
     (system / "products.yaml").write_text("products: {}\n", encoding="utf-8")
     (system / "members.yaml").write_text("members: {}\n", encoding="utf-8")
     (system / "workspaces.yaml").write_text("workspaces: {}\n", encoding="utf-8")
+    run_git(path, "init", "-q")
+    run_git(path, "config", "user.name", "test")
+    run_git(path, "config", "user.email", "test@example.com")
+    run_git(path, "add", "-A")
+    run_git(path, "commit", "-q", "-m", "synthetic vault")
     return path
 
 
@@ -102,6 +112,37 @@ def test_clean_synthetic_repository_passes(tmp_path: Path):
     repo = git_repo(tmp_path, {"app.py": "title = 'OneOS'\n"})
 
     assert audit_repository(repo, vault=None, include_history=True) == []
+
+
+def test_public_audit_pattern_includes_the_accumulated_head_receipt_gate(
+    tmp_path: Path,
+):
+    proposal_id = "20260824T120000-" + "ab" * 16
+    relative = f"synthetic/outbox/.receipts/{proposal_id}.yaml"
+    receipt = render_action_receipt(
+        make_action_receipt(proposal_id, "a" * 64, "approval")
+    )
+    repo = git_repo_with_bytes(tmp_path, {relative: receipt})
+
+    assert audit_repository(repo, vault=None, include_history=True) == []
+    assert validate_head_receipt_store(repo, "synthetic") == (
+        make_action_receipt(proposal_id, "a" * 64, "approval"),
+    )
+
+
+def test_public_audit_rejects_a_malformed_accumulated_vault_receipt(tmp_path: Path):
+    vault = synthetic_vault(tmp_path / "vault", "synthetic")
+    proposal_id = "20260824T120000-" + "ab" * 16
+    relative = f"synthetic/outbox/.receipts/{proposal_id}.yaml"
+    commit_bytes(vault, {relative: b"not: a closed receipt\n"}, "bad receipt")
+    (vault / "_system/entities.yaml").write_text(
+        "entities: {}\n", encoding="utf-8"
+    )
+    repo = git_repo(tmp_path / "repo", {"app.py": "clean = True\n"})
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert [item.category for item in findings] == ["receipt-integrity"]
 
 
 def test_general_credential_assignment_is_not_python_audit_policy(tmp_path: Path):

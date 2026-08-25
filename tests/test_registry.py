@@ -21,6 +21,14 @@ from app.git_transaction import (
     ReviewedStateConflict,
     VaultBusyError,
 )
+from app.action_receipts import (
+    InvalidActionReceipt,
+    SpentAction,
+    make_action_receipt,
+    parse_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
+)
 from app.scope import CrossScopeError, Scope
 from app.registry import (
     RegistryError,
@@ -39,6 +47,7 @@ from tests.conftest import (
     git_head_message,
     git_index_entries,
     git_is_clean,
+    git_is_clean_apart_from_quarantine,
     git_status_bytes,
 )
 
@@ -354,7 +363,7 @@ def test_add_workspace_is_direct_and_commits(tmp_path):
     assert "id: rti" in ws
     assert git_count_commits(vault) == before + 1
     assert git_head_message(vault).startswith("registry: add workspace")
-    assert git_is_clean(vault)
+    assert git_is_clean_apart_from_quarantine(vault)
 
 
 def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
@@ -514,7 +523,7 @@ def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_pat
     with pytest.raises(RegistryError):
         get_delete_proposal(scope, "../13-analytics/kpis")
     with pytest.raises(RegistryError):
-        execute_delete(scope, "../13-analytics/kpis")
+        execute_delete(scope, "../13-analytics/kpis", _UNBOUND_FINGERPRINT)
 
     assert target.read_bytes() == target_before
     assert registry.read_bytes() == registry_before
@@ -525,24 +534,189 @@ def test_execute_delete_refuses_while_referenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
     scope = Scope(vault, "demo")
     prop = propose_delete(scope, "product", "widgetx")
-    try:
-        execute_delete(scope, prop.id)
-        assert False, "should have refused"
-    except RegistryError:
-        pass
+    review_sha256 = _fingerprint_of(scope, prop.id)
+    assert registry.reference_count(scope, prop.kind, prop.slug).total > 0
+
+    with pytest.raises(
+        RegistryError,
+        match="this proposal was reviewed while references remained",
+    ):
+        execute_delete(scope, prop.id, review_sha256)
+
     assert "widgetx:" in (vault / "_system/products.yaml").read_text()
+
+
+#: A well-formed fingerprint that binds nothing, for ids that name no
+#: reviewable delete proposal — the refusal under test is reached before any
+#: comparison against stored bytes.
+_UNBOUND_FINGERPRINT = "0" * 64
+
+
+def _fingerprint_of(scope, proposal_id: str) -> str:
+    """The fingerprint of the delete proposal exactly as it now stands."""
+    return registry.get_delete_review(scope, proposal_id).sha256
 
 
 def test_execute_delete_removes_when_unreferenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
     scope = Scope(vault, "demo")
     prop = propose_delete(scope, "product", "widgetx")
-    execute_delete(scope, prop.id)
+    execute_delete(scope, prop.id, _fingerprint_of(scope, prop.id))
     prods = (vault / "_system/products.yaml").read_text()
     assert "widgetx:" not in prods
     assert "other:" in prods                    # sibling untouched
     assert git_head_message(vault).startswith("registry: delete product")
-    assert git_is_clean(vault)
+    assert git_is_clean_apart_from_quarantine(vault)
+
+
+def test_execute_delete_commits_the_exact_review_receipt_with_the_action(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+
+    deleted = execute_delete(scope, prop.id, review.sha256)
+
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert git_changed_paths(vault) == sorted(
+        ("_system/products.yaml", receipt_path)
+    )
+    receipt_bytes = git_bytes(vault, "show", f"HEAD:{receipt_path}")
+    receipt = parse_action_receipt(Path(receipt_path), receipt_bytes)
+    assert deleted.id == prop.id
+    assert receipt.proposal_id == prop.id
+    assert receipt.review_sha256 == review.sha256
+    assert receipt.action_kind == "registry deletion"
+
+
+def test_execute_delete_refuses_a_receipt_committed_before_the_lock(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    receipt = make_action_receipt(prop.id, "0" * 64, "registry deletion")
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(render_action_receipt(receipt))
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant spent receipt")
+    head_before = git_head(vault)
+    stored.unlink()
+    malformed = b"not: [a delete proposal\n"
+    prop.path.write_bytes(malformed)
+
+    result = execute_delete(scope, prop.id, review.sha256)
+
+    assert result == SpentAction(receipt)
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == malformed
+    assert not list(vault.rglob(".consumed/*.yaml"))
+
+
+def test_execute_delete_rechecks_receipts_under_its_lock(tmp_path, monkeypatch):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    receipt = make_action_receipt(
+        prop.id, review.sha256, "registry deletion"
+    )
+    receipt_path = receipt_relative_path("demo", prop.id)
+    real_lookup = registry._head_action_receipt
+    lookups = []
+
+    def plant_on_locked_lookup(scope_arg, proposal_id):
+        lookups.append(proposal_id)
+        if len(lookups) == 1:
+            return None
+        stored = vault / receipt_path
+        stored.parent.mkdir(mode=0o700)
+        stored.write_bytes(render_action_receipt(receipt))
+        git_bytes(vault, "add", receipt_path)
+        git_bytes(vault, "commit", "-q", "-m", "race in spent receipt")
+        return real_lookup(scope_arg, proposal_id)
+
+    monkeypatch.setattr(registry, "_head_action_receipt", plant_on_locked_lookup)
+
+    result = execute_delete(scope, prop.id, review.sha256)
+
+    assert lookups == [prop.id, prop.id]
+    assert result == SpentAction(receipt)
+    assert prop.path.exists()
+    assert not list(vault.rglob(".consumed/*.yaml"))
+
+
+def test_execute_delete_fails_closed_on_a_malformed_matching_receipt(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant malformed receipt")
+    head_before = git_head(vault)
+
+    with pytest.raises(InvalidActionReceipt):
+        execute_delete(scope, prop.id, review.sha256)
+
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert not list(vault.rglob(".consumed/*.yaml"))
+
+
+def test_reverting_a_post_commit_consumption_failure_reenables_the_pending_delete(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    real_quarantine = git_transaction.quarantine_path_if_unchanged
+
+    def fail_consumption(*args, **kwargs):
+        raise git_transaction.ReviewedPathUnavailable(
+            "injected post-commit consumption failure"
+        )
+
+    monkeypatch.setattr(
+        git_transaction, "quarantine_path_if_unchanged", fail_consumption
+    )
+
+    with pytest.raises(registry.RegistryTransactionError) as raised:
+        execute_delete(scope, prop.id, review.sha256)
+
+    assert isinstance(
+        raised.value.__cause__, git_transaction.PostCommitConsumptionError
+    )
+    action_oid = git_head(vault)
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert (vault / receipt_path).exists()
+    assert prop.path.exists()
+
+    subprocess.run(
+        ["git", "revert", "--no-edit", action_oid],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+    )
+    assert not (vault / receipt_path).exists()
+    assert prop.path.exists()
+    assert "widgetx:" in scope.system_path("products.yaml").read_text()
+
+    monkeypatch.setattr(
+        git_transaction,
+        "quarantine_path_if_unchanged",
+        real_quarantine,
+    )
+    result = execute_delete(scope, prop.id, review.sha256)
+
+    assert isinstance(result, registry.DeleteProposal)
+    assert not prop.path.exists()
 
 
 def test_delete_with_unrelated_staged_unstaged_and_untracked_work_commits_only_registry_file(
@@ -554,9 +728,12 @@ def test_delete_with_unrelated_staged_unstaged_and_untracked_work_commits_only_r
     proposal = propose_delete(scope, "product", "widgetx")
     head_before = git_head(vault)
 
-    execute_delete(scope, proposal.id)
+    execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
-    assert git_changed_paths(vault) == ["_system/products.yaml"]
+    receipt_path = receipt_relative_path("demo", proposal.id)
+    assert git_changed_paths(vault) == sorted(
+        ["_system/products.yaml", receipt_path]
+    )
     assert subprocess.run(
         ["git", "rev-list", "--count", f"{head_before}..HEAD"],
         cwd=vault,
@@ -585,7 +762,7 @@ def test_dirty_reviewed_registry_is_refused_before_proposal_or_registry_mutation
     status_before = git_status_bytes(vault)
 
     with pytest.raises(registry.RegistryTransactionError) as raised:
-        execute_delete(scope, proposal.id)
+        execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
     assert isinstance(raised.value.__cause__, ReviewedStateConflict)
     assert git_head(vault) == head_before
@@ -608,7 +785,7 @@ def test_registry_delete_busy_error_preserves_exact_state(tmp_path):
 
     with git_transaction._approval_lock(vault):
         with pytest.raises(registry.RegistryTransactionError) as raised:
-            execute_delete(scope, proposal.id)
+            execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
     assert isinstance(raised.value.__cause__, VaultBusyError)
     assert git_head(vault) == head_before
@@ -637,12 +814,13 @@ def test_registry_delete_commit_failure_restores_registry_and_proposal_bytes(
     monkeypatch.setattr(git_transaction, "_checkpoint", fail_after_filesystem_apply)
 
     with pytest.raises(registry.RegistryTransactionError) as raised:
-        execute_delete(scope, proposal.id)
+        execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
-    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+    assert isinstance(raised.value.__cause__, git_transaction.GitTransactionFailure)
     assert git_head(vault) == head_before
     assert registry_path.read_bytes() == registry_bytes
     assert proposal.path.read_bytes() == proposal_bytes
+    assert not (proposal.path.parent / ".consumed").exists()
     _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
 
 
@@ -656,7 +834,7 @@ def test_registry_delete_is_one_commit_and_one_revert_restores_every_registry_ke
     registry_before = registry_path.read_bytes()
     head_before = git_head(vault)
 
-    execute_delete(scope, proposal.id)
+    execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
     approval_oid = git_head(vault)
 
     assert subprocess.run(
@@ -666,7 +844,10 @@ def test_registry_delete_is_one_commit_and_one_revert_restores_every_registry_ke
         capture_output=True,
         text=True,
     ).stdout.strip() == "1"
-    assert git_changed_paths(vault, approval_oid) == ["_system/products.yaml"]
+    receipt_path = receipt_relative_path("alpha", proposal.id)
+    assert git_changed_paths(vault, approval_oid) == sorted(
+        ["_system/products.yaml", receipt_path]
+    )
     assert proposal.path.exists() is False
     subprocess.run(
         ["git", "revert", "--no-edit", approval_oid],
@@ -675,6 +856,8 @@ def test_registry_delete_is_one_commit_and_one_revert_restores_every_registry_ke
         capture_output=True,
     )
     assert registry_path.read_bytes() == registry_before
+    assert not (vault / receipt_path).exists()
+    assert not proposal.path.exists()
 
 
 def test_direct_registry_add_still_uses_existing_direct_flow(
@@ -708,7 +891,7 @@ def test_direct_registry_add_still_uses_existing_direct_flow(
 def test_delete_removes_only_bound_registry_key(two_entity_registry_vault):
     scope = Scope(two_entity_registry_vault, "alpha")
     proposal = propose_delete(scope, "product", "unused")
-    execute_delete(scope, proposal.id)
+    execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
     cfg = yaml.safe_load(scope.system_path("products.yaml").read_text())
     assert "unused" not in cfg["products"]["alpha"]
     assert "unused" in cfg["products"]["beta"]
@@ -741,7 +924,7 @@ def test_forged_delete_proposal_cannot_be_read_or_executed(
     with pytest.raises(RegistryError):
         get_delete_proposal(scope, "forged-delete")
     with pytest.raises(RegistryError):
-        execute_delete(scope, "forged-delete")
+        execute_delete(scope, "forged-delete", _UNBOUND_FINGERPRINT)
 
     assert scope.system_path("products.yaml").read_bytes() == registry_before
     assert git_head(two_entity_registry_vault) == head_before
@@ -761,7 +944,7 @@ def test_same_outbox_leaf_symlink_cannot_redirect_requested_delete(
     with pytest.raises(CrossScopeError):
         get_delete_proposal(scope, requested.id)
     with pytest.raises(CrossScopeError):
-        execute_delete(scope, requested.id)
+        execute_delete(scope, requested.id, _UNBOUND_FINGERPRINT)
 
     assert target.path.read_bytes() == target_before
     assert registry_path.read_bytes() == registry_before
@@ -813,3 +996,723 @@ def test_add_workspace_rejects_another_entity_entry(two_entity_registry_vault):
 
     assert path.read_bytes() == before
     assert git_head(two_entity_registry_vault) == head_before
+
+
+# --- S7 Task 4: registry delete bound to the reviewed proposal bytes --------
+
+
+def _delete_fp(scope, proposal_id: str) -> str:
+    return registry.get_delete_review(scope, proposal_id).sha256
+
+
+def test_get_delete_review_returns_the_value_its_bytes_and_their_hash(tmp_path):
+    import hashlib
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    review = registry.get_delete_review(scope, prop.id)
+    stored = prop.path.read_bytes()
+
+    assert review.value.id == prop.id
+    assert review.value.kind == "product"
+    assert review.value.slug == "widgetx"
+    assert review.contents == stored
+    assert review.sha256 == hashlib.sha256(stored).hexdigest()
+
+
+def test_the_delete_review_value_and_hash_come_from_one_capture(tmp_path):
+    """The Task 2 proof, for the delete reader: the record is replaced the
+    instant its bytes are captured. Value and digest must both describe the
+    capture, never the replacement."""
+    import hashlib
+
+    import app.registry as reg
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    original = prop.path.read_bytes()
+
+    real_capture = reg.capture_path_state
+    replaced = []
+
+    def capture_then_replace(vault_arg, relative_path, *args, **kwargs):
+        state = real_capture(vault_arg, relative_path, *args, **kwargs)
+        if relative_path.endswith(f"{prop.id}.yaml") and not replaced:
+            record = yaml.safe_load(original.decode("utf-8"))
+            record["slug"] = "other"
+            raw = yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+            prop.path.write_bytes(raw)
+            replaced.append(raw)
+        return state
+
+    reg.capture_path_state = capture_then_replace
+    try:
+        review = reg.get_delete_review(scope, prop.id)
+    finally:
+        reg.capture_path_state = real_capture
+
+    assert replaced, "the probe never replaced the record"
+    assert review.contents == original
+    assert review.sha256 == hashlib.sha256(original).hexdigest()
+    assert review.value.slug == "widgetx"
+
+
+def test_execute_delete_requires_a_fingerprint_with_no_default():
+    signature = inspect.signature(registry.execute_delete)
+    assert list(signature.parameters) == ["scope", "proposal_id", "review_sha256"]
+    assert signature.parameters["review_sha256"].default is inspect.Parameter.empty
+
+
+def test_execute_delete_has_no_id_only_compatibility_path(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    before = (vault / "_system/products.yaml").read_bytes()
+
+    with pytest.raises(TypeError):
+        registry.execute_delete(scope, prop.id)
+
+    assert (vault / "_system/products.yaml").read_bytes() == before
+    assert prop.path.exists()
+
+
+@pytest.mark.parametrize(
+    "fingerprint", [None, "", "0" * 63, "G" * 64, "A" * 64, 123, b"0" * 64]
+)
+def test_execute_delete_refuses_a_malformed_fingerprint(tmp_path, fingerprint):
+    from app.review_tokens import InvalidReviewToken
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    before = (vault / "_system/products.yaml").read_bytes()
+
+    with pytest.raises(InvalidReviewToken):
+        registry.execute_delete(scope, prop.id, fingerprint)
+
+    assert (vault / "_system/products.yaml").read_bytes() == before
+    assert prop.path.exists()
+
+
+@pytest.mark.parametrize("label", ["meaningful", "byte-only"])
+def test_a_replaced_delete_proposal_refuses_and_changes_nothing(tmp_path, label):
+    from app.review_tokens import ReviewedProposalChanged
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    if label == "meaningful":
+        record["slug"] = "other"
+        replacement = yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+    else:
+        replacement = yaml.safe_dump(record, sort_keys=True).encode("utf-8")
+    prop.path.write_bytes(replacement)
+    assert replacement != review.contents
+
+    registry_before = (vault / "_system/products.yaml").read_bytes()
+    head_before = git_head(vault)
+
+    with pytest.raises(ReviewedProposalChanged):
+        registry.execute_delete(scope, prop.id, review.sha256)
+
+    assert (vault / "_system/products.yaml").read_bytes() == registry_before
+    assert git_head(vault) == head_before
+    # The replacement is preserved for diagnosis, never consumed.
+    assert prop.path.read_bytes() == replacement
+
+
+def test_execute_delete_returns_the_bound_proposal_it_executed(tmp_path):
+    """The route needs no earlier unbound read for its success copy."""
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    returned = registry.execute_delete(scope, prop.id, _delete_fp(scope, prop.id))
+
+    assert returned is not None
+    assert returned.id == prop.id
+    assert returned.kind == "product"
+    assert returned.slug == "widgetx"
+
+
+def test_a_new_live_reference_refuses_an_otherwise_matching_review(tmp_path):
+    """The fingerprint binds the proposal, not the registries. A reference
+    that appears after the review must still refuse the deletion."""
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+
+    # A brand-new reference lands after the operator reviewed the proposal.
+    referencing = vault / "demo/11-knowledge/active/note.md"
+    referencing.parent.mkdir(parents=True, exist_ok=True)
+    referencing.write_text(
+        "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
+    )
+
+    registry_before = (vault / "_system/products.yaml").read_bytes()
+    with pytest.raises(registry.RegistryError):
+        registry.execute_delete(scope, prop.id, review.sha256)
+
+    assert (vault / "_system/products.yaml").read_bytes() == registry_before
+    assert prop.path.exists()
+
+
+def test_the_reference_count_is_repeated_against_current_state(tmp_path):
+    """Not read from the proposal's recorded impact: a stale zero in the
+    record must not authorise a deletion."""
+    import app.registry as reg
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = reg.get_delete_review(scope, prop.id)
+
+    counted = []
+    real_count = reg.reference_count
+
+    def spy(scope_arg, kind, slug):
+        counted.append((kind, slug))
+        return real_count(scope_arg, kind, slug)
+
+    reg.reference_count = spy
+    try:
+        reg.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        reg.reference_count = real_count
+
+    assert ("product", "widgetx") in counted
+
+
+def test_no_delete_action_reads_through_the_value_only_reader():
+    source = inspect.getsource(registry.execute_delete)
+    assert "get_delete_proposal(" not in source
+
+
+def test_delete_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
+    """A contents comparison alone cannot catch a reread.
+
+    When nothing changes in between, a fresh capture yields byte-identical
+    contents and the substitution is invisible. So the record is rewritten
+    *after* the fingerprint matched and *before* the plan is built: only an
+    implementation that kept the compared state refuses.
+
+    An implementation that recaptured here would take the replacement as
+    transaction authority and consume a proposal nobody reviewed, while
+    committing a registry deletion for it.
+    """
+    import app.registry as reg
+    from app.console_errors import describe
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = reg.get_delete_review(scope, prop.id)
+    registry_before = (vault / "_system/products.yaml").read_bytes()
+    head_before = git_head(vault)
+
+    # The reference count now runs as a transaction precondition, under the
+    # approval lock and *after* the plan is built, so it is no longer in the
+    # window this test needs. The registry file's own capture is: it happens
+    # after the proposal's fingerprint comparison and before the plan.
+    real_capture = reg.capture_path_state
+    replaced = []
+
+    def rewrite_then_capture(vault_arg, relative_path, *args, **kwargs):
+        if relative_path.endswith("products.yaml") and not replaced:
+            record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+            raw = yaml.safe_dump(record, sort_keys=True).encode("utf-8")
+            prop.path.write_bytes(raw)
+            replaced.append(raw)
+        return real_capture(vault_arg, relative_path, *args, **kwargs)
+
+    reg.capture_path_state = rewrite_then_capture
+    try:
+        with pytest.raises(Exception) as raised:
+            reg.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        reg.capture_path_state = real_capture
+
+    assert replaced, "the probe never replaced the record"
+    assert replaced[0] != review.contents
+    assert describe(raised.value).code == "E-CONFLICT"
+
+    # Nothing committed, the registry untouched, the replacement preserved.
+    assert git_head(vault) == head_before
+    assert (vault / "_system/products.yaml").read_bytes() == registry_before
+    assert prop.path.read_bytes() == replaced[0]
+
+
+# --- Task 4 review: the review must be a currently valid deletion -----------
+
+
+def test_a_review_taken_while_referenced_is_never_actionable(tmp_path):
+    """P1 (review): clearing the references does not make an old review
+    valid. The approved design requires reviewing a currently valid
+    deletion again — both the recorded impact and the live count must
+    permit it."""
+    vault = _products_vault(tmp_path, referenced=True)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    assert review.value.total > 0, "the fixture must start with references"
+
+    # Every reference is now gone, but the operator never reviewed again.
+    cleared = registry.ReferenceReport("product", "widgetx", {})
+    real_count = registry.reference_count
+    registry.reference_count = lambda *args, **kwargs: cleared
+    registry_before = (vault / "_system/products.yaml").read_bytes()
+    try:
+        assert registry.reference_count(scope, "product", "widgetx").total == 0
+        with pytest.raises(registry.RegistryError):
+            registry.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        registry.reference_count = real_count
+
+    assert (vault / "_system/products.yaml").read_bytes() == registry_before
+    assert prop.path.exists()
+
+
+def test_a_fresh_review_after_clearing_references_does_delete(tmp_path):
+    """The other half: reviewing again is what makes it actionable."""
+    vault = _products_vault(tmp_path, referenced=True)
+    scope = Scope(vault, "demo")
+    stale = propose_delete(scope, "product", "widgetx")
+    assert registry.get_delete_review(scope, stale.id).value.total > 0
+
+    cleared = registry.ReferenceReport("product", "widgetx", {})
+    real_count = registry.reference_count
+    registry.reference_count = lambda *args, **kwargs: cleared
+    try:
+        fresh = propose_delete(scope, "product", "widgetx")
+        review = registry.get_delete_review(scope, fresh.id)
+        assert review.value.total == 0
+        registry.execute_delete(scope, fresh.id, review.sha256)
+    finally:
+        registry.reference_count = real_count
+
+    assert "widgetx:" not in (vault / "_system/products.yaml").read_text()
+    # The stale proposal is untouched and still not actionable.
+    assert stale.path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("total_references", "not-a-number"),
+        ("total_references", None),
+        ("total_references", [1]),
+        ("total_references", -1),
+        ("total_references", True),
+        ("impact", ["not", "a", "mapping"]),
+        ("impact", "text"),
+        ("impact", {"source": "not-a-count"}),
+        ("impact", {1: 2}),
+    ],
+)
+def test_a_malformed_saved_impact_is_refused(tmp_path, field, value):
+    """P1 (review): the recorded impact is displayed to the operator and now
+    gates the deletion, so it is validated like every other stored field
+    rather than trusted as whatever YAML happened to hold."""
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record[field] = value
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    from app.outbox import UnreadableProposalRecord
+
+    with pytest.raises(UnreadableProposalRecord):
+        registry.get_delete_review(scope, prop.id)
+
+
+def test_a_path_integrity_race_stays_in_the_registry_family(tmp_path):
+    """P1 (review): a leaf swapped between the lexical check and the capture
+    must reach the route as its declared redirection outcome, not as a raw
+    transaction-layer type escaping to the global fallback."""
+    import app.registry as reg
+    from app.console_errors import describe
+    from app.scope import CrossScopeError
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    real_capture = reg.capture_path_state
+
+    def integrity_race(*args, **kwargs):
+        raise git_transaction.ReviewedPathIntegrityError("leaf is redirected")
+
+    reg.capture_path_state = integrity_race
+    try:
+        with pytest.raises(CrossScopeError) as raised:
+            reg.get_delete_review(scope, prop.id)
+    finally:
+        reg.capture_path_state = real_capture
+
+    assert describe(raised.value).code == "E-TAMPER"
+
+
+@pytest.mark.parametrize(
+    ("total", "sources"),
+    [
+        (0, {"front-matter": 1, "workspaces": 2}),
+        (5, {"front-matter": 1}),
+        (1, {}),
+        (0, {"front-matter": 0, "workspaces": 1}),
+    ],
+)
+def test_a_saved_impact_that_contradicts_its_own_total_is_refused(
+    tmp_path, total, sources
+):
+    """P1 (review): type-checking the fields is not enough. A record whose
+    total disagrees with its own breakdown describes an impact that was
+    never measured — and since the total now gates the deletion, a zero
+    beside a non-empty breakdown is precisely how an unsafe deletion would
+    be waved through."""
+    from app.outbox import UnreadableProposalRecord
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record["total_references"] = total
+    record["impact"] = sources
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(UnreadableProposalRecord):
+        registry.get_delete_review(scope, prop.id)
+
+
+def test_a_consistent_saved_impact_is_accepted(tmp_path):
+    """The control: a total that matches its breakdown still reads."""
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    record["total_references"] = 3
+    record["impact"] = {"front-matter": 1, "workspaces": 2}
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    review = registry.get_delete_review(scope, prop.id)
+    assert review.value.total == 3
+    assert sum(review.value.sources.values()) == 3
+
+
+# --- S7 Task 6: the delete no-mutation matrix -------------------------------
+
+
+_DELETE_MATRIX = (
+    "exact-reviewed-bytes",
+    "same-id-meaningful-change",
+    "same-id-byte-only-change",
+    "missing-token",
+    "malformed-token",
+    "missing-proposal",
+    "malformed-proposal",
+    "redirected-proposal",
+    "cross-scope-proposal",
+    "non-regular-replacement",
+    "new-live-reference",
+)
+
+
+def _registry_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
+    """Every path in the vault, with its type and exact bytes.
+
+    Git state alone is not the boundary: a delete proposal is untracked, so
+    a refusal that silently rewrote or retyped the proposal record would
+    leave HEAD, the index and the tracked diff identical and pass. The bytes
+    and the type of every file are what "nothing changed" has to mean.
+    """
+    entries = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        # Only the repository's own `.git`. Matching `.git` anywhere in the
+        # path would hide ordinary vault content — a directory named
+        # `ordinary.git/`, or any file beneath one — from a proof whose
+        # whole job is to notice content changing.
+        if relative == ".git" or relative.startswith(".git/"):
+            continue
+        if path.is_symlink():
+            entries.append((relative, "symlink", path.readlink().as_posix()))
+        elif path.is_dir():
+            entries.append((relative, "directory", ""))
+        else:
+            entries.append((relative, "file", path.read_bytes()))
+    return tuple(sorted(entries))
+
+
+def _registry_boundary(vault: Path) -> dict:
+    def _git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": _git("rev-parse", "HEAD"),
+        "commits": len(_git("rev-list", "HEAD").split()),
+        "index": _git("diff", "--cached", "--binary"),
+        "tracked": _git("diff", "--binary"),
+        "status": _git("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        "products": (vault / "_system/products.yaml").read_bytes(),
+        "tree": _registry_tree(vault),
+    }
+
+
+@pytest.mark.parametrize("state", _DELETE_MATRIX)
+def test_the_delete_no_mutation_matrix(tmp_path, state):
+    from app.console_errors import describe
+    from app.review_tokens import InvalidReviewToken
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    token = review.sha256
+    outside = tmp_path / "outside.yaml"
+    outside.write_bytes(review.contents)
+
+    def _rewrite(**changes):
+        record = yaml.safe_load(review.contents.decode("utf-8"))
+        record.update(changes)
+        prop.path.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+
+    if state == "same-id-meaningful-change":
+        _rewrite(slug="other")
+    elif state == "same-id-byte-only-change":
+        record = yaml.safe_load(review.contents.decode("utf-8"))
+        prop.path.write_text(
+            yaml.safe_dump(record, sort_keys=True), encoding="utf-8"
+        )
+    elif state == "missing-token":
+        token = None
+    elif state == "malformed-token":
+        token = "not-a-fingerprint"
+    elif state == "missing-proposal":
+        prop.path.unlink()
+    elif state == "malformed-proposal":
+        prop.path.write_text("{ not: [valid, yaml", encoding="utf-8")
+    elif state == "redirected-proposal":
+        prop.path.unlink()
+        prop.path.symlink_to(outside)
+    elif state == "cross-scope-proposal":
+        _rewrite(entity="not-the-bound-entity")
+    elif state == "non-regular-replacement":
+        prop.path.unlink()
+        prop.path.mkdir()
+    elif state == "new-live-reference":
+        note = vault / "demo/11-knowledge/active/note.md"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(
+            "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
+        )
+
+    before = _registry_boundary(vault)
+
+    if state == "exact-reviewed-bytes":
+        returned = registry.execute_delete(scope, prop.id, token)
+        assert returned.slug == "widgetx"
+        assert "widgetx:" not in (vault / "_system/products.yaml").read_text()
+        return
+
+    with pytest.raises(Exception) as raised:
+        registry.execute_delete(scope, prop.id, token)
+
+    outcome = describe(raised.value)
+    assert outcome.committed == "no", state
+    assert outcome.code != "E-UNKNOWN", state
+    if state in {"missing-token", "malformed-token"}:
+        assert isinstance(raised.value, InvalidReviewToken)
+
+    assert _registry_boundary(vault) == before, (
+        f"delete refusal mutated vault state ({state})"
+    )
+    assert "widgetx:" in (vault / "_system/products.yaml").read_text()
+    assert not sorted(vault.rglob(".consumed/*.yaml")), state
+    assert outside.read_bytes() == review.contents
+    if state == "redirected-proposal":
+        assert prop.path.is_symlink()
+    elif state == "non-regular-replacement":
+        assert prop.path.is_dir()
+
+
+# --- S7: the live reference gate runs under the approval lock ---------------
+
+
+def test_a_reference_committed_before_the_lock_still_refuses_the_delete(tmp_path):
+    """The race acceptance criterion 5 exists to close.
+
+    Counting references before acquiring the approval lock leaves a window
+    another approval can commit into: this transaction's own expected states
+    — the registry file and the proposal record — are untouched by a new
+    *reference*, so they still match and the deletion proceeds, orphaning it.
+
+    The reference here appears strictly after the fingerprint comparison and
+    strictly before the lock, which is exactly that window.
+    """
+    import app.git_transaction as gt
+    import app.registry as reg
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = reg.get_delete_review(scope, prop.id)
+    products_before = (vault / "_system/products.yaml").read_bytes()
+
+    real_lock = reg.execute_transaction
+    landed = []
+
+    def reference_appears_then_execute(vault_arg, plan):
+        if not landed:
+            note = vault / "demo/11-knowledge/active/late.md"
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text(
+                "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
+            )
+            landed.append(note)
+        return real_lock(vault_arg, plan)
+
+    reg.execute_transaction = reference_appears_then_execute
+    try:
+        with pytest.raises(registry.RegistryError) as raised:
+            reg.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        reg.execute_transaction = real_lock
+
+    assert landed, "the probe never created the late reference"
+    assert "references remain" in str(raised.value)
+    # Nothing deleted, and the new reference is not orphaned.
+    assert (vault / "_system/products.yaml").read_bytes() == products_before
+    assert "widgetx:" in (vault / "_system/products.yaml").read_text()
+    assert landed[0].exists()
+    assert prop.path.exists()
+
+
+def test_the_reference_recount_holds_the_approval_lock(tmp_path):
+    """Not merely "late" — provably inside the locked window.
+
+    A refusal test alone cannot distinguish "counted under the lock" from
+    "counted a moment earlier", so assert the lock is actually held while
+    the count runs: a non-blocking `flock` from this same process on a
+    separate descriptor must fail.
+    """
+    import fcntl
+    import os as _os
+    import subprocess as _subprocess
+
+    import app.registry as reg
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = reg.get_delete_review(scope, prop.id)
+
+    git_dir = Path(
+        _subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+            cwd=vault, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    )
+    lock_path = git_dir / "oneos-approval.lock"
+
+    observed = []
+    real_count = reg.reference_count
+
+    def count_and_probe_the_lock(scope_arg, kind, slug):
+        descriptor = _os.open(lock_path, _os.O_RDWR | _os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            observed.append("lock was FREE")
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            observed.append("lock was HELD")
+        finally:
+            _os.close(descriptor)
+        return real_count(scope_arg, kind, slug)
+
+    reg.reference_count = count_and_probe_the_lock
+    try:
+        reg.execute_delete(scope, prop.id, review.sha256)
+    finally:
+        reg.reference_count = real_count
+
+    assert observed, "the reference count never ran"
+    assert observed[-1] == "lock was HELD", observed
+
+
+def test_execute_delete_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
+    """Item 5 (safety review): the registry half of the same boundary.
+
+    `execute_delete` parses `proposal_state.contents`. Rereading the path
+    there was an equivalent mutant for the same reason it was in the
+    outbox: `PathState` compares full contents, so a replacement still on
+    disk at transaction time is refused either way.
+
+    A replacement that is *put back* before the transaction is not. Every
+    state check then sees the reviewed bytes, because by the time anything
+    checks, that is what the file holds — but the parse saw something
+    else, and in this route the parsed value chooses which registry entry
+    is removed. The witness is therefore which product survives.
+    """
+    import yaml
+
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    fingerprint = _fingerprint_of(scope, prop.id)
+    reviewed_bytes = prop.path.read_bytes()
+
+    products = vault / "_system/products.yaml"
+    assert "other:" in products.read_text(encoding="utf-8")
+
+    real_match = registry.require_review_match
+    real_parse = registry._parse_delete_record
+    window = []
+
+    def open_the_window(contents, submitted):
+        result = real_match(contents, submitted)
+        record = yaml.safe_load(reviewed_bytes.decode("utf-8"))
+        record["slug"] = "other"
+        prop.path.write_bytes(
+            yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+        )
+        window.append("open")
+        return result
+
+    def close_the_window(contents):
+        try:
+            return real_parse(contents)
+        finally:
+            if window and window[-1] == "open":
+                prop.path.write_bytes(reviewed_bytes)
+                window.append("closed")
+
+    registry.require_review_match = open_the_window
+    registry._parse_delete_record = close_the_window
+    try:
+        deleted = execute_delete(scope, prop.id, fingerprint)
+    finally:
+        registry.require_review_match = real_match
+        registry._parse_delete_record = real_parse
+
+    assert window == ["open", "closed"], window
+
+    # The entry removed is the reviewed one, and the sibling the hostile
+    # record named is untouched.
+    assert deleted.slug == "widgetx", "delete chose a target from a reread"
+    remaining = products.read_text(encoding="utf-8")
+    assert "widgetx:" not in remaining
+    assert "other:" in remaining, "deleted a product nobody reviewed"

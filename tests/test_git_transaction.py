@@ -1,3 +1,5 @@
+import ctypes
+import errno
 import fcntl
 import hashlib
 import os
@@ -70,11 +72,373 @@ def _approval_plan() -> TransactionPlan:
     )
 
 
+def _approval_plan_with_receipt() -> TransactionPlan:
+    """The Stage 2 shape: action and receipt commit; proposal is consumed."""
+    from app.action_receipts import make_action_receipt, render_action_receipt
+
+    base = _approval_plan()
+    proposal_id = "20260824T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    receipt_path = f"synthetic/outbox/.receipts/{proposal_id}.yaml"
+    receipt = make_action_receipt(proposal_id, "a" * 64, "approval")
+    receipt_change = PathChange(
+        receipt_path,
+        PathState.absent(),
+        PathState.regular(render_action_receipt(receipt), 0o644),
+        create_parent=True,
+    )
+    return TransactionPlan(
+        base.message,
+        base.changes + (receipt_change,),
+        base.commit_paths + (receipt_path,),
+        base.owned_changes,
+    )
+
+
+def test_a_returned_precondition_refuses_under_lock_without_mutation(tmp_path):
+    from dataclasses import replace
+
+    from app.action_receipts import make_action_receipt
+
+    vault = _vault(tmp_path)
+    _write_proposal(vault)
+    receipt = make_action_receipt(
+        "20260824T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "a" * 64,
+        "approval",
+    )
+    locked = []
+
+    def refuse_with_the_existing_receipt():
+        descriptor = os.open(vault / ".git" / "oneos-approval.lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+        locked.append(True)
+        return receipt
+
+    plan = replace(
+        _approval_plan(), preconditions=(refuse_with_the_existing_receipt,)
+    )
+    boundary = _tree_boundary(vault)
+
+    result = transaction.execute_transaction(vault, plan)
+
+    assert locked == [True], "the receipt refusal did not run under the lock"
+    assert isinstance(result, transaction.TransactionPreconditionRefused)
+    assert result.reason is receipt
+    assert _tree_boundary(vault) == boundary, "a refused precondition mutated state"
+
+
+def test_receipt_change_creates_only_its_checked_parent_and_enters_commit(tmp_path):
+    vault = _vault(tmp_path)
+    _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    receipt_change = plan.changes[-1]
+
+    result = transaction.execute_transaction(vault, plan)
+
+    receipt_path = vault / receipt_change.path
+    assert receipt_path.read_bytes() == receipt_change.after.contents
+    assert stat.S_IMODE(receipt_path.parent.stat().st_mode) == 0o700
+    assert git_changed_paths(vault, result.commit_oid) == sorted(plan.commit_paths)
+
+
+def test_a_precommit_failure_never_quarantines_the_proposal(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    start_head = git_head(vault)
+
+    def fail_before_commit(name: str) -> None:
+        if name == "reviewed-paths-staged":
+            raise OSError("injected before commit")
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_before_commit)
+
+    with pytest.raises(transaction.GitTransactionError):
+        transaction.execute_transaction(vault, plan)
+
+    assert git_head(vault) == start_head
+    assert proposal.read_bytes() == b"proposal\n"
+    assert not (proposal.parent / ".consumed").exists(), (
+        "a proposal was quarantined before its action committed"
+    )
+
+
+def test_a_postcommit_consumption_failure_preserves_commit_and_receipt(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    start_head = git_head(vault)
+
+    def fail_before_consumption(name: str) -> None:
+        if name == "before-proposal-quarantine":
+            raise transaction.ReviewedPathUnavailable(
+                "injected after commit and before consumption"
+            )
+
+    monkeypatch.setattr(transaction, "_checkpoint", fail_before_consumption)
+
+    with pytest.raises(transaction.PostCommitConsumptionError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert git_head(vault) == raised.value.result.commit_oid
+    assert git_head(vault) != start_head
+    assert git_changed_paths(vault, git_head(vault)) == sorted(plan.commit_paths)
+    assert (vault / plan.changes[-1].path).read_bytes() == plan.changes[-1].after.contents
+    assert proposal.read_bytes() == b"proposal\n"
+    assert not (proposal.parent / ".consumed").exists()
+
+
+def test_transaction_reverifies_the_quarantine_entry_after_the_move_returns(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    real_quarantine = transaction.quarantine_path_if_unchanged
+    decoy = b"DECOY-AFTER-QUARANTINE-RETURN\n"
+    replaced = []
+
+    def quarantine_then_replace(vault_arg, relative_path, expected):
+        record = real_quarantine(vault_arg, relative_path, expected)
+        landed = vault / transaction.quarantine_destination(relative_path)
+        substitute = landed.with_name(landed.name + ".substitute")
+        substitute.write_bytes(decoy)
+        os.replace(substitute, landed)
+        replaced.append(record)
+        return record
+
+    monkeypatch.setattr(
+        transaction, "quarantine_path_if_unchanged", quarantine_then_replace
+    )
+
+    with pytest.raises(transaction.PostCommitConsumptionError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert replaced, "the quarantine entry was never replaced"
+    assert isinstance(
+        raised.value.consumption_error, transaction.QuarantineEntrySubstituted
+    )
+    assert raised.value.consumption_error.condition == "replaced"
+    assert git_head(vault) == raised.value.commit_oid
+    assert not proposal.exists()
+    landed = vault / transaction.quarantine_destination(
+        plan.owned_changes[0].path
+    )
+    assert landed.read_bytes() == decoy
+
+
+def test_transaction_rechecks_head_after_the_final_quarantine_verification(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    real_verify = transaction._require_quarantined_record_unchanged
+    newer_head = []
+
+    def verify_then_advance(vault_arg, record):
+        real_verify(vault_arg, record)
+        if newer_head:
+            return
+        transaction_head = git_head(vault)
+        tree = git_bytes(
+            vault, "rev-parse", f"{transaction_head}^{{tree}}"
+        ).decode("ascii").strip()
+        advanced = git_bytes(
+            vault,
+            "commit-tree",
+            tree,
+            "-p",
+            transaction_head,
+            "-m",
+            "concurrent head after quarantine verification",
+        ).decode("ascii").strip()
+        git_bytes(vault, "update-ref", "HEAD", advanced, transaction_head)
+        newer_head.append(advanced)
+
+    monkeypatch.setattr(
+        transaction,
+        "_require_quarantined_record_unchanged",
+        verify_then_advance,
+    )
+
+    with pytest.raises(transaction.PostCommitConsumptionError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert newer_head, "the final quarantine verifier never advanced HEAD"
+    assert git_head(vault) == newer_head[0]
+    assert raised.value.commit_oid != newer_head[0]
+    assert not proposal.exists()
+
+
+def test_standalone_consumption_returned_precondition_refuses_under_lock(tmp_path):
+    from app.action_receipts import make_action_receipt
+
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    expected = transaction.capture_path_state(
+        vault, proposal.relative_to(vault).as_posix()
+    )
+    receipt = make_action_receipt(
+        "20260824T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "a" * 64,
+        "approval",
+    )
+    locked = []
+
+    def refuse():
+        descriptor = os.open(vault / ".git" / "oneos-approval.lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+        locked.append(True)
+        return receipt
+
+    boundary = _tree_boundary(vault)
+    result = transaction.consume_reviewed_proposal(
+        vault,
+        proposal.relative_to(vault).as_posix(),
+        expected,
+        preconditions=(refuse,),
+    )
+
+    assert result == transaction.TransactionPreconditionRefused(receipt)
+    assert locked == [True]
+    assert _tree_boundary(vault) == boundary
+
+
+@pytest.mark.parametrize("parent_kind", ("symlink", "file"))
+def test_receipt_parent_redirection_refuses_without_writing_outside(
+    tmp_path, parent_kind
+):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    receipt_parent = vault / "synthetic/outbox/.receipts"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if parent_kind == "symlink":
+        receipt_parent.symlink_to(outside, target_is_directory=True)
+    else:
+        receipt_parent.write_bytes(b"not a directory\n")
+    outside_before = tuple(outside.iterdir())
+
+    with pytest.raises(transaction.ReviewedStateConflict):
+        transaction.execute_transaction(vault, plan)
+
+    assert tuple(outside.iterdir()) == outside_before
+    assert proposal.read_bytes() == b"proposal\n"
+
+
+def test_receipt_parent_creation_race_is_never_adopted(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    real_mkdir = transaction.os.mkdir
+    raced = []
+
+    def create_competing_parent(path, mode=0o777, *, dir_fd=None):
+        if path == ".receipts" and dir_fd is not None and not raced:
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            raced.append(True)
+            raise FileExistsError(errno.EEXIST, "injected creation race", path)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(transaction.os, "mkdir", create_competing_parent)
+
+    with pytest.raises(transaction.GitTransactionError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert raced == [True]
+    assert _exception_chain_contains(
+        raised.value, transaction.ReviewedPathIntegrityError
+    )
+    assert proposal.read_bytes() == b"proposal\n"
+    assert list((vault / "synthetic/outbox/.receipts").iterdir()) == []
+
+
+def test_quarantine_is_the_final_vault_mutation_after_commit(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    vault = _vault(tmp_path)
+    _write_proposal(vault)
+    events = []
+    real_expected = transaction._require_expected_states
+    real_checkpoint = transaction._checkpoint
+
+    def expected(vault_arg, plan_arg):
+        events.append("expected-states")
+        return real_expected(vault_arg, plan_arg)
+
+    def precondition():
+        events.append("precondition")
+
+    def checkpoint(name):
+        if name in {
+            "filesystem-applied",
+            "commit-verified",
+            "real-index-synchronized",
+            "before-proposal-quarantine",
+        }:
+            events.append(name)
+        return real_checkpoint(name)
+
+    monkeypatch.setattr(transaction, "_require_expected_states", expected)
+    monkeypatch.setattr(transaction, "_checkpoint", checkpoint)
+    plan = replace(_approval_plan_with_receipt(), preconditions=(precondition,))
+
+    transaction.execute_transaction(vault, plan)
+
+    assert events == [
+        "expected-states",
+        "precondition",
+        "filesystem-applied",
+        "commit-verified",
+        "real-index-synchronized",
+        "before-proposal-quarantine",
+    ]
+
+
 def _write_proposal(vault: Path, contents: bytes = b"proposal\n") -> Path:
     proposal = vault / "synthetic/outbox/proposal.yaml"
     proposal.parent.mkdir(parents=True, exist_ok=True)
     proposal.write_bytes(contents)
     return proposal
+
+
+def _tree_boundary(vault: Path):
+    """Git state plus every non-Git filesystem object, for refusal proofs."""
+    paths = []
+    for path in sorted(vault.rglob("*")):
+        relative = path.relative_to(vault)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        found = os.lstat(path)
+        if stat.S_ISREG(found.st_mode):
+            value = ("file", stat.S_IMODE(found.st_mode), path.read_bytes())
+        elif stat.S_ISDIR(found.st_mode):
+            value = ("directory", stat.S_IMODE(found.st_mode), None)
+        elif stat.S_ISLNK(found.st_mode):
+            value = ("symlink", stat.S_IMODE(found.st_mode), os.readlink(path))
+        else:
+            value = ("other", stat.S_IMODE(found.st_mode), None)
+        paths.append((relative.as_posix(), value))
+    return (
+        git_head(vault),
+        git_index_entries(vault),
+        git_cached_diff(vault),
+        git_worktree_diff(vault),
+        git_status_bytes(vault),
+        tuple(paths),
+    )
 
 
 def _unrelated_index_entries(vault: Path, reviewed: tuple[str, ...]) -> tuple[bytes, ...]:
@@ -132,8 +496,14 @@ def _temporary_directory_state(directory: Path) -> tuple[tuple[str, bytes], ...]
 def _complete_state(
     vault: Path, plan: TransactionPlan, index_directory: Path
 ) -> dict[str, object]:
+    from app.git_transaction import quarantine_destination
+
     owned_paths = tuple(change.path for change in plan.changes + plan.owned_changes)
-    excluded = set(owned_paths)
+    # Amendment 1: an owned proposal is consumed into quarantine, so its
+    # destination is the transaction's own effect, not unrelated state.
+    excluded = set(owned_paths) | {
+        quarantine_destination(change.path) for change in plan.owned_changes
+    }
     return {
         "head": git_head(vault),
         "owned": tuple(
@@ -147,6 +517,39 @@ def _complete_state(
         "cached_diff": git_cached_diff(vault),
         "temporary_indexes": _temporary_directory_state(index_directory),
     }
+
+
+def _assert_everything_else_rolled_back(
+    vault: Path,
+    plan: TransactionPlan,
+    index_directory: Path,
+    before,
+    raised,
+    current=None,
+) -> None:
+    """Before commit, every transaction-owned byte remains recoverable."""
+    del raised
+    assert (
+        current
+        if current is not None
+        else _complete_state(vault, plan, index_directory)
+    ) == before
+
+
+def _assert_record_retained(vault: Path, proposal: Path, contents: bytes) -> None:
+    """The reviewed record's bytes survive at their transaction-owned place."""
+    quarantined = sorted((proposal.parent / ".consumed").glob("*.yaml"))
+    if not quarantined:
+        # Refused before the record was consumed: it is still under its own
+        # name, unchanged. This is the original assertion, unrelaxed.
+        assert proposal.read_bytes() == contents
+        return
+    # Consumed and retained. The reviewed bytes survive in exactly one
+    # place — never at the record's own name and in quarantine at once,
+    # which would mean something was copied rather than moved.
+    assert not proposal.exists(), proposal
+    assert len(quarantined) == 1, quarantined
+    assert quarantined[0].read_bytes() == contents
 
 
 def _prepared_transaction(
@@ -457,10 +860,12 @@ def test_approval_lock_closes_and_releases_when_unlock_fails(tmp_path, monkeypat
     monkeypatch.setattr(transaction.os, "close", record_close)
     monkeypatch.setattr(transaction.os, "open", record_lock_open)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         with transaction._approval_lock(vault):
             pass
 
+    assert type(raised.value).__name__ == "ActionLockCleanupFailure"
+    assert type(raised.value) is transaction.ActionLockCleanupFailure
     assert isinstance(raised.value.__cause__, OSError)
     assert str(raised.value.__cause__) == "injected unlock failure"
     assert set(opened_descriptors).issubset(closed_descriptors)
@@ -517,7 +922,14 @@ def test_unrelated_staged_unstaged_and_untracked_state_is_preserved_exactly(tmp_
     git_bytes(vault, "add", "staged.md")
     unrelated_unstaged.write_bytes(unstaged_bytes)
     unrelated_untracked.write_bytes(untracked_bytes)
+    # Amendment 1: an owned proposal is consumed by moving it into
+    # quarantine, so its destination is the transaction's own effect and not
+    # unrelated state that changed underneath it.
+    from app.git_transaction import quarantine_destination
+
     status_exclusions = set(plan.commit_paths) | {
+        quarantine_destination(change.path) for change in plan.owned_changes
+    } | {
         change.path for change in plan.owned_changes
     }
     status_before = _unrelated_status(vault, status_exclusions)
@@ -584,7 +996,9 @@ def test_same_path_replacement_before_staging_is_not_committed(
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.read_bytes() == b"same-path replacement\n"
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 @pytest.mark.parametrize(
@@ -616,14 +1030,15 @@ def test_hook_cannot_replace_reviewed_commit_tree_entry(
     hook.write_text("#!/bin/sh\nset -eu\n" + hook_body, encoding="utf-8")
     hook.chmod(0o755)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
+    assert type(raised.value) is transaction.GitTransactionFailure
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Stage 2: a pre-commit refusal never consumes the proposal.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_commit_tree_mode_uses_git_owner_execute_normalization(tmp_path):
@@ -677,7 +1092,9 @@ def test_hook_same_path_replacement_after_staging_blocks_success(tmp_path):
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.read_bytes() == b"concurrent replacement\n"
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_head_advance_after_transaction_commit_blocks_success(tmp_path, monkeypatch):
@@ -717,7 +1134,9 @@ def test_head_advance_after_transaction_commit_blocks_success(tmp_path, monkeypa
     assert git_head(vault) == newer_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
     assert git_head(vault) != start_head
 
 
@@ -738,7 +1157,9 @@ def test_reviewed_staged_change_is_refused_before_filesystem_mutation(tmp_path):
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_reviewed_unstaged_change_is_refused_before_filesystem_mutation(tmp_path):
@@ -756,7 +1177,9 @@ def test_reviewed_unstaged_change_is_refused_before_filesystem_mutation(tmp_path
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"unexpected unstaged\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_owned_proposal_mismatch_is_refused_before_filesystem_mutation(tmp_path):
@@ -773,7 +1196,7 @@ def test_owned_proposal_mismatch_is_refused_before_filesystem_mutation(tmp_path)
     assert git_head(vault) == start_head
     assert source.read_bytes() == b"reviewed\n"
     assert destination.exists() is False
-    assert proposal.read_bytes() == b"different proposal\n"
+    _assert_record_retained(vault, proposal, b"different proposal\n")
 
 
 @pytest.mark.parametrize("proposal_git_state", ("staged", "tracked"))
@@ -797,7 +1220,9 @@ def test_owned_proposal_must_be_absent_from_real_index_and_head(
     assert git_head(vault) == start_head
     assert git_status_bytes(vault) == status_before
     assert git_index_entries(vault) == index_before
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
     assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
     assert (vault / plan.commit_paths[1]).exists() is False
 
@@ -839,11 +1264,12 @@ def test_failure_at_every_phase_restores_owned_and_unrelated_state(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_here, raising=False)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
     assert list(index_directory.iterdir()) == []
     with transaction._approval_lock(vault):
         pass
@@ -857,11 +1283,12 @@ def test_rejecting_hook_restores_exact_starting_state(tmp_path, monkeypatch):
     hook.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
     hook.chmod(0o755)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
     assert _exception_chain_contains(raised.value, subprocess.CalledProcessError)
     assert list(index_directory.iterdir()) == []
     with transaction._approval_lock(vault):
@@ -936,7 +1363,9 @@ def test_head_ownership_preserves_newer_ref_during_recovery(tmp_path, monkeypatc
     assert git_head(vault) == newer_head
     current = _complete_state(vault, plan, index_directory)
     current["head"] = before["head"]
-    assert current == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value, current=current
+    )
     assert list(index_directory.iterdir()) == []
     with transaction._approval_lock(vault):
         pass
@@ -981,7 +1410,9 @@ def test_forward_index_sync_preserves_concurrent_reviewed_index_update(
         assert current[key] == before[key]
     assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
     assert (vault / destination).exists() is False
-    assert (vault / plan.owned_changes[0].path).read_bytes() == b"proposal\n"
+    _assert_record_retained(
+        vault, vault / plan.owned_changes[0].path, b"proposal\n"
+    )
     assert list(index_directory.iterdir()) == []
 
 
@@ -1081,15 +1512,16 @@ def test_forward_index_replace_then_exception_restores_exact_starting_state(
 
     monkeypatch.setattr(transaction.os, "replace", fail_after_real_index_replace)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
     assert type(raised.value) is transaction.GitTransactionFailure
-    assert str(raised.value) == "approval transaction failed and was rolled back"
     assert _exception_chain_contains(raised.value, OSError)
     assert replace_completed is True
     assert git_index_entries(vault) == starting_index
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
     assert index_lock.exists() is False
     with transaction._approval_lock(vault):
         pass
@@ -1179,13 +1611,15 @@ def test_recovery_holds_real_index_lock_across_compare_and_restore(
     monkeypatch.setattr(transaction, "_checkpoint", fail_after_index_sync)
     monkeypatch.setattr(transaction, "_git", race_restore)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
     assert type(raised.value) is transaction.GitTransactionFailure
     assert concurrent_attempt is not None
     assert concurrent_attempt.returncode != 0
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
 
 
 def test_unmerged_unrelated_stage_mutation_is_detected_during_recovery(
@@ -1224,7 +1658,9 @@ def test_unmerged_unrelated_stage_mutation_is_detected_during_recovery(
     assert (vault / conflict).read_bytes() == b"worktree stays constant\n"
     assert (vault / plan.commit_paths[0]).read_bytes() == b"reviewed\n"
     assert (vault / plan.commit_paths[1]).exists() is False
-    assert proposal.read_bytes() == b"proposal\n"
+    # Amendment 3, stage 1: rollback retains the record rather than
+    # renaming it back. Its bytes are unchanged, in quarantine.
+    _assert_record_retained(vault, proposal, b"proposal\n")
 
 
 def test_failure_after_commit_returns_before_ownership_capture_restores_head(
@@ -1242,11 +1678,12 @@ def test_failure_after_commit_returns_before_ownership_capture_restores_head(
         transaction, "_checkpoint", fail_before_ownership_capture
     )
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
 
 
 def test_concurrent_head_before_ownership_capture_is_never_claimed(
@@ -1289,7 +1726,9 @@ def test_concurrent_head_before_ownership_capture_is_never_claimed(
     assert git_head(vault) == newer_head
     current = _complete_state(vault, plan, index_directory)
     current["head"] = before["head"]
-    assert current == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value, current=current
+    )
 
 
 def test_failure_after_real_mutation_before_apply_returns_restores_state(
@@ -1305,11 +1744,12 @@ def test_failure_after_real_mutation_before_apply_returns_restores_state(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_before_apply_returns)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
-    assert str(raised.value) == "approval transaction failed and was rolled back"
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
 
 
 def test_concurrent_replacement_before_apply_returns_is_preserved(
@@ -1360,7 +1800,7 @@ def test_pre_commit_failure_with_cleanup_failure_is_typed_and_restores_state(
     hook.chmod(0o755)
     _inject_temporary_index_cleanup_failure(monkeypatch, index_directory)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
     assert type(raised.value) is transaction.GitTransactionFailure
@@ -1371,7 +1811,9 @@ def test_pre_commit_failure_with_cleanup_failure_is_typed_and_restores_state(
     current = _complete_state(vault, plan, index_directory)
     leaked_indexes = current["temporary_indexes"]
     current["temporary_indexes"] = before["temporary_indexes"]
-    assert current == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value, current=current
+    )
     assert leaked_indexes
     with transaction._approval_lock(vault):
         pass
@@ -1456,11 +1898,10 @@ def test_lock_teardown_failure_preserves_original_transaction_failure(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_before_commit)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
     assert type(raised.value) is transaction.GitTransactionFailure
-    assert str(raised.value) == "approval transaction failed and was rolled back"
     assert isinstance(raised.value.__cause__, OSError)
     assert str(raised.value.__cause__) == "injected transaction body failure"
     assert git_head(vault) == start_head
@@ -1505,10 +1946,990 @@ def test_sha256_post_commit_failure_restores_exact_starting_state(
 
     monkeypatch.setattr(transaction, "_checkpoint", fail_after_commit_capture)
 
-    with pytest.raises(transaction.GitTransactionFailure) as raised:
+    with pytest.raises(transaction.GitTransactionError) as raised:
         transaction.execute_transaction(vault, plan)
 
     assert type(raised.value) is transaction.GitTransactionFailure
-    assert str(raised.value) == "approval transaction failed and was rolled back"
     assert len(before["head"]) == 64
-    assert _complete_state(vault, plan, index_directory) == before
+    _assert_everything_else_rolled_back(
+        vault, plan, index_directory, before, raised.value
+    )
+
+
+# --- S7 Task 3c: quarantine safety, replacing the retired removal tests ----
+#
+# The `remove_path_if_unchanged` suite that stood here was deleted with the
+# primitive it exercised: Amendment 1 forbids deleting a proposal record, so
+# a conditional *removal* has nothing left to test. Its still-relevant
+# conditions — unsafe paths, an absent expected state, and unrelated Git
+# state — are carried over to the quarantine primitive below.
+
+
+def _conditional_vault(tmp_path):
+    from tests.conftest import git_vault
+
+    vault = git_vault(tmp_path, {"tracked.md": "tracked\n"})
+    leaf = vault / "outbox-record.yaml"
+    leaf.write_bytes(b"id: probe\nvalue: first\n")
+    return vault, leaf
+
+
+def test_quarantine_refuses_an_absent_expected_state(tmp_path):
+    from app.git_transaction import PathState, quarantine_path_if_unchanged
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    with pytest.raises(ValueError):
+        quarantine_path_if_unchanged(
+            vault, "outbox-record.yaml", PathState.absent()
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe", ["/absolute.yaml", "../escape.yaml", ".git/config", "", "a//b.yaml"]
+)
+def test_quarantine_refuses_an_unsafe_path(tmp_path, unsafe):
+    from app.git_transaction import (
+        InvalidTransactionPath,
+        PathState,
+        quarantine_path_if_unchanged,
+    )
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    with pytest.raises(InvalidTransactionPath):
+        quarantine_path_if_unchanged(
+            vault, unsafe, PathState.regular(b"probe", 0o644)
+        )
+
+
+def test_quarantine_leaves_unrelated_git_state_untouched(tmp_path):
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+    from tests.conftest import git_cached_diff, git_worktree_diff
+
+    vault, leaf = _conditional_vault(tmp_path)
+    (vault / "tracked.md").write_text("locally edited\n", encoding="utf-8")
+    worktree_before = git_worktree_diff(vault)
+    cached_before = git_cached_diff(vault)
+
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert not leaf.exists()
+    assert git_worktree_diff(vault) == worktree_before
+    assert git_cached_diff(vault) == cached_before
+
+
+def test_quarantine_makes_no_commit(tmp_path):
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+    from tests.conftest import git_count_commits, git_head
+
+    vault, _leaf = _conditional_vault(tmp_path)
+    head_before, commits_before = git_head(vault), git_count_commits(vault)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert git_head(vault) == head_before
+    assert git_count_commits(vault) == commits_before
+
+
+# --- S7 Task 3c: consumption by quarantine, never by deletion ---------------
+
+
+def test_atomic_move_refuses_an_occupied_destination(tmp_path):
+    """The one primitive everything rests on: a single kernel operation that
+    moves and fails if the destination exists. An ordinary rename would
+    silently overwrite."""
+    from app.git_transaction import _move_no_replace
+
+    (tmp_path / "src").write_bytes(b"SRC\n")
+    (tmp_path / "occupied").write_bytes(b"MUST SURVIVE\n")
+    descriptor = os.open(tmp_path, os.O_RDONLY)
+    try:
+        with pytest.raises(FileExistsError):
+            _move_no_replace(descriptor, "src", descriptor, "occupied")
+        assert (tmp_path / "occupied").read_bytes() == b"MUST SURVIVE\n"
+        assert (tmp_path / "src").read_bytes() == b"SRC\n"
+
+        _move_no_replace(descriptor, "src", descriptor, "free")
+        assert (tmp_path / "free").read_bytes() == b"SRC\n"
+        assert not (tmp_path / "src").exists()
+    finally:
+        os.close(descriptor)
+
+
+def test_no_reviewed_action_can_unlink_a_proposal_record():
+    """The structural guarantee of Amendment 1, checked by AST: proposal
+    consumption never reaches an unlink."""
+    import ast
+    import pathlib as _pathlib
+
+    root = _pathlib.Path(__file__).resolve().parents[1]
+    source = (root / "app" / "git_transaction.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    consuming = {
+        "quarantine_path_if_unchanged",
+        "_quarantine_reviewed_leaf",
+        "restore_quarantined_leaf",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in consuming:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    name = getattr(inner.func, "attr", getattr(inner.func, "id", ""))
+                    assert name != "unlink", (
+                        f"{node.name} reaches unlink — Amendment 1 forbids it"
+                    )
+    # And the destructive primitive it replaces is gone entirely.
+    assert "def remove_path_if_unchanged" not in source
+
+
+def test_quarantine_moves_the_reviewed_record_and_keeps_its_bytes(tmp_path):
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    name = quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert not leaf.exists()
+    quarantined = vault / ".consumed" / name.name
+    assert quarantined.read_bytes() == reviewed
+
+
+def test_quarantine_refuses_a_changed_record_and_restores_it(tmp_path):
+    from app.git_transaction import (
+        ReviewedStateChanged,
+        capture_path_state,
+        quarantine_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    replacement = b"id: probe\nvalue: REPLACEMENT\n"
+    leaf.write_bytes(replacement)
+
+    with pytest.raises(ReviewedStateChanged):
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert leaf.read_bytes() == replacement
+    assert not (vault / ".consumed").exists() or not any(
+        (vault / ".consumed").iterdir()
+    )
+
+
+def _after_forward_move(gt, vault, action):
+    """Wrap the atomic move so `action` runs once, right after the forward
+    move into quarantine and before the file is verified — the only seam
+    where a swap can still change what gets consumed."""
+    real = gt._move_no_replace
+    fired = []
+
+    def wrapper(from_fd, from_name, to_fd, to_name):
+        real(from_fd, from_name, to_fd, to_name)
+        if not fired:
+            fired.append(True)
+            action()
+
+    return real, wrapper, fired
+
+
+
+
+def test_a_post_verification_rewrite_cannot_destroy_anything(tmp_path):
+    """The residual that deletion could never close is simply not harmful
+    here. A rewrite landing after verification changes a record that has
+    already been consumed; the reviewed bytes were the ones moved, and
+    nothing was destroyed. There is no unlink left to race."""
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    real_held = gt._held_state
+    fired = []
+    calls = []
+
+    def rewrite_after_verifying(descriptor):
+        state = real_held(descriptor)
+        # The second call is the post-move verification; the first runs on
+        # the source, when nothing is in quarantine yet.
+        calls.append(1)
+        if len(calls) == 2:
+            fired.append(True)
+            next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(b"LATER\n")
+        return state
+
+    gt._held_state = rewrite_after_verifying
+    try:
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._held_state = real_held
+
+    assert fired
+    assert not leaf.exists()                       # consumed, as reviewed
+    quarantined = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert len(quarantined) == 1                   # nothing destroyed
+
+
+
+
+def test_quarantine_fails_closed_when_the_atomic_move_is_unavailable(tmp_path):
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    def unavailable(*_args, **_kwargs):
+        raise gt.AtomicMoveUnavailable("no atomic no-overwrite move here")
+
+    real = gt._move_no_replace
+    gt._move_no_replace = unavailable
+    try:
+        with pytest.raises(gt.AtomicMoveUnavailable) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._move_no_replace = real
+
+    # Nothing changed, and no destructive fallback ran.
+    assert leaf.read_bytes() == reviewed
+    outcome = describe(raised.value)
+    assert outcome.committed == "no"
+    assert outcome.code != "E-UNKNOWN"
+
+
+@pytest.mark.parametrize("shape", ["symlink", "file", "outside-entity"])
+def test_quarantine_refuses_a_redirected_or_invalid_consumed_directory(
+    tmp_path, shape
+):
+    from app.git_transaction import (
+        ReviewedStateConflict,
+        capture_path_state,
+        quarantine_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    consumed = vault / ".consumed"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if shape == "symlink":
+        consumed.symlink_to(outside, target_is_directory=True)
+    elif shape == "file":
+        consumed.write_bytes(b"not a directory\n")
+    else:
+        consumed.symlink_to(outside.resolve(), target_is_directory=True)
+
+    with pytest.raises(ReviewedStateConflict):
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    assert leaf.read_bytes() == reviewed
+    assert not list(outside.iterdir()), "a record was written outside the entity"
+
+
+def test_a_refusal_leaves_the_quarantine_directory_but_no_record(tmp_path):
+    """There is no cleanup step left to fail invisibly.
+
+    The quarantine directory is durable infrastructure — created on first
+    use and never removed. Removing it again after a refusal would add a
+    step whose failure the operator could not see, since the refusal they
+    are shown is about the proposal. An empty directory is not vault
+    content; a silently failing cleanup is a lie about state.
+    """
+    import app.git_transaction as gt
+    from app.git_transaction import (
+        ReviewedStateChanged,
+        capture_path_state,
+        quarantine_path_if_unchanged,
+    )
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    changed = b"id: probe\nvalue: changed\n"
+    leaf.write_bytes(changed)
+
+    with pytest.raises(ReviewedStateChanged):
+        quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+
+    # Every proposal record is exactly as the refusal found it ...
+    assert leaf.read_bytes() == changed
+    # ... and the directory, if it was created, holds nothing.
+    quarantine = vault / gt.QUARANTINE_DIRECTORY
+    assert not quarantine.exists() or not list(quarantine.iterdir())
+
+
+@pytest.mark.parametrize("code", ["ENOSYS", "EINVAL", "ENOTSUP", "EOPNOTSUPP"])
+def test_an_unsupported_errno_fails_closed_and_never_falls_back(tmp_path, code):
+    """The errno path itself, not a patched-out `_move_no_replace`.
+
+    A kernel or filesystem that cannot do the atomic move reports it through
+    errno. That must become a refusal — never a plain `rename`, which would
+    silently overwrite the destination and reintroduce the exact destructive
+    behaviour Amendment 1 removes.
+    """
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    occupied = vault / "occupied"
+    occupied.write_bytes(b"MUST SURVIVE\n")
+
+    real = gt._MOVE_NO_REPLACE
+
+    def unsupported(_ffd, _f, _tfd, _t):
+        ctypes.set_errno(getattr(_errno, code))
+        return -1
+
+    gt._MOVE_NO_REPLACE = unsupported
+    descriptor = os.open(vault, os.O_RDONLY)
+    try:
+        with pytest.raises(gt.AtomicMoveUnavailable):
+            gt._move_no_replace(descriptor, "outbox-record.yaml", descriptor, "occupied")
+    finally:
+        os.close(descriptor)
+        gt._MOVE_NO_REPLACE = real
+
+    # No fallback ran: neither file moved, and the occupant is intact.
+    assert leaf.read_bytes() == reviewed
+    assert occupied.read_bytes() == b"MUST SURVIVE\n"
+
+
+def test_a_consumption_fails_closed_end_to_end_on_an_unsupported_errno(tmp_path):
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    real = gt._MOVE_NO_REPLACE
+
+    def unsupported(_ffd, _f, _tfd, _t):
+        ctypes.set_errno(_errno.ENOTSUP)
+        return -1
+
+    gt._MOVE_NO_REPLACE = unsupported
+    try:
+        with pytest.raises(gt.AtomicMoveUnavailable) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._MOVE_NO_REPLACE = real
+
+    assert leaf.read_bytes() == reviewed
+    quarantine = vault / gt.QUARANTINE_DIRECTORY
+    assert not quarantine.exists() or not list(quarantine.iterdir())
+    assert describe(raised.value).code == "E-UNSUPPORTED"
+    assert describe(raised.value).committed == "no"
+
+
+# --- Task 3c review: restoration failure, creation race, directory swaps ----
+
+
+
+
+def test_a_quarantine_creation_race_refuses_rather_than_accepting_it(tmp_path):
+    """P1 (review): `FileExistsError` from `mkdir` means something appeared
+    between the check and the creation. Whatever appeared was not
+    established by this call, so it is refused, not adopted."""
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    reviewed = leaf.read_bytes()
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    real_mkdir = gt.os.mkdir
+
+    def raced(path, mode=0o777, *, dir_fd=None):
+        if path == gt.QUARANTINE_DIRECTORY:
+            raise FileExistsError(17, "File exists", path)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    gt.os.mkdir = raced
+    try:
+        with pytest.raises(gt.ReviewedPathIntegrityError) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt.os.mkdir = real_mkdir
+
+    # An integrity finding about the directory that appeared — not merely
+    # "unavailable", which is what adopting it and then failing to open it
+    # would produce.
+    from app.console_errors import describe
+
+    assert describe(raised.value).code == "E-TAMPER"
+    assert leaf.read_bytes() == reviewed
+
+
+@pytest.mark.parametrize("target", ["quarantine", "outbox"])
+@pytest.mark.parametrize("replacement", ["symlink", "real-directory"])
+def test_a_directory_swapped_between_open_and_name_check_is_refused(
+    tmp_path, target, replacement
+):
+    """P1 (review): the required live swap, not a pre-configured symlink.
+
+    The descriptor is opened first, then its name is checked against it. The
+    directory is replaced between those two operations. Nothing may be
+    written or moved through the replacement.
+    """
+    import app.git_transaction as gt
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    from tests.conftest import git_vault
+
+    vault = git_vault(tmp_path, {"tracked.md": "tracked\n"})
+    outbox = vault / "outbox"
+    outbox.mkdir()
+    leaf = outbox / "record.yaml"
+    leaf.write_bytes(b"id: probe\nvalue: first\n")
+    reviewed = leaf.read_bytes()
+    (outbox / gt.QUARANTINE_DIRECTORY).mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    expected = capture_path_state(vault, "outbox/record.yaml")
+    watched = gt.QUARANTINE_DIRECTORY if target == "quarantine" else "outbox"
+    real_lstat = gt.os.lstat
+    swapped = []
+
+    def lstat_then_swap(path, *args, **kwargs):
+        if path == watched and not swapped:
+            swapped.append(True)
+            victim = outbox / gt.QUARANTINE_DIRECTORY if target == "quarantine" else outbox
+            for entry in victim.iterdir():
+                entry.rename(tmp_path / f"stash-{entry.name}")
+            victim.rmdir()
+            if replacement == "symlink":
+                victim.symlink_to(outside, target_is_directory=True)
+            else:
+                # A real directory, so `O_NOFOLLOW` opens it happily. Only
+                # re-verifying the descriptor's identity against what was
+                # validated can catch this one.
+                victim.mkdir()
+        return real_lstat(path, *args, **kwargs)
+
+    gt.os.lstat = lstat_then_swap
+    try:
+        # Every swap is refused, symlink or not. The opened descriptor is
+        # verified against the name after the swap, so a substituted real
+        # directory is just as detectable as a redirection — sameness of
+        # path is not sameness of file.
+        with pytest.raises(gt.ReviewedPathIntegrityError) as raised:
+            quarantine_path_if_unchanged(vault, "outbox/record.yaml", expected)
+    finally:
+        gt.os.lstat = real_lstat
+
+    from app.console_errors import describe
+
+    assert describe(raised.value).code == "E-TAMPER"
+
+    assert swapped, "the probe never swapped the directory"
+    assert not list(outside.iterdir()), "a record was moved outside the entity"
+    substitute = outbox / gt.QUARANTINE_DIRECTORY if target == "quarantine" else outbox
+    if substitute.is_dir() and not substitute.is_symlink():
+        assert not [
+            entry for entry in substitute.iterdir() if entry.name.endswith(".yaml")
+        ], "a record was moved into the substituted directory"
+    stashed = tmp_path / "stash-record.yaml"
+    if stashed.exists():
+        assert stashed.read_bytes() == reviewed
+
+
+def _vault_snapshot(root: Path):
+    """Every name, mode and byte under `root`, for proving nothing changed."""
+    entries = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        info = path.lstat()
+        entries[relative] = (
+            stat.S_IFMT(info.st_mode),
+            stat.S_IMODE(info.st_mode),
+            path.read_bytes() if path.is_file() and not path.is_symlink() else None,
+        )
+    return entries
+
+
+def _refuse_all_writes(monkeypatch, root: Path):
+    """Make any attempt to create or remove anything under `root` fail loudly.
+
+    A snapshot comparison proves no *surviving* artifact. It cannot prove no
+    write happened: a probe that creates a file and deletes it again leaves
+    the tree identical. This closes that gap, and it is also the
+    cleanup-failure condition — `unlink` here raises, so a classifier that
+    created something could not tidy it away even if it tried.
+    """
+    attempts = []
+    real_open, real_unlink, real_rename = os.open, os.unlink, os.rename
+
+    def guard(name, real, *, creates):
+        def wrapped(*args, **kwargs):
+            target = args[0] if args else None
+            # `os.rename` has no `dir_fd`; it has `src_dir_fd`/`dst_dir_fd`,
+            # and a probe using those passes *relative* names. Checking only
+            # `dir_fd` and absoluteness let exactly that shape through
+            # unrecorded, which made this weaker than its docstring.
+            relative_to_a_descriptor = any(
+                kwargs.get(name) is not None
+                for name in ("dir_fd", "src_dir_fd", "dst_dir_fd")
+            )
+            inside = relative_to_a_descriptor
+            if not inside:
+                try:
+                    candidate = Path(os.fsdecode(target))
+                    inside = candidate.is_absolute() and (
+                        root in candidate.parents or candidate == root
+                    )
+                except (TypeError, ValueError):
+                    inside = False
+            if inside and creates(args, kwargs):
+                attempts.append((name, target))
+                raise OSError(errno.EACCES, "refused by test guard")
+            return real(*args, **kwargs)
+        return wrapped
+
+    monkeypatch.setattr(
+        os, "open",
+        guard("open", real_open,
+              creates=lambda a, k: bool((a[1] if len(a) > 1 else 0) & os.O_CREAT)),
+    )
+    monkeypatch.setattr(
+        os, "unlink", guard("unlink", real_unlink, creates=lambda a, k: True)
+    )
+    monkeypatch.setattr(
+        os, "rename", guard("rename", real_rename, creates=lambda a, k: True)
+    )
+    return attempts
+
+
+@pytest.mark.parametrize(
+    "blocked, argument_errno",
+    [
+        # Which argument error a reachable syscall returns is platform
+        # dependent — `EBADF` on some, `ENOENT` on macOS — so the
+        # classification is driven under both. Nothing may depend on the
+        # specific value, only on its not being `EPERM`.
+        (False, errno.EBADF),
+        (False, errno.ENOENT),
+        (True, None),
+    ],
+    ids=["one-file-ebadf", "one-file-enoent", "syscall-blocked"],
+)
+def test_eperm_classification_writes_nothing_into_the_vault(
+    tmp_path, monkeypatch, blocked, argument_errno
+):
+    """P1 (review): classifying `EPERM` must not touch the vault.
+
+    An earlier version answered the "syscall or operands?" question by
+    creating a file in the *target directory* and moving it. That is a
+    write inside the vault on a refusal path, outside the Git transaction,
+    and its cleanup suppressed `OSError` so an artifact could survive —
+    the exact invariant S5 and S7 hold. The claim "neither path mutates
+    anything" was false while that probe existed.
+
+    Both classifications are driven here, under a guard that fails any
+    create, unlink or rename under the vault — which is simultaneously the
+    cleanup-failure condition, since a classifier that created something
+    could not remove it. The tree is compared byte-for-byte as well, so
+    neither a surviving artifact nor a create-then-delete passes.
+    """
+    vault = tmp_path / "vault"
+    (vault / "outbox").mkdir(parents=True)
+    (vault / "outbox/locked").write_text("reviewed\n", encoding="utf-8")
+    directory = vault / "outbox"
+
+    monkeypatch.setattr(transaction, "_MOVE_REACHABLE", None)
+    monkeypatch.setattr(
+        transaction, "_MOVE_NO_REPLACE",
+        _eperm_mover(
+            blocked=blocked,
+            **({} if argument_errno is None else {"argument_errno": argument_errno}),
+        ),
+    )
+
+    before = _vault_snapshot(vault)
+    attempts = _refuse_all_writes(monkeypatch, vault)
+
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        with pytest.raises(Exception) as caught:
+            transaction._move_no_replace(
+                descriptor, "locked", descriptor, "moved"
+            )
+    finally:
+        os.close(descriptor)
+
+    if blocked:
+        assert isinstance(caught.value, transaction.AtomicMoveUnavailable)
+    else:
+        assert not isinstance(caught.value, transaction.AtomicMoveUnavailable)
+        assert caught.value.errno == errno.EPERM
+
+    assert attempts == [], f"classification attempted vault writes: {attempts}"
+    assert _vault_snapshot(vault) == before
+
+
+def _eperm_mover(*, blocked, argument_errno=errno.EBADF):
+    """A stand-in mover modelling the two ways `EPERM` can arise.
+
+    `blocked=True` is a seccomp-filtered syscall: it answers `EPERM` to
+    everything, argument-validity included, because the filter runs before
+    the kernel reads any argument. `blocked=False` is a reachable syscall
+    that refuses one particular operand — so the classifier's no-operand
+    call reaches argument validation and gets a non-`EPERM` argument error,
+    as the real syscall does. Which error is platform-dependent (`EBADF` on
+    some, `ENOENT` on macOS), so `EBADF` here stands for that whole class
+    and nothing depends on the specific value.
+    """
+    def move(from_descriptor, from_name, to_descriptor, to_name):
+        if blocked:
+            ctypes.set_errno(errno.EPERM)
+            return -1
+        if from_descriptor < 0 or not from_name:
+            ctypes.set_errno(argument_errno)
+            return -1
+        if os.fsdecode(from_name) == "locked":
+            ctypes.set_errno(errno.EPERM)
+            return -1
+        return os.rename(
+            os.fsdecode(from_name), os.fsdecode(to_name),
+            src_dir_fd=from_descriptor, dst_dir_fd=to_descriptor,
+        ) or 0
+    return move
+
+
+def test_eperm_about_one_file_is_not_reported_as_a_platform_limit(tmp_path, monkeypatch):
+    """Item 6 (review): `EPERM` was classed as "unsupported" unconditionally.
+
+    It is ambiguous. A seccomp filter that blocks `renameat2` answers
+    `EPERM` — Docker's default profile did — and that really is a
+    capability problem. But `EPERM` is equally the kernel's answer for a
+    refusal about *these files*: an immutable or append-only attribute, or
+    a sticky-bit directory holding a file this process does not own.
+
+    Collapsing both into `AtomicMoveUnavailable` told the operator "this
+    vault's filesystem cannot move files safely" — a whole-vault verdict
+    at `attention` severity, status 500 — when one file was unwritable.
+    Neither path mutates anything, so this is about the claim, not safety.
+
+    Here the probe's own files move fine, so the `EPERM` is about the
+    operand and must surface as the error it is.
+    """
+    directory = tmp_path / "d"
+    directory.mkdir()
+    (directory / "locked").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(transaction, "_MOVE_REACHABLE", None)
+    monkeypatch.setattr(
+        transaction, "_MOVE_NO_REPLACE",
+        _eperm_mover(blocked=False),
+    )
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        with pytest.raises(OSError) as caught:
+            transaction._move_no_replace(
+                descriptor, "locked", descriptor, "moved"
+            )
+    finally:
+        os.close(descriptor)
+
+    assert not isinstance(caught.value, transaction.AtomicMoveUnavailable)
+    assert caught.value.errno == errno.EPERM
+    # The probe cleaned up after itself: only the operand is left behind.
+    assert {p.name for p in directory.iterdir()} == {"locked"}
+
+
+def test_eperm_on_every_file_is_still_reported_as_a_platform_limit(tmp_path, monkeypatch):
+    """The other half: a blanket `EPERM` is a blocked syscall.
+
+    Without this, narrowing the classification above would turn a
+    seccomp-blocked `renameat2` into a raw `OSError` that no longer maps
+    to E-UNSUPPORTED, and Amendment 1's fail-closed refusal would lose
+    the outcome that explains itself.
+    """
+    directory = tmp_path / "d"
+    directory.mkdir()
+    (directory / "locked").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(transaction, "_MOVE_REACHABLE", None)
+    monkeypatch.setattr(
+        transaction, "_MOVE_NO_REPLACE",
+        _eperm_mover(blocked=True),
+    )
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        with pytest.raises(transaction.AtomicMoveUnavailable):
+            transaction._move_no_replace(
+                descriptor, "locked", descriptor, "moved"
+            )
+    finally:
+        os.close(descriptor)
+
+    assert {p.name for p in directory.iterdir()} == {"locked"}
+
+
+def test_a_substituted_quarantine_entry_is_refused_and_nothing_further_moves(
+    tmp_path,
+):
+    """P1 (review) / Amendment 2: the substitution outcome, in full.
+
+    Verification used to open the moved record *by name* in `.consumed/`
+    and compare only contents and mode, so a writer who replaced that name
+    had the substitute verified. Adding the identity check caught the
+    substitution — and then `_restore()` moved the substitute back under
+    the *reviewed record's* name, while the reviewed inode, unlinked by
+    the substitution, died when the descriptor closed. Measured on that
+    implementation: no link to the reviewed inode anywhere in the vault,
+    the proposal's own name holding the decoy's bytes, and an outcome of
+    `E-CONFLICT` / `committed=no` — "nothing was changed".
+
+    The earlier version of this test asserted `leaf.exists() or ...`,
+    which the decoy satisfied. It proved nothing about *which* object
+    survived, which is the only question that matters here.
+
+    So: name every inode, and assert exactly what is where afterwards.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    reviewed_bytes = leaf.read_bytes()
+    reviewed_inode = leaf.stat().st_ino
+    decoy_bytes = b"DECOY-SUBSTITUTE\n"
+    assert decoy_bytes != reviewed_bytes
+
+    real_move = gt._MOVE_NO_REPLACE
+    substitution = {}
+
+    def move_then_substitute(from_fd, from_name, to_fd, to_name):
+        outcome = real_move(from_fd, from_name, to_fd, to_name)
+        if outcome == 0 and not substitution:
+            landed = next((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+            decoy = landed.with_name(landed.name + ".decoy")
+            decoy.write_bytes(decoy_bytes)
+            decoy.chmod(landed.stat().st_mode)
+            os.replace(decoy, landed)          # unlinks the reviewed inode
+            substitution["name"] = landed.name
+            substitution["inode"] = landed.stat().st_ino
+        return outcome
+
+    gt._MOVE_NO_REPLACE = move_then_substitute
+    try:
+        with pytest.raises(gt.QuarantineEntrySubstituted) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+
+    assert substitution, "the substitution never happened"
+    assert substitution["inode"] != reviewed_inode
+
+    # 1. The exact outcome Amendment 2 closes.
+    outcome = describe(raised.value)
+    assert outcome.code == "E-SUBSTITUTED", outcome.code
+    assert outcome.committed == "unknown"
+    assert outcome.retry == "stop"
+    assert "may no longer exist" in outcome.message
+    assert "Nothing was changed" not in outcome.message
+    # 2. `st_nlink` is carried as evidence, and is the truth here: the
+    #    substitution unlinked the reviewed inode's only name.
+    assert raised.value.link_count == 0, raised.value.link_count
+
+    # 3. Nothing further moved. The substitute is exactly where the writer
+    #    put it, under the name it took, with its own bytes.
+    quarantined = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert [p.name for p in quarantined] == [substitution["name"]]
+    assert quarantined[0].stat().st_ino == substitution["inode"]
+    assert quarantined[0].read_bytes() == decoy_bytes
+
+    # 4. And above all: the decoy was NOT installed under the reviewed
+    #    record's name. That name is empty — the move happened and is not
+    #    undone — rather than holding an object nobody reviewed.
+    assert not leaf.exists(), leaf.read_bytes()
+    # And it is nowhere else in the vault either — quarantine is the one
+    # place it belongs, because that is where its writer put it.
+    elsewhere = [
+        p
+        for p in vault.rglob("*")
+        if p.is_file()
+        and gt.QUARANTINE_DIRECTORY not in p.parts
+        and ".git" not in p.parts
+        and p.read_bytes() == decoy_bytes
+    ]
+    assert not elsewhere, elsewhere
+
+
+def test_a_rewrite_landing_in_quarantine_is_refused_and_nothing_moves_back(
+    tmp_path,
+):
+    """Amendment 3: the seam from Task 3, with the remedy withdrawn.
+
+    A rewrite that lands after the record reaches quarantine but before
+    verification must still refuse — identity alone cannot see it, which
+    is why the contents check survives Amendment 3. What does not survive
+    is the old response. This test previously asserted "the record goes
+    back under its own name and no bytes are lost on any path"; putting it
+    back meant renaming by a name that had just been proved untrustworthy,
+    which is the defect Amendment 3 closes.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    expected = capture_path_state(vault, "outbox-record.yaml")
+    rewritten = b"REWRITTEN-IN-QUARANTINE\n"
+
+    def rewrite_the_quarantined_file():
+        next((vault / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(rewritten)
+
+    real, wrapper, fired = _after_forward_move(gt, vault, rewrite_the_quarantined_file)
+    gt._move_no_replace = wrapper
+    try:
+        with pytest.raises(gt.QuarantineEntrySubstituted) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._move_no_replace = real
+
+    assert fired, "the probe never fired"
+    assert raised.value.condition == "rewritten", raised.value.condition
+    assert describe(raised.value).code == "E-SUBSTITUTED"
+
+    # Nothing was renamed back: the record's own name is empty, and the
+    # rewritten bytes stayed exactly where the writer put them.
+    assert not leaf.exists(), leaf.read_bytes()
+    quarantined = list((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+    assert [q.read_bytes() for q in quarantined] == [rewritten]
+
+
+def test_a_transaction_closes_every_descriptor_it_took_ownership_of(tmp_path):
+    """P1 (review): Amendment 3 made the transaction the descriptor's owner.
+
+    `_quarantine_reviewed_leaf` used to close the descriptor itself. Stage
+    1 requires it held through commit and rollback diagnosis, so ownership
+    moved up — and nothing closed it. Every approve and every registry
+    delete leaked one descriptor, on success and on failure alike;
+    measured at one per successful approve before the fix.
+    """
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+
+    def open_descriptors() -> int:
+        return len(os.listdir("/dev/fd"))
+
+    before = open_descriptors()
+    transaction.execute_transaction(vault, plan)
+    assert open_descriptors() == before, "a descriptor was leaked on success"
+
+
+def test_a_failed_transaction_closes_the_descriptor_it_owns(tmp_path, monkeypatch):
+    """The failure path, on its own terms.
+
+    An earlier version of this reused the vault from the success case. The
+    source had already moved and the quarantine name was already taken, so
+    the second transaction refused *before* taking ownership of any
+    descriptor — it proved nothing about the failure path, and would have
+    passed with no release code at all.
+
+    A fresh vault, and the failure injected in the final-state verification,
+    after quarantine, so the descriptor is genuinely owned when it fails.
+    """
+    vault = _vault(tmp_path)
+    plan = _approval_plan()
+    _write_proposal(vault)
+
+    def open_descriptors() -> int:
+        return len(os.listdir("/dev/fd"))
+
+    owned_at_failure = []
+    def fail_after_ownership(vault_arg, plan_arg) -> None:
+        del vault_arg, plan_arg
+        owned_at_failure.append(open_descriptors())
+        raise OSError("injected after ownership")
+
+    monkeypatch.setattr(transaction, "_require_final_states", fail_after_ownership)
+
+    before = open_descriptors()
+    with pytest.raises(transaction.PostCommitConsumptionError):
+        transaction.execute_transaction(vault, plan)
+
+    assert owned_at_failure, "the failure was never injected"
+    assert owned_at_failure[0] > before, (
+        "the descriptor was not yet owned when the failure was injected, so "
+        "this proves nothing about releasing it"
+    )
+    assert open_descriptors() == before, "a descriptor was leaked on failure"
+
+
+@pytest.mark.parametrize("extra_link", [False, True])
+def test_link_count_evidence_reports_both_outcomes_without_changing_the_message(
+    tmp_path, extra_link
+):
+    """Amendment 2/3: `st_nlink` is evidence, and only evidence.
+
+    The design specifies both readings — zero means no filesystem link
+    preserved the reviewed inode at detection; positive means some link
+    existed, with no claim about where or whether following it is safe.
+    Only the zero case was covered, so a mutant that behaved differently
+    when `link_count > 0` would have survived.
+
+    Whichever it is, the operator message must be identical: the design
+    forbids the evidence from softening or varying it.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+    from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
+
+    vault, leaf = _conditional_vault(tmp_path)
+    if extra_link:
+        # A second name for the same inode, so unlinking the quarantine
+        # entry cannot reduce the link count to zero.
+        os.link(leaf, vault / "second-name.yaml")
+    expected = capture_path_state(vault, "outbox-record.yaml")
+
+    real_move = gt._MOVE_NO_REPLACE
+    substituted = []
+
+    def replace_after_the_move(from_fd, from_name, to_fd, to_name):
+        outcome = real_move(from_fd, from_name, to_fd, to_name)
+        if outcome == 0 and not substituted:
+            landed = next((vault / gt.QUARANTINE_DIRECTORY).iterdir())
+            decoy = landed.with_name(landed.name + ".decoy")
+            decoy.write_bytes(b"DECOY\n")
+            os.replace(decoy, landed)
+            substituted.append(True)
+        return outcome
+
+    gt._MOVE_NO_REPLACE = replace_after_the_move
+    try:
+        with pytest.raises(gt.QuarantineEntrySubstituted) as raised:
+            quarantine_path_if_unchanged(vault, "outbox-record.yaml", expected)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+
+    assert substituted, "the substitution never happened"
+    if extra_link:
+        assert raised.value.link_count > 0, raised.value.link_count
+    else:
+        assert raised.value.link_count == 0, raised.value.link_count
+
+    # Identical operator-facing outcome either way.
+    outcome = describe(raised.value)
+    assert outcome.code == "E-SUBSTITUTED"
+    assert outcome.committed == "unknown"
+    assert outcome.retry == "stop"
+    assert "cannot verify" in outcome.message
+    assert str(raised.value.link_count) not in outcome.message

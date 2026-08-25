@@ -6,8 +6,11 @@ commits (exactly one commit, git-revertible); reject discards the proposal.
 
 Temp git vaults only; the real vault is never touched.
 """
+import ast
+import errno
 import hashlib
 import inspect
+import os
 import re
 import subprocess
 import textwrap
@@ -26,6 +29,14 @@ from app.git_transaction import (
     GitTransactionFailure,
     ReviewedStateConflict,
     VaultBusyError,
+)
+from app.action_receipts import (
+    InvalidActionReceipt,
+    SpentAction,
+    make_action_receipt,
+    parse_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
 )
 from app.scope import CrossScopeError, Scope
 from app.destinations import DestinationError
@@ -91,6 +102,19 @@ def _vault_tree(root: Path) -> tuple[tuple[str, str, bytes | str], ...]:
         else:
             entries.append((relative, "file", path.read_bytes()))
     return tuple(sorted(entries))
+
+
+def _quarantined(vault: Path) -> list[Path]:
+    """Every consumed record currently held in quarantine (Amendment 1)."""
+    return sorted(vault.rglob(".consumed/*.yaml"))
+
+
+def _is_clean_apart_from_quarantine(vault: Path) -> bool:
+    """Quarantined records are untracked by design, so `git status` is never
+    empty after a consumption. Everything else must still be clean."""
+    from tests.conftest import git_is_clean_apart_from_quarantine
+
+    return git_is_clean_apart_from_quarantine(vault)
 
 
 def _approval_state(vault: Path):
@@ -272,6 +296,16 @@ def _assert_destination_error(operation) -> None:
     with pytest.raises(outbox.OutboxError) as raised:
         operation()
     assert type(raised.value) is outbox.OutboxDestinationError
+
+
+def _fp(scope: Scope, proposal_id: str) -> str:
+    """The fingerprint of the proposal exactly as it now stands.
+
+    S7 test convenience only: a real operator's fingerprint comes from the
+    review they were shown. Tests that need a *stale* fingerprint capture it
+    before mutating the record.
+    """
+    return outbox.get_proposal_review(scope, proposal_id).sha256
 
 
 def _write_record(scope: Scope, name: str, record: str) -> Path:
@@ -569,7 +603,7 @@ def test_module_general_approval_removes_triage_sub_in_one_revertible_commit(
     assert "+sub:" not in diff
 
     before = git_count_commits(vault)
-    approval = approve(scope, prop.id)
+    approval = approve(scope, prop.id, _fp(scope, prop.id))
     approval_oid = git_head(vault)
     destination = vault / approval.dst
 
@@ -587,7 +621,7 @@ def test_module_general_approval_removes_triage_sub_in_one_revertible_commit(
     assert restored.exists()
     assert "sub: triage" in restored.read_text(encoding="utf-8")
     assert not destination.exists()
-    assert git_is_clean(vault)
+    assert _is_clean_apart_from_quarantine(vault)
 
 
 def test_preview_diff_shows_move_and_sub_change(tmp_path):
@@ -902,7 +936,7 @@ def test_operations_reject_noncanonical_destination_without_mutation(
         proposal = _proposal_from_record(path, record)
         attempt = lambda: preview_diff(scope, proposal)
     else:
-        attempt = lambda: approve(scope, record["id"])
+        attempt = lambda: approve(scope, record["id"], _fp(scope, record["id"]))
 
     _assert_destination_error(attempt)
 
@@ -934,7 +968,7 @@ def test_noncanonical_destination_fails_before_source_body_read(
         proposal = _proposal_from_record(path, record)
         attempt = lambda: preview_diff(scope, proposal)
     else:
-        attempt = lambda: approve(scope, record["id"])
+        attempt = lambda: approve(scope, record["id"], _fp(scope, record["id"]))
 
     _assert_destination_error(attempt)
 
@@ -944,7 +978,7 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
     scope, prop = _propose(vault)
     before = git_count_commits(vault)
 
-    approve(scope, prop.id)
+    approve(scope, prop.id, _fp(scope, prop.id))
 
     assert not scope.resolve("00-inbox", "active", "note.md").exists()
     dst = scope.resolve("11-knowledge", "active", "note.md")
@@ -954,7 +988,7 @@ def test_approve_moves_file_and_makes_one_commit(tmp_path):
 
     assert git_count_commits(vault) == before + 1
     assert git_head_message(vault).startswith("outbox: approve")
-    assert git_is_clean(vault)
+    assert _is_clean_apart_from_quarantine(vault)
 
 
 def test_approval_refuses_changed_source_without_any_added_mutation(tmp_path):
@@ -966,7 +1000,7 @@ def test_approval_refuses_changed_source_without_any_added_mutation(tmp_path):
     before = _approval_state(vault)
 
     with pytest.raises(outbox.StaleProposalSource):
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert _approval_state(vault) == before
     assert prop.path.read_bytes() == proposal_bytes
@@ -983,7 +1017,7 @@ def test_approval_refuses_missing_source_and_preserves_proposal(tmp_path):
     before = _approval_state(vault)
 
     with pytest.raises(outbox.MissingProposalSource):
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert _approval_state(vault) == before
     assert prop.path.read_bytes() == proposal_bytes
@@ -998,9 +1032,12 @@ def test_approval_with_unrelated_staged_unstaged_and_untracked_work_commits_only
     scope, prop = _propose(vault)
     head_before = git_head(vault)
 
-    approve(scope, prop.id)
+    approve(scope, prop.id, _fp(scope, prop.id))
 
-    assert git_changed_paths(vault) == sorted([prop.src, prop.dst])
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert git_changed_paths(vault) == sorted(
+        [prop.src, prop.dst, receipt_path]
+    )
     assert subprocess.run(
         ["git", "rev-list", "--count", f"{head_before}..HEAD"],
         cwd=vault,
@@ -1035,7 +1072,7 @@ def test_reviewed_source_or_destination_index_dirt_is_refused_before_mutation(
     status_before = git_status_bytes(vault)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert isinstance(raised.value.__cause__, ReviewedStateConflict)
     assert git_head(vault) == head_before
@@ -1061,7 +1098,7 @@ def test_approval_busy_error_preserves_source_destination_proposal_and_git_state
 
     with git_transaction._approval_lock(vault):
         with pytest.raises(outbox.OutboxTransactionError) as raised:
-            approve(scope, prop.id)
+            approve(scope, prop.id, _fp(scope, prop.id))
 
     assert isinstance(raised.value.__cause__, VaultBusyError)
     assert git_head(vault) == head_before
@@ -1091,13 +1128,14 @@ def test_injected_transaction_failure_restores_source_destination_and_exact_prop
     monkeypatch.setattr(git_transaction, "_checkpoint", fail_after_filesystem_apply)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
-    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+    assert isinstance(raised.value.__cause__, git_transaction.GitTransactionFailure)
     assert git_head(vault) == head_before
     assert source.read_bytes() == source_bytes
     assert destination.exists() is False
     assert prop.path.read_bytes() == proposal_bytes
+    assert not _quarantined(vault)
     _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
 
 
@@ -1111,7 +1149,7 @@ def test_approval_transaction_error_is_an_outbox_error(tmp_path, monkeypatch):
     monkeypatch.setattr(outbox, "execute_transaction", fail_transaction, raising=False)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     assert isinstance(raised.value, outbox.OutboxError)
     assert isinstance(raised.value.__cause__, GitTransactionFailure)
@@ -1143,7 +1181,7 @@ def test_approval_refuses_race_after_verified_snapshot_without_overwriting_sourc
     monkeypatch.setattr(outbox, "capture_path_state", race_after_source_capture)
 
     with pytest.raises(outbox.OutboxTransactionError) as raised:
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
     destination = scope.resolve("11-knowledge", "active", "note.md")
     assert isinstance(raised.value.__cause__, ReviewedStateConflict)
@@ -1189,7 +1227,7 @@ def test_classification_approval_still_creates_exactly_one_commit_and_one_revert
         rule_id="synthetic-rule",
     )
     before_approval = git_head(vault)
-    approve(scope, prop.id)
+    approve(scope, prop.id, _fp(scope, prop.id))
     approval_oid = git_head(vault)
 
     assert approval_oid != ingest_oid
@@ -1201,7 +1239,10 @@ def test_classification_approval_still_creates_exactly_one_commit_and_one_revert
         capture_output=True,
         text=True,
     ).stdout.strip() == "1"
-    assert git_changed_paths(vault, approval_oid) == sorted([prop.src, prop.dst])
+    receipt_path = receipt_relative_path("synthetic", prop.id)
+    assert git_changed_paths(vault, approval_oid) == sorted(
+        [prop.src, prop.dst, receipt_path]
+    )
     assert unrelated.read_bytes() == unrelated_bytes
 
     subprocess.run(
@@ -1211,13 +1252,15 @@ def test_classification_approval_still_creates_exactly_one_commit_and_one_revert
     assert result.path.exists()
     assert triage_rel in git_tracked_paths(vault)
     assert not (vault / prop.dst).exists()
+    assert not (vault / receipt_path).exists()
+    assert not prop.path.exists()
     assert unrelated.read_bytes() == unrelated_bytes
 
 
 def test_reject_discards_proposal_without_moving(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
-    reject(scope, prop.id)
+    reject(scope, prop.id, _fp(scope, prop.id))
     assert not prop.path.exists()
     assert scope.resolve("00-inbox", "active", "note.md").exists()
     assert load_proposals(scope) == []
@@ -1236,9 +1279,9 @@ def test_operations_reject_same_entity_proposal_leaf_symlink_without_mutation(
     if operation == "preview":
         attempt = lambda: preview_diff(scope, proposal)
     elif operation == "approve":
-        attempt = lambda: approve(scope, proposal.id)
+        attempt = lambda: approve(scope, proposal.id, _fp(scope, proposal.id))
     else:
-        attempt = lambda: reject(scope, proposal.id)
+        attempt = lambda: reject(scope, proposal.id, _fp(scope, proposal.id))
 
     with pytest.raises(CrossScopeError):
         attempt()
@@ -1254,11 +1297,17 @@ def test_mutation_revalidates_lexical_proposal_leaf_after_lookup(
 ):
     vault = _vault(tmp_path)
     scope, proposal = _propose(vault)
-    real_get = outbox.get_proposal
+    fingerprint = _fp(scope, proposal.id)
+    # S7: actions no longer read through `get_proposal`; they locate the
+    # leaf through `get_proposal_review`. Patching the reader they actually
+    # use keeps this test's point — the mutation must revalidate the leaf
+    # *after* the lookup — instead of leaving it inert.
+    real_get = outbox.get_proposal_review
     state = {}
 
     def redirect_after_lookup(bound_scope, proposal_id):
-        loaded = real_get(bound_scope, proposal_id)
+        review = real_get(bound_scope, proposal_id)
+        loaded = review.value
         shadow = bound_scope.resolve("proposal-shadow", loaded.path.name)
         shadow.parent.mkdir()
         loaded.path.rename(shadow)
@@ -1266,12 +1315,12 @@ def test_mutation_revalidates_lexical_proposal_leaf_after_lookup(
         state["head"] = git_head(vault)
         state["paths"] = git_tracked_paths(vault)
         state["tree"] = _vault_tree(vault)
-        return loaded
+        return review
 
-    monkeypatch.setattr(outbox, "get_proposal", redirect_after_lookup)
+    monkeypatch.setattr(outbox, "get_proposal_review", redirect_after_lookup)
 
     with pytest.raises(CrossScopeError):
-        operation(scope, proposal.id)
+        operation(scope, proposal.id, fingerprint)
 
     assert git_head(vault) == state["head"]
     assert git_tracked_paths(vault) == state["paths"]
@@ -1284,11 +1333,11 @@ def test_approval_never_scaffolds_destination_parent_after_validation(
 ):
     vault = _vault(tmp_path)
     scope, proposal = _propose(vault)
-    real_get = outbox.get_proposal
+    real_get = outbox.get_proposal_review
     state = {}
 
     def change_parent_after_lookup(bound_scope, proposal_id):
-        loaded = real_get(bound_scope, proposal_id)
+        review = real_get(bound_scope, proposal_id)
         active = vault / "demo/11-knowledge/active"
         saved = vault / "demo/11-knowledge/saved-active"
         active.rename(saved)
@@ -1297,11 +1346,12 @@ def test_approval_never_scaffolds_destination_parent_after_validation(
         state["head"] = git_head(vault)
         state["paths"] = git_tracked_paths(vault)
         state["tree"] = _vault_tree(vault)
-        return loaded
+        return review
 
-    monkeypatch.setattr(outbox, "get_proposal", change_parent_after_lookup)
+    fingerprint = _fp(scope, proposal.id)
+    monkeypatch.setattr(outbox, "get_proposal_review", change_parent_after_lookup)
 
-    _assert_destination_error(lambda: approve(scope, proposal.id))
+    _assert_destination_error(lambda: approve(scope, proposal.id, fingerprint))
 
     assert git_head(vault) == state["head"]
     assert git_tracked_paths(vault) == state["paths"]
@@ -1378,8 +1428,10 @@ def test_outbox_interfaces_have_one_identity_authority():
 
 
 def test_public_routes_remain_single_proposal_actions():
-    assert tuple(inspect.signature(approve).parameters) == ("scope", "proposal_id")
-    assert tuple(inspect.signature(reject).parameters) == ("scope", "proposal_id")
+    """Still one proposal per call — now bound to that proposal's review."""
+    bound = ("scope", "proposal_id", "review_sha256")
+    assert tuple(inspect.signature(approve).parameters) == bound
+    assert tuple(inspect.signature(reject).parameters) == bound
 
 
 def test_propose_rejects_item_path_from_another_entity(two_entity_vault):
@@ -1460,8 +1512,10 @@ def test_mutation_rejects_foreign_record_and_leaves_both_entities_unchanged(
     )
     before = {path: path.read_bytes() for path in watched}
 
+    # A well-formed fingerprint that binds nothing: the scope refusal is
+    # independent of it, and must come first.
     with pytest.raises(outbox.OutboxScopeError):
-        operation(alpha, record["id"])
+        operation(alpha, record["id"], "0" * 64)
 
     assert {path: path.read_bytes() for path in watched} == before
     assert not (two_entity_vault / "alpha/11-knowledge/active/beta.md").exists()
@@ -1532,3 +1586,1442 @@ def test_concurrent_proposals_are_written_only_to_the_bound_entity(two_entity_va
     assert list((two_entity_vault / "beta/outbox").glob("*.yaml"))
     assert not list((two_entity_vault / "alpha/outbox").glob("*beta*.yaml"))
     assert not list((two_entity_vault / "beta/outbox").glob("*alpha*.yaml"))
+
+
+# --- S7 Task 2: one byte snapshot behind every classification review --------
+
+
+def _review_imports():
+    from app.outbox import get_proposal_review
+
+    return get_proposal_review
+
+
+def _proposal_bytes(prop: Proposal) -> bytes:
+    return prop.path.read_bytes()
+
+
+def _rewrite_record(path: Path, **changes) -> bytes:
+    """Rewrite a stored proposal in place, preserving id and filename."""
+    record = yaml.safe_load(path.read_text(encoding="utf-8"))
+    record.update(changes)
+    raw = yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+    path.write_bytes(raw)
+    return raw
+
+
+def test_get_proposal_review_returns_the_value_its_bytes_and_their_hash(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    review = get_proposal_review(scope, prop.id)
+
+    stored = _proposal_bytes(prop)
+    assert review.value.id == prop.id
+    assert review.value == prop
+    assert review.contents == stored
+    assert review.sha256 == hashlib.sha256(stored).hexdigest()
+
+
+def test_review_value_and_hash_come_from_one_capture_not_a_second_read(tmp_path):
+    """The core Task 2 proof.
+
+    The stored file is replaced *between* the byte capture and everything
+    that follows. If the reader parses the path again — instead of the bytes
+    it captured — the returned value describes the replacement while the
+    digest describes the capture, and the two no longer agree about
+    anything. The operator would then review one proposal and act on
+    another, which is precisely the S7 defect.
+    """
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    original = _proposal_bytes(prop)
+    replacement_holder = {}
+
+    real_capture = outbox.capture_path_state
+
+    def capture_then_replace(vault, relative_path, *args, **kwargs):
+        state = real_capture(vault, relative_path, *args, **kwargs)
+        if relative_path.endswith(f"{prop.id}.yaml") and not replacement_holder:
+            # The instant after the bytes are in hand, the file becomes a
+            # different proposal under the same id and filename.
+            # A fully canonical replacement: module, sub AND dst all agree,
+            # so it would validate cleanly. Nothing but a value/digest
+            # disagreement can make this test fail.
+            replacement_holder["bytes"] = _rewrite_record(
+                prop.path,
+                module="11-library",
+                sub="reference",
+                dst="demo/11-library/active/note.md",
+            )
+        return state
+
+    import app.outbox as outbox_module
+
+    original_attr = outbox_module.capture_path_state
+    outbox_module.capture_path_state = capture_then_replace
+    try:
+        review = get_proposal_review(scope, prop.id)
+    finally:
+        outbox_module.capture_path_state = original_attr
+
+    assert replacement_holder["bytes"] != original, "the probe did not replace anything"
+
+    # Every part of the review describes the captured bytes, not the file.
+    assert review.contents == original, (
+        "the review carries bytes other than the ones it captured"
+    )
+    assert review.sha256 == hashlib.sha256(original).hexdigest(), (
+        "the digest is not of the captured bytes"
+    )
+    assert review.value.module == prop.module
+    assert review.value.sub == prop.sub
+    assert review.value.dst == prop.dst
+    # And the value is genuinely the one those bytes describe.
+    assert review.value == _to_proposal_from_bytes(prop.path, original)
+
+
+def _to_proposal_from_bytes(path: Path, raw: bytes) -> Proposal:
+    return outbox._to_proposal(path, yaml.safe_load(raw.decode("utf-8")))
+
+
+def test_a_replacement_after_the_review_does_not_change_the_review(tmp_path):
+    from app.review_tokens import ReviewedProposalChanged, require_review_match
+
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    review = get_proposal_review(scope, prop.id)
+    replacement = _rewrite_record(prop.path, module="11-library", sub="reference")
+
+    assert review.contents != replacement
+    assert review.sha256 == hashlib.sha256(review.contents).hexdigest()
+    # The fingerprint the operator holds no longer matches the file: this is
+    # exactly what the action boundary in Task 3 will compare.
+    with pytest.raises(ReviewedProposalChanged):
+        require_review_match(replacement, review.sha256)
+
+
+def test_the_same_id_with_only_byte_differences_reviews_differently(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    first = get_proposal_review(scope, prop.id)
+
+    # Same meaningful fields, different stored bytes: re-serialised sorted.
+    record = yaml.safe_load(first.contents.decode("utf-8"))
+    prop.path.write_bytes(yaml.safe_dump(record, sort_keys=True).encode("utf-8"))
+    second = get_proposal_review(scope, prop.id)
+
+    assert second.contents != first.contents
+    assert second.sha256 != first.sha256
+    assert second.value == first.value        # the values are indistinguishable
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../../../etc/passwd",
+        "..",
+        "nested/20260102T030405-" + "ab" * 16,
+        "20260102T030405-" + "ab" * 16 + "/../other",
+        "not-a-proposal-id",
+        "",
+        "20260102T030405-" + "AB" * 16,        # uppercase is non-canonical
+    ],
+)
+def test_review_refuses_a_non_canonical_proposal_id(tmp_path, bad_id):
+    get_proposal_review = _review_imports()
+    scope, _prop = _propose(_vault(tmp_path))
+    before = _vault_tree(scope.root)
+
+    from app.console_errors import describe
+
+    # P2 (review): assert the promised family and outcome, not merely that
+    # *something* was raised — a TypeError or an unrelated scope error would
+    # otherwise pass as if the contract held.
+    with pytest.raises(outbox.OutboxError) as raised:
+        get_proposal_review(scope, bad_id)
+    assert describe(raised.value).code == "E-INVALID"
+
+    assert _vault_tree(scope.root) == before
+
+
+def test_review_refuses_a_missing_proposal(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+    prop.path.unlink()
+
+    with pytest.raises(outbox.OutboxError):
+        get_proposal_review(scope, prop.id)
+
+
+def test_review_refuses_an_unreadable_record(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+    prop.path.write_text("{ not: [valid, yaml", encoding="utf-8")
+
+    with pytest.raises(outbox.OutboxError):
+        get_proposal_review(scope, prop.id)
+
+
+def test_review_refuses_a_redirected_proposal_leaf(tmp_path):
+    get_proposal_review = _review_imports()
+    scope, prop, _target = _redirect_proposal_leaf(_vault(tmp_path))
+
+    with pytest.raises(CrossScopeError):
+        get_proposal_review(scope, prop.id)
+
+
+def test_review_refuses_a_cross_scope_proposal(two_entity_vault):
+    """An alpha-entity record sitting in beta's outbox: the filename and id
+    are canonical, so only the scope check refuses it."""
+    get_proposal_review = _review_imports()
+    vault = two_entity_vault
+    alpha_scope = Scope(vault, "alpha")
+    beta_scope = Scope(vault, "beta")
+    record = _canonical_alpha_record(alpha_scope)
+    path = _write_record(
+        beta_scope, f"{record['id']}.yaml", yaml.safe_dump(record, sort_keys=False)
+    )
+    assert path.exists()
+
+    with pytest.raises(outbox.OutboxScopeError):
+        get_proposal_review(beta_scope, record["id"])
+
+    # And the misfiled record is left exactly where it was for diagnosis.
+    assert path.read_bytes() == yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+
+
+def test_get_proposal_delegates_to_the_review_reader(tmp_path):
+    """`get_proposal` survives only for non-action callers, and must be the
+    review reader's value — never a second, independently parsed read."""
+    get_proposal_review = _review_imports()
+    scope, prop = _propose(_vault(tmp_path))
+
+    assert outbox.get_proposal(scope, prop.id) == get_proposal_review(scope, prop.id).value
+
+    tree = ast.parse(Path(outbox.__file__).read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_proposal"
+    )
+    calls = {
+        call.func.id
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+    assert "get_proposal_review" in calls
+    assert "load_proposals" not in calls
+
+
+def test_pending_presence_never_uses_a_swapped_outbox_target(
+    tmp_path, monkeypatch
+):
+    scope, prop = _propose(_vault(tmp_path))
+    assert outbox.pending_proposal_entry_exists(scope, prop.id), (
+        "positive control: the real pending leaf was not observed"
+    )
+
+    lexical = tmp_path / "demo/outbox"
+    held = tmp_path / "demo/outbox-held"
+    outside = tmp_path / "outside-outbox"
+    outside.mkdir()
+    (outside / prop.path.name).write_bytes(b"outside-metadata-marker")
+    real_require = outbox._require_outbox_path
+    swapped = False
+
+    def swap_after_validation(*args, **kwargs):
+        nonlocal swapped
+        result = real_require(*args, **kwargs)
+        if not swapped:
+            lexical.rename(held)
+            lexical.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(outbox, "_require_outbox_path", swap_after_validation)
+
+    assert not outbox.pending_proposal_entry_exists(scope, prop.id), (
+        "an outside leaf supplied pending-record presentation evidence"
+    )
+    assert swapped, "the probe never swapped the validated outbox"
+
+
+def test_pending_presence_cleanup_failure_never_overrides_receipt_evidence(
+    tmp_path, monkeypatch
+):
+    scope, prop = _propose(_vault(tmp_path))
+    real_close = outbox.os.close
+    raised = False
+
+    def close_then_fail_once(descriptor):
+        nonlocal raised
+        real_close(descriptor)
+        if not raised:
+            raised = True
+            raise OSError("synthetic descriptor cleanup failure")
+
+    monkeypatch.setattr(outbox.os, "close", close_then_fail_once)
+
+    assert not outbox.pending_proposal_entry_exists(scope, prop.id), (
+        "optional presence cleanup overrode the conservative presentation result"
+    )
+    assert raised, "the cleanup-failure probe never fired"
+
+
+# --- S7 Task 2 review findings: the strict scan ------------------------------
+
+
+def _two_note_review_vault(tmp_path):
+    files = {
+        "demo/00-inbox/active/note.md": textwrap.dedent(
+            """\
+            ---
+            type: inbox-item
+            title: Clinical study protocol
+            entity: demo
+            product: null
+            status: active
+            created: 2026-01-01
+            updated: 2026-01-01
+            sub: triage
+            source: folder
+            ---
+            Randomised trial protocol body.
+            """
+        ),
+        "demo/00-inbox/active/other.md": textwrap.dedent(
+            """\
+            ---
+            type: inbox-item
+            title: Second protocol
+            entity: demo
+            product: null
+            status: active
+            created: 2026-01-01
+            updated: 2026-01-01
+            sub: triage
+            source: folder
+            ---
+            Second protocol body.
+            """
+        ),
+        "demo/11-knowledge/active/.gitkeep": "",
+        "demo/11-library/active/.gitkeep": "",
+    }
+    vault = _outbox_vault(tmp_path, ("demo",), files)
+    scope = Scope(vault, "demo")
+    target = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "note.md"),
+        module="11-knowledge", sub="kb", claimed_block="govern",
+    )
+    sibling = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "other.md"),
+        module="11-knowledge", sub="kb", claimed_block="govern",
+    )
+    return vault, scope, target, sibling
+
+
+def test_review_refuses_when_a_sibling_destination_is_non_canonical(tmp_path):
+    """P1 (review): the strict loader's refusal is listing-wide, and it is
+    not only about unreadable records.
+
+    A well-formed sibling whose destination no longer canonicalises makes
+    `load_proposals` refuse everything in the entity. A review reader that
+    checked only phase-1 readability would hand out a fingerprint — and
+    therefore an action — that the strict loader would refuse.
+    """
+    _vault_root, scope, target, sibling = _two_note_review_vault(tmp_path)
+
+    record = yaml.safe_load(sibling.path.read_text(encoding="utf-8"))
+    record["dst"] = "demo/11-library/active/other.md"   # module says knowledge
+    sibling.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    # The strict loader refuses ...
+    with pytest.raises(outbox.OutboxDestinationError):
+        load_proposals(scope)
+    # ... so the review of a perfectly valid target must refuse identically.
+    with pytest.raises(outbox.OutboxDestinationError):
+        outbox.get_proposal_review(scope, target.id)
+
+
+def test_the_strict_scan_never_follows_a_leaf_swapped_after_its_lexical_check(
+    tmp_path,
+):
+    """P1 (review): the lexical `is_symlink()` check and the record read are
+    two separate operations. Between them the leaf can become a symlink to a
+    file outside the outbox; a following read would parse that outside file
+    and, because the symlink keeps the filename, its identity check would
+    pass. The read itself must be no-follow."""
+    _vault_root, scope, target, _sibling = _two_note_review_vault(tmp_path)
+    vault = scope.root
+
+    # An outside file that is a perfectly valid proposal under the SAME id,
+    # naming a different destination. If it is ever read, it is returned.
+    outside = tmp_path / "outside-proposal.yaml"
+    planted = yaml.safe_load(target.path.read_text(encoding="utf-8"))
+    planted["module"] = "11-library"
+    planted["sub"] = "reference"
+    planted["dst"] = "demo/11-library/active/note.md"
+    outside.write_text(yaml.safe_dump(planted, sort_keys=False), encoding="utf-8")
+
+    original_bytes = target.path.read_bytes()
+
+    # Record what each read actually resolves to. Watching the *argument*
+    # path is not enough: a following read is called on the leaf and only
+    # its realpath reveals that the outside file was consumed.
+    import os as _os
+
+    reads: list[str] = []
+    real_read_bytes = Path.read_bytes
+    real_read_text = Path.read_text
+
+    def spy_read_bytes(self):
+        reads.append(_os.path.realpath(self))
+        return real_read_bytes(self)
+
+    def spy_read_text(self, *args, **kwargs):
+        reads.append(_os.path.realpath(self))
+        return real_read_text(self, *args, **kwargs)
+
+    real_require = outbox._require_outbox_path
+    swapped = []
+
+    def swap_after_check(scope_arg, proposal_path=None, **kwargs):
+        result = real_require(scope_arg, proposal_path, **kwargs)
+        if (
+            proposal_path is not None
+            and Path(proposal_path).name == f"{target.id}.yaml"
+            and not swapped
+        ):
+            swapped.append(True)
+            Path(proposal_path).unlink()
+            Path(proposal_path).symlink_to(outside)
+        return result
+
+    outbox._require_outbox_path = swap_after_check
+    Path.read_bytes = spy_read_bytes
+    Path.read_text = spy_read_text
+    try:
+        with pytest.raises(CrossScopeError):
+            outbox.get_proposal_review(scope, target.id)
+    finally:
+        Path.read_bytes = real_read_bytes
+        Path.read_text = real_read_text
+        outbox._require_outbox_path = real_require
+
+    assert swapped, "the probe never swapped the leaf"
+    # The decisive assertion: no read anywhere in the scan resolved to the
+    # planted outside file.
+    assert _os.path.realpath(outside) not in reads, (
+        f"the redirected outside file was read: {reads}"
+    )
+    # It is also untouched, and its distinctive destination never became a
+    # review.
+    assert outside.read_text(encoding="utf-8") == yaml.safe_dump(
+        planted, sort_keys=False
+    )
+
+    # Restoring the real leaf reviews the real record, proving the refusal
+    # above was about the redirection and not about the id.
+    Path(target.path).unlink()
+    Path(target.path).write_bytes(original_bytes)
+    assert outbox.get_proposal_review(scope, target.id).value.module == "11-knowledge"
+
+
+# --- S7 Task 3: approve and reject bound to the reviewed bytes ---------------
+
+
+def _review_of(scope: Scope, prop: Proposal):
+    return outbox.get_proposal_review(scope, prop.id)
+
+
+def _rewrite_same_id_meaningfully(prop: Proposal) -> bytes:
+    """A canonical replacement under the same id and filename."""
+    return _rewrite_record(
+        prop.path,
+        module="11-library",
+        sub="reference",
+        dst="demo/11-library/active/note.md",
+    )
+
+
+def _rewrite_same_id_byte_only(prop: Proposal) -> bytes:
+    """Identical action-relevant values, different stored bytes."""
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    raw = yaml.safe_dump(record, sort_keys=True).encode("utf-8")
+    prop.path.write_bytes(raw)
+    return raw
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_actions_require_a_review_fingerprint_with_no_default(action):
+    signature = inspect.signature(getattr(outbox, action))
+    assert list(signature.parameters) == ["scope", "proposal_id", "review_sha256"]
+    fingerprint = signature.parameters["review_sha256"]
+    assert fingerprint.default is inspect.Parameter.empty
+    assert fingerprint.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_actions_have_no_id_only_compatibility_path(tmp_path, action):
+    scope, prop = _propose(_vault(tmp_path))
+    before = _approval_state(scope.root)
+
+    with pytest.raises(TypeError):
+        getattr(outbox, action)(scope, prop.id)
+
+    assert _approval_state(scope.root) == before
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize(
+    "fingerprint", [None, "", "0" * 63, "0" * 65, "G" * 64, "A" * 64, 123, b"0" * 64]
+)
+def test_actions_refuse_a_malformed_fingerprint_without_mutation(
+    tmp_path, action, fingerprint
+):
+    from app.review_tokens import InvalidReviewToken
+
+    scope, prop = _propose(_vault(tmp_path))
+    before = _approval_state(scope.root)
+
+    with pytest.raises(InvalidReviewToken):
+        getattr(outbox, action)(scope, prop.id, fingerprint)
+
+    assert _approval_state(scope.root) == before
+    assert prop.path.exists()
+
+
+def test_approve_still_moves_and_commits_when_the_review_matches(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    commits_before = git_count_commits(vault)
+
+    approved = approve(scope, prop.id, _review_of(scope, prop).sha256)
+
+    assert approved.id == prop.id
+    assert git_count_commits(vault) == commits_before + 1
+    assert not (vault / prop.src).exists()
+    assert (vault / prop.dst).exists()
+    assert not prop.path.exists()
+
+
+def test_approve_commits_the_exact_review_receipt_with_the_action(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    approved = approve(scope, prop.id, review.sha256)
+
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert git_changed_paths(vault) == sorted(
+        (approved.src, approved.dst, receipt_path)
+    )
+    receipt_bytes = git_bytes(vault, "show", f"HEAD:{receipt_path}")
+    receipt = parse_action_receipt(Path(receipt_path), receipt_bytes)
+    assert receipt.proposal_id == prop.id
+    assert receipt.review_sha256 == review.sha256
+    assert receipt.action_kind == "approval"
+
+
+@pytest.mark.parametrize("action", [approve, reject])
+def test_classification_action_refuses_a_receipt_committed_before_the_lock(
+    tmp_path, action
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    receipt = make_action_receipt(prop.id, "0" * 64, "approval")
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(render_action_receipt(receipt))
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant spent receipt")
+    head_before = git_head(vault)
+    stored.unlink()
+    malformed = b"not: [a proposal\n"
+    prop.path.write_bytes(malformed)
+
+    result = action(scope, prop.id, review.sha256)
+
+    assert result == SpentAction(receipt)
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == malformed
+    assert not _quarantined(vault)
+
+
+@pytest.mark.parametrize("action", [approve, reject])
+def test_classification_action_rechecks_receipts_under_its_lock(
+    tmp_path, monkeypatch, action
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    receipt = make_action_receipt(prop.id, review.sha256, "approval")
+    receipt_path = receipt_relative_path("demo", prop.id)
+    real_lookup = outbox._head_action_receipt
+    lookups = []
+
+    def plant_on_locked_lookup(scope_arg, proposal_id):
+        lookups.append(proposal_id)
+        if len(lookups) == 1:
+            return None
+        stored = vault / receipt_path
+        stored.parent.mkdir(mode=0o700)
+        stored.write_bytes(render_action_receipt(receipt))
+        git_bytes(vault, "add", receipt_path)
+        git_bytes(vault, "commit", "-q", "-m", "race in spent receipt")
+        return real_lookup(scope_arg, proposal_id)
+
+    monkeypatch.setattr(outbox, "_head_action_receipt", plant_on_locked_lookup)
+
+    result = action(scope, prop.id, review.sha256)
+
+    assert lookups == [prop.id, prop.id]
+    assert result == SpentAction(receipt)
+    assert prop.path.exists()
+    assert not _quarantined(vault)
+
+
+@pytest.mark.parametrize("action", [approve, reject])
+def test_classification_action_fails_closed_on_a_malformed_matching_receipt(
+    tmp_path, action
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant malformed receipt")
+    head_before = git_head(vault)
+
+    with pytest.raises(InvalidActionReceipt):
+        action(scope, prop.id, review.sha256)
+
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert not _quarantined(vault)
+
+
+def test_reject_still_discards_when_the_review_matches(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    commits_before = git_count_commits(vault)
+    reviewed_bytes = prop.path.read_bytes()
+
+    rejected = reject(scope, prop.id, _review_of(scope, prop).sha256)
+
+    assert rejected.id == prop.id
+    assert not prop.path.exists()
+    # Amendment 1: consumed, not deleted — the reviewed bytes are retained.
+    quarantined = _quarantined(vault)
+    assert len(quarantined) == 1
+    assert quarantined[0].name == prop.path.name
+    assert quarantined[0].read_bytes() == reviewed_bytes
+    assert git_count_commits(vault) == commits_before
+    assert (vault / prop.src).exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize(
+    ("label", "rewrite"),
+    [
+        ("meaningful", _rewrite_same_id_meaningfully),
+        ("byte-only", _rewrite_same_id_byte_only),
+    ],
+)
+def test_a_same_id_replacement_refuses_and_changes_nothing(
+    tmp_path, action, label, rewrite
+):
+    from app.review_tokens import ReviewedProposalChanged
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    replacement = rewrite(prop)
+    assert replacement != review.contents, label
+    before = _approval_state(vault)
+
+    with pytest.raises(ReviewedProposalChanged):
+        getattr(outbox, action)(scope, prop.id, review.sha256)
+
+    # Complete non-mutation, and the replacement is preserved for diagnosis.
+    assert _approval_state(vault) == before
+    assert prop.path.read_bytes() == replacement
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_replacement_between_the_comparison_and_the_mutation_refuses(
+    tmp_path, action
+):
+    """The final pre-mutation boundary.
+
+    The fingerprint already matched. A replacement landing *after* that
+    comparison must still be refused, because the state the action owns is
+    the state it compared — not whatever is on disk when it reaches the
+    mutation.
+    """
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    before = _approval_state(vault)
+
+    mutating_call = "execute_transaction" if action == "approve" else "consume_reviewed_proposal"
+    real = getattr(outbox, mutating_call)
+    replaced = []
+
+    def replace_then_run(*args, **kwargs):
+        if not replaced:
+            replaced.append(_rewrite_same_id_byte_only(prop))
+        return real(*args, **kwargs)
+
+    setattr(outbox, mutating_call, replace_then_run)
+    try:
+        # approve wraps the transaction's refusal in its own domain type;
+        # reject raises the conflict directly. The operator outcome is the
+        # contract, so assert that rather than either wrapper.
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        setattr(outbox, mutating_call, real)
+
+    assert describe(raised.value).code == "E-CONFLICT"
+    assert replaced, "the probe never replaced the record"
+
+    # Everything the action could have changed is unchanged. The vault tree
+    # is compared minus the proposal leaf, because the probe itself rewrote
+    # that one file — asserting it equal would assert the probe never ran.
+    after = _approval_state(vault)
+    for key in ("head", "status", "index", "worktree"):
+        assert after[key] == before[key], key
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+    # `.git/oneos-approval.lock` is the transaction's own lock file, created
+    # by taking the lock and not vault content.
+    ignored = {proposal_rel, ".git/oneos-approval.lock",
+               "demo/outbox/.consumed"}
+
+    def _comparable(tree):
+        return tuple(entry for entry in tree if entry[0] not in ignored)
+
+    assert _comparable(after["tree"]) == _comparable(before["tree"])
+    assert (vault / prop.src).exists()
+    assert not (vault / prop.dst).exists()
+    # Reject must not unlink the replacement it never reviewed.
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == replaced[0]
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize("substitution", ["absent", "symlink", "directory"])
+def test_a_non_regular_substitution_before_mutation_refuses_without_blocking(
+    tmp_path, action, substitution
+):
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_bytes(review.contents)
+
+    mutating_call = "execute_transaction" if action == "approve" else "consume_reviewed_proposal"
+    real = getattr(outbox, mutating_call)
+    swapped = []
+
+    def substitute_then_run(*args, **kwargs):
+        if not swapped:
+            swapped.append(substitution)
+            prop.path.unlink()
+            if substitution == "symlink":
+                prop.path.symlink_to(outside)
+            elif substitution == "directory":
+                prop.path.mkdir()
+        return real(*args, **kwargs)
+
+    setattr(outbox, mutating_call, substitute_then_run)
+    try:
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        setattr(outbox, mutating_call, real)
+
+    # A changed regular file is a conflict; a type swap is a tamper finding.
+    # Both refuse, neither blocks, and neither is E-UNKNOWN.
+    assert describe(raised.value).code in {"E-CONFLICT", "E-TAMPER"}
+    assert swapped, "the probe never substituted anything"
+    # Whatever was substituted is still there — never followed, never removed.
+    assert outside.exists() and outside.read_bytes() == review.contents
+    if substitution == "symlink":
+        assert prop.path.is_symlink()
+    elif substitution == "directory":
+        assert prop.path.is_dir()
+    else:
+        assert not prop.path.exists()
+
+
+def test_no_action_reads_the_proposal_through_the_value_only_reader():
+    """`get_proposal` survives for non-action callers only. An action that
+    used it would be acting on a value with no fingerprint behind it."""
+    for action in (outbox.approve, outbox.reject):
+        source = inspect.getsource(action)
+        assert "get_proposal(" not in source, action.__name__
+
+
+def test_approve_gives_the_transaction_the_state_it_compared(tmp_path):
+    """The compared bytes and the transaction-owned bytes are one object.
+
+    A reread between the comparison and the plan would reopen exactly the
+    window S7 exists to close, so the owned change must carry the same
+    `PathState` the fingerprint was checked against.
+    """
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+
+    seen = {}
+    real = outbox.execute_transaction
+
+    def record_plan(vault_arg, plan):
+        seen["owned"] = plan.owned_changes
+        return real(vault_arg, plan)
+
+    outbox.execute_transaction = record_plan
+    try:
+        approve(scope, prop.id, review.sha256)
+    finally:
+        outbox.execute_transaction = real
+
+    owned = {change.path: change for change in seen["owned"]}
+    assert proposal_rel in owned
+    assert owned[proposal_rel].before.contents == review.contents
+    assert owned[proposal_rel].after.contents is None
+
+
+def test_approve_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
+    """The reread that a contents comparison alone cannot catch.
+
+    `test_approve_gives_the_transaction_the_state_it_compared` compares the
+    owned bytes to the reviewed bytes — but when nothing changes in between,
+    a fresh capture yields byte-identical contents and the substitution is
+    invisible. So change the record *after* the fingerprint matched and
+    *before* the plan is built: the reviewed state no longer describes the
+    file, and only an implementation that kept the compared state refuses.
+
+    An implementation that recaptured here would take the replacement as
+    authority, `_apply_state` would find it unchanged, and approve would
+    commit a move for a proposal nobody ever reviewed — while unlinking the
+    replacement as though it had been.
+    """
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    commits_before = git_count_commits(vault)
+    before = _approval_state(vault)
+
+    real_capture = outbox._capture_source_state
+    replaced = []
+
+    def rewrite_proposal_then_read(root, relative):
+        # Fires on approve's source capture, which sits between the
+        # fingerprint comparison and the transaction plan. This used to hook
+        # `_read_no_follow_bytes`, approve's separate source-receipt read;
+        # that read was collapsed into this capture once both went through
+        # `capture_path_state` and the second one became redundant. The
+        # window being probed is the same one.
+        if not replaced:
+            replaced.append(_rewrite_same_id_byte_only(prop))
+        return real_capture(root, relative)
+
+    outbox._capture_source_state = rewrite_proposal_then_read
+    try:
+        with pytest.raises(Exception) as raised:
+            approve(scope, prop.id, review.sha256)
+    finally:
+        outbox._capture_source_state = real_capture
+
+    assert replaced, "the probe never replaced the record"
+    assert replaced[0] != review.contents
+    assert describe(raised.value).code == "E-CONFLICT"
+
+    # Nothing committed, nothing moved, and the replacement is still there.
+    assert git_count_commits(vault) == commits_before
+    assert _approval_state(vault)["head"] == before["head"]
+    assert (vault / prop.src).exists()
+    assert not (vault / prop.dst).exists()
+    assert prop.path.read_bytes() == replaced[0]
+
+
+# --- S7 Task 3 review: the swap inside the mutation primitive ----------------
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
+    tmp_path, action
+):
+    """The last gap: the swap lands inside the mutation primitive itself,
+    after it captured the leaf and before it acts on it.
+
+    Neither the fingerprint comparison nor the plan's own state comparison
+    can see this one — only acting on the reviewed file rather than on its
+    name can. The replacement must survive untouched, and approve must
+    neither move the receipt nor create a commit.
+    """
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    proposal_rel = prop.path.relative_to(vault).as_posix()
+    leaf_name = prop.path.name
+    commits_before = git_count_commits(vault)
+    head_before = git_head(vault)
+    source_before = (vault / prop.src).read_bytes()
+
+    replacement = b"id: swapped\nvalue: REPLACEMENT-NOBODY-REVIEWED\n"
+    # Amendment 1: the seam is the atomic move into quarantine. The swap
+    # lands after the record is moved and before it is verified — the only
+    # window in which what gets consumed can still change.
+    real_move = gt._move_no_replace
+    swapped = []
+
+    def move_then_swap(from_fd, from_name, to_fd, to_name):
+        real_move(from_fd, from_name, to_fd, to_name)
+        if not swapped and from_name == leaf_name:
+            swapped.append(True)
+            next((vault / "demo/outbox" / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(
+                replacement
+            )
+        return None
+
+    gt._move_no_replace = move_then_swap
+    try:
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        gt._move_no_replace = real_move
+
+    assert swapped, "the probe never swapped the proposal"
+    # Amendment 3. The swap here is an in-place rewrite of the quarantined
+    # file — same inode, new bytes — which every identity check passes and
+    # only the contents check can see. That is E-SUBSTITUTED's "rewritten"
+    # condition.
+    expected_code = "E-APPLIED" if action == "approve" else "E-SUBSTITUTED"
+    assert describe(raised.value).code == expected_code, describe(raised.value).code
+
+    # Nothing was destroyed, and nothing was renamed back. This previously
+    # asserted the record was "back under its own name, holding the
+    # replacement bytes" — which is OneOS moving an object nobody reviewed
+    # under the reviewed record's name, the defect Amendment 3 closes. The
+    # replacement stays exactly where its writer put it.
+    assert not prop.path.exists(), prop.path.read_bytes()
+    quarantined = _quarantined(vault)
+    assert [q.read_bytes() for q in quarantined] == [replacement]
+
+    if action == "approve":
+        assert git_count_commits(vault) == commits_before + 1
+        assert git_head(vault) != head_before
+        assert not (vault / prop.src).exists()
+        assert (vault / prop.dst).exists()
+    else:
+        assert git_count_commits(vault) == commits_before
+        assert git_head(vault) == head_before
+        assert (vault / prop.src).read_bytes() == source_before
+        assert not (vault / prop.dst).exists()
+
+    # No orphan was stranded in the outbox. The quarantine directory itself
+    # is durable infrastructure and may exist; what matters is that it holds
+    # no record and that nothing else was left behind.
+    import app.git_transaction as _gt
+
+    leftovers = sorted(
+        entry.name
+        for entry in prop.path.parent.iterdir()
+        if entry.name not in {_gt.QUARANTINE_DIRECTORY, ".receipts"}
+    )
+    # Empty now, not the record's own name: the record was consumed and
+    # retained rather than renamed back.
+    assert leftovers == [], (
+        f"unexpected leftovers in {proposal_rel}'s directory: {leftovers}"
+    )
+
+
+def test_reject_reports_truthfully_when_cleanup_fails_after_the_removal(tmp_path):
+    """A completed reject followed by a lock-cleanup failure must not tell
+    the operator that nothing was changed — the proposal is gone."""
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    real_flock = gt.fcntl.flock
+
+    def failing_unlock(descriptor, operation):
+        if operation == gt.fcntl.LOCK_UN:
+            raise OSError(5, "simulated unlock failure")
+        return real_flock(descriptor, operation)
+
+    gt.fcntl.flock = failing_unlock
+    try:
+        with pytest.raises(Exception) as raised:
+            reject(scope, prop.id, review.sha256)
+    finally:
+        gt.fcntl.flock = real_flock
+
+    assert not prop.path.exists(), "the reject did complete"
+    outcome = describe(raised.value)
+    assert "Nothing was changed" not in outcome.message
+    assert outcome.retry == "stop"
+    assert outcome.committed != "no"
+
+
+def test_reject_transaction_failures_stay_inside_the_outbox_family(tmp_path):
+    """Reject now takes the approval lock, so lock outcomes are reachable
+    through it. They must arrive as outbox errors, the family the routes
+    declare, with their described outcome preserved through the cause."""
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    real_flock = gt.fcntl.flock
+
+    def busy(descriptor, operation):
+        if operation == gt.fcntl.LOCK_EX | gt.fcntl.LOCK_NB:
+            raise OSError(errno.EAGAIN, "simulated busy lock")
+        return real_flock(descriptor, operation)
+
+    gt.fcntl.flock = busy
+    try:
+        with pytest.raises(outbox.OutboxError) as raised:
+            reject(scope, prop.id, review.sha256)
+    finally:
+        gt.fcntl.flock = real_flock
+
+    assert describe(raised.value).code == "E-BUSY"
+    assert prop.path.exists()
+
+
+# --- S7 Task 6: the complete no-mutation matrix ------------------------------
+#
+# "No mutation" must not mean only "no new commit". Every refusal below
+# compares proposal bytes and type, source and destination, Git HEAD, index,
+# tracked diff, untracked paths and commit count — the whole boundary.
+
+
+def _boundary_state(vault: Path) -> dict:
+    def _git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=vault, check=True, capture_output=True
+        ).stdout
+
+    return {
+        "head": _git("rev-parse", "HEAD"),
+        "commits": git_count_commits(vault),
+        "index": _git("diff", "--cached", "--binary"),
+        "tracked": _git("diff", "--binary"),
+        "status": _git("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+        "tree": _vault_tree(vault),
+    }
+
+
+_MATRIX = (
+    "exact-reviewed-bytes",
+    "same-id-meaningful-change",
+    "same-id-byte-only-change",
+    "missing-token",
+    "malformed-token",
+    "missing-proposal",
+    "malformed-proposal",
+    "redirected-proposal",
+    "cross-scope-proposal",
+    "non-regular-replacement",
+)
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize("state", _MATRIX)
+def test_the_no_mutation_matrix(tmp_path, action, state):
+    from app.console_errors import describe
+    from app.review_tokens import InvalidReviewToken
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    token = review.sha256
+    outside = tmp_path / "outside.yaml"
+    outside.write_bytes(review.contents)
+
+    if state == "same-id-meaningful-change":
+        _rewrite_same_id_meaningfully(prop)
+    elif state == "same-id-byte-only-change":
+        _rewrite_same_id_byte_only(prop)
+    elif state == "missing-token":
+        token = None
+    elif state == "malformed-token":
+        token = "not-a-fingerprint"
+    elif state == "missing-proposal":
+        prop.path.unlink()
+    elif state == "malformed-proposal":
+        prop.path.write_text("{ not: [valid, yaml", encoding="utf-8")
+    elif state == "redirected-proposal":
+        prop.path.unlink()
+        prop.path.symlink_to(outside)
+    elif state == "cross-scope-proposal":
+        record = yaml.safe_load(review.contents.decode("utf-8"))
+        record["entity"] = "not-the-bound-entity"
+        prop.path.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+    elif state == "non-regular-replacement":
+        prop.path.unlink()
+        prop.path.mkdir()
+
+    before = _boundary_state(vault)
+
+    if state == "exact-reviewed-bytes":
+        getattr(outbox, action)(scope, prop.id, token)
+        after = _boundary_state(vault)
+        if action == "approve":
+            assert after["commits"] == before["commits"] + 1
+            assert (vault / prop.dst).exists()
+        else:
+            assert after["commits"] == before["commits"]
+        assert not prop.path.exists()
+        # Consumed, never destroyed (Amendment 1).
+        assert len(_quarantined(vault)) == 1
+        return
+
+    with pytest.raises(Exception) as raised:
+        getattr(outbox, action)(scope, prop.id, token)
+
+    outcome = describe(raised.value)
+    assert outcome.committed == "no", state
+    assert outcome.code != "E-UNKNOWN", state
+    if state in {"missing-token", "malformed-token"}:
+        assert isinstance(raised.value, InvalidReviewToken)
+
+    # The whole boundary, byte for byte.
+    assert _boundary_state(vault) == before, (
+        f"refusal mutated vault state ({state})"
+    )
+    assert (vault / prop.src).exists()
+    assert not (vault / prop.dst).exists()
+    assert not _quarantined(vault), state
+    # Whatever was substituted is preserved exactly as found.
+    assert outside.read_bytes() == review.contents
+    if state == "redirected-proposal":
+        assert prop.path.is_symlink()
+    elif state == "non-regular-replacement":
+        assert prop.path.is_dir()
+
+
+def test_reject_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
+    """Reject's counterpart to the approve reread proof.
+
+    A contents comparison cannot distinguish a fresh capture from the
+    compared one while nothing changes in between. So change the record
+    *after* the fingerprint matched and *before* the consumption: only an
+    implementation that carried the compared state forward refuses.
+
+    An implementation that recaptured here would quarantine a record nobody
+    reviewed and report the reject as done.
+    """
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    before = _approval_state(vault)
+
+    real_require = outbox._require_outbox_path
+    replaced = []
+
+    # The leaf is checked several times while it is being located, so
+    # counting calls is brittle. Anchor on the boundary instead: the
+    # fingerprint comparison lives inside `_own_reviewed_proposal`, so once
+    # that has returned, the next leaf check is reject's own — the one call
+    # sitting between the comparison and the consumption.
+    compared = []
+    real_own = outbox._own_reviewed_proposal
+
+    def note_comparison(*args, **kwargs):
+        owned = real_own(*args, **kwargs)
+        compared.append(True)
+        return owned
+
+    def rewrite_then_check(scope_arg, proposal_path=None, **kwargs):
+        if (
+            compared
+            and not replaced
+            and proposal_path is not None
+            and Path(proposal_path).name == prop.path.name
+        ):
+            replaced.append(_rewrite_same_id_byte_only(prop))
+        return real_require(scope_arg, proposal_path, **kwargs)
+
+    outbox._own_reviewed_proposal = note_comparison
+    outbox._require_outbox_path = rewrite_then_check
+    try:
+        with pytest.raises(Exception) as raised:
+            reject(scope, prop.id, review.sha256)
+    finally:
+        outbox._require_outbox_path = real_require
+        outbox._own_reviewed_proposal = real_own
+
+    assert replaced, "the probe never replaced the record"
+    assert replaced[0] != review.contents
+    assert describe(raised.value).code == "E-CONFLICT"
+
+    # Nothing consumed, nothing quarantined, the replacement preserved.
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == replaced[0]
+    assert not _quarantined(vault)
+    assert _approval_state(vault)["head"] == before["head"]
+
+
+def test_approve_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
+    """Item 5 (safety review): the action-boundary parse, proved directly.
+
+    `_own_reviewed_proposal` parses `proposal_state.contents`. Swapping
+    that for `path.read_bytes()` was an *equivalent* mutant under every
+    existing test, because `PathState` compares full contents: if the
+    replacement is still on disk when the transaction runs,
+    `_require_expected_states` refuses either way, and the two
+    implementations are indistinguishable from outside.
+
+    The gap is a replacement that does not survive to the transaction. A
+    writer that swaps the record and puts the original back — an
+    fsync-less editor, a regenerator that rewrites and rolls back, a
+    racing proposer — leaves every state check satisfied, because by the
+    time anything checks, the reviewed bytes are what is on disk. Only
+    the parse saw the replacement. A fresh read there would derive the
+    destination from bytes nobody reviewed, and then approve a move to it
+    while the transaction dutifully owns the reviewed record.
+
+    So: hostile bytes on disk for exactly the window a reread would use,
+    reviewed bytes everywhere else, and the destination as the witness.
+    """
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    reviewed_bytes = prop.path.read_bytes()
+
+    reviewed_dst = vault / prop.dst
+    hostile_dst = vault / "demo/11-library/active/note.md"
+    assert prop.dst != "demo/11-library/active/note.md"
+
+    real_match = outbox.require_review_match
+    real_parse = outbox._parse_record_bytes
+    window = []
+
+    def open_the_window(contents, submitted):
+        # Runs after the single capture, before the parse. The comparison
+        # itself is against captured bytes, so it still matches.
+        result = real_match(contents, submitted)
+        _rewrite_same_id_meaningfully(prop)
+        window.append("open")
+        return result
+
+    def close_the_window(contents):
+        # The reread a mutant would perform happens while evaluating this
+        # call's argument, so the replacement is restored only afterwards.
+        try:
+            return real_parse(contents)
+        finally:
+            if window and window[-1] == "open":
+                prop.path.write_bytes(reviewed_bytes)
+                window.append("closed")
+
+    outbox.require_review_match = open_the_window
+    outbox._parse_record_bytes = close_the_window
+    try:
+        approved = approve(scope, prop.id, review.sha256)
+    finally:
+        outbox.require_review_match = real_match
+        outbox._parse_record_bytes = real_parse
+
+    # The window really opened and closed, so the test drove the race it
+    # describes rather than passing because nothing happened.
+    assert window == ["open", "closed"], window
+
+    # The move that landed is the reviewed one.
+    assert approved.dst == prop.dst, "approve chose a destination from a reread"
+    assert reviewed_dst.exists()
+    assert not hostile_dst.exists(), "approved a destination nobody reviewed"
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_an_unmovable_record_is_a_refusal_not_an_unhandled_error(tmp_path, action):
+    """P2 (safety review): a designed refusal must not describe as E-UNKNOWN.
+
+    Narrowing `_UNSUPPORTED_ERRNOS` so that an operand-level `EPERM` is no
+    longer `AtomicMoveUnavailable` left it as a bare `PermissionError`.
+    Approve and registry delete survive that — `_execute_locked` wraps
+    everything — but reject calls `consume_reviewed_proposal` directly and
+    caught only `GitTransactionError`, so the exception escaped the
+    declared family and reached the global fallback. The operator was told
+    "an unexpected error was not handled", `committed=unknown`,
+    `retry=stop`, for a refusal in which nothing moved at all.
+
+    Reachable without an attacker: an immutable (`chattr +i` / `uchg`)
+    record, a sticky-bit outbox holding a record this process does not
+    own, `EACCES`, or a read-only remount.
+
+    It is normalised at the quarantine boundary rather than by widening
+    the route's catch list, so every caller gets the truthful outcome.
+    """
+    import ctypes
+    import errno as _errno
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    before = _approval_state(vault)
+
+    real_move = gt._MOVE_NO_REPLACE
+
+    def refuse_this_record(from_fd, from_name, to_fd, to_name):
+        if from_fd < 0 or not from_name:      # the classifier's own probe
+            ctypes.set_errno(_errno.ENOENT)
+            return -1
+        ctypes.set_errno(_errno.EPERM)
+        return -1
+
+    gt._MOVE_NO_REPLACE = refuse_this_record
+    gt._MOVE_REACHABLE = None
+    try:
+        with pytest.raises(Exception) as raised:
+            getattr(outbox, action)(scope, prop.id, review.sha256)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+        gt._MOVE_REACHABLE = None
+
+    outcome = describe(raised.value)
+    assert outcome.code != "E-UNKNOWN", f"{action}: {raised.value!r}"
+    assert outcome.committed == ("yes" if action == "approve" else "no"), outcome
+
+    # And the refusal is truthful. Compared on the same terms the existing
+    # no-mutation matrices use: every Git-visible fact, plus the absence of
+    # any quarantined record. The quarantine *directory* may exist — it is
+    # opened before the move is attempted, is empty, and Git does not track
+    # empty directories, which is why `status` is identical either way.
+    after = _approval_state(vault)
+    if action == "approve":
+        assert after["head"] != before["head"]
+        assert after["index"] == before["index"]
+        receipt_path = receipt_relative_path("demo", prop.id)
+        assert receipt_path in git_changed_paths(vault)
+        assert after["worktree"] == before["worktree"]
+        assert not (vault / prop.src).exists()
+        assert (vault / prop.dst).exists()
+    else:
+        for fact in ("head", "index", "status", "worktree"):
+            assert after[fact] == before[fact], fact
+        assert not (vault / prop.dst).exists()
+    assert not sorted(vault.rglob(".consumed/*.yaml"))
+    assert prop.path.exists()
+
+
+@pytest.mark.parametrize(
+    "condition", ["replaced", "absent", "rewritten"]
+)
+def test_reject_refuses_every_post_move_quarantine_condition(tmp_path, condition):
+    """Amendment 3, through the action that has no rollback.
+
+    Reject consumes directly under the approval lock — no transaction, no
+    rollback — so its only exposure to a substituted quarantine entry is
+    the window inside the consumption primitive itself. All three
+    conditions must reach the operator as E-SUBSTITUTED, and none may
+    rename anything back.
+    """
+    import ctypes
+
+    import app.git_transaction as gt
+    from app.console_errors import describe
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    reviewed_bytes = prop.path.read_bytes()
+    before = _approval_state(vault)
+    decoy = b"NOT-THE-REVIEWED-RECORD\n"
+
+    real_move = gt._MOVE_NO_REPLACE
+    fired = []
+
+    def act_after_the_move(ffd, fname, tfd, tname):
+        outcome = real_move(ffd, fname, tfd, tname)
+        if outcome != 0 or fired:
+            return outcome
+        fired.append(True)
+        landed = next((vault / "demo/outbox" / gt.QUARANTINE_DIRECTORY).iterdir())
+        if condition == "replaced":
+            other = landed.with_name(landed.name + ".other")
+            other.write_bytes(decoy)
+            os.replace(other, landed)          # different inode
+        elif condition == "absent":
+            landed.unlink()
+        else:
+            landed.write_bytes(decoy)          # same inode, new bytes
+        return outcome
+
+    gt._MOVE_NO_REPLACE = act_after_the_move
+    try:
+        with pytest.raises(Exception) as raised:
+            outbox.reject(scope, prop.id, review.sha256)
+    finally:
+        gt._MOVE_NO_REPLACE = real_move
+
+    assert fired, "the probe never fired"
+    outcome = describe(raised.value)
+    assert outcome.code == "E-SUBSTITUTED", outcome.code
+    assert outcome.committed == "unknown"
+    assert outcome.retry == "stop"
+
+    # Nothing renamed back: the record's own name is empty in every case,
+    # and whatever the writer left is exactly where they left it. The
+    # message is unique so `--tb=line` can bind a mutation to this exact
+    # assertion rather than to a bare bytes repr.
+    assert not prop.path.exists(), (
+        "a substitute was renamed back under the record's name: "
+        f"{prop.path.read_bytes()!r}"
+    )
+    quarantined = _quarantined(vault)
+    if condition == "absent":
+        assert quarantined == []
+    else:
+        assert [q.read_bytes() for q in quarantined] == [decoy]
+        assert reviewed_bytes not in [q.read_bytes() for q in quarantined]
+
+    # And reject touched nothing else. Compared on tracked state only:
+    # untracked output legitimately differs here, because the probe itself
+    # removed or replaced a file in the outbox, and that is the writer's
+    # doing rather than reject's.
+    after = _approval_state(vault)
+    for fact in ("head", "index", "worktree"):
+        assert after[fact] == before[fact], fact
+    assert (vault / prop.src).exists(), "reject moved the source"
+    assert not (vault / prop.dst).exists(), "reject created the destination"

@@ -21,12 +21,17 @@ Synthetic vaults only; the real vault is never touched.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import hashlib
 import importlib
+import inspect
+import html
 import json
 import os
 import re
 import subprocess
+
+import yaml
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -41,6 +46,7 @@ from tests.conftest import (
     git_count_commits,
     git_head,
     git_index_entries,
+    git_status_apart_from_quarantine,
     git_status_bytes,
     git_worktree_diff,
     scaffold_modules,
@@ -793,11 +799,41 @@ def test_bundles_shape_failures_never_blank_any_sidebar_route(tmp_path, monkeypa
 # logged a raw traceback) for every one of the three routes.
 
 
+def _outbox_fingerprint(tmp_path, proposal_id, entity="alpha"):
+    from app.outbox import get_proposal_review
+    from app.scope import Scope
+
+    return get_proposal_review(Scope(tmp_path, entity), proposal_id).sha256
+
+
+#: A well-formed fingerprint that binds nothing. Used where the id names no
+#: reviewable proposal (a hostile id, a poisoned listing), so the refusal
+#: under test is reached before any comparison against stored bytes.
+_UNBOUND_FINGERPRINT = "0" * 64
+
+
+def _action_data(tmp_path, proposal_id, entity="alpha"):
+    """Form data for an outbox action, carrying the proposal's own
+    fingerprint exactly as a rendered button would."""
+    return {
+        "id": proposal_id,
+        "review_sha256": _outbox_fingerprint(tmp_path, proposal_id, entity),
+    }
+
+
 def _outbox_proposal_client(tmp_path, monkeypatch, *, proposal_id=None):
     """A vault with one active module and one valid, loadable outbox
-    proposal — no Git repo. Sufficient for every test that monkeypatches
+    proposal, in a committed Git vault while the proposal stays untracked.
+
+    Sufficient for every test that monkeypatches
     `app.outbox.execute_transaction` (or `main.approve`/`main.reject`
     directly) rather than driving a real transaction.
+
+    S7: `git init` is required now that reject removes the proposal through
+    the conditional-removal primitive, which takes the per-vault approval
+    lock so a reject cannot race an approval that owns the same record. The
+    lock lives in the Git directory, so a vault without one is no longer a
+    faithful fixture — a real vault always has it.
     """
     main = _load_main(tmp_path, monkeypatch, ENTITIES)
     active = tmp_path / "alpha/00-inbox/active"
@@ -829,7 +865,537 @@ def _outbox_proposal_client(tmp_path, monkeypatch, *, proposal_id=None):
         ),
         encoding="utf-8",
     )
+    if not (tmp_path / ".git").exists():
+        (tmp_path / ".gitignore").write_text(
+            "*/outbox/*.yaml\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "test"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "fixture"],
+            cwd=tmp_path,
+            check=True,
+        )
     return main, TestClient(main.app), proposal_id
+
+
+def _commit_head_receipt(vault: Path, proposal_id: str, action_kind: str) -> None:
+    from app.action_receipts import (
+        make_action_receipt,
+        receipt_relative_path,
+        render_action_receipt,
+    )
+
+    receipt = make_action_receipt(proposal_id, "a" * 64, action_kind)
+    relative = receipt_relative_path("alpha", proposal_id)
+    path = vault / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(render_action_receipt(receipt))
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "fixture receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+
+def test_outbox_matching_receipt_renders_spent_card_without_record_contents(
+    tmp_path, monkeypatch
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    _commit_head_receipt(tmp_path, proposal_id, "approval")
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    marker = "hostile-unreviewed-record-marker"
+    proposal.write_text(marker, encoding="utf-8")
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "An approval has already completed for this proposal ID" in body
+    assert "A record with this ID is still present" in body
+    assert "If the item still needs classifying" in body
+    assert 'href="/triage/alpha"' in body
+    assert marker not in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+    assert not re.search(r"[0-9a-f]{64}", body)
+    assert re.search(rf'id="receipt-card-{re.escape(proposal_id)}-[0-9a-f]{{12}}"', body)
+
+
+def test_outbox_receipt_card_does_not_call_a_directory_a_pending_record(
+    tmp_path, monkeypatch
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    _commit_head_receipt(tmp_path, proposal_id, "approval")
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.unlink()
+    proposal.mkdir()
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    assert "An approval has already completed for this proposal ID" in response.text
+    assert "A record with this ID is still present" not in response.text, (
+        "a non-regular outbox entry was presented as a real pending record"
+    )
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_spent_result_renders_receipt_backed_listing(
+    tmp_path, monkeypatch, action
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    _commit_head_receipt(tmp_path, proposal_id, "approval")
+
+    response = client.post(
+        f"/outbox/alpha/{action}",
+        data={"id": proposal_id, "review_sha256": _UNBOUND_FINGERPRINT},
+    )
+
+    assert response.status_code == 200
+    assert 'id="outbox-list"' in response.text
+    assert "An approval has already completed for this proposal ID" in response.text
+    assert "hx-post" not in response.text
+    assert "review_sha256" not in response.text
+
+
+def test_outbox_malformed_matching_receipt_renders_linkless_e_receipt_card(
+    tmp_path, monkeypatch
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    relative = f"alpha/outbox/.receipts/{proposal_id}.yaml"
+    path = tmp_path / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    body = client.get("/outbox/alpha").text
+
+    assert "E-RECEIPT" in body
+    assert "No automated recovery is available" in body
+    assert "A record with this ID is still present" in body
+    assert "If the item still needs classifying" not in body
+    assert "If the entry still needs deleting" not in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_reports_a_malformed_matching_receipt_once(
+    tmp_path, monkeypatch, action
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    relative = f"alpha/outbox/.receipts/{proposal_id}.yaml"
+    path = tmp_path / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    response = client.post(
+        f"/outbox/alpha/{action}",
+        data={"id": proposal_id, "review_sha256": _UNBOUND_FINGERPRINT},
+    )
+
+    assert response.status_code == 500
+    assert response.text.count("E-RECEIPT") == 1, (
+        "one malformed receipt condition rendered more than one alert"
+    )
+    assert "hx-post" not in response.text
+
+
+def test_one_action_error_does_not_hide_a_sibling_receipt_error(
+    tmp_path, monkeypatch
+):
+    _main, client, acted_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    sibling_id = "20260815T090704-" + "bb" * 16
+    sibling = tmp_path / "alpha/outbox" / f"{sibling_id}.yaml"
+    sibling.write_bytes(b"receipt-first means these bytes stay unread")
+
+    for proposal_id in (acted_id, sibling_id):
+        relative = f"alpha/outbox/.receipts/{proposal_id}.yaml"
+        path = tmp_path / relative
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+        subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "two malformed receipts"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    response = client.post(
+        "/outbox/alpha/approve",
+        data={"id": acted_id, "review_sha256": _UNBOUND_FINGERPRINT},
+    )
+
+    assert response.status_code == 500
+    assert response.text.count("E-RECEIPT") == 2, (
+        "deduplicating the acted-on alert hid a sibling receipt failure"
+    )
+    assert f"receipt-card-{acted_id}-" in response.text
+    assert f"receipt-card-{sibling_id}-" in response.text
+
+
+def test_delete_refresh_matching_receipt_renders_spent_card_without_record_parse(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(_main, client, tmp_path, slug)
+    _commit_head_receipt(tmp_path, values["id"], "registry deletion")
+    proposal = tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    marker = "hostile-unreviewed-delete-marker"
+    proposal.write_text(marker, encoding="utf-8")
+
+    response = client.get(
+        f"/registry/alpha/product/review/{values['id']}"
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "A registry deletion has already completed for this proposal ID" in body
+    assert "If the entry still needs deleting" in body
+    assert 'href="/registry/alpha/products"' in body
+    assert marker not in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["same", "different", "malformed", "redirected", "non-file", "recreated"],
+)
+def test_delete_refresh_never_opens_any_spent_leaf_shape(
+    tmp_path, monkeypatch, shape
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(_main, client, tmp_path, slug)
+    proposal = tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    url = f"/registry/alpha/product/review/{values['id']}"
+    outside = tmp_path / "outside-delete-receipt-target.yaml"
+    outside.write_bytes(b"OUTSIDE-DELETE-SPENT-MARKER\n")
+
+    opened: list[tuple[int, int]] = []
+
+    def record(descriptor):
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            return
+        opened.append((info.st_dev, info.st_ino))
+
+    real_os_open = os.open
+    real_builtin_open = builtins.open
+
+    def spy_os_open(*args, **kwargs):
+        descriptor = real_os_open(*args, **kwargs)
+        record(descriptor)
+        return descriptor
+
+    def spy_builtin_open(*args, **kwargs):
+        handle = real_builtin_open(*args, **kwargs)
+        try:
+            record(handle.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return handle
+
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_builtin_open)
+
+    healthy = proposal.stat()
+    client.get(url)
+    assert (healthy.st_dev, healthy.st_ino) in opened, (
+        "positive control: the spy did not observe the unspent delete proposal"
+    )
+
+    _commit_head_receipt(tmp_path, values["id"], "registry deletion")
+    if shape == "different":
+        proposal.write_bytes(b"different but still bytes\n")
+    elif shape == "malformed":
+        proposal.write_bytes(b"not: [a delete proposal\n")
+    elif shape == "redirected":
+        proposal.unlink()
+        proposal.symlink_to(outside)
+    elif shape == "non-file":
+        proposal.unlink()
+        proposal.mkdir()
+    elif shape == "recreated":
+        original = proposal.read_bytes()
+        proposal.unlink()
+        proposal.write_bytes(original)
+
+    forbidden = (outside if shape == "redirected" else proposal).stat()
+    opened.clear()
+    body = client.get(url).text
+
+    assert (forbidden.st_dev, forbidden.st_ino) not in opened, (
+        f"the {shape} spent delete leaf or its target was opened"
+    )
+    assert "A registry deletion has already completed for this proposal ID" in body
+    assert "OUTSIDE-DELETE-SPENT-MARKER" not in body
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_spent_replay_keeps_the_card_after_the_record_is_consumed(
+    tmp_path, monkeypatch, action
+):
+    _main, client, proposal_id = _git_outbox_proposal_client(
+        tmp_path, monkeypatch
+    )
+    data = _action_data(tmp_path, proposal_id)
+
+    first = client.post("/outbox/alpha/approve", data=data)
+    assert first.status_code == 200
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    assert not proposal.exists(), "setup did not consume the proposal record"
+
+    replay = client.post(f"/outbox/alpha/{action}", data=data)
+
+    assert replay.status_code == 200
+    assert 'id="outbox-list"' in replay.text
+    assert "An approval has already completed for this proposal ID" in replay.text, (
+        "a spent replay lost its receipt-backed card"
+    )
+    assert "No pending proposals" not in replay.text, (
+        "a spent replay lost its receipt-backed card"
+    )
+    assert "A record with this ID is still present" not in replay.text
+    assert "hx-post" not in replay.text
+
+
+def test_approve_post_move_failure_keeps_applied_alert_and_spent_card(
+    tmp_path, monkeypatch
+):
+    import app.git_transaction as transaction
+
+    _main, client, proposal_id = _git_outbox_proposal_client(
+        tmp_path, monkeypatch
+    )
+
+    def fail_after_move(*args, **kwargs):
+        raise transaction.ReviewedPathUnavailable(
+            "injected after quarantine moved the proposal"
+        )
+
+    monkeypatch.setattr(
+        transaction, "_require_quarantined_record_unchanged", fail_after_move
+    )
+
+    response = client.post(
+        "/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id)
+    )
+
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    assert not proposal.exists(), "setup did not reach the post-move failure"
+    assert response.status_code == 500
+    assert "E-APPLIED" in response.text
+    assert "An approval has already completed for this proposal ID" in response.text, (
+        "E-APPLIED lost the acted-on receipt card after consumption"
+    )
+    assert "No pending proposals" not in response.text, (
+        "E-APPLIED lost the acted-on receipt card after consumption"
+    )
+    assert "A record with this ID is still present" not in response.text
+    assert "hx-post" not in response.text
+
+
+def test_delete_refresh_malformed_receipt_renders_linkless_e_receipt_card(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(_main, client, tmp_path, slug)
+    relative = f"alpha/outbox/.receipts/{values['id']}.yaml"
+    path = tmp_path / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    response = client.get(
+        f"/registry/alpha/product/review/{values['id']}"
+    )
+
+    assert response.status_code == 500
+    assert "E-RECEIPT" in response.text
+    assert "No automated recovery is available" in response.text
+    assert "If the item still needs classifying" not in response.text
+    assert "If the entry still needs deleting" not in response.text
+    assert "hx-post" not in response.text
+
+
+def test_delete_execute_spent_result_renders_receipt_card_not_success_copy(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+    _commit_head_receipt(tmp_path, values["id"], "registry deletion")
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert response.status_code == 200
+    assert "A registry deletion has already completed for this proposal ID" in response.text
+    assert "Deleted" not in response.text
+    assert "hx-post" not in response.text
+    assert response.headers["HX-Retarget"] == (
+        f"#review-card-{values['id']}-{values['review_sha256']}-{issue}"
+    )
+    assert response.headers["HX-Reswap"] == "outerHTML"
+
+
+def test_delete_replay_does_not_claim_the_consumed_record_is_still_present(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+
+    first = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+    assert first.status_code == 200
+    assert not (
+        tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    ).exists()
+
+    replay = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert replay.status_code == 200
+    assert "A registry deletion has already completed" in replay.text
+    assert "A record with this ID is still present" not in replay.text
+
+
+def test_delete_receipt_stays_authoritative_when_optional_presence_is_unsafe(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+    first = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+    assert first.status_code == 200
+
+    outbox = tmp_path / "alpha/outbox"
+    held = tmp_path / "alpha/outbox-held"
+    outside = tmp_path / "outside-outbox"
+    outside.mkdir()
+    outbox.rename(held)
+    outbox.symlink_to(outside, target_is_directory=True)
+
+    replay = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert replay.status_code == 200
+    assert "A registry deletion has already completed" in replay.text
+    assert "A record with this ID is still present" not in replay.text
+    assert not any(outside.iterdir()), "optional presentation evidence wrote outside"
+
+
+def test_approve_post_commit_consumption_failure_shows_applied_and_spent_card(
+    tmp_path, monkeypatch
+):
+    import app.git_transaction as transaction
+
+    _main, client, proposal_id = _git_outbox_proposal_client(
+        tmp_path, monkeypatch
+    )
+
+    def fail_consumption(*args, **kwargs):
+        raise transaction.ReviewedPathUnavailable("injected consumption failure")
+
+    monkeypatch.setattr(transaction, "quarantine_path_if_unchanged", fail_consumption)
+
+    response = client.post(
+        "/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id)
+    )
+
+    assert response.status_code == 500
+    assert "E-APPLIED" in response.text
+    assert "An approval has already completed for this proposal ID" in response.text
+    assert "hx-post" not in response.text
+    assert (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").exists()
+
+
+def test_delete_post_commit_consumption_failure_composes_applied_and_spent_card(
+    tmp_path, monkeypatch
+):
+    import app.git_transaction as transaction
+
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+    acted_on = f"review-card-{values['id']}-{values['review_sha256']}-{issue}"
+    assert acted_on in set(re.findall(r'id="([^"]+)"', preview))
+
+    def fail_consumption(*args, **kwargs):
+        raise transaction.ReviewedPathUnavailable("injected consumption failure")
+
+    monkeypatch.setattr(transaction, "quarantine_path_if_unchanged", fail_consumption)
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert response.status_code == 500
+    assert "E-APPLIED" in response.text
+    assert "A registry deletion has already completed for this proposal ID" in response.text
+    assert "hx-post" not in response.text
+    assert (tmp_path / "alpha/outbox" / f"{values['id']}.yaml").exists()
+    assert response.headers["HX-Retarget"] == f"#{acted_on}"
+    assert response.headers["HX-Reswap"] == "outerHTML"
+    assert re.search(
+        rf'id="receipt-card-{re.escape(values["id"])}-[0-9a-f]{{12}}"',
+        response.text,
+    )
 
 
 def _git_outbox_proposal_client(tmp_path, monkeypatch):
@@ -838,15 +1404,6 @@ def _git_outbox_proposal_client(tmp_path, monkeypatch):
     case must be a genuine post-commit cleanup failure, not a monkeypatched
     `execute_transaction`, which produces no commit at all)."""
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
-    (tmp_path / ".gitignore").write_text("*/outbox/*.yaml\n", encoding="utf-8")
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.invalid"],
-        cwd=tmp_path, check=True,
-    )
-    subprocess.run(["git", "config", "user.name", "test"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=tmp_path, check=True)
     return main, client, proposal_id
 
 
@@ -898,6 +1455,59 @@ def test_outbox_screen_renders_projection_blocked_listing(tmp_path, monkeypatch)
     assert "-sub: triage" in body
 
 
+def test_blocked_outbox_notice_uses_unreadable_row_not_earlier_receipt_error(
+    tmp_path, monkeypatch
+):
+    """The listing-wide blocker must not be borrowed from another bad row."""
+    _main, client, valid_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    outbox_dir = tmp_path / "alpha/outbox"
+    receipt_id = "20260815T090701-" + "11" * 16
+    receipt_record_marker = "raw-malformed-receipt-record-content-marker"
+    (outbox_dir / f"{receipt_id}.yaml").write_text(
+        receipt_record_marker, encoding="utf-8"
+    )
+    receipt_relative = f"alpha/outbox/.receipts/{receipt_id}.yaml"
+    receipt = tmp_path / receipt_relative
+    receipt.parent.mkdir(mode=0o700, exist_ok=True)
+    receipt.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(
+        ["git", "add", "--", receipt_relative], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed earlier receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    unreadable_id = "20260815T090704-" + "cc" * 16
+    unreadable_content_marker = "raw-unreadable-content-marker"
+    (outbox_dir / f"{unreadable_id}.yaml").write_text(
+        f"{unreadable_content_marker}: [unterminated\n", encoding="utf-8"
+    )
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    alert_codes = re.findall(r'class="alert-code">([^<]+)</span>', body)
+    assert alert_codes[0] == "E-UNREADABLE", (
+        "the listing-level notice did not describe the condition that blocked it"
+    )
+    assert alert_codes.count("E-UNREADABLE") == 1
+    assert alert_codes.count("E-RECEIPT") == 1
+    assert body.count(f"receipt-card-{receipt_id}-") == 1
+    assert valid_id in body
+    assert 'class="approve"' not in body
+    assert 'class="reject"' not in body
+    assert "/outbox/alpha/approve" not in body
+    assert "/outbox/alpha/reject" not in body
+    assert "review_sha256" not in body
+    assert not re.search(r"[0-9a-f]{64}", body)
+    assert unreadable_id not in body
+    assert unreadable_content_marker not in body
+    assert receipt_record_marker not in body
+
+
 def test_outbox_screen_unblocked_listing_keeps_controls(tmp_path, monkeypatch):
     """Sanity counterpart: with no unreadable record, the same valid proposal
     keeps its approve/reject controls — proving the blocked test above is
@@ -927,7 +1537,7 @@ def test_approve_busy_shows_e_busy_at_200(tmp_path, monkeypatch):
 
     monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
 
-    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+    response = client.post("/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id))
 
     assert response.status_code == 200
     assert 'role="alert"' in response.text
@@ -951,7 +1561,7 @@ def test_approve_conflict_shows_e_conflict(tmp_path, monkeypatch):
 
     monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
 
-    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+    response = client.post("/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id))
 
     assert response.status_code == 200
     assert 'role="alert"' in response.text
@@ -980,7 +1590,7 @@ def test_approve_rolled_back_shows_e_git(tmp_path, monkeypatch):
 
     monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
 
-    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+    response = client.post("/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id))
 
     assert response.status_code == 200
     assert 'role="alert"' in response.text
@@ -1009,7 +1619,7 @@ def test_approve_recovery_blocked_shows_e_recover(tmp_path, monkeypatch):
 
     monkeypatch.setattr(outbox_module, "execute_transaction", _raise, raising=False)
 
-    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+    response = client.post("/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id))
 
     from app.console_errors import _CODES
 
@@ -1045,7 +1655,7 @@ def test_approve_committed_cleanup_shows_e_committed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(git_transaction, "_remove_temporary_index", _fail_cleanup)
 
-    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+    response = client.post("/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id))
 
     assert response.status_code == 500
     assert 'role="alert"' in response.text
@@ -1059,7 +1669,11 @@ def test_approve_committed_cleanup_shows_e_committed(tmp_path, monkeypatch):
     new_head = git_head(vault)
     assert new_head != head_before
     assert git_changed_paths(vault, new_head) == sorted(
-        ["alpha/00-inbox/active/marker.md", "alpha/02-work/active/marker.md"]
+        [
+            "alpha/00-inbox/active/marker.md",
+            "alpha/02-work/active/marker.md",
+            f"alpha/outbox/.receipts/{proposal_id}.yaml",
+        ]
     )
     assert source.exists() is False
     assert destination.exists() is True
@@ -1074,7 +1688,7 @@ def test_reject_failure_is_visible_not_silent(tmp_path, monkeypatch):
 
     response = client.post(
         "/outbox/alpha/reject",
-        data={"id": "20260101T000000-" + "00" * 16},
+        data={"id": "20260101T000000-" + "00" * 16, "review_sha256": _UNBOUND_FINGERPRINT},
     )
 
     assert response.status_code == 200
@@ -1097,13 +1711,18 @@ def test_outbox_fragments_reproduce_outbox_list_root(tmp_path, monkeypatch):
     from app.vault import DestinationRegistryError
 
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    # Captured before the successful reject below consumes the proposal; the
+    # double-failure posts at the end reuse it and are refused anyway.
+    action_data = _action_data(tmp_path, proposal_id)
 
     refusal = client.post(
-        "/outbox/alpha/reject", data={"id": "hostile-nonexistent-id"}
+        "/outbox/alpha/reject",
+        data={"id": "hostile-nonexistent-id",
+              "review_sha256": _UNBOUND_FINGERPRINT},
     )
     assert refusal.text.count('id="outbox-list"') == 1
 
-    success = client.post("/outbox/alpha/reject", data={"id": proposal_id})
+    success = client.post("/outbox/alpha/reject", data=action_data)
     assert success.text.count('id="outbox-list"') == 1
 
     # Blocked shape: a genuinely unreadable record blocks the whole listing.
@@ -1123,11 +1742,11 @@ def test_outbox_fragments_reproduce_outbox_list_root(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, "project_outbox", _fail_listing)
     approve_double_failure = client.post(
-        "/outbox/alpha/approve", data={"id": proposal_id}
+        "/outbox/alpha/approve", data=action_data
     )
     assert approve_double_failure.text.count('id="outbox-list"') == 1
     reject_double_failure = client.post(
-        "/outbox/alpha/reject", data={"id": proposal_id}
+        "/outbox/alpha/reject", data=action_data
     )
     assert reject_double_failure.text.count('id="outbox-list"') == 1
 
@@ -1160,7 +1779,7 @@ def test_outbox_double_failure_renders_both_the_action_refusal_and_the_listing_f
     monkeypatch.setattr(main, action, _refuse_action)
     monkeypatch.setattr(main, "project_outbox", _fail_listing)
 
-    response = client.post(f"/outbox/alpha/{action}", data={"id": proposal_id})
+    response = client.post(f"/outbox/alpha/{action}", data=_action_data(tmp_path, proposal_id))
     body = response.text
 
     # The action's own refusal (E-INVALID, a refusal) drives the status —
@@ -1200,7 +1819,7 @@ def test_outbox_same_code_double_failure_renders_one_alert(
     monkeypatch.setattr(main, action, _one_condition_refuses_both)
     monkeypatch.setattr(main, "project_outbox", _one_condition_refuses_both)
 
-    response = client.post(f"/outbox/alpha/{action}", data={"id": proposal_id})
+    response = client.post(f"/outbox/alpha/{action}", data=_action_data(tmp_path, proposal_id))
     body = response.text
 
     assert body.count('role="alert"') == 1
@@ -1221,7 +1840,10 @@ def test_outbox_blocked_action_renders_one_alert_not_two(tmp_path, monkeypatch):
         "{ not: [valid, yaml", encoding="utf-8",
     )
 
-    response = client.post("/outbox/alpha/approve", data={"id": valid_id})
+    response = client.post(
+        "/outbox/alpha/approve",
+        data={"id": valid_id, "review_sha256": _UNBOUND_FINGERPRINT},
+    )
 
     # E-UNREADABLE is `attention` severity, so the fragment status follows
     # its own page status (422) rather than 200 (design §5).
@@ -1256,7 +1878,7 @@ def test_outbox_double_failure_does_not_claim_no_pending_proposals(
     monkeypatch.setattr(main, "project_outbox", _fail_listing)
 
     response = client.post(
-        "/outbox/alpha/reject", data={"id": "hostile-nonexistent-id"}
+        "/outbox/alpha/reject", data={"id": "hostile-nonexistent-id", "review_sha256": _UNBOUND_FINGERPRINT}
     )
 
     assert "No pending proposals" not in response.text
@@ -1315,15 +1937,25 @@ def test_outbox_hx_vals_are_tojson(tmp_path, monkeypatch):
 
     response = client.get("/outbox/alpha")
 
+    fingerprint = _outbox_fingerprint(tmp_path, proposal_id)
     parser = HxValsParser()
     parser.feed(response.text)
     assert len(parser.values) == 2  # one approve button, one reject button
     for raw in parser.values:
-        assert json.loads(raw) == {"id": proposal_id}
+        # S7 added the fingerprint to the same serialised mapping; it is
+        # still `tojson`, still server-rendered, still never hand-built.
+        assert json.loads(raw) == {
+            "id": proposal_id,
+            "review_sha256": fingerprint,
+        }, "an action control does not transport exactly id + review_sha256"
 
+    # S7 Task 5 moved the card — and with it the `hx-vals` — into
+    # `blocks/outbox_card.html`, which the list includes. Follow it there:
+    # scanning the list alone would now scan zero attributes and pass having
+    # proved nothing.
     source = (
         Path(__file__).resolve().parents[1]
-        / "templates/blocks/outbox_list.html"
+        / "templates/blocks/outbox_card.html"
     ).read_text(encoding="utf-8")
     hx_vals_attrs = re.findall(r"hx-vals='([^']*)'", source)
     assert hx_vals_attrs, "expected at least one hx-vals attribute"
@@ -1353,6 +1985,10 @@ def test_outbox_declared_family_never_reaches_the_global_fallback(
     from app.outbox import OutboxError
 
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    # Captured once, before any patching: every pass below refuses rather
+    # than consuming the proposal, and recomputing mid-test would read
+    # through a deliberately broken reader.
+    action_data = _action_data(tmp_path, proposal_id)
     real_approve = main.approve
     real_reject = main.reject
     reached = []
@@ -1378,7 +2014,7 @@ def test_outbox_declared_family_never_reaches_the_global_fallback(
 
         monkeypatch.setattr(main, "approve", _raise)
         approve_response = client.post(
-            "/outbox/alpha/approve", data={"id": proposal_id}
+            "/outbox/alpha/approve", data=action_data
         )
         assert expected_code in approve_response.text, approve_response.text
         assert proposal_id in approve_response.text, (
@@ -1388,7 +2024,7 @@ def test_outbox_declared_family_never_reaches_the_global_fallback(
 
         monkeypatch.setattr(main, "reject", _raise)
         reject_response = client.post(
-            "/outbox/alpha/reject", data={"id": proposal_id}
+            "/outbox/alpha/reject", data=action_data
         )
         assert expected_code in reject_response.text, reject_response.text
         assert proposal_id in reject_response.text, (
@@ -1416,13 +2052,13 @@ def test_outbox_declared_family_never_reaches_the_global_fallback(
         assert reached == [], f"outbox_screen: fallback reached for {expected_code}"
 
         approve_response = client.post(
-            "/outbox/alpha/approve", data={"id": proposal_id}
+            "/outbox/alpha/approve", data=action_data
         )
         assert expected_code in approve_response.text, approve_response.text
         assert reached == [], f"outbox_approve: fallback reached for {expected_code}"
 
         reject_response = client.post(
-            "/outbox/alpha/reject", data={"id": proposal_id}
+            "/outbox/alpha/reject", data=action_data
         )
         assert expected_code in reject_response.text, reject_response.text
         assert reached == [], f"outbox_reject: fallback reached for {expected_code}"
@@ -1597,8 +2233,30 @@ def test_delete_preview_hx_vals_survive_hostile_slug(tmp_path, monkeypatch):
     parser.feed(response.text)
     assert len(parser.values) == 1
     parsed = json.loads(parser.values[0])
-    assert parsed == {"id": proposal_id}
-    assert "hostile-injected-id-marker" not in response.text
+    # S7 added the fingerprint to the same serialised mapping; it is still
+    # `tojson`, still server-rendered, and the hostile slug still never
+    # appears in it.
+    assert parsed == {
+        "id": proposal_id,
+        "review_sha256": hashlib.sha256(
+            (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").read_bytes()
+        ).hexdigest(),
+    }, "the delete control does not transport exactly id + review_sha256"
+    # S7 (blocker: displayed slug outside the snapshot) now renders the
+    # *fingerprinted* slug, which for this request is the hostile string the
+    # proposal actually stores. That is the correct thing to show — the
+    # operator must see what they are approving — so the guarantee is no
+    # longer "the marker never appears" but the two that actually matter:
+    #
+    # 1. it can never reach an `hx-vals` mapping, and
+    for raw in parser.values:
+        assert "hostile-injected-id-marker" not in raw
+    # 2. it is never rendered unescaped, so it cannot close the attribute or
+    #    inject a second key once the browser decodes the page.
+    assert 'shown", "id": "hostile-injected-id-marker' not in response.text
+    assert "hostile-injected-id-marker" in response.text, (
+        "the stored slug must be shown to the operator, escaped"
+    )
 
     # M1 (review): `prop.id` is server-generated
     # (`^[0-9]{8}T[0-9]{6}-[0-9a-f]{32}$`, `app/proposal_identity.py`) and can
@@ -1646,7 +2304,8 @@ def test_delete_execute_success_copy_from_validated_slug(tmp_path, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id, "slug": "hostile-spoofed-slug-marker"},
+        data={**_delete_action_data(tmp_path, proposal),
+              "slug": "hostile-spoofed-slug-marker"},
     )
 
     assert response.status_code == 200
@@ -1678,7 +2337,7 @@ def test_delete_execute_error_is_templated_and_escaped(tmp_path, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id},
+        data=_delete_action_data(tmp_path, proposal),
     )
 
     assert response.status_code == 200
@@ -1769,7 +2428,7 @@ def test_all_five_s5_outcomes_via_real_execute_delete(tmp_path, monkeypatch):
 
         response = client.post(
             "/registry/alpha/product/delete-execute",
-            data={"id": proposal.id},
+            data=_delete_action_data(tmp_path, proposal),
         )
 
         assert response.status_code == expected_status, response.text
@@ -1798,7 +2457,7 @@ def test_all_five_s5_outcomes_via_real_execute_delete(tmp_path, monkeypatch):
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": committed_proposal.id},
+        data=_delete_action_data(tmp_path, committed_proposal),
     )
 
     assert response.status_code == 500
@@ -1833,7 +2492,7 @@ def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch)
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
     outbox_before = _outbox_snapshot(vault)
 
     def _fail_after_persisting(*args, **kwargs):
@@ -1841,7 +2500,12 @@ def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch)
             "registries unreadable after proposal write"
         )
 
-    monkeypatch.setattr(main, "reference_count", _fail_after_persisting)
+    # S7: the route's post-persist step is now the review read, not a live
+    # reference count — the failure must be injected where it still reads, or
+    # this cell proves nothing about "persisted, then failed".
+    monkeypatch.setattr(
+        main, "get_delete_receipt_or_review", _fail_after_persisting
+    )
 
     response = client.post(
         "/registry/alpha/product/delete-preview", data={"slug": slug}
@@ -1861,7 +2525,7 @@ def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch)
     assert git_worktree_diff(vault) == worktree_before
     # git itself sees nothing new anywhere — the proposal file is gitignored,
     # exactly as this fixture's own `.gitignore` says.
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
 
     outbox_after = _outbox_snapshot(vault)
     assert outbox_before - outbox_after == set(), "nothing was removed"
@@ -1893,7 +2557,7 @@ def _state_proof_proposal_written_propose(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
     outbox_before = _outbox_snapshot(vault)
 
     def _fail_after_persisting(*args, **kwargs):
@@ -1914,7 +2578,7 @@ def _state_proof_proposal_written_propose(tmp_path, monkeypatch):
     assert git_index_entries(vault) == index_before
     assert git_cached_diff(vault) == cached_before
     assert git_worktree_diff(vault) == worktree_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
 
     outbox_after = _outbox_snapshot(vault)
     assert outbox_before - outbox_after == set(), "nothing was removed"
@@ -2028,16 +2692,20 @@ def test_registry_declared_family_never_reaches_the_global_fallback(
         def _raise(*args, __exc=raiser, **kwargs):
             raise __exc
 
-        monkeypatch.setattr(main, "get_delete_proposal", _raise)
+        # S7: the route no longer reads through a value-only reader —
+        # `execute_delete` is its single domain call, and returns the
+        # bound proposal used for the success copy.
+        monkeypatch.setattr(main, "execute_delete", _raise)
         response = client.post(
-            "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+            "/registry/alpha/product/delete-execute",
+        data=_delete_action_data(tmp_path, proposal),
         )
         assert expected_code in response.text, response.text
         assert reached == [], (
-            f"registry_delete_execute (get_delete_proposal): fallback reached "
+            f"registry_delete_execute (execute_delete): fallback reached "
             f"for {expected_code}"
         )
-    monkeypatch.setattr(main, "get_delete_proposal", registry.get_delete_proposal)
+    monkeypatch.setattr(main, "execute_delete", registry.execute_delete)
 
     for raiser, expected_code in (
         (RedirectedPathError("redirected outbox"), "E-TAMPER"),
@@ -2050,7 +2718,8 @@ def test_registry_declared_family_never_reaches_the_global_fallback(
 
         monkeypatch.setattr(main, "execute_delete", _raise)
         response = client.post(
-            "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+            "/registry/alpha/product/delete-execute",
+        data=_delete_action_data(tmp_path, proposal),
         )
         assert expected_code in response.text, response.text
         assert reached == [], (
@@ -2144,6 +2813,11 @@ def test_registry_delete_execute_real_corrupt_proposal_shows_e_unreadable(
     # the likelier hand-editing mistake `yaml.safe_load(...) or {}` cannot
     # guard against.
     proposal.path.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    # S7: submit the fingerprint of the corrupt bytes themselves. The
+    # comparison runs before the parse (design §3), so an unrelated
+    # fingerprint would refuse as a changed review and never reach the
+    # unreadable-record outcome this test exists to pin.
+    corrupt_fingerprint = hashlib.sha256(proposal.path.read_bytes()).hexdigest()
 
     reached = []
     original = main.app.exception_handlers[Exception]
@@ -2155,7 +2829,8 @@ def test_registry_delete_execute_real_corrupt_proposal_shows_e_unreadable(
     monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
 
     response = TestClient(main.app).post(
-        "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+        "/registry/alpha/product/delete-execute",
+        data={"id": proposal.id, "review_sha256": corrupt_fingerprint},
     )
 
     assert reached == [], f"fallback reached: {reached}"
@@ -2257,7 +2932,7 @@ def test_delete_execute_fragment_does_not_reproduce_delete_impact_root(
 
     response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": proposal.id},
+        data=_delete_action_data(tmp_path, proposal),
         headers={"HX-Target": "hostile-target-marker"},
     )
 
@@ -2272,7 +2947,8 @@ def test_delete_execute_fragment_does_not_reproduce_delete_impact_root(
 
     error_response = client.post(
         "/registry/alpha/product/delete-execute",
-        data={"id": "not-a-real-proposal-id"},
+        data={"id": "not-a-real-proposal-id",
+              "review_sha256": _UNBOUND_FINGERPRINT},
         headers={"HX-Target": "hostile-target-marker"},
     )
 
@@ -2457,7 +3133,7 @@ def _state_proof_no_none(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
     outbox_before = _outbox_snapshot(vault)
 
     real_project_outbox = main.project_outbox
@@ -2477,12 +3153,12 @@ def _state_proof_no_none(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, "approve", _raise_outbox)
     outbox_approve_response = client.post(
-        "/outbox/alpha/approve", data={"id": proposal_id}
+        "/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id)
     )
 
     monkeypatch.setattr(main, "reject", _raise_outbox)
     outbox_reject_response = client.post(
-        "/outbox/alpha/reject", data={"id": proposal_id}
+        "/outbox/alpha/reject", data=_action_data(tmp_path, proposal_id)
     )
 
     def _raise_registry_error(*args, **kwargs):
@@ -2491,9 +3167,9 @@ def _state_proof_no_none(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "products_for", _raise_registry_error)
     registry_products_response = client.get("/registry/alpha/products")
 
-    monkeypatch.setattr(main, "get_delete_proposal", _raise_registry_error)
+    monkeypatch.setattr(main, "execute_delete", _raise_registry_error)
     registry_delete_execute_response = client.post(
-        "/registry/alpha/product/delete-execute", data={"id": "irrelevant"}
+        "/registry/alpha/product/delete-execute", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
     )
 
     # (response, expected code, expected status)
@@ -2520,7 +3196,7 @@ def _state_proof_no_none(tmp_path, monkeypatch):
     assert git_index_entries(vault) == index_before
     assert git_cached_diff(vault) == cached_before
     assert git_worktree_diff(vault) == worktree_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
     assert _outbox_snapshot(vault) == outbox_before
 
 
@@ -2600,7 +3276,7 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
     index_before = _index_entries_by_path(git_index_entries(vault))
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     def _fail_cleanup(temporary_index):
         return OSError("injected post-commit temporary index cleanup failure")
@@ -2608,7 +3284,8 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
     monkeypatch.setattr(git_transaction, "_remove_temporary_index", _fail_cleanup)
 
     response = client.post(
-        "/registry/alpha/product/delete-execute", data={"id": proposal.id}
+        "/registry/alpha/product/delete-execute",
+        data=_delete_action_data(tmp_path, proposal),
     )
 
     from app.console_errors import _CODES
@@ -2619,14 +3296,19 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
     assert git_count_commits(vault) == commits_before + 1
     new_head = git_head(vault)
     assert new_head != head_before
-    assert git_changed_paths(vault, new_head) == [reviewed_path]
+    receipt_path = f"alpha/outbox/.receipts/{proposal.id}.yaml"
+    assert git_changed_paths(vault, new_head) == sorted(
+        [reviewed_path, receipt_path]
+    )
 
     assert git_worktree_diff(vault) == worktree_before
     assert git_cached_diff(vault) == cached_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
     index_after = _index_entries_by_path(git_index_entries(vault))
     index_before.pop(reviewed_path, None)
     index_after.pop(reviewed_path, None)
+    index_before.pop(receipt_path, None)
+    index_after.pop(receipt_path, None)
     assert index_after == index_before
 
     assert slug.encode("utf-8") not in registry_path.read_bytes()
@@ -2656,7 +3338,7 @@ def _state_proof_unknown(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     blocked_path = "alpha/11-other/active/blocked-path-marker.md"
     real_execute_transaction = outbox_module.execute_transaction
@@ -2670,7 +3352,7 @@ def _state_proof_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(outbox_module, "execute_transaction", _raise)
 
     try:
-        response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+        response = client.post("/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id))
 
         assert response.status_code == _CODES["E-RECOVER"].page_status
         assert "E-RECOVER" in response.text
@@ -2681,7 +3363,7 @@ def _state_proof_unknown(tmp_path, monkeypatch):
         assert git_index_entries(vault) == index_before
         assert git_cached_diff(vault) == cached_before
         assert git_worktree_diff(vault) == worktree_before
-        assert git_status_bytes(vault) == status_before
+        assert git_status_apart_from_quarantine(vault) == status_before
 
         # The owned path — the proposal's source — matches its pre-request
         # state.
@@ -2728,7 +3410,7 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
     head_before = git_head(vault)
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     concurrent_bytes = b"concurrent replacement\n"
     hook = vault / ".git/hooks/pre-commit"
@@ -2742,7 +3424,7 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
 
     from app.console_errors import _CODES
 
-    response = client.post("/outbox/alpha/approve", data={"id": proposal_id})
+    response = client.post("/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id))
 
     assert response.status_code == _CODES["E-RECOVER"].page_status
     assert "E-RECOVER" in response.text
@@ -2761,11 +3443,33 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
         git_status_bytes(vault), destination_relative
     ) == _status_lines_excluding(status_before, destination_relative)
 
+    # And the exclusion is exact: a decoy alongside it, and one under
+    # another entity, must both still be seen.
+    decoy = vault / "alpha/outbox/.consumed/not-this-record.yaml"
+    decoy.parent.mkdir()
+    decoy.write_bytes(b"decoy\n")
+    other = vault / "beta/outbox/.consumed"
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "another-entity.yaml").write_bytes(b"decoy\n")
+    try:
+        seen = _status_lines_excluding(
+            git_status_bytes(vault), destination_relative
+        )
+        assert any(b"not-this-record.yaml" in line for line in seen), seen
+        assert any(b"another-entity.yaml" in line for line in seen), seen
+    finally:
+        decoy.unlink()
+        decoy.parent.rmdir()
+        (other / "another-entity.yaml").unlink()
+        other.rmdir()
+
     # The owned path — the destination — matches the CONCURRENT WRITER's
     # bytes. This is the disjunct `_state_proof_unknown` cannot exercise.
     assert destination.read_bytes() == concurrent_bytes
     assert source.read_bytes() == source_before
+    # Stage 2: pre-commit failures never consume the proposal.
     assert proposal_path.read_bytes() == proposal_before
+    assert not (proposal_path.parent / ".consumed").exists()
 
 
 def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):
@@ -2794,7 +3498,7 @@ def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):
     index_before = git_index_entries(vault)
     cached_before = git_cached_diff(vault)
     worktree_before = git_worktree_diff(vault)
-    status_before = git_status_bytes(vault)
+    status_before = git_status_apart_from_quarantine(vault)
 
     def _raise(self):
         raise DestinationRegistryError("registries unreadable")
@@ -2811,7 +3515,7 @@ def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):
     assert git_index_entries(vault) == index_before
     assert git_cached_diff(vault) == cached_before
     assert git_worktree_diff(vault) == worktree_before
-    assert git_status_bytes(vault) == status_before
+    assert git_status_apart_from_quarantine(vault) == status_before
 
 
 @pytest.mark.parametrize("cell", ["no-none", "no-proposal-written", "yes", "unknown"])
@@ -2997,15 +3701,22 @@ def test_alerts_never_contain_paths_slugs_or_echoes(tmp_path, monkeypatch):
             main, client, proposal_id = _outbox_proposal_client(subdir, monkeypatch)
             marker = _marker(f"outbox-{action}-{code}")
             id_marker = _marker(f"outbox-{action}-{code}-id")
+            # S7 adds a second submitted value to the same request, so
+            # Rule 8 is proved for the fingerprint field too: a hostile
+            # value there must never be reflected into the alert.
+            fingerprint_marker = _marker(f"outbox-{action}-{code}-fp")
 
             def _raise_action(*args, __exc=exc_factory(marker), **kwargs):
                 raise __exc
 
             monkeypatch.setattr(main, action, _raise_action)
             response = client.post(
-                f"/outbox/alpha/{action}", data={"id": id_marker}
+                f"/outbox/alpha/{action}",
+                data={"id": id_marker, "review_sha256": fingerprint_marker},
             )
-            _assert_alert_discloses_nothing(response, code, [marker, id_marker])
+            _assert_alert_discloses_nothing(
+                response, code, [marker, id_marker, fingerprint_marker]
+            )
 
     # -- outbox_approve: E-RECOVER, E-COMMITTED (I5, review: these two
     #    chain-derived outcomes — Rule 1's resolver walking a wrapper's
@@ -3058,7 +3769,7 @@ def test_alerts_never_contain_paths_slugs_or_echoes(tmp_path, monkeypatch):
 
         monkeypatch.setattr(main, "approve", _raise_chained)
         response = client.post(
-            "/outbox/alpha/approve", data={"id": proposal_id}
+            "/outbox/alpha/approve", data=_action_data(subdir, proposal_id)
         )
         _assert_alert_discloses_nothing(response, code, [marker])
 
@@ -3121,13 +3832,17 @@ def test_alerts_never_contain_paths_slugs_or_echoes(tmp_path, monkeypatch):
         main, client, slug = _registry_client(subdir, monkeypatch)
         marker = _marker(f"registry-delete-execute-{code}")
         id_marker = _marker(f"registry-delete-execute-{code}-id")
+        # S7: a second submitted value, so Rule 8 is proved for the
+        # fingerprint field too.
+        fingerprint_marker = _marker(f"registry-delete-execute-{code}-fp")
 
         def _raise_execute(*args, __exc=exc_factory(marker), **kwargs):
             raise __exc
 
-        monkeypatch.setattr(main, "get_delete_proposal", _raise_execute)
+        monkeypatch.setattr(main, "execute_delete", _raise_execute)
         response = client.post(
-            "/registry/alpha/product/delete-execute", data={"id": id_marker}
+            "/registry/alpha/product/delete-execute",
+            data={"id": id_marker, "review_sha256": fingerprint_marker},
         )
         _assert_alert_discloses_nothing(response, code, [marker, id_marker, slug])
 
@@ -3200,13 +3915,13 @@ def _route_totality_plan(main) -> dict:
         },
         main.outbox_approve: {
             "request": lambda c: c.post(
-                "/outbox/alpha/approve", data={"id": "irrelevant"}
+                "/outbox/alpha/approve", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
             ),
             "patch_targets": [(main, "approve")],
         },
         main.outbox_reject: {
             "request": lambda c: c.post(
-                "/outbox/alpha/reject", data={"id": "irrelevant"}
+                "/outbox/alpha/reject", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
             ),
             "patch_targets": [(main, "reject")],
         },
@@ -3222,9 +3937,22 @@ def _route_totality_plan(main) -> dict:
         },
         main.registry_delete_execute: {
             "request": lambda c: c.post(
-                "/registry/alpha/product/delete-execute", data={"id": "irrelevant"}
+                "/registry/alpha/product/delete-execute", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
             ),
-            "patch_targets": [(main, "get_delete_proposal")],
+            "patch_targets": [(main, "execute_delete")],
+        },
+        main.outbox_review_fragment: {
+            "request": lambda c: c.get(
+                "/outbox/alpha/review/20260815T090703-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            "patch_targets": [(main, "project_outbox")],
+        },
+        main.registry_delete_review_fragment: {
+            "request": lambda c: c.get(
+                "/registry/alpha/product/review/"
+                "20260815T090703-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            "patch_targets": [(main, "get_delete_receipt_or_review")],
         },
         main.pulse: {"request": lambda c: c.get("/blocks/pulse"), "patch_targets": []},
     }
@@ -3282,16 +4010,30 @@ def test_route_totality_from_declared_catches(tmp_path, monkeypatch):
         try:
             for exc_class in catches:
                 for owner, attr in spec["patch_targets"]:
-                    def _raise(*args, __exc=exc_class, **kwargs):
+                    injected = []
+
+                    def _raise(
+                        *args, __exc=exc_class, __injected=injected, **kwargs
+                    ):
+                        __injected.append(True)
                         raise __exc("injected for route totality")
 
                     monkeypatch.setattr(owner, attr, _raise)
                     reached.clear()
-                    spec["request"](client)
+                    response = spec["request"](client)
+                    assert injected, (
+                        f"{endpoint.__qualname__}: {exc_class.__name__} via "
+                        f"{owner!r}.{attr} was not injected"
+                    )
                     assert reached == [], (
                         f"{endpoint.__qualname__}: {exc_class.__name__} via "
                         f"{owner!r}.{attr} reached the global fallback"
                     )
+                    if endpoint is main.registry_delete_review_fragment:
+                        assert 'role="alert"' in response.text
+                        assert not _rendered_control_ids(response.text), response.text
+                        assert "review_sha256" not in response.text
+                        assert "hx-post" not in response.text
         finally:
             # Restore before moving to the next route: several routes share
             # a patch target (`Vault.bundles`, in particular), and a
@@ -4098,7 +4840,8 @@ def test_outbox_reject_real_corrupt_sibling_shows_e_unreadable(tmp_path, monkeyp
     monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
 
     response = TestClient(main.app).post(
-        "/outbox/alpha/reject", data={"id": valid_id}
+        "/outbox/alpha/reject",
+        data={"id": valid_id, "review_sha256": _UNBOUND_FINGERPRINT},
     )
 
     assert reached == [], f"fallback reached: {reached}"
@@ -4165,7 +4908,122 @@ def test_outbox_screen_real_symlinked_outbox_shows_e_tamper(tmp_path, monkeypatc
     assert response.status_code == _CODES["E-TAMPER"].page_status
     assert 'role="alert"' in response.text
     assert "E-TAMPER" in response.text
+    assert _CODES["E-TAMPER"].message in response.text
+    assert "ONEOS_VAULT" in response.text
+    assert "symlink" in response.text
+    assert "hx-post" not in response.text
+    assert "review_sha256" not in response.text
     assert "outside-outbox-screen-marker" not in response.text
+
+
+def test_registry_tamper_preview_swap_removes_its_initiating_delete_control(
+    tmp_path, monkeypatch
+):
+    """A 409 fragment swaps into the control's page target, not an isolated
+    response document. The initiated delete control must therefore be absent
+    from the browser's resulting DOM while unrelated registry actions remain
+    outside this amendment's scope."""
+    from app.console_errors import _CODES
+
+    class _Node:
+        def __init__(self, tag, attrs, parent=None):
+            self.tag = tag
+            self.attrs = dict(attrs)
+            self.parent = parent
+            self.children = []
+
+    class _BrowserDom(HTMLParser):
+        _VOID = frozenset({
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        })
+
+        def __init__(self, markup):
+            super().__init__()
+            self.root = _Node("document", [])
+            self.stack = [self.root]
+            self.feed(markup)
+
+        def handle_starttag(self, tag, attrs):
+            node = _Node(tag, attrs, self.stack[-1])
+            self.stack[-1].children.append(node)
+            if tag not in self._VOID:
+                self.stack.append(node)
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+            if tag not in self._VOID:
+                self.stack.pop()
+
+        def handle_endtag(self, tag):
+            for index in range(len(self.stack) - 1, 0, -1):
+                if self.stack[index].tag == tag:
+                    del self.stack[index:]
+                    return
+
+        def nodes(self):
+            pending = list(self.root.children)
+            while pending:
+                node = pending.pop(0)
+                yield node
+                pending[0:0] = node.children
+
+        def node_with_id(self, element_id):
+            return next(
+                node for node in self.nodes() if node.attrs.get("id") == element_id
+            )
+
+        def swap(self, element_id, markup, strategy):
+            target = self.node_with_id(element_id)
+            replacement = type(self)(markup).root.children
+            if strategy == "innerHTML":
+                target.children = replacement
+                for node in replacement:
+                    node.parent = target
+                return
+            assert strategy == "outerHTML"
+            parent = target.parent
+            index = parent.children.index(target)
+            parent.children[index:index + 1] = replacement
+            for node in replacement:
+                node.parent = parent
+
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    page = client.get("/registry/alpha/products")
+    assert page.status_code == 200
+
+    before = _BrowserDom(page.text)
+    delete_url = "/registry/alpha/product/delete-preview"
+    control = next(
+        node
+        for node in before.nodes()
+        if node.attrs.get("hx-post") == delete_url
+        and json.loads(node.attrs.get("hx-vals", "{}")) == {"slug": slug}
+    )
+    target_id = control.attrs["hx-target"].removeprefix("#")
+    swap_strategy = control.attrs["hx-swap"]
+    assert before.node_with_id(target_id)
+
+    outbox_dir = tmp_path / "alpha/outbox"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-outbox-preview-marker"
+    outside.mkdir()
+    if outbox_dir.exists():
+        import shutil
+
+        shutil.rmtree(outbox_dir)
+    outbox_dir.symlink_to(outside)
+
+    response = client.post(delete_url, data={"slug": slug})
+    assert response.status_code == _CODES["E-TAMPER"].page_status
+    assert "E-TAMPER" in response.text
+
+    after = _BrowserDom(page.text)
+    after.swap(target_id, response.text, swap_strategy)
+    assert not any(
+        node.attrs.get("hx-post") == delete_url
+        and json.loads(node.attrs.get("hx-vals", "{}")) == {"slug": slug}
+        for node in after.nodes()
+    )
 
 
 def test_registry_delete_preview_real_symlinked_outbox_shows_e_tamper(
@@ -4237,9 +5095,1963 @@ def test_registry_delete_preview_real_symlinked_outbox_shows_e_tamper(
     assert response.status_code == _CODES["E-TAMPER"].page_status
     assert 'role="alert"' in response.text
     assert "E-TAMPER" in response.text
+    assert _CODES["E-TAMPER"].message in response.text
+    assert "ONEOS_VAULT" in response.text
+    assert "symlink" in response.text
+    assert "hx-post" not in response.text
+    assert "review_sha256" not in response.text
     assert "outside-outbox-preview-marker" not in response.text
 
     # persistence=none: nothing was written anywhere, including the real
     # (redirected) target directory.
     assert list(outside.glob("*.yaml")) == []
     assert outbox_before == set()
+
+
+# --- S7 Task 3: the fingerprint travels from the rendered row to the service --
+#
+# Only the transport is proved here. The same-screen changed-review
+# presentation is Task 5's; these tests exist so no commit ships a route
+# that requires a fingerprint its own buttons do not send.
+
+
+def test_outbox_action_buttons_carry_id_and_fingerprint_through_tojson(
+    tmp_path, monkeypatch
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    fingerprint = _outbox_fingerprint(tmp_path, proposal_id)
+
+    from tests.test_app import HxValsParser
+
+    body = client.get("/outbox/alpha").text
+
+    assert "/outbox/alpha/approve" in body
+    assert "/outbox/alpha/reject" in body
+    parser = HxValsParser()
+    parser.feed(body)
+    assert len(parser.values) == 2
+    for raw in parser.values:
+        assert json.loads(raw) == {
+            "id": proposal_id,
+            "review_sha256": fingerprint,
+        }, "an action control does not transport exactly id + review_sha256"
+    # The fingerprint is the one this row was actually rendered from.
+    assert fingerprint == hashlib.sha256(
+        (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").read_bytes()
+    ).hexdigest()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_route_requires_a_fingerprint(tmp_path, monkeypatch, action):
+    """A missing field is an invalid request, never an id-only fallback."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+
+    source_before = (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes()
+
+    # Deliberately id-only: the field is omitted, not merely wrong.
+    response = client.post(f"/outbox/alpha/{action}", data={"id": proposal_id})
+
+    # An invalid request, described as one. A fragment refusal renders at 200
+    # (design §5); what matters is that it is E-REQUEST and nothing moved.
+    assert "E-REQUEST" in response.text
+    assert 'role="alert"' in response.text
+    assert (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").exists()
+    assert (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes() == source_before
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_route_passes_the_submitted_fingerprint_unchanged(
+    tmp_path, monkeypatch, action
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    submitted = "b" * 64
+    seen = {}
+
+    def _spy(scope, id, review_sha256):
+        seen["id"] = id
+        seen["review_sha256"] = review_sha256
+        raise RuntimeError("stop before mutating")
+
+    monkeypatch.setattr(main, action, _spy)
+    with pytest.raises(RuntimeError):
+        client.post(
+            f"/outbox/alpha/{action}",
+            data={"id": proposal_id, "review_sha256": submitted},
+        )
+
+    # Byte-for-byte: the route neither recomputes nor normalises it.
+    assert seen == {"id": proposal_id, "review_sha256": submitted}
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_route_never_recomputes_the_fingerprint(
+    tmp_path, monkeypatch, action
+):
+    """A route that read the proposal to derive its own fingerprint would
+    rebind the action to whatever is on disk now — exactly the defect S7
+    exists to close."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    real_fingerprint = _outbox_fingerprint(tmp_path, proposal_id)
+    stale = "c" * 64
+    seen = {}
+
+    def _spy(scope, id, review_sha256):
+        seen["review_sha256"] = review_sha256
+        raise RuntimeError("stop before mutating")
+
+    monkeypatch.setattr(main, action, _spy)
+    with pytest.raises(RuntimeError):
+        client.post(
+            f"/outbox/alpha/{action}",
+            data={"id": proposal_id, "review_sha256": stale},
+        )
+
+    assert seen["review_sha256"] == stale
+    assert seen["review_sha256"] != real_fingerprint
+
+
+def test_no_outbox_action_row_renders_a_button_without_a_fingerprint(
+    tmp_path, monkeypatch
+):
+    """An unreadable record blocks the listing: no buttons, and therefore no
+    fingerprints, anywhere in the fragment."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox/unreadable-marker.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8",
+    )
+
+    body = client.get("/outbox/alpha").text
+
+    assert "hx-post=\"/outbox/alpha/approve\"" not in body
+    assert "hx-post=\"/outbox/alpha/reject\"" not in body
+    assert "review_sha256" not in body
+
+
+# --- S7 Task 3 review: the routes answer the review outcomes ----------------
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_with_a_stale_fingerprint_shows_the_approved_refusal(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): a stale fingerprint is a declared outcome of these
+    routes, not something that escapes to the global fallback."""
+    from app.console_errors import _CODES
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    # The record is rewritten under the same id after the review was issued.
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# rewritten\n")
+    proposal_before = proposal_path.read_bytes()
+    source_before = (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes()
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert 'role="alert"' in response.text
+    assert "E-REVIEW" in response.text
+    assert _CODES["E-REVIEW"].message in response.text
+    # Nothing changed, and the current record is preserved for comparison.
+    assert proposal_path.read_bytes() == proposal_before
+    assert (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes() == source_before
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+@pytest.mark.parametrize("bad", ["not-a-hash", "", "A" * 64, "0" * 63])
+def test_outbox_action_with_a_malformed_fingerprint_is_an_invalid_request(
+    tmp_path, monkeypatch, action, bad
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal_before = proposal_path.read_bytes()
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = client.post(
+        f"/outbox/alpha/{action}", data={"id": proposal_id, "review_sha256": bad}
+    )
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert "E-REQUEST" in response.text
+    assert proposal_path.read_bytes() == proposal_before
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_stale_refusal_re_renders_the_current_review_with_a_fresh_fingerprint(
+    tmp_path, monkeypatch, action
+):
+    """The operator is left able to act again on what is actually stored.
+
+    Task 5 owns the side-by-side comparison of the old and current values;
+    what must already hold is that the refusal does not strand the operator
+    with a fingerprint that can never match again.
+    """
+    from tests.test_app import HxValsParser
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+    assert current != stale["review_sha256"]
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+
+    parser = HxValsParser()
+    parser.feed(response.text)
+    assert parser.values, "the refusal left no actionable review on screen"
+    for raw in parser.values:
+        values = json.loads(raw)
+        assert values["id"] == proposal_id
+        # Only the current fingerprint is live; the stale one is never
+        # re-offered as though it could still act.
+        assert values["review_sha256"] == current
+        assert values["review_sha256"] != stale["review_sha256"]
+
+
+def test_a_second_rewrite_invalidates_the_fingerprint_the_refusal_just_issued(
+    tmp_path, monkeypatch
+):
+    """Approved decision 4: every subsequent rewrite invalidates the
+    controls issued for the previous version."""
+    from tests.test_app import HxValsParser
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal_path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# first rewrite\n")
+    first_refusal = client.post("/outbox/alpha/approve", data=stale)
+    parser = HxValsParser()
+    parser.feed(first_refusal.text)
+    reissued = json.loads(parser.values[0])["review_sha256"]
+
+    # A second rewrite lands before the operator reconfirms.
+    proposal_path.write_bytes(proposal_path.read_bytes() + b"# second rewrite\n")
+    second_refusal = client.post(
+        "/outbox/alpha/approve",
+        data={"id": proposal_id, "review_sha256": reissued},
+    )
+
+    assert "E-REVIEW" in second_refusal.text
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+    parser = HxValsParser()
+    parser.feed(second_refusal.text)
+    assert json.loads(parser.values[0])["review_sha256"] != reissued
+
+
+# --- S7 Task 4: the delete fingerprint travels and binds --------------------
+
+
+def _delete_action_data(tmp_path, proposal, entity="alpha"):
+    """Form data for delete-execute, carrying the proposal's own fingerprint
+    exactly as the rendered button would. Falls back to a well-formed but
+    unbound value when the record cannot be reviewed at all — those tests
+    are about refusals reached before any comparison."""
+    from app.registry import get_delete_review
+    from app.scope import Scope
+
+    try:
+        fingerprint = get_delete_review(
+            Scope(Path(tmp_path), entity), proposal.id
+        ).sha256
+    except Exception:
+        fingerprint = _UNBOUND_FINGERPRINT
+    return {"id": proposal.id, "review_sha256": fingerprint}
+
+
+def _delete_preview_values(main, client, tmp_path, slug):
+    """Render the impact fragment and read back the values its button sends."""
+    from tests.test_app import HxValsParser
+
+    response = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    )
+    parser = HxValsParser()
+    parser.feed(response.text)
+    assert len(parser.values) == 1, response.text
+    return json.loads(parser.values[0])
+
+
+def test_delete_impact_carries_id_and_fingerprint_through_tojson(
+    tmp_path, monkeypatch
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+
+    values = _delete_preview_values(main, client, tmp_path, slug)
+
+    assert set(values) == {"id", "review_sha256"}
+    proposal = tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    assert values["review_sha256"] == hashlib.sha256(
+        proposal.read_bytes()
+    ).hexdigest()
+
+
+def test_delete_execute_requires_a_fingerprint(tmp_path, monkeypatch):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(main, client, tmp_path, slug)
+    registry_file = tmp_path / "_system/products.yaml"
+    before = registry_file.read_bytes()
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute", data={"id": values["id"]}
+    )
+
+    assert "E-REQUEST" in response.text
+    assert registry_file.read_bytes() == before
+
+
+def test_delete_execute_with_a_stale_fingerprint_shows_the_approved_refusal(
+    tmp_path, monkeypatch
+):
+    from app.console_errors import _CODES
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    stale = _delete_preview_values(main, client, tmp_path, slug)
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    registry_file = tmp_path / "_system/products.yaml"
+    before = registry_file.read_bytes()
+
+    response = client.post("/registry/alpha/product/delete-execute", data=stale)
+
+    assert "E-REVIEW" in response.text
+    assert _CODES["E-REVIEW"].message in response.text
+    assert registry_file.read_bytes() == before
+    assert proposal.exists()
+
+
+def test_delete_execute_passes_the_submitted_fingerprint_unchanged(
+    tmp_path, monkeypatch
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(main, client, tmp_path, slug)
+    submitted = "d" * 64
+    seen = {}
+
+    def _spy(scope, id, review_sha256):
+        seen["id"] = id
+        seen["review_sha256"] = review_sha256
+        raise RuntimeError("stop before mutating")
+
+    monkeypatch.setattr(main, "execute_delete", _spy)
+    with pytest.raises(RuntimeError):
+        client.post(
+            "/registry/alpha/product/delete-execute",
+            data={"id": values["id"], "review_sha256": submitted},
+        )
+
+    assert seen == {"id": values["id"], "review_sha256": submitted}
+
+
+def test_delete_success_copy_comes_from_the_bound_execution(tmp_path, monkeypatch):
+    """The route must not perform an earlier, unbound read for display."""
+    import inspect as _inspect
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(main, client, tmp_path, slug)
+
+    response = client.post("/registry/alpha/product/delete-execute", data=values)
+
+    assert response.status_code == 200
+    assert slug in response.text
+    source = _inspect.getsource(main.registry_delete_execute)
+    assert "get_delete_proposal(" not in source
+
+
+def test_delete_preview_renders_only_the_fingerprinted_impact(tmp_path, monkeypatch):
+    """P1 (review): the impact on screen must be the impact inside the
+    fingerprint. A second live count rendered beside it describes state the
+    button is not bound to, so the operator reviews one thing and acts on
+    another."""
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+
+    # The proposal is written with a saved impact of zero; every count taken
+    # *after* that says one. Only the saved, fingerprinted value may reach
+    # the screen — a second live count would render "would orphan 1" beside
+    # a button bound to bytes that record none.
+    calls = []
+    real_count = registry.reference_count
+
+    def zero_then_one(scope_arg, kind, value):
+        calls.append(1)
+        if len(calls) == 1:                       # the write's own count
+            return registry.ReferenceReport(kind, value, {})
+        return registry.ReferenceReport(kind, value, {"front-matter": 1})
+
+    monkeypatch.setattr(registry, "reference_count", zero_then_one)
+
+    response = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    )
+
+    body = response.text
+    proposal = next((tmp_path / "alpha/outbox").glob("*.yaml"))
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    assert record["total_references"] == 0, "the fixture must save a zero impact"
+    assert "would orphan" not in body, body
+    assert "No references" in body
+    assert registry.reference_count is zero_then_one
+    monkeypatch.setattr(registry, "reference_count", real_count)
+
+
+def test_the_delete_route_takes_no_second_live_count_at_render_time(tmp_path,
+                                                                   monkeypatch):
+    """Structural: the preview route reads the impact from its review
+    snapshot and never calls the live counter for display."""
+    import inspect as _inspect
+
+    import app.main as main
+
+    source = _inspect.getsource(main.registry_delete_preview)
+    assert "reference_count(" not in source
+
+
+def test_delete_preview_displays_the_fingerprinted_slug_not_the_submitted_one(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the value on screen must come from inside the
+    fingerprint. Rendering the submitted slug lets the screen describe one
+    product while the button is bound to a proposal naming another."""
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+
+    import app.registry as registry
+
+    # The stored proposal is replaced between its creation and its review, so
+    # the fingerprinted record names a different value than the form did.
+    real_propose = registry.propose_delete
+
+    def propose_then_rewrite(scope_arg, kind, value):
+        written = real_propose(scope_arg, kind, value)
+        record = yaml.safe_load(written.path.read_text(encoding="utf-8"))
+        record["slug"] = "fingerprinted-slug-marker"
+        written.path.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+        return written
+
+    monkeypatch.setattr(main, "propose_delete", propose_then_rewrite)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "fingerprinted-slug-marker" in body, body
+    assert slug not in body, body
+
+
+def test_the_preview_route_never_renders_the_submitted_slug(tmp_path, monkeypatch):
+    """Structural: the fragment's context carries no submitted value."""
+    import inspect as _inspect
+
+    import app.main as main
+
+    source = _inspect.getsource(main.registry_delete_preview)
+    rendered = source.split("TemplateResponse", 1)[1]
+    assert '"slug": slug' not in rendered
+    template = (
+        Path(__file__).resolve().parents[1] / "templates/blocks/delete_impact.html"
+    ).read_text(encoding="utf-8")
+    assert "{{ slug }}" not in template
+
+
+# --- S7 Task 5: reconfirm on the same screen --------------------------------
+
+
+def _rendered_card_ids(body: str) -> set[str]:
+    return set(re.findall(r'id="(review-card-[^"]+)"', body))
+
+
+def _rendered_control_ids(body: str) -> set[str]:
+    return set(re.findall(r'id="(review-controls-[^"]+)"', body))
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_keeps_the_old_card_and_appends_the_current_one(
+    tmp_path, monkeypatch, action
+):
+    """Spec §Presentation, "Changed-since-review response", points 2-6."""
+    from app.console_errors import _CODES
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    listing = client.get("/outbox/alpha").text
+    stale = {**_action_data(tmp_path, proposal_id),
+             "review_issue": _card_issue(listing)}
+    # The card the operator will act from, as the listing actually rendered
+    # it — asserting against a hand-built id would not prove the retarget
+    # names anything that exists.
+    rendered_card = next(
+        i for i in _rendered_card_ids(listing) if proposal_id in i
+    )
+    rendered_controls = next(
+        i for i in _rendered_control_ids(listing) if proposal_id in i
+    )
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+    body = response.text
+
+    # 4 + 6: a newly validated current card, and only it offers controls.
+    assert f"review-card-{proposal_id}-{current}" in body
+    assert _CODES["E-REVIEW"].message in body
+
+    # 3: the old controls are emptied out-of-band — and the id must be the
+    # one the listing rendered, not a plausible-looking string that matches
+    # nothing on the page.
+    old_controls = rendered_controls
+    assert old_controls in body
+    assert 'hx-swap-oob="true"' in body
+    replaced_block = body.split(old_controls, 1)[1].split("</div>", 1)[0]
+    # This used to assert `disabled` appeared here, which the invented
+    # `stale_controls` captions satisfied. Requiring *no* control is
+    # stronger: a greyed button the operator was never offered is a false
+    # claim about the old card, and a live one would be far worse.
+    assert "<button" not in replaced_block, replaced_block
+    assert "hx-post" not in replaced_block, replaced_block
+    assert "no longer actionable" in replaced_block, replaced_block
+
+    # 2: the old card is labelled rather than replaced or re-served.
+    assert "Previously reviewed" in body
+
+    # The response is appended beside the old card, not swapped over the list.
+    assert response.headers.get("HX-Retarget") == f"#{rendered_card}"
+    assert response.headers.get("HX-Reswap") == "afterend"
+
+    # 6: the stale fingerprint is never re-offered as actionable.
+    for raw in _hx_vals(body):
+        assert json.loads(raw)["review_sha256"] == current
+
+
+def _hx_vals(body: str) -> list[str]:
+    from tests.test_app import HxValsParser
+
+    parser = HxValsParser()
+    parser.feed(body)
+    return parser.values
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_changes_no_state(tmp_path, monkeypatch, action):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    proposal_before = proposal.read_bytes()
+    source_before = (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes()
+    status_before = git_status_apart_from_quarantine(tmp_path)
+
+    client.post(f"/outbox/alpha/{action}", data=stale)
+
+    assert proposal.read_bytes() == proposal_before
+    assert (tmp_path / "alpha/00-inbox/active/marker.md").read_bytes() == source_before
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+    assert git_status_apart_from_quarantine(tmp_path) == status_before
+
+
+def test_repeated_rewrites_never_accumulate_live_controls(tmp_path, monkeypatch):
+    """Approved decision 4: only the newest reviewed version may act."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+
+    proposal.write_bytes(proposal.read_bytes() + b"# first\n")
+    first = client.post("/outbox/alpha/approve", data=stale).text
+    reissued = json.loads(_hx_vals(first)[0])["review_sha256"]
+
+    proposal.write_bytes(proposal.read_bytes() + b"# second\n")
+    second = client.post(
+        "/outbox/alpha/approve",
+        data={"id": proposal_id, "review_sha256": reissued},
+    ).text
+    newest = _outbox_fingerprint(tmp_path, proposal_id)
+
+    live = {json.loads(raw)["review_sha256"] for raw in _hx_vals(second)}
+    assert live == {newest}
+    assert reissued not in live
+    assert stale["review_sha256"] not in live
+
+
+# --- read-only refresh ------------------------------------------------------
+
+
+def test_check_again_returns_the_current_review_and_writes_nothing(
+    tmp_path, monkeypatch
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+    status_before = git_status_apart_from_quarantine(tmp_path)
+    proposal_before = proposal.read_bytes()
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    assert response.status_code == 200
+    assert f"review-card-{proposal_id}-{current}" in response.text
+    assert json.loads(_hx_vals(response.text)[0])["review_sha256"] == current
+    # Read-only: nothing written, nothing moved, nothing consumed.
+    assert proposal.read_bytes() == proposal_before
+    assert git_status_apart_from_quarantine(tmp_path) == status_before
+
+
+@pytest.mark.parametrize("shape", ["missing", "malformed", "hostile-id"])
+def test_check_again_on_an_unreviewable_proposal_offers_no_controls(
+    tmp_path, monkeypatch, shape
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    if shape == "missing":
+        proposal.unlink()
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    else:
+        proposal_id = "hostile-nonexistent-id"
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    body = response.text
+    assert 'role="alert"' in body
+    assert not _rendered_control_ids(body), body
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+
+
+def test_the_review_fragment_route_is_declared_and_read_only():
+    """S6 route declarations: the new GET fragment names its own family and
+    never broadens to a catch-all."""
+    import app.main as main
+
+    declaration = main.outbox_review_fragment.__console_route__
+    assert declaration.surface == "fragment-only"
+    assert Exception not in declaration.catches
+    assert BaseException not in declaration.catches
+    source = inspect.getsource(main.outbox_review_fragment)
+    for mutating in ("approve(", "reject(", "propose_classification(", "unlink"):
+        assert mutating not in source
+
+
+# --- Task 5 review: differences, delete reconfirmation, composed failure ----
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_names_the_fields_that_changed(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): two versions side by side is not "show exactly what
+    changed". The operator must be told which values differ, and how.
+
+    The old values come from the browser — the server never saw those bytes
+    and must not infer them (approved decision 8) — and are used for this
+    comparison only, never as authority."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+
+    page = client.get("/outbox/alpha").text
+    reviewed = _reviewed_fields(page)
+    assert reviewed, "the card must carry its reviewed values for comparison"
+    stale = _action_data(tmp_path, proposal_id)
+    assert _reported(page)["src"] == "alpha/00-inbox/active/marker.md"
+
+    # A genuine rewrite into an equally valid proposal: same module, but it
+    # now moves a *different* receipt. Nothing about the comparison is
+    # manufactured in the request — the browser reports exactly what it was
+    # rendered with, and the new record is one the server validates fully.
+    second = tmp_path / "alpha/00-inbox/active/second.md"
+    second.write_text(
+        "---\ntitle: second-marker\nsub: triage\n---\nbody\n", encoding="utf-8"
+    )
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["src"] = "alpha/00-inbox/active/second.md"
+    record["dst"] = "alpha/02-work/active/second.md"
+    record["source_sha256"] = hashlib.sha256(second.read_bytes()).hexdigest()
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    response = client.post(
+        f"/outbox/alpha/{action}", data={**stale, **reviewed}
+    )
+    text = response.text
+
+    assert "What changed" in text, text
+    differences = text.split("What changed", 1)[1].split("</ul>", 1)[0]
+    # Each genuinely changed field is named, with the server's own current
+    # value — never the value the browser submitted (Rule 8).
+    assert "source path" in differences
+    assert "alpha/00-inbox/active/second.md" in differences
+    assert "destination path" in differences
+    assert "alpha/02-work/active/second.md" in differences
+    # The source's recorded contents changed with it, and is named too.
+    assert "source contents" in differences
+    # Fields that did not change are not reported.
+    assert "module" not in differences
+    assert "block" not in differences
+
+
+def _card_issue(body: str) -> str:
+    """The issuance nonce the rendered card reports back with its action."""
+    match = re.search(r'name="review_issue" value="([0-9a-f]{12})"', body)
+    assert match, "the card did not report an issuance nonce"
+    return match.group(1)
+
+
+def _reviewed_fields(body: str) -> dict:
+    """The values a rendered card reports back, as the form data to post.
+
+    One JSON field, so "reviewed as empty" stays distinguishable from "not
+    reported" — an empty form value arrives at FastAPI as `None`.
+    """
+    match = re.search(
+        r"""<input type="hidden" name="reviewed_values" value='([^']*)'""", body
+    )
+    if match is None:
+        return {}
+    return {"reviewed_values": html.unescape(match.group(1))}
+
+
+def _reported(body: str) -> dict:
+    """The reviewed mapping itself, decoded."""
+    fields = _reviewed_fields(body)
+    return json.loads(fields["reviewed_values"]) if fields else {}
+
+
+def test_a_byte_only_change_says_so_rather_than_listing_no_differences(
+    tmp_path, monkeypatch
+):
+    """The case the spec calls out: the stored bytes changed but every
+    action-relevant value is identical. OneOS still refuses, and must say
+    that plainly instead of showing an empty difference list."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# byte-only\n")
+
+    text = client.post(
+        "/outbox/alpha/approve", data={**stale, **reviewed}
+    ).text
+
+    assert "stored record changed" in text.lower()
+    assert "identical" in text.lower()
+
+
+def test_the_reviewed_values_are_never_treated_as_authority(
+    tmp_path, monkeypatch
+):
+    """Hostile submitted comparison data may reach the screen escaped, but
+    must never alter what the action does or what the current card says."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+
+    text = client.post(
+        f"/outbox/alpha/approve",
+        data={
+            **stale,
+            "reviewed_values": json.dumps(
+                {
+                    "module": '"><script>alert(1)</script>',
+                    "sub": "spoofed-sub-marker",
+                }
+            ),
+        },
+    ).text
+
+    assert "<script>" not in text
+    # Rule 8: the submitted value is never echoed at all, escaped or not.
+    assert "spoofed-sub-marker" not in text
+    assert "alert(1)" not in text
+    # The current card is built from the server's own validated read.
+    assert f"review-card-{proposal_id}-{current}" in text
+    for raw in _hx_vals(text):
+        assert json.loads(raw)["review_sha256"] == current
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+# --- registry delete gets the same treatment --------------------------------
+
+
+def test_a_changed_delete_review_reconfirms_on_the_same_screen(
+    tmp_path, monkeypatch
+):
+    """P1 (review): registry delete is a reviewed action and must reconfirm
+    exactly as the classification actions do."""
+    from app.console_errors import _CODES
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    stale = {**json.loads(_hx_vals(preview)[0]),
+             "review_issue": _card_issue(preview)}
+    rendered_card = next(i for i in _rendered_card_ids(preview))
+    rendered_controls = next(i for i in _rendered_control_ids(preview))
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = hashlib.sha256(proposal.read_bytes()).hexdigest()
+
+    response = client.post("/registry/alpha/product/delete-execute", data=stale)
+    body = response.text
+
+    assert _CODES["E-REVIEW"].message in body
+    assert f"review-card-{stale['id']}-{current}" in body
+    assert rendered_controls in body
+    assert 'hx-swap-oob="true"' in body
+    assert response.headers.get("HX-Retarget") == f"#{rendered_card}"
+    assert response.headers.get("HX-Reswap") == "afterend"
+    for raw in _hx_vals(body):
+        assert json.loads(raw)["review_sha256"] == current
+    # Nothing deleted.
+    assert slug in (tmp_path / "_system/products.yaml").read_text()
+
+
+# --- the composed failure ---------------------------------------------------
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_failed_current_review_render_still_reports_the_changed_review(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): if building the current card fails on top of the
+    refusal, both outcomes must survive — S6's composition rule. Losing the
+    E-REVIEW would tell the operator their action failed for an unrelated
+    reason and hide that their proposal was rewritten."""
+    from app.console_errors import _CODES
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    def _fail_projection(*args, **kwargs):
+        raise DestinationRegistryError("registries unreadable during re-render")
+
+    monkeypatch.setattr(main, "project_outbox", _fail_projection)
+
+    response = client.post(f"/outbox/alpha/{action}", data=stale)
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert _CODES["E-REVIEW"].message in response.text
+    assert "E-CONFIG" in response.text
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+def test_a_changed_delete_review_names_the_changed_impact(tmp_path, monkeypatch):
+    """P1 (review): the delete comparison covers the breakdown, not only the
+    total — an impact that moved between sources while summing the same is
+    still a different impact."""
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    stale = json.loads(_hx_vals(preview)[0])
+    reviewed = _reviewed_fields(preview)
+    assert set(_reported(preview)) == {"kind", "slug", "total", "impact"}
+
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["total_references"] = 2
+    record["impact"] = {"front-matter": 2}
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    body = client.post(
+        "/registry/alpha/product/delete-execute", data={**stale, **reviewed}
+    ).text
+
+    assert "What changed" in body
+    differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
+    assert "total" in differences
+    assert "impact" in differences and "front-matter=2" in differences
+    assert "slug" not in differences
+
+
+def test_delete_check_again_is_read_only_and_offers_the_current_review(
+    tmp_path, monkeypatch
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = hashlib.sha256(proposal.read_bytes()).hexdigest()
+    before = proposal.read_bytes()
+    registry_before = (tmp_path / "_system/products.yaml").read_bytes()
+
+    response = client.get(f"/registry/alpha/product/review/{proposal_id}")
+
+    assert response.status_code == 200
+    assert f"review-card-{proposal_id}-{current}" in response.text
+    assert json.loads(_hx_vals(response.text)[0])["review_sha256"] == current
+    assert proposal.read_bytes() == before
+    assert (tmp_path / "_system/products.yaml").read_bytes() == registry_before
+
+
+@pytest.mark.parametrize("shape", ["missing", "malformed", "hostile-id"])
+def test_delete_check_again_on_an_unreviewable_proposal_offers_no_controls(
+    tmp_path, monkeypatch, shape
+):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    if shape == "missing":
+        proposal.unlink()
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    else:
+        proposal_id = "hostile-nonexistent-id"
+
+    body = client.get(f"/registry/alpha/product/review/{proposal_id}").text
+
+    assert 'role="alert"' in body
+    assert not _rendered_control_ids(body), body
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+    if shape in {"hostile-id", "missing"}:
+        # A re-read is offered only where it could answer differently.
+        #
+        # `hostile-id`: the id itself is what the route refuses, and the
+        # untrusted string must not reach the fragment in any form — it
+        # used to be built into both the button's URL and its `hx-target`.
+        #
+        # `missing`: `propose_delete` allocates a fresh id and never
+        # reissues one, and a consumed record is quarantined rather than
+        # restored under its old name, so nothing can ever bring this id
+        # back. This case previously got a button that re-fetched the same
+        # refusal forever *and* was denied the registry link that resolves
+        # it, because the link was gated on the id also being unacceptable.
+        assert "Check again" not in body, body
+        assert "the registry" in body
+        if shape == "hostile-id":
+            assert proposal_id not in body, body
+    else:
+        # `malformed`: the record exists and is repairable outside the
+        # Console, which is what E-UNREADABLE instructs — so the read-only
+        # re-read stays, pointing at the delete review, never the outbox
+        # one. It is how the operator sees the repair took.
+        assert "Check again" in body
+        assert f"/registry/alpha/product/review/{proposal_id}" in body
+
+
+def test_a_failed_delete_current_review_render_keeps_both_outcomes(
+    tmp_path, monkeypatch
+):
+    """P1 (review): independent composition coverage for the delete path."""
+    from app.console_errors import _CODES
+    from app.vault import DestinationRegistryError
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    stale = json.loads(_hx_vals(preview)[0])
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    calls = []
+    def fail_the_second_read(scope, proposal_id):
+        calls.append(1)
+        raise DestinationRegistryError("registries unreadable during re-render")
+
+    monkeypatch.setattr(
+        main, "get_delete_receipt_or_review", fail_the_second_read
+    )
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute", data=stale
+    )
+
+    assert reached == [], f"fallback reached: {reached}"
+    assert calls, "the current-review read was never attempted"
+    assert _CODES["E-REVIEW"].message in response.text
+    assert "E-CONFIG" in response.text
+    assert slug in (tmp_path / "_system/products.yaml").read_text()
+
+
+def test_a_changed_source_fingerprint_is_named(tmp_path, monkeypatch):
+    """P1 (review): the record's claim about its source contents is an
+    action-relevant value. A proposal rewritten to approve a *different
+    state of the same file* changes nothing else — same module, same paths —
+    and would otherwise be refused with nothing named."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    assert "source_sha256" in _reported(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+
+    source = tmp_path / "alpha/00-inbox/active/marker.md"
+    source.write_text(
+        "---\ntitle: outbox-route-marker\nsub: triage\n---\nedited\n",
+        encoding="utf-8",
+    )
+    current_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["source_sha256"] = current_hash
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    body = client.post("/outbox/alpha/approve", data={**stale, **reviewed}).text
+
+    assert "What changed" in body, body
+    differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
+    assert "source contents" in differences
+    # Named as changed, with no value: see the dedicated test for why.
+    assert current_hash[:12] not in differences
+    assert "module" not in differences
+    assert "destination path" not in differences
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_an_unreported_review_is_not_called_identical(tmp_path, monkeypatch, action):
+    """P1 (review): when the browser reports nothing, OneOS has no evidence
+    of what was reviewed. Saying the values "look identical" asserts a
+    comparison that never happened."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    body = client.post(f"/outbox/alpha/{action}", data=stale).text
+
+    assert "identical" not in body.lower(), body
+    assert "What changed" not in body
+    # It says plainly that nothing could be compared, names every field it
+    # could not compare, and still offers the current version to act on.
+    assert "could not be compared" in body.lower()
+    for field in ("module", "sub", "block", "source path", "destination path",
+                  "source contents"):
+        assert field in body, field
+    assert f"review-card-{proposal_id}-" in body
+
+
+def test_a_byte_only_change_with_evidence_still_says_identical(
+    tmp_path, monkeypatch
+):
+    """The control: with evidence in hand, "identical values, changed bytes"
+    is a true statement and must still be made."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# byte-only\n")
+
+    body = client.post(
+        "/outbox/alpha/approve", data={**stale, **reviewed}
+    ).text
+
+    assert "identical" in body.lower()
+    assert "could not be compared" not in body.lower()
+
+
+# --- the refresh integrity matrix, completed --------------------------------
+
+
+@pytest.mark.parametrize("surface", ["outbox", "registry"])
+@pytest.mark.parametrize(
+    "shape", ["missing", "malformed", "redirected", "non-file", "cross-scope"]
+)
+def test_check_again_refuses_every_unreviewable_shape_read_only(
+    tmp_path, monkeypatch, surface, shape
+):
+    """P2 (review): the matrix must cover redirection, non-file and
+    cross-scope states too — each renders the safe no-action state, offers
+    nothing to act on, and writes nothing."""
+    if surface == "outbox":
+        main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+        url = f"/outbox/alpha/review/{proposal_id}"
+    else:
+        main, client, slug = _registry_client(tmp_path, monkeypatch)
+        preview = client.post(
+            "/registry/alpha/product/delete-preview", data={"slug": slug}
+        ).text
+        proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+        url = f"/registry/alpha/product/review/{proposal_id}"
+
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    outside = tmp_path / "outside-marker.yaml"
+    outside.write_bytes(proposal.read_bytes())
+
+    if shape == "missing":
+        proposal.unlink()
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    elif shape == "redirected":
+        proposal.unlink()
+        proposal.symlink_to(outside)
+    elif shape == "non-file":
+        proposal.unlink()
+        proposal.mkdir()
+    else:
+        record = yaml.safe_load(outside.read_text(encoding="utf-8"))
+        record["entity"] = "beta-not-bound"
+        proposal.write_text(
+            yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
+        )
+
+    outside_before = outside.read_bytes()
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    response = client.get(url)
+
+    assert reached == [], f"fallback reached: {reached}"
+    body = response.text
+    assert 'role="alert"' in body
+    assert not _rendered_control_ids(body), body
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+    # Read-only, and the redirect target is never followed or consumed.
+    assert outside.read_bytes() == outside_before
+    if shape == "redirected":
+        assert proposal.is_symlink()
+    elif shape == "non-file":
+        assert proposal.is_dir()
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_partial_evidence_is_never_reported_as_complete(
+    tmp_path, monkeypatch, action
+):
+    """P1 (review): reporting some fields is not reporting all of them.
+
+    If every field the browser did report happens to match, saying the
+    values "look identical" claims a comparison of fields OneOS never saw.
+    The uncompared fields must be named instead.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# byte-only\n")
+
+    # The browser reports everything except the source state.
+    reported = json.loads(reviewed["reviewed_values"])
+    reported.pop("source_sha256")
+    partial = {"reviewed_values": json.dumps(reported)}
+    body = client.post(f"/outbox/alpha/{action}", data={**stale, **partial}).text
+
+    assert "identical" not in body.lower(), body
+    assert "could not be compared" in body.lower()
+    uncompared = body.split("could not be compared", 1)[1].split("</p>", 1)[0]
+    assert "source contents" in uncompared
+    # Fields that were reported and matched are not listed as uncompared.
+    assert "module" not in uncompared
+    assert "destination path" not in uncompared
+
+
+def test_a_changed_digest_is_shown_readably_not_as_raw_hex(tmp_path, monkeypatch):
+    """P2 (review): a 64-character digest tells the operator nothing. It is
+    named in words and abbreviated, so the line is readable and still
+    identifies the value."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    reviewed = _reviewed_fields(client.get("/outbox/alpha").text)
+    stale = _action_data(tmp_path, proposal_id)
+
+    source = tmp_path / "alpha/00-inbox/active/marker.md"
+    source.write_text(
+        "---\ntitle: outbox-route-marker\nsub: triage\n---\nedited\n",
+        encoding="utf-8",
+    )
+    current_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    record = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    record["source_sha256"] = current_hash
+    proposal.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+
+    body = client.post("/outbox/alpha/approve", data={**stale, **reviewed}).text
+    differences = body.split("What changed", 1)[1].split("</ul>", 1)[0]
+
+    assert "source contents" in differences.lower()
+    # A digest identifies nothing to a person, abbreviated or not. The field
+    # is named as changed and no value is shown for it.
+    assert current_hash not in differences
+    assert current_hash[:12] not in differences
+    assert "changed" in differences.lower()
+
+
+@pytest.mark.parametrize("surface", ["outbox", "registry"])
+def test_check_again_never_reads_through_a_redirected_leaf(
+    tmp_path, monkeypatch, surface
+):
+    """P2 (review): asserting the target is unchanged proves no mutation, not
+    that it was never read. Record what each read resolves to."""
+    import os as _os
+
+    if surface == "outbox":
+        main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+        url = f"/outbox/alpha/review/{proposal_id}"
+    else:
+        main, client, slug = _registry_client(tmp_path, monkeypatch)
+        preview = client.post(
+            "/registry/alpha/product/delete-preview", data={"slug": slug}
+        ).text
+        proposal_id = json.loads(_hx_vals(preview)[0])["id"]
+        url = f"/registry/alpha/product/review/{proposal_id}"
+
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    outside = tmp_path / "outside-marker.yaml"
+    planted = yaml.safe_load(proposal.read_text(encoding="utf-8"))
+    planted["planted_marker"] = "REDIRECT-TARGET-CONTENTS-MARKER"
+    outside.write_text(yaml.safe_dump(planted, sort_keys=False), encoding="utf-8")
+
+    # The proposal is read through `os.open` with a directory descriptor, so a
+    # spy on `Path.read_bytes` records nothing and passes vacuously. Watch
+    # every descriptor this process opens and identify what was opened by
+    # inode, which no path trick can disguise.
+    opened: list[tuple[int, int]] = []
+
+    def _record(descriptor):
+        try:
+            info = _os.fstat(descriptor)
+        except OSError:
+            return
+        opened.append((info.st_dev, info.st_ino))
+
+    real_os_open = _os.open
+    real_builtin_open = builtins.open
+
+    def spy_os_open(*args, **kwargs):
+        descriptor = real_os_open(*args, **kwargs)
+        _record(descriptor)
+        return descriptor
+
+    def spy_builtin_open(*args, **kwargs):
+        handle = real_builtin_open(*args, **kwargs)
+        try:
+            _record(handle.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return handle
+
+    monkeypatch.setattr(_os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_builtin_open)
+
+    # Positive control: with the real leaf in place, the spy sees the
+    # proposal itself being opened. Without this the negative assertion
+    # below could pass simply by watching the wrong boundary.
+    healthy = proposal.stat()
+    client.get(url)
+    assert (healthy.st_dev, healthy.st_ino) in opened, (
+        "the spy is not watching the boundary the reads go through"
+    )
+
+    # Now redirect the leaf and prove the target is never opened.
+    target = outside.stat()
+    proposal.unlink()
+    proposal.symlink_to(outside)
+    opened.clear()
+
+    body = client.get(url).text
+
+    monkeypatch.undo()
+    assert opened, "the redirected request opened nothing at all"
+    assert (target.st_dev, target.st_ino) not in opened, (
+        "the redirected target was opened"
+    )
+    assert "REDIRECT-TARGET-CONTENTS-MARKER" not in body
+    assert not _rendered_control_ids(body)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"module": 7, "sub": ["a"], "block": {"x": 1}}',   # wrong value types
+        '["not", "a", "mapping"]',                          # wrong shape
+        "not json at all",                                  # unparseable
+        '{"module": null}',                                 # explicit null
+        "",                                                 # empty
+    ],
+)
+def test_malformed_reported_evidence_is_treated_as_absent(
+    tmp_path, monkeypatch, payload
+):
+    """Evidence the browser sends is parsed defensively.
+
+    Anything that is not a plain string-to-string mapping is treated as not
+    reported: it may withhold a line of explanation, never add a false one,
+    and never reach the action or the page.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+    current = _outbox_fingerprint(tmp_path, proposal_id)
+
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+
+    body = client.post(
+        "/outbox/alpha/approve",
+        data={**stale, "reviewed_values": payload},
+    ).text
+
+    assert reached == [], f"fallback reached: {reached}"
+    # Nothing is claimed about fields that were not properly reported: they
+    # are listed as uncompared, never rendered as differences.
+    assert "identical" not in body.lower()
+    assert "could not be compared" in body.lower()
+    assert "What changed" not in body, body
+    uncompared = body.split("could not be compared", 1)[1].split("</p>", 1)[0]
+    for label in ("module", "sub", "block", "source path", "destination path",
+                  "source contents"):
+        assert label in uncompared, f"{label} missing from {uncompared}"
+    # Nothing submitted is echoed, and the current card is the server's own.
+    for fragment in ("not json at all", "not a mapping", "[&#39;a&#39;]", "{&#39;x&#39;"):
+        assert fragment not in body
+    assert f"review-card-{proposal_id}-{current}" in body
+    assert not (tmp_path / "alpha/02-work/active/marker.md").exists()
+
+
+# --- Task 7 review: the recovery surface needs a way in ---------------------
+
+
+def test_a_row_that_lost_its_diff_offers_a_read_only_check_again(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the `Check again` routes existed but nothing linked to
+    them, so acceptance criterion 6 was reachable only by typing a URL."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/00-inbox/active/marker.md").unlink()
+
+    body = client.get("/outbox/alpha").text
+
+    assert f'hx-get="/outbox/alpha/review/{proposal_id}"' in body, body
+    assert "Check again" in body
+
+
+def test_a_blocked_listing_offers_a_read_only_recheck(tmp_path, monkeypatch):
+    """An unreadable record has no validated id to check individually — the
+    filename is not a proposal id and S6 Rule 9 forbids echoing it. The
+    listing itself is what the operator can re-read."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox/unreadable-marker.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8",
+    )
+
+    body = client.get("/outbox/alpha").text
+
+    assert "Check again" in body
+    assert 'hx-get="/outbox/alpha"' in body
+    # Still no controls and no fingerprints anywhere in a blocked listing.
+    assert "review_sha256" not in body
+    assert "hx-post" not in body
+    assert "unreadable-marker" not in body
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_a_changed_review_offers_a_check_again_for_the_current_version(
+    tmp_path, monkeypatch, action
+):
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    stale = _action_data(tmp_path, proposal_id)
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    body = client.post(f"/outbox/alpha/{action}", data=stale).text
+
+    assert f'hx-get="/outbox/alpha/review/{proposal_id}"' in body, body
+    assert "Check again" in body
+
+
+def test_a_changed_delete_review_offers_a_check_again(tmp_path, monkeypatch):
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    stale = _delete_preview_values(main, client, tmp_path, slug)
+    proposal = tmp_path / "alpha/outbox" / f"{stale['id']}.yaml"
+    proposal.write_bytes(proposal.read_bytes() + b"# rewritten\n")
+
+    body = client.post("/registry/alpha/product/delete-execute", data=stale).text
+
+    assert f'hx-get="/registry/alpha/product/review/{stale["id"]}"' in body, body
+    assert "Check again" in body
+
+
+def test_a_referenced_delete_preview_offers_no_control_and_says_why(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the recorded impact is inside the fingerprint, so a
+    proposal reviewed while references existed refuses forever. Offering a
+    live control bound to it, under copy promising that clearing the
+    references will unblock it, is false on both counts."""
+    import app.registry as registry
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    referenced = registry.ReferenceReport("product", slug, {"front-matter": 2})
+    monkeypatch.setattr(registry, "reference_count", lambda *a, **k: referenced)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "would orphan 2 reference(s)" in body
+    # No control, and therefore no fingerprint — the same rule OutboxRow
+    # enforces for classification rows.
+    assert "hx-post" not in body, body
+    assert "review_sha256" not in body
+    # And the copy says what is actually true.
+    assert "until these are cleared" not in body
+    # A new proposal is the way forward, not a re-read of an immutable one.
+    assert "start a new deletion" in body.lower()
+    assert 'href="/registry/alpha/products"' in body
+    # Not just the field name: the digest itself must be absent from the
+    # whole fragment. It used to survive in the card id and `hx-target`,
+    # which is what made the "no fingerprint" claim above false.
+    assert not re.search(r"[0-9a-f]{64}", body), body
+
+
+def test_an_unreferenced_delete_preview_still_offers_its_control(
+    tmp_path, monkeypatch
+):
+    """The control: a proposal reviewed with no references is actionable."""
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "hx-post" in body
+    assert "review_sha256" in body
+    assert "Approve delete" in body
+    # The control for the assertion above: this fragment *does* carry a
+    # 64-character digest, so its absence there is a real difference.
+    assert re.search(r"[0-9a-f]{64}", body), body
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_code"),
+    [("redirected", "E-TAMPER"), ("malformed", "E-UNREADABLE"), ("missing", "E-INVALID")],
+)
+def test_the_unavailable_fragment_uses_the_taxonomy_status(
+    tmp_path, monkeypatch, shape, expected_code
+):
+    """P1 (review): S6 §5 is normative — a fragment's status follows the
+    outcome's *severity*, and an `attention` outcome keeps its declared page
+    status so the one class that must not look routine never returns 200.
+    A tamper finding served as 200 tells monitoring nothing happened."""
+    from app.console_errors import _CODES
+    from app.console_render import status_for
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    outside = tmp_path / "outside.yaml"
+    outside.write_bytes(proposal.read_bytes())
+
+    if shape == "redirected":
+        proposal.unlink()
+        proposal.symlink_to(outside)
+    elif shape == "malformed":
+        proposal.write_text("{ not: [valid, yaml", encoding="utf-8")
+    else:
+        proposal.unlink()
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    assert expected_code in response.text
+    assert response.status_code == status_for(_CODES[expected_code], True)
+
+
+class _ElementIds(HTMLParser):
+    """Element ids in a fragment, split by what they mean.
+
+    An `hx-swap-oob` element *replaces* something already on the page, so
+    its id is expected to repeat. Every other id introduces a new element
+    and must be unique in the resulting document. Conflating the two is what
+    made an earlier version of this test vacuous.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.introduced: list[str] = []
+        self.replaces: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        element_id = attributes.get("id")
+        if not element_id:
+            return
+        if attributes.get("hx-swap-oob"):
+            self.replaces.add(element_id)
+        else:
+            self.introduced.append(element_id)
+
+
+def _element_ids(body: str) -> _ElementIds:
+    parser = _ElementIds()
+    parser.feed(body)
+    return parser
+
+
+def test_a_reverted_proposal_never_produces_duplicate_dom_ids(
+    tmp_path, monkeypatch
+):
+    """P1 (review): `(id, sha)` names a *version*, and a version recurs.
+
+    An external rewrite cycle that returns the file to earlier bytes — an
+    editor undo, an idempotent regenerator — reissues the same digest. This
+    drives three real exchanges, posting the issuance each rendered card
+    reports, accumulates the DOM as a browser would, and requires that every
+    selector a response asks the page to find is actually there.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    v1 = proposal.read_bytes()
+
+    listing = client.get("/outbox/alpha").text
+    dom = list(_element_ids(listing).introduced)
+    live = {
+        "id": proposal_id,
+        "review_sha256": _outbox_fingerprint(tmp_path, proposal_id),
+        "review_issue": _card_issue(listing),
+    }
+
+    for step, bytes_now in enumerate((v1 + b"# v2\n", v1, v1 + b"# v2\n"), start=1):
+        # Rewrite *after* the token was issued, so `live` is stale and the
+        # action is refused — the changed-review path this test is about.
+        # (Recomputing the digest here would make approve succeed and the
+        # test would prove nothing; it did, until this comment was needed.)
+        proposal.write_bytes(bytes_now)
+        response = client.post("/outbox/alpha/approve", data=live)
+        body = response.text
+        assert "E-REVIEW" in body, f"step {step} was not a changed-review refusal"
+
+        parsed = _element_ids(body)
+
+        # Every selector this response asks the browser to resolve — the
+        # retarget anchor and each out-of-band replacement — must name an
+        # element the accumulated DOM actually holds.
+        retarget = response.headers.get("HX-Retarget", "").lstrip("#")
+        assert retarget, f"step {step}: no retarget"
+        for selector in {retarget} | parsed.replaces:
+            assert selector in dom, (
+                f"step {step}: response targets #{selector}, which is not on "
+                f"the page. Present: {sorted(dom)}"
+            )
+
+        # And every element it *introduces* must be new.
+        for element_id in parsed.introduced:
+            assert element_id not in dom, (
+                f"step {step}: duplicate element id {element_id}"
+            )
+            dom.append(element_id)
+
+        # The token the operator now holds: the one this very response
+        # issued for the current version.
+        live = {
+            "id": proposal_id,
+            "review_sha256": json.loads(_hx_vals(body)[0])["review_sha256"],
+            "review_issue": _card_issue(body),
+        }
+
+    # The v1 bytes were reviewed twice, so the digest genuinely recurred.
+    assert len(dom) == len(set(dom)), "an element id was issued twice"
+
+
+
+
+
+
+
+
+
+
+def test_a_referenced_delete_card_carries_no_digest_anywhere(tmp_path, monkeypatch):
+    """P1 (review): "no fingerprint" must mean the digest is absent, not
+    merely absent from `hx-vals`. It was still in the card id and the
+    `hx-target`."""
+    import app.registry as registry
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    referenced = registry.ReferenceReport("product", slug, {"front-matter": 2})
+    monkeypatch.setattr(registry, "reference_count", lambda *a, **k: referenced)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    proposal = next((tmp_path / "alpha/outbox").glob("*.yaml"))
+    digest = hashlib.sha256(proposal.read_bytes()).hexdigest()
+    assert digest not in body, "the digest is still on a non-actionable card"
+    assert not re.search(r"[0-9a-f]{64}", body), re.search(r"[0-9a-f]{64}", body)
+
+
+def test_a_referenced_delete_card_sends_the_operator_to_make_a_new_proposal(
+    tmp_path, monkeypatch
+):
+    """P1 (review): re-reading an immutable record loops forever. Its
+    recorded impact is inside the fingerprint and can never change, so
+    "review the deletion again" means creating a *new* proposal after
+    clearing the references — not checking this one again."""
+    import app.registry as registry
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    referenced = registry.ReferenceReport("product", slug, {"front-matter": 2})
+    monkeypatch.setattr(registry, "reference_count", lambda *a, **k: referenced)
+
+    body = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+
+    assert "Check again" not in body, "an immutable record cannot be re-reviewed"
+    assert 'href="/registry/alpha/products"' in body, body
+
+
+def test_a_stale_delete_review_whose_current_version_has_references_shows_no_digest(
+    tmp_path, monkeypatch
+):
+    """P1 (review): the composite case the wrapper id leaked through.
+
+    A delete reviewed at zero references is actionable, so its card
+    legitimately carries a fingerprint. If the stored record then gains
+    references, the *current* version can never be approved — and a card
+    that can never act must carry no fingerprint anywhere, which
+    `delete_impact.html` already enforces. But `review_changed.html`
+    wrapped that card in an id keyed on the current digest, and pointed
+    `Check again` at the same string, putting the value back on screen
+    twice on this one path.
+
+    The stale digest is a different matter: the out-of-band selector has
+    to name the container the browser is holding — which is keyed on the
+    bytes the operator actually reviewed — in order to empty it. That one
+    stays.
+    """
+    import yaml
+
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+
+    # Every stale value comes from one rendered page — id, digest, and
+    # issuance alike. An earlier version of this test proposed one deletion
+    # and then rendered the preview, which allocates a *second* proposal;
+    # posting the first one's id with the second one's issuance named an
+    # OOB target that had never been on any page, so the linkage assertions
+    # below were checking a selector against markup that never existed.
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    assert "hx-post" in preview
+    stale = json.loads(_hx_vals(preview)[0])
+    assert set(stale) == {"id", "review_sha256"}, stale
+    assert stale["review_sha256"] != _UNBOUND_FINGERPRINT
+    stale_issue = _card_issue(preview)
+
+    # The ids the operator's page is actually holding, read off that page.
+    rendered_ids = set(re.findall(r'id="([^"]+)"', preview))
+    stale_card = f"review-card-{stale['id']}-{stale['review_sha256']}-{stale_issue}"
+    stale_controls = (
+        f"review-controls-{stale['id']}-{stale['review_sha256']}-{stale_issue}"
+    )
+    assert stale_card in rendered_ids, sorted(rendered_ids)
+    assert stale_controls in rendered_ids, sorted(rendered_ids)
+
+    # That same proposal now records references. New bytes, new digest, and
+    # a current version that can never be approved.
+    path = registry._delete_proposal_path(scope, stale["id"])
+    record = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert record["total_references"] == 0, record
+    record["total_references"] = 2
+    record["impact"] = {"front-matter": 2}
+    path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
+    current = registry.get_delete_review(scope, stale["id"]).sha256
+    assert current != stale["review_sha256"]
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**stale, "review_issue": stale_issue},
+    )
+    body = response.text
+
+    # The refusal the operator sees, with a current card that cannot act.
+    assert "E-REVIEW" in body
+    assert "hx-post" not in body, body
+    assert "would orphan 2 reference(s)" in body
+
+    # Both selectors name elements the preview really rendered.
+    assert response.headers.get("HX-Retarget") == f"#{stale_card}", (
+        response.headers.get("HX-Retarget"),
+        stale_card,
+    )
+    oob = re.search(
+        r'hx-swap-oob="true"\s+id="([^"]+)"', body
+    ) or re.search(r'id="([^"]+)"\s+hx-swap-oob="true"', body)
+    assert oob, body
+    assert oob.group(1) == stale_controls, (oob.group(1), stale_controls)
+
+    # The current digest is absent — not in the wrapper id, not in the
+    # `Check again` target, not anywhere.
+    assert current not in body, body
+
+    # P1 (route review): the wrapper must not contradict the card it
+    # wraps. The current card here can never be approved and says so, so
+    # the wrapper offers neither "act again below" — there is nothing
+    # below to act with — nor a `Check again` directly underneath a card
+    # that has just said re-reading answers identically forever.
+    assert "Act again below" not in body, body
+    assert "Check again" not in body, body
+    assert "the registry" in body
+
+    # Exactly one digest survives, and it is the stale one, present only to
+    # name the stale control container being emptied out of band.
+    digests = set(re.findall(r"[0-9a-f]{64}", body))
+    assert digests == {stale["review_sha256"]}, digests
+
+
+def test_a_replayed_issuance_nonce_changes_only_which_anchor_is_named(
+    tmp_path, monkeypatch
+):
+    """P2 (review): the nonce's authority, pinned rather than asserted.
+
+    `_require_issue` validates syntax, not provenance — decision 6 leaves
+    nothing to validate against — so a crafted valid nonce can name some
+    other same-version anchor. The docstring and threat model now claim
+    that this is the whole of its reach: it cannot change the service
+    action, the bytes the server reads, the fingerprint, or the outcome.
+
+    A claim about a threat boundary that no test exercises is the class of
+    defect this review already caught once, so drive it: hold every other
+    input fixed, vary only `review_issue` over hostile-but-valid values,
+    and require the decision to be identical each time.
+    """
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+
+    hostile = ["0" * 12, "f" * 12, "deadbeefcafe", "not-hex-at-all", "", None]
+
+    # A refusal: stale digest. The nonce must not rescue it.
+    proposal = registry.propose_delete(scope, "product", slug)
+    stale = _delete_action_data(tmp_path, proposal)
+    proposal.path.write_text(
+        proposal.path.read_text(encoding="utf-8") + "# changed\n",
+        encoding="utf-8",
+    )
+    current = registry.get_delete_review(scope, proposal.id).sha256
+
+    seen_digests = []
+    for issue in hostile:
+        data = dict(stale)
+        if issue is not None:
+            data["review_issue"] = issue
+        response = client.post(
+            "/registry/alpha/product/delete-execute", data=data
+        )
+        assert response.status_code == 200, issue
+        assert "E-REVIEW" in response.text, issue
+        # The proposal is untouched: no nonce authorized a mutation.
+        assert proposal.path.exists(), issue
+        seen_digests.append(frozenset(re.findall(r"[0-9a-f]{64}", response.text)))
+
+    # Which digests the response carries is a property of the bytes, not of
+    # the nonce: every variant produced exactly the same pair — the stale
+    # one the operator submitted and the current one now on offer.
+    assert len(set(seen_digests)) == 1, seen_digests
+    assert seen_digests[0] == {stale["review_sha256"], current}, seen_digests[0]
+
+    # And the mirror case: a hostile nonce cannot *block* a genuine action
+    # whose digest does match, so the refusals above are the digest's doing.
+    fresh = registry.propose_delete(scope, "product", slug)
+    good = _delete_action_data(tmp_path, fresh)
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**good, "review_issue": "0" * 12},
+    )
+    assert "E-REVIEW" not in response.text, response.text
+    assert "One commit written" in response.text, response.text
+
+
+def test_a_hostile_issuance_nonce_never_reaches_the_rendered_id(
+    tmp_path, monkeypatch
+):
+    """What `_ISSUE`'s syntax check is actually for.
+
+    The nonce grants no authority — the test above pins that — but it is
+    still interpolated into element ids and into selectors the browser is
+    told to resolve. Unvalidated, an attacker-chosen string lands inside
+    an `id="..."` attribute and inside an `hx-swap-oob` target. Rejecting
+    anything that is not twelve hex characters is the whole defence, and
+    until now nothing failed when it was removed: deleting the
+    `fullmatch` left the suite green.
+    """
+    import app.registry as registry
+    from app.scope import Scope
+
+    main, client, slug = _registry_client(tmp_path, monkeypatch)
+    scope = Scope(Path(tmp_path), "alpha")
+    proposal = registry.propose_delete(scope, "product", slug)
+    stale = _delete_action_data(tmp_path, proposal)
+    proposal.path.write_text(
+        proposal.path.read_text(encoding="utf-8") + "# changed\n",
+        encoding="utf-8",
+    )
+
+    payloads = [
+        '"><script>alert(1)</script>',
+        '" onload="alert(1)',
+        "a' or '1'='1",
+        "../../etc/passwd",
+        "x" * 4096,
+    ]
+    for payload in payloads:
+        body = client.post(
+            "/registry/alpha/product/delete-execute",
+            data={**stale, "review_issue": payload},
+        ).text
+        assert "E-REVIEW" in body, payload
+        # Not reflected in any form — not raw, not escaped, not truncated.
+        assert payload not in body, payload
+        assert payload[:32] not in body, payload
+        # Every id the response renders is still the shape we mint.
+        for element_id in re.findall(r'id="([^"]*)"', body):
+            assert re.fullmatch(r"[A-Za-z0-9_.:-]+", element_id), (
+                f"{payload!r} produced id {element_id!r}"
+            )
+
+
+def test_a_missing_classification_proposal_sends_the_operator_to_triage(
+    tmp_path, monkeypatch
+):
+    """The outbox half of the same rule (route review, accepted).
+
+    A proposal id is never reissued, so once the record is gone a re-read
+    of that id is permanently inert. The useful recovery is a new
+    proposal from triage, which allocates a new id.
+    """
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").unlink()
+
+    body = client.get(f"/outbox/alpha/review/{proposal_id}").text
+
+    assert 'role="alert"' in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+    assert "Check again" not in body, body
+    assert "/triage/alpha" in body
+
+
+def test_an_unreadable_classification_record_keeps_its_re_read(
+    tmp_path, monkeypatch
+):
+    """The control: a record that exists but cannot be parsed is
+    repairable outside the Console, so the re-read stays — it is how the
+    operator confirms the repair worked."""
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").write_text(
+        "{ not: [valid, yaml", encoding="utf-8"
+    )
+
+    body = client.get(f"/outbox/alpha/review/{proposal_id}").text
+
+    assert 'role="alert"' in body
+    assert "hx-post" not in body
+    assert "Check again" in body, body
+    assert f"/outbox/alpha/review/{proposal_id}" in body
+
+
+def test_a_blocking_condition_arising_between_the_two_reads_is_described(
+    tmp_path, monkeypatch
+):
+    """P2 (safety review): the second read was outside the guard.
+
+    `outbox_review_fragment` reads the row, and when the projection does
+    not hold the id it calls `project_outbox` a second time to describe
+    what is blocking the listing. That second call sat outside the `try`,
+    so a declared member of `_OUTBOX_CATCHES` arising *between* the two
+    reads escaped the endpoint and reached the global fallback — a 500
+    page for a condition the taxonomy can describe.
+
+    The existing totality sweeps cannot catch this: they make the
+    function raise unconditionally, so the first read raises and the
+    second is never reached. It needs a failure on the second call only.
+    """
+    from app.vault import DestinationRegistryError
+
+    main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").unlink()
+
+    real = main.project_outbox
+    calls = []
+
+    def fail_on_the_second_read(scope):
+        calls.append(1)
+        if len(calls) >= 2:
+            raise DestinationRegistryError("registry became unreadable")
+        return real(scope)
+
+    monkeypatch.setattr(main, "project_outbox", fail_on_the_second_read)
+
+    response = client.get(f"/outbox/alpha/review/{proposal_id}")
+
+    assert len(calls) >= 2, "the second read never happened"
+    # 500 is E-CONFIG's *declared* status — it is an `attention` outcome —
+    # so the status alone proves nothing here. What must hold is that the
+    # response is the described fragment and not the global fallback.
+    assert "E-CONFIG" in response.text, response.text
+    assert "E-UNKNOWN" not in response.text, response.text
+    assert 'role="alert"' in response.text

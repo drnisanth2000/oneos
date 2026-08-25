@@ -14,8 +14,10 @@ strict loader (`get_proposal`, `load_proposals`, `preview_diff`). Rows carry
 
 Temp git vaults only; the real vault is never touched.
 """
+import builtins
 import os
 import stat
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -23,6 +25,13 @@ import pytest
 import yaml
 
 import app.outbox as outbox
+from app.action_receipts import (
+    InvalidActionReceipt,
+    ReceiptStoreUnavailable,
+    make_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
+)
 from app.console_errors import describe
 from app.outbox import (
     approve,
@@ -54,6 +63,13 @@ PROJECTION_ARCHETYPES = textwrap.dedent(
       plain: {}
     """
 )
+
+
+def _fp(scope, proposal_id: str) -> str:
+    """The fingerprint of the proposal exactly as it now stands (S7)."""
+    from app.outbox import get_proposal_review
+
+    return get_proposal_review(scope, proposal_id).sha256
 
 
 def _projection_vault(root, entities, files):
@@ -131,6 +147,272 @@ def _delete_record(delete_id: str) -> str:
     )
 
 
+def _commit_receipt(vault: Path, proposal_id: str, action_kind: str) -> None:
+    receipt = make_action_receipt(proposal_id, "a" * 64, action_kind)
+    relative = receipt_relative_path("demo", proposal_id)
+    stored = vault / relative
+    stored.parent.mkdir(mode=0o700, exist_ok=True)
+    stored.write_bytes(render_action_receipt(receipt))
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "fixture receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+
+def test_matching_receipt_projects_spent_without_opening_pending_record(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    _commit_receipt(vault, prop.id, "approval")
+    prop.path.write_bytes(b"not: [a proposal\n")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a spent proposal record was opened")
+
+    monkeypatch.setattr(outbox, "review_snapshot_for", forbidden)
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is False
+    assert len(listing.rows) == 1
+    row = listing.rows[0]
+    assert row.proposal is None
+    assert row.receipt is not None
+    assert row.receipt.proposal_id == prop.id
+    assert row.proposal_id == prop.id
+    assert not row.can_approve and not row.can_reject
+    assert row.review_sha256 is None
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["same", "different", "malformed", "redirected", "non-file", "recreated"],
+)
+def test_receipt_first_projection_never_opens_any_spent_leaf_shape(
+    tmp_path, monkeypatch, shape
+):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    spent = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+    unspent = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-b.md"),
+        module="11-library",
+        sub="reference",
+        claimed_block="govern",
+    )
+    _commit_receipt(vault, spent.id, "approval")
+
+    outside = vault / "outside-receipt-target.yaml"
+    outside.write_bytes(b"OUTSIDE-SPENT-MARKER\n")
+    if shape == "different":
+        spent.path.write_bytes(b"different but still bytes\n")
+    elif shape == "malformed":
+        spent.path.write_bytes(b"not: [a proposal\n")
+    elif shape == "redirected":
+        spent.path.unlink()
+        spent.path.symlink_to(outside)
+    elif shape == "non-file":
+        spent.path.unlink()
+        spent.path.mkdir()
+    elif shape == "recreated":
+        original = spent.path.read_bytes()
+        spent.path.unlink()
+        spent.path.write_bytes(original)
+
+    opened: list[tuple[int, int]] = []
+
+    def record(descriptor):
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            return
+        opened.append((info.st_dev, info.st_ino))
+
+    real_os_open = os.open
+    real_builtin_open = builtins.open
+
+    def spy_os_open(*args, **kwargs):
+        descriptor = real_os_open(*args, **kwargs)
+        record(descriptor)
+        return descriptor
+
+    def spy_builtin_open(*args, **kwargs):
+        handle = real_builtin_open(*args, **kwargs)
+        try:
+            record(handle.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return handle
+
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_builtin_open)
+
+    positive = unspent.path.stat()
+    forbidden = (outside if shape == "redirected" else spent.path).stat()
+    listing = project_outbox(scope)
+
+    assert (positive.st_dev, positive.st_ino) in opened, (
+        "positive control: the spy did not observe the unspent proposal read"
+    )
+    assert (forbidden.st_dev, forbidden.st_ino) not in opened, (
+        f"the {shape} spent leaf or its target was opened"
+    )
+    assert [row.receipt.proposal_id for row in listing.rows if row.receipt] == [
+        spent.id
+    ]
+    expected_present = shape not in {"redirected", "non-file"}
+    spent_row = next(row for row in listing.rows if row.receipt is not None)
+    assert spent_row.record_present is expected_present, (
+        f"the {shape} spent row misreported whether a real pending record exists"
+    )
+    assert any(row.proposal and row.proposal.id == unspent.id for row in listing.rows)
+
+
+def test_blocked_listing_preserves_spent_rows_pending_record_evidence(tmp_path):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    spent = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+    sibling = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-b.md"),
+        module="11-library",
+        sub="reference",
+        claimed_block="govern",
+    )
+    _commit_receipt(vault, spent.id, "approval")
+    sibling.path.write_bytes(b"not: [a proposal\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is True
+    spent_row = next(row for row in listing.rows if row.receipt is not None)
+    assert spent.path.is_file(), "setup lost the spent proposal's real leaf"
+    assert spent_row.record_present is True, (
+        "blocked-row reconstruction lost the pending-record evidence"
+    )
+
+
+def test_registry_delete_receipt_is_not_projected_as_a_classification(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    _commit_receipt(vault, prop.id, "registry deletion")
+    prop.path.write_bytes(b"not: [a proposal\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.rows == ()
+    assert listing.blocked is False
+
+
+def test_malformed_matching_receipt_is_one_linkless_row_without_proposal_read(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    relative = receipt_relative_path("demo", prop.id)
+    stored = vault / relative
+    stored.parent.mkdir(mode=0o700, exist_ok=True)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a malformed-receipt proposal record was opened")
+
+    monkeypatch.setattr(outbox, "review_snapshot_for", forbidden)
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is False
+    assert len(listing.rows) == 1
+    row = listing.rows[0]
+    assert row.proposal_id == prop.id
+    assert row.receipt is None
+    assert isinstance(row.error, InvalidActionReceipt)
+    assert not row.can_approve and not row.can_reject
+
+
+def test_receipt_store_failure_aborts_the_whole_entity_projection(
+    tmp_path, monkeypatch
+):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+
+    def unavailable(*args, **kwargs):
+        raise ReceiptStoreUnavailable("receipt authority unavailable")
+
+    monkeypatch.setattr(outbox, "resolve_head_receipts", unavailable)
+
+    with pytest.raises(ReceiptStoreUnavailable):
+        project_outbox(scope)
+
+
+def test_malformed_matching_receipt_does_not_disable_a_valid_sibling(tmp_path):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    bad = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+    good = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-b.md"),
+        module="11-library",
+        sub="reference",
+        claimed_block="govern",
+    )
+    relative = receipt_relative_path("demo", bad.id)
+    stored = vault / relative
+    stored.parent.mkdir(mode=0o700, exist_ok=True)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is False
+    malformed = next(row for row in listing.rows if row.proposal_id == bad.id)
+    sibling = next(row for row in listing.rows if row.proposal and row.proposal.id == good.id)
+    assert isinstance(malformed.error, InvalidActionReceipt)
+    assert not malformed.can_approve and not malformed.can_reject
+    assert sibling.can_approve and sibling.can_reject
+    assert sibling.review_sha256 is not None
+
+
 # --- unblocked listing -------------------------------------------------------
 
 
@@ -163,7 +445,7 @@ def test_unblocked_listing_renders_all_valid_rows_with_controls(tmp_path):
 
     # The row's capability corresponds to a genuinely approvable proposal,
     # through the untouched strict path — not merely a flag on the row.
-    approve(scope, a.id)
+    approve(scope, a.id, _fp(scope, a.id))
     assert [p.id for p in load_proposals(scope)] == [b.id]
 
 
@@ -213,9 +495,9 @@ def test_blocked_state_actions_still_refused_by_strict_loader(tmp_path):
     good = next(row for row in listing.rows if row.proposal is not None)
 
     with pytest.raises(outbox.OutboxDestinationError):
-        approve(scope, good.proposal.id)
+        approve(scope, good.proposal.id, _fp(scope, good.proposal.id))
     with pytest.raises(outbox.OutboxDestinationError):
-        reject(scope, good.proposal.id)
+        reject(scope, good.proposal.id, _fp(scope, good.proposal.id))
 
 
 # --- delete proposals: skipped exactly as today ------------------------------
@@ -316,9 +598,18 @@ def test_undiffable_row_error_matches_approve_outcome(tmp_path, monkeypatch, con
         # only inspects `Path.is_symlink()`) still passes and this failure
         # is genuinely row-local (phase 3), not phase 2.
         real_fstat = outbox.os.fstat
+        # S7: narrowed to the source receipt's own inode. `outbox.os` is the
+        # one `os` module, so an unconditional lie here also reaches the
+        # proposal-record capture in phase 1 and aborts the whole projection
+        # with a tamper finding — the opposite of what this test asserts.
+        # Lying only about the receipt keeps the failure genuinely row-local,
+        # which is this test's stated point.
+        source_inode = source.stat().st_ino
 
         def nonregular_fstat(descriptor):
             result = real_fstat(descriptor)
+            if result.st_ino != source_inode:
+                return result
             return os.stat_result(
                 (stat.S_IFIFO | stat.S_IMODE(result.st_mode),) + tuple(result)[1:]
             )
@@ -343,7 +634,7 @@ def test_undiffable_row_error_matches_approve_outcome(tmp_path, monkeypatch, con
         assert row.can_approve is False
 
         try:
-            approve(scope, prop.id)
+            approve(scope, prop.id, _fp(scope, prop.id))
             pytest.fail("approve did not raise for the injected condition")
         except Exception as exc:  # noqa: BLE001 - deliberately broad: compare codes
             approve_error = exc
@@ -388,7 +679,7 @@ def test_approval_after_projection_still_revalidates(tmp_path):
     prop.path.write_text(yaml.safe_dump(record), encoding="utf-8")
 
     with pytest.raises(outbox.OutboxDestinationError):
-        approve(scope, prop.id)
+        approve(scope, prop.id, _fp(scope, prop.id))
 
 
 # --- I2: every row of the design's seven-condition phase-1 table ---------------
@@ -488,3 +779,269 @@ def test_strict_loader_describes_an_unreadable_record_as_e_unreadable(tmp_path):
     # D2: the cause carries the truthful description through the resolver.
     assert isinstance(raised.value.__cause__, outbox.UnreadableProposalRecord)
     assert describe(raised.value).code == "E-UNREADABLE"
+
+
+# --- S7 Task 2: every actionable row carries its own review fingerprint -----
+
+
+def _sha256(raw: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()
+
+
+def test_every_actionable_row_carries_the_hash_of_its_own_stored_bytes(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    listing = project_outbox(scope)
+    row = next(row for row in listing.rows if row.proposal is not None)
+
+    assert row.can_approve and row.can_reject
+    assert row.review_sha256 == _sha256(prop.path.read_bytes())
+
+
+def test_the_row_token_is_what_the_action_boundary_will_compare(tmp_path):
+    from app.review_tokens import require_review_match
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+
+    assert require_review_match(prop.path.read_bytes(), row.review_sha256) == (
+        row.review_sha256
+    )
+
+
+def test_two_proposals_get_distinct_tokens(tmp_path):
+    vault = _projection_vault(
+        tmp_path,
+        ("demo",),
+        {
+            "demo/00-inbox/active/note-a.md": _note("Alpha receipt body.\n"),
+            "demo/00-inbox/active/note-b.md": _note("Beta receipt body.\n"),
+            "demo/11-knowledge/active/.gitkeep": "",
+            "demo/11-library/active/.gitkeep": "",
+        },
+    )
+    scope = Scope(vault, "demo")
+    for name in ("note-a.md", "note-b.md"):
+        propose_classification(
+            scope,
+            scope.resolve("00-inbox", "active", name),
+            module="11-knowledge",
+            sub="kb",
+            claimed_block="govern",
+        )
+
+    rows = [r for r in project_outbox(scope).rows if r.proposal is not None]
+    tokens = [r.review_sha256 for r in rows]
+
+    assert len(rows) == 2
+    assert all(token is not None for token in tokens)
+    assert len(set(tokens)) == 2
+    for row in rows:
+        assert row.review_sha256 == _sha256(row.proposal.path.read_bytes())
+
+
+def test_an_unavailable_source_keeps_reject_and_its_proposal_token(tmp_path):
+    """Design §Architecture-1: source-diff failure must not erase the
+    proposal's own review hash — the proposal is still well-formed, and
+    rejecting it is still a safe, reviewed action."""
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    (vault / "demo/00-inbox/active/note.md").unlink()
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+
+    assert row.can_approve is False
+    assert row.can_reject is True
+    assert row.error is not None
+    assert row.review_sha256 == _sha256(prop.path.read_bytes())
+
+
+def test_an_unreadable_record_exposes_no_token_and_no_controls(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo")
+    _write_record(scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is True
+    assert len(listing.rows) == 1
+    assert listing.rows[0].proposal is None
+    assert listing.rows[0].review_sha256 is None
+    assert listing.rows[0].can_approve is False
+    assert listing.rows[0].can_reject is False
+
+
+def test_a_blocked_listing_withholds_every_token_not_just_every_control(tmp_path):
+    """Controls and fingerprints are withheld together. The fingerprint
+    grants nothing on its own, but it is the value that binds an action to
+    reviewed bytes — leaving one on a row whose controls are gone describes
+    a review the listing has already decided not to offer."""
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    _write_record(scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is True
+    assert any(row.proposal is not None for row in listing.rows)
+    for row in listing.rows:
+        assert row.can_approve is False
+        assert row.can_reject is False
+        assert row.review_sha256 is None
+
+
+@pytest.mark.parametrize(
+    ("label", "prepare"),
+    [
+        ("clean", lambda vault, scope, prop: None),
+        (
+            "missing-source",
+            lambda vault, scope, prop: (vault / "demo/00-inbox/active/note.md").unlink(),
+        ),
+        (
+            "blocked-sibling",
+            lambda vault, scope, prop: _write_record(
+                scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n"
+            ),
+        ),
+        (
+            "delete-record",
+            lambda vault, scope, prop: _write_record(
+                scope,
+                f"20260815T090703-{'33' * 16}.yaml",
+                _delete_record("20260815T090703-" + "33" * 16),
+            ),
+        ),
+    ],
+)
+def test_a_token_exists_on_a_row_if_and_only_if_some_action_is_offered(
+    tmp_path, label, prepare
+):
+    """The structural rule the templates depend on in Task 5: no row ever
+    renders an action button without a fingerprint, and no row without
+    buttons ships a fingerprint nobody can use."""
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    prepare(vault, scope, prop)
+
+    for row in project_outbox(scope).rows:
+        actionable = row.can_approve or row.can_reject
+        assert (row.review_sha256 is not None) is actionable, label
+        if row.review_sha256 is not None:
+            assert row.review_sha256 == _sha256(row.proposal.path.read_bytes())
+
+
+def test_a_row_cannot_be_constructed_with_controls_but_no_token(tmp_path):
+    from app.outbox import OutboxRow
+
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=True, can_reject=False,
+                  review_sha256=None)
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=False, can_reject=True,
+                  review_sha256=None)
+
+
+def test_a_row_cannot_be_constructed_with_a_token_but_no_controls(tmp_path):
+    from app.outbox import OutboxRow
+
+    with pytest.raises(ValueError):
+        OutboxRow(None, None, None, can_approve=False, can_reject=False,
+                  review_sha256="a" * 64)
+
+
+def test_the_projected_token_survives_a_replacement_only_as_a_mismatch(tmp_path):
+    from app.review_tokens import ReviewedProposalChanged, require_review_match
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    # A byte-only rewrite: re-serialised with sorted keys, so every
+    # action-relevant value is identical and only the stored bytes differ.
+    # S7 refuses on bytes, so this must still invalidate the fingerprint.
+    record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
+    prop.path.write_text(yaml.safe_dump(record, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ReviewedProposalChanged):
+        require_review_match(prop.path.read_bytes(), row.review_sha256)
+
+    # A fresh projection is a fresh review with a fresh fingerprint.
+    fresh = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    assert fresh.review_sha256 != row.review_sha256
+    assert fresh.review_sha256 == _sha256(prop.path.read_bytes())
+
+
+def test_the_projected_value_and_hash_come_from_one_capture(tmp_path):
+    """The fingerprint an operator's button actually carries.
+
+    This is the digest that reaches a browser. It had no mutation evidence:
+    every test bound against `get_proposal_review`'s snapshot, whose digest
+    no production caller reads, so hashing a second read here changed
+    nothing any test could see while handing the operator a token for bytes
+    they never reviewed.
+    """
+    import hashlib
+
+    import app.outbox as outbox
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    original = prop.path.read_bytes()
+    replaced = []
+
+    real_capture = outbox._capture_proposal_contents
+
+    def capture_then_replace(scope_arg, path):
+        contents = real_capture(scope_arg, path)
+        if path.name == prop.path.name and not replaced:
+            record = yaml.safe_load(original.decode("utf-8"))
+            record["module"] = "11-library"
+            record["sub"] = "reference"
+            record["dst"] = "demo/11-library/active/note.md"
+            raw = yaml.safe_dump(record, sort_keys=False).encode("utf-8")
+            prop.path.write_bytes(raw)
+            replaced.append(raw)
+        return contents
+
+    outbox._capture_proposal_contents = capture_then_replace
+    try:
+        row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    finally:
+        outbox._capture_proposal_contents = real_capture
+
+    assert replaced, "the probe never replaced the record"
+    assert replaced[0] != original
+    # The rendered row and the token it carries both describe the capture.
+    assert row.review_sha256 == hashlib.sha256(original).hexdigest(), (
+        "the operator's fingerprint is not of the captured bytes"
+    )
+    assert row.review_sha256 != hashlib.sha256(replaced[0]).hexdigest(), (
+        "the operator's fingerprint is of the replacement"
+    )
+    assert row.proposal.module == "11-knowledge"
+
+
+def test_the_projection_and_the_loader_issue_the_same_snapshot(tmp_path):
+    """Production and tests must bind against one snapshot, not two.
+
+    The projection issues the operator's token; the tests reach for
+    `get_proposal_review`. If those ever diverge again, a mutation of the
+    operator-facing one is invisible to the suite — which is exactly how the
+    gap above survived six rounds of mutation testing.
+    """
+    import app.outbox as outbox
+
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+
+    row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
+    review = outbox.get_proposal_review(scope, prop.id)
+
+    assert row.review_sha256 == review.sha256
+    assert row.proposal == review.value
