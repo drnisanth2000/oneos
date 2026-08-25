@@ -90,15 +90,14 @@ M1   RED then GREEN   M3   RED then GREEN   M4b  RED then GREEN
 M5   RED then GREEN   M5b  RED then GREEN   M6   RED then GREEN
 M7   RED then GREEN   M7b  RED then GREEN   M8   RED then GREEN
 M9   RED then GREEN   M10  RED then GREEN   M12  RED then GREEN
-M13  RED then GREEN   M14  RED then GREEN   M15  RED then GREEN
-M16  RED then GREEN   M17  RED then GREEN   M18  RED then GREEN
-M19  RED then GREEN   M20  RED then GREEN   M21  RED then GREEN
-M22  RED then GREEN   M23  RED then GREEN   M11  RED then GREEN
+M15  RED then GREEN   M16  RED then GREEN   M17  RED then GREEN
+M20  RED then GREEN   M21  RED then GREEN   M22  RED then GREEN
+M23  RED then GREEN   M11  RED then GREEN
 
-all 24 mutations: red under mutation, green once restored
+all 20 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1285 passed in 99.06s (0:01:39)
+  1365 passed in 114.37s (0:01:54)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
