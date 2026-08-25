@@ -34,9 +34,14 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
 The **Safety Foundation S1-S7 is complete** at its gate-certified branch tip:
-every public and private gate passes, including the combined repo+vault history
-audit and Grey Matter preservation proof. The separately sequenced inherited
-items 2–4 in `docs/STATUS.md` remain required before live Phase 1 gate trials.
+the final public suite recorded 1,463 passed; all 48 mutation rows went RED
+then GREEN; Gitleaks plus current-tree and history public audits were clean;
+and the private gates recorded `check_v2` 0/0 and 37 tests. The combined
+repo-plus-vault history audit was clean and Grey Matter's pre-existing state
+was byte-identical before and after. The macOS no-overwrite path was exercised;
+Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
+user/platform limitation. The separately sequenced inherited items 2–4 in
+`docs/STATUS.md` remain required before live Phase 1 gate trials.
 A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
@@ -47,8 +52,11 @@ state.
 S7 was developed sequentially from the fresh merged-S6 baseline recorded in its
 plan. It binds every reviewed action to exact proposal bytes; transactional
 actions retain committed receipts, while reject safely quarantines its record.
-Spent ids are refused. Its inherited items are recorded in
-`docs/STATUS.md`; do not silently claim those separately sequenced items done.
+Supported writers cooperate through OneOS interfaces and the shared action
+lock. Deliberate ancestor-directory relocation after the final check is outside
+that cooperative-writer boundary. Spent ids are refused. Its inherited items
+are recorded in `docs/STATUS.md`; do not silently claim those separately
+sequenced items done.
 
 The satisfied historical sequence rule remains part of the audit record:
 **Do not begin S7 until S6 is merged into `origin/main` and a fresh

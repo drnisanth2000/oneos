@@ -1,17 +1,18 @@
 # S7 — Bound Review Tokens
 
-**Status:** AMENDMENT 5 APPROVED — implementation complete, final verification
-pending. The previously approved design and gates remain recorded below as
-historical evidence until Task 3 refreshes the final verification. Amendment 3
-Stage 2 provides action receipts, quarantine-last,
+**Status:** S7 COMPLETE — Amendment 5 verified. Final verification recorded
+1,463 public tests passed; all 48 mutation rows RED then GREEN; Gitleaks and
+public current-tree/history audits were clean; private gates recorded
+`check_v2` 0/0 and 37 tests; the combined repo-plus-vault history audit was
+clean; and Grey Matter's pre-existing state was byte-identical before and
+after. Amendment 3 Stage 2 provides action receipts, quarantine-last,
 `E-APPLIED`, `E-RECEIPT`, the offline receipt validator, and the
 orphan-outcome guard. `E-RETAINED`, `E-STRANDED`, and
 `diagnose_quarantined_record` are retired. Final evidence is recorded in the
 implementation plans and mutation ledger. Inherited items 2–4 remain separate
 pre-live-gate work and are not silently claimed complete here.
 
-**Amendment 5 (APPROVED — implementation complete, final verification pending,
-2026-08-25):**
+**Amendment 5 (COMPLETE, 2026-08-25):**
 managed ancestor directories are stable for the duration of a reviewed action.
 Every supported OneOS, Hermes, parser, browser-extension, and external-agent
 writer must use OneOS interfaces and the shared action lock; none may rename an

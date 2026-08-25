@@ -166,7 +166,7 @@ Create no empty commit when review is clean.
 - Consumes: independently approved final correction tip.
 - Produces: final evidence, a green PR, and a merged `main` without branch/ref/worktree cleanup.
 
-- [ ] **Step 1: Run public verification from a clean, single-writer tree**
+- [x] **Step 1: Run public verification from a clean, single-writer tree**
 
 ```bash
 uv run python -m pytest -q
@@ -178,9 +178,11 @@ git diff --check
 git status --porcelain
 ```
 
-Required: full suite green; all 48 mutations RED then GREEN; audits clean; restored worktree empty. Record the exact test count printed here.
+Measured completion: `1463 passed in 115.04s`; all 48 mutations RED then
+GREEN; Gitleaks and public current-tree/history audits CLEAN. The restored
+worktree was clean. Record this final count only.
 
-- [ ] **Step 2: Run private gates inside a new preservation envelope**
+- [x] **Step 2: Run private gates inside a new preservation envelope**
 
 Capture HEAD, porcelain-v2 NUL status, binary worktree diff, and binary cached diff to a new mode-0700 directory under `/private/tmp`. Run only:
 
@@ -190,13 +192,17 @@ cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover
 uv run python -m tools.public_repo_audit --repo . --vault "$ONEOS_VAULT" --history
 ```
 
-Capture the same four artifacts afterward and compare byte-for-byte. Required: `check_v2` 0/0, 37 tests, combined audit CLEAN, four identical artifacts, all pre-existing edits preserved. Retain the proof directory and never track its location.
+Measured completion: `check_v2` reported 0 errors/0 warnings; unittest
+discovery ran 37 tests and reported OK; the combined history audit was CLEAN;
+and the four preservation artifacts were byte-identical before and after, with
+all pre-existing edits preserved. The proof location is intentionally not
+tracked.
 
-- [ ] **Step 3: Record measured completion**
+- [x] **Step 3: Record measured completion**
 
 Update only the five declared documents. Mark Amendment 5 and S7 COMPLETE; record the exact Step 1 count, 48/48 mutations, private 37, `check_v2` 0/0, the cooperative-writer boundary, and the accepted Linux limitation. Do not record private paths or point-in-time PR state.
 
-- [ ] **Step 4: Commit and recheck documentation**
+- [x] **Step 4: Commit and recheck documentation**
 
 ```bash
 git add AGENTS.md BUILD.md docs/STATUS.md \
