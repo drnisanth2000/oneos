@@ -299,6 +299,7 @@ CLOSED_FAMILY = _git_transaction.GitTransactionError
 
 #: `exact` — the entry applies to that class only, never through MRO.
 _EXACT: dict[type[BaseException], ConsoleError] = {
+    _rename.RenameCommittedError: _CODES["E-COMMITTED"],
     _git_transaction.GitTransactionCommittedError: _CODES["E-COMMITTED"],
     _git_transaction.PostCommitConsumptionError: _CODES["E-APPLIED"],
     _git_transaction.GitTransactionRecoveryError: _CODES["E-RECOVER"],
@@ -309,7 +310,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.VaultBusyError: _CODES["E-BUSY"],
     _git_transaction.GitTransactionFailure: _CODES["E-GIT"],
     _git_transaction.GitTransactionError: _CODES["E-GIT"],
-    _git_transaction._ApprovalLockCleanupFailure: _CODES["E-GIT"],
+    _git_transaction.ActionLockCleanupFailure: _CODES["E-GIT"],
     _git_transaction.QuarantineCleanupError: _CODES["E-QUARANTINED"],
     _git_transaction.QuarantineEntrySubstituted: _CODES["E-SUBSTITUTED"],
     _git_transaction.AtomicMoveUnavailable: _CODES["E-UNSUPPORTED"],
@@ -368,7 +369,7 @@ ALLOWLIST: frozenset[type[BaseException]] = frozenset(
         _registry.RegistryTransactionError,
         _outbox.OutboxDestinationError,
         _git_transaction.GitTransactionFailure,
-        _git_transaction._ApprovalLockCleanupFailure,
+        _git_transaction.ActionLockCleanupFailure,
         _git_transaction.QuarantineCleanupError,
         _git_transaction._ReviewedIndexOwnershipConflict,
     }

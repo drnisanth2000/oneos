@@ -79,10 +79,15 @@ class PostCommitConsumptionError(GitTransactionError):
         super().__init__("action committed but proposal consumption failed")
 
 
-class _ApprovalLockCleanupFailure(GitTransactionFailure):
+class ActionLockCleanupFailure(GitTransactionFailure):
+    """The action-lock body completed, but unlock or close failed."""
+
     def __init__(self, cleanup_error: OSError) -> None:
         self.cleanup_error = cleanup_error
         super().__init__("approval lock cleanup failed")
+
+
+_ApprovalLockCleanupFailure = ActionLockCleanupFailure
 
 
 class AtomicMoveUnavailable(GitTransactionError):
@@ -130,7 +135,7 @@ class QuarantineEntrySubstituted(GitTransactionError):
 class QuarantineCleanupError(GitTransactionFailure):
     """The record was quarantined; only the cleanup afterwards failed.
 
-    Distinct from `_ApprovalLockCleanupFailure`, which reaches the operator
+    Distinct from `ActionLockCleanupFailure`, which reaches the operator
     as "nothing was changed and it was rolled back". After a completed
     consumption that sentence is simply false.
     """
@@ -469,7 +474,7 @@ def action_lock(vault: Path) -> Iterator[None]:
                     f"approval lock cleanup also failed: {cleanup_error}"
                 )
             else:
-                raise _ApprovalLockCleanupFailure(cleanup_error) from cleanup_error
+                raise ActionLockCleanupFailure(cleanup_error) from cleanup_error
 
 
 # Kept as a compatibility alias for existing callers that imported the old
@@ -503,7 +508,7 @@ def execute_transaction(
             result = _execute_locked(
                 vault, start_head, reviewed_index, unrelated, plan
             )
-    except _ApprovalLockCleanupFailure as exc:
+    except ActionLockCleanupFailure as exc:
         if result is None:
             raise
         raise GitTransactionCommittedError(result, exc.cleanup_error) from exc.cleanup_error
@@ -1771,7 +1776,7 @@ def consume_reviewed_proposal(
                     if reason is not None:
                         return TransactionPreconditionRefused(reason)
                 record = quarantine_path_if_unchanged(root, relative_path, expected)
-        except _ApprovalLockCleanupFailure as exc:
+        except ActionLockCleanupFailure as exc:
             # Mirrors `execute_transaction`: once the work has happened, a
             # cleanup failure may not be reported as "nothing was changed".
             if record is None:

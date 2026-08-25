@@ -864,6 +864,8 @@ def test_approval_lock_closes_and_releases_when_unlock_fails(tmp_path, monkeypat
         with transaction._approval_lock(vault):
             pass
 
+    assert type(raised.value).__name__ == "ActionLockCleanupFailure"
+    assert type(raised.value) is transaction.ActionLockCleanupFailure
     assert isinstance(raised.value.__cause__, OSError)
     assert str(raised.value.__cause__) == "injected unlock failure"
     assert set(opened_descriptors).issubset(closed_descriptors)

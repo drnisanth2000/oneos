@@ -33,7 +33,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .console_routing import structured_reader
-from .git_transaction import VaultBusyError, action_lock
+from .git_transaction import (
+    ActionLockCleanupFailure,
+    GitTransactionFailure,
+    VaultBusyError,
+    action_lock,
+)
 
 # Mirror of oneos_wizard.SLUG_RE / RESERVED — the app cannot import from the
 # vault (it is public and vault-path-free), so the grammar is restated and the
@@ -54,6 +59,18 @@ SKIP_DIRS = {".git", ".obsidian", ".trash"}
 
 class RenameError(Exception):
     pass
+
+
+class RenameCommittedError(Exception):
+    """The rename committed, but action-lock cleanup failed afterwards."""
+
+    def __init__(self, commit_oid: str, cleanup_error: OSError) -> None:
+        self.commit_oid = commit_oid
+        self.cleanup_error = cleanup_error
+        super().__init__(
+            f"rename committed as {commit_oid}; action-lock cleanup failed; "
+            "do not retry"
+        )
 
 
 @dataclass
@@ -435,8 +452,11 @@ DEFAULT_VALIDATORS = [_validate_check_v2]
 
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
     vault = Path(vault)
+    commit_oid: str | None = None
+    lock_body_entered = False
     try:
         with action_lock(vault):
+            lock_body_entered = True
             if not _git_clean(vault):
                 raise RenameError(
                     "vault has uncommitted changes; commit or stash first"
@@ -470,15 +490,28 @@ def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
                     "-m",
                     f"rename: {plan.old} → {plan.new}",
                 )
+                commit_oid = _git(vault, "rev-parse", "HEAD").strip()
                 return f"rename: {plan.old} → {plan.new}"
             except Exception:
                 _git(vault, "reset", "-q", "--hard", "HEAD")
                 _git(vault, "clean", "-qfd")
                 raise
+    except ActionLockCleanupFailure as exc:
+        if commit_oid is None:
+            raise RenameError(
+                "shared action lock cleanup failed before the rename committed"
+            ) from exc
+        raise RenameCommittedError(commit_oid, exc.cleanup_error) from exc
     except VaultBusyError as exc:
         raise RenameError(
             "vault is busy; another OneOS action is already running"
         ) from exc
+    except GitTransactionFailure as exc:
+        if not lock_body_entered:
+            raise RenameError(
+                "shared action lock is unavailable; the rename was not started"
+            ) from exc
+        raise
 
 
 def main(argv=None) -> int:
@@ -500,6 +533,12 @@ def main(argv=None) -> int:
         msg = apply_rename(vault, plan)
         print(f"[DONE] {msg}")
         return 0
+    except RenameCommittedError as e:
+        print(
+            f"[COMMITTED] Rename committed as {e.commit_oid}, but shared "
+            "action-lock cleanup failed. Do not retry this rename."
+        )
+        return 2
     except RenameError as e:
         print(f"[ABORTED] {e}")
         return 1

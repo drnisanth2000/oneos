@@ -176,7 +176,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         git_transaction.VaultBusyError: "E-BUSY",
         git_transaction.GitTransactionFailure: "E-GIT",
         git_transaction.GitTransactionError: "E-GIT",
-        git_transaction._ApprovalLockCleanupFailure: "E-GIT",
+        git_transaction.ActionLockCleanupFailure: "E-GIT",
         git_transaction._ReviewedIndexOwnershipConflict: "E-CONFLICT",
         scope.RedirectedPathError: "E-TAMPER",
         outbox.ProposalSourceUnavailable: "E-UNAVAILABLE",
@@ -211,6 +211,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         review_tokens.ReviewContractViolation: "E-INTERNAL",
         review_tokens.ReviewTokenError: "E-INTERNAL",
         ingest_base.IngestError: "E-INGEST",
+        rename.RenameCommittedError: "E-COMMITTED",
         rename.RenameError: "E-ADMIN",
         RequestValidationError: "E-REQUEST",
     }

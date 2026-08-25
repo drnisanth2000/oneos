@@ -153,10 +153,10 @@ def test_map_GitTransactionError():
     assert _code_of(GitTransactionError("probe")) == "E-GIT"
 
 
-def test_map_ApprovalLockCleanupFailure():
-    from app.git_transaction import _ApprovalLockCleanupFailure
+def test_map_ActionLockCleanupFailure():
+    from app.git_transaction import ActionLockCleanupFailure
 
-    assert _code_of(_ApprovalLockCleanupFailure(OSError("probe"))) == "E-GIT"
+    assert _code_of(ActionLockCleanupFailure(OSError("probe"))) == "E-GIT"
 
 
 def test_map_ReviewedIndexOwnershipConflict():

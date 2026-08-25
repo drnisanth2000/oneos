@@ -6,6 +6,7 @@ rewrite BOTH halves of the fail-open action-policy rule atomically — the allow
 `paths:` and its `except:` for `.sensitive/` — with no residual old slug left.
 """
 import os
+from pathlib import Path
 import stat
 import textwrap
 
@@ -207,6 +208,151 @@ def test_entity_rename_busy_shared_lock_refuses_before_any_mutation(
         )
 
     assert shared_lock is git_transaction.action_lock
+
+
+@pytest.mark.parametrize("failure_point", ("unlock", "close"))
+def test_entity_rename_lock_cleanup_failure_reports_committed_without_rollback(
+    tmp_path, monkeypatch, failure_point
+):
+    files = dict(ENTITY_FILES)
+    files[".gitignore"] = "*/outbox/*.yaml\n"
+    vault = git_vault(tmp_path, files)
+    pending = vault / "oldentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    pending.parent.mkdir(parents=True)
+    pending.write_bytes(b"entity: oldentity\nstatus: pending\n")
+    plan = plan_rename(vault, "entity", "oldentity", "newentity")
+    rename_git_calls = []
+    real_git = rename._git
+
+    def record_rename_git_call(vault_arg, *args):
+        rename_git_calls.append(args)
+        return real_git(vault_arg, *args)
+
+    monkeypatch.setattr(rename, "_git", record_rename_git_call)
+    if failure_point == "unlock":
+        real_flock = git_transaction.fcntl.flock
+
+        def fail_unlock(descriptor, operation):
+            if operation == git_transaction.fcntl.LOCK_UN:
+                raise OSError("injected rename unlock failure")
+            return real_flock(descriptor, operation)
+
+        monkeypatch.setattr(git_transaction.fcntl, "flock", fail_unlock)
+    else:
+        real_open = git_transaction.os.open
+        real_close = git_transaction.os.close
+        lock_descriptors = set()
+
+        def record_lock_open(path, *args, **kwargs):
+            descriptor = real_open(path, *args, **kwargs)
+            if Path(path).name == "oneos-approval.lock":
+                lock_descriptors.add(descriptor)
+            return descriptor
+
+        def fail_lock_close(descriptor):
+            result = real_close(descriptor)
+            if descriptor in lock_descriptors:
+                raise OSError("injected rename close failure")
+            return result
+
+        monkeypatch.setattr(git_transaction.os, "open", record_lock_open)
+        monkeypatch.setattr(git_transaction.os, "close", fail_lock_close)
+
+    with pytest.raises(Exception) as raised:
+        apply_rename(vault, plan)
+
+    assert type(raised.value).__name__ == "RenameCommittedError"
+    assert type(raised.value) is rename.RenameCommittedError
+    assert raised.value.commit_oid == git_head(vault)
+    assert "committed" in str(raised.value).lower()
+    assert "do not retry" in str(raised.value).lower()
+    assert (vault / "newentity").is_dir()
+    assert not (vault / "oldentity").exists()
+    assert (
+        vault
+        / "newentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    ).read_bytes() == b"entity: newentity\nstatus: pending\n"
+    assert not any(args[0] in {"reset", "clean"} for args in rename_git_calls)
+    assert git_head_message(vault) == "rename: oldentity → newentity"
+    assert git_count_commits(vault) == 2
+    assert git_is_clean(vault)
+
+
+def test_entity_rename_precommit_lock_open_failure_is_a_safe_refusal(
+    tmp_path, monkeypatch
+):
+    vault = git_vault(tmp_path, ENTITY_FILES)
+    plan = plan_rename(vault, "entity", "oldentity", "newentity")
+    boundary = _rename_boundary(vault)
+    real_open = git_transaction.os.open
+    rename_git_calls = []
+
+    def fail_lock_open(path, *args, **kwargs):
+        if Path(path).name == "oneos-approval.lock":
+            raise OSError("injected lock open failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_transaction.os, "open", fail_lock_open)
+    real_git = rename._git
+
+    def record_real_rename_git_call(vault_arg, *args):
+        rename_git_calls.append(args)
+        return real_git(vault_arg, *args)
+
+    monkeypatch.setattr(rename, "_git", record_real_rename_git_call)
+
+    with pytest.raises(RenameError, match="shared action lock is unavailable"):
+        apply_rename(vault, plan)
+
+    assert _rename_boundary(vault) == boundary
+    assert (vault / "oldentity").is_dir()
+    assert not (vault / "newentity").exists()
+    assert rename_git_calls == []
+
+
+def test_rename_cli_reports_committed_lock_cleanup_failure_without_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    files = dict(ENTITY_FILES)
+    files[".gitignore"] = "*/outbox/*.yaml\n"
+    vault = git_vault(tmp_path, files)
+    pending = vault / "oldentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    pending.parent.mkdir(parents=True)
+    pending.write_bytes(b"entity: oldentity\nstatus: pending\n")
+    real_flock = git_transaction.fcntl.flock
+    real_git = rename._git
+    rename_git_calls = []
+
+    def fail_unlock(descriptor, operation):
+        if operation == git_transaction.fcntl.LOCK_UN:
+            raise OSError("injected CLI unlock failure")
+        return real_flock(descriptor, operation)
+
+    def record_rename_git_call(vault_arg, *args):
+        rename_git_calls.append(args)
+        return real_git(vault_arg, *args)
+
+    monkeypatch.setattr(git_transaction.fcntl, "flock", fail_unlock)
+    monkeypatch.setattr(rename, "_git", record_rename_git_call)
+
+    result = rename.main(
+        ["entity", "oldentity", "newentity", "--vault-root", str(vault), "--apply"]
+    )
+    output = capsys.readouterr()
+
+    assert result == 2
+    assert "[COMMITTED]" in output.out
+    assert "committed" in output.out.lower()
+    assert "do not retry" in output.out.lower()
+    assert git_head(vault) in output.out
+    assert output.err == ""
+    assert (vault / "newentity").is_dir()
+    assert not (vault / "oldentity").exists()
+    assert (
+        vault
+        / "newentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    ).read_bytes() == b"entity: newentity\nstatus: pending\n"
+    assert not any(args[0] in {"reset", "clean"} for args in rename_git_calls)
 
 
 def test_dry_run_touches_nothing(tmp_path):
