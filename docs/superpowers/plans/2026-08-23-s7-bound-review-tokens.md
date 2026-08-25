@@ -593,14 +593,16 @@ git commit -m "feat: consume reviewed proposals by quarantine"
    reject and registry delete refuse outright. That is the intended trade:
    refusing to act is strictly better than acting destructively.
 
-**Blocking verification, not a deferred one:** the Linux
-`renameat2(RENAME_NOREPLACE)` **success** path must be exercised on real
-Linux — both that it moves the file and that it refuses an occupied
-destination — before S7 can be declared complete. It is unverified in the
-session that wrote this task, which is macOS, where only
-`renameatx_np(RENAME_EXCL)` was confirmed. This is a completion condition, not
-a pre-live-gate item: an untested success path on a supported platform could
-mean reviewed actions refuse everywhere, or worse, do not.
+**Withdrawn as a completion condition (product-owner decision, 2026-08-25).**
+This originally required the Linux `renameat2(RENAME_NOREPLACE)` success and
+occupied-destination paths to be exercised on real Linux before S7 could be
+declared complete. No Linux host is available, so the owner accepted it as a
+**known Linux limitation** instead. Only `renameatx_np(RENAME_EXCL)` on macOS
+has been exercised. The concern that motivated the original wording is
+unchanged and is recorded in full under "Known Linux limitation" in the design:
+an unexercised path could refuse everywhere (safe, unusable) or degrade to an
+overwriting rename (destructive). It is documented as unverified, never as
+verified.
 
 ---
 
@@ -934,7 +936,9 @@ S7 is complete only when:
 - Grey Matter's exact pre-existing state is preserved; and
 - the inherited pre-live-gate items remain separately sequenced rather than
   silently claimed complete; and
-- the atomic no-overwrite move has been exercised on real Linux
-  (`renameat2(RENAME_NOREPLACE)`) and on macOS
+- the atomic no-overwrite move has been exercised on macOS
   (`renameatx_np(RENAME_EXCL)`), covering both the success path and the
-  occupied-destination refusal *(Amendment 1)*.
+  occupied-destination refusal *(Amendment 1)*. The equivalent Linux
+  requirement was **withdrawn on 2026-08-25** by product-owner decision and
+  recorded as a known Linux limitation; it is no longer a completion
+  condition.

@@ -3,6 +3,14 @@
 **Status:** APPROVED — conversational and written design approved. Amendment 3
 Stage 2 is designed here but not implemented.
 
+**Amendment 4 (product-owner decision, 2026-08-25):** Linux
+`renameat2(RENAME_NOREPLACE)` verification is **withdrawn as a completion
+condition** and recorded instead as a known limitation for Linux users. No
+Linux host is available; only macOS `renameatx_np(RENAME_EXCL)` has been
+exercised. The Linux implementation is unchanged. Rationale and the exact
+exposure in “Known Linux limitation” below; acceptance criterion 16 is struck
+accordingly.
+
 **Amendment 1 (APPROVED at e0316cc):** consumed proposals are
 quarantined rather than deleted. Amended clauses are marked
 *(Amendment 1)*. Rationale in “Why deletion cannot satisfy criterion 4”
@@ -328,6 +336,37 @@ file *and* fails if the destination exists:
 
 - Linux: `renameat2(..., RENAME_NOREPLACE)`
 - macOS: `renameatx_np(..., RENAME_EXCL)`
+
+#### Known Linux limitation *(product-owner decision, 2026-08-25)*
+
+Only the macOS path has ever been executed. No real Linux host is available to
+this project, so `renameat2(RENAME_NOREPLACE)` has never run — not its success
+path and not its occupied-destination refusal. The product owner has accepted
+this as a **known limitation for Linux users** rather than a blocking
+completion condition. It is recorded here as *unverified*; nothing in this
+repository should be read as claiming otherwise.
+
+The Linux implementation is deliberately left unchanged. Editing code that
+cannot be exercised would replace untested code with untested edits, which is
+not an improvement.
+
+**What a Linux user carries.** `_atomic_mover()` resolves the Linux path two
+ways — the libc `renameat2` symbol, or a raw `syscall()` with a
+per-architecture number from `_SYS_RENAMEAT2`. Neither has run, and the two
+ways it can be wrong differ in kind:
+
+- **Fail-closed, safe but unusable.** If neither path resolves — an unlisted
+  `platform.machine()`, or a kernel without `renameat2` — `_MOVE_NO_REPLACE`
+  is `None` and every reviewed action refuses with `E-UNSUPPORTED`. Nothing is
+  destroyed; approve, reject and registry delete simply do not work there.
+- **Fail-open, destructive.** If `_RENAME_NOREPLACE` or a syscall number were
+  wrong, the call could degrade to an *ordinary* rename, which silently
+  overwrites its destination. That is exactly the harm Amendment 1 exists to
+  prevent, reached through the one path no test has entered.
+
+No evidence in this repository distinguishes those outcomes on Linux. Before
+S7 is relied upon on a Linux host, both paths must be exercised there. That
+work is out of S7's scope and is not a precondition of S7's completion.
 
 Both are reachable through the standard library's `ctypes`, so this adds no
 dependency. **Ordinary `rename` is never an acceptable fallback**, because it
@@ -1207,9 +1246,12 @@ S7 is complete only when all of the following are true:
     tests, and their live campaign claims are retired only after evidence
     proves quarantine-last made them unreachable; every remaining taxonomy
     code has a reachable producer.
-16. Linux `renameat2(RENAME_NOREPLACE)` is exercised on a real Linux host for
-    both successful movement and occupied-destination refusal. macOS
-    `renameatx_np(RENAME_EXCL)` evidence does not satisfy this condition.
+16. ~~Linux `renameat2(RENAME_NOREPLACE)` is exercised on a real Linux host.~~
+    **Withdrawn as a completion condition** by product-owner decision on
+    2026-08-25; recorded instead as a known Linux limitation (see "Known
+    Linux limitation" above). macOS `renameatx_np(RENAME_EXCL)` has been
+    exercised; the Linux path has not, and is documented as unverified rather
+    than claimed.
 
 Only after these criteria pass may S7 be called complete. S7 does not itself
 authorize live gate trials until the separately sequenced inherited items 2–4

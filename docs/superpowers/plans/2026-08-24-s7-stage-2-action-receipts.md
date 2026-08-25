@@ -24,7 +24,7 @@
 - Receipt-backed cards never open or parse the pending proposal. They carry no digest, mutating attribute, reconfirmation, or `Check again`; ids use only a scan-validated proposal id plus a server-minted issuance.
 - `E-RETAINED`, `E-STRANDED`, `diagnose_quarantined_record`, their executable tests, and mutation rows M18/M19 retire only in the same task that makes quarantine-last real and proves the old producers unreachable.
 - Independent review and mutation-tested verification remain mandatory. An implementer never reviews their own task. No push, PR, merge, branch deletion, or worktree removal is authorized by this plan.
-- Linux `renameat2(RENAME_NOREPLACE)` success and occupied-destination behavior, private read-only gates, and the Grey Matter preservation proof remain external completion conditions; Stage 2 cannot make S7 complete without them.
+- Private read-only gates and the Grey Matter preservation proof remain external completion conditions; Stage 2 cannot make S7 complete without them. Linux `renameat2(RENAME_NOREPLACE)` verification was **withdrawn as a completion condition on 2026-08-25** by product-owner decision and is recorded as a known Linux limitation instead.
 
 ---
 
@@ -772,9 +772,9 @@ git status --porcelain
 
 Read every count from these runs; do not reuse earlier commentary.
 
-- [ ] **Step 2: Verify Linux atomic move on a real Linux host**
+- [x] **Step 2: Verify Linux atomic move on a real Linux host — WITHDRAWN 2026-08-25**
 
-Exercise `renameat2(RENAME_NOREPLACE)` for both successful movement and occupied-destination refusal, asserting source/destination bytes and no overwrite. macOS `renameatx_np` evidence does not satisfy this step.
+Withdrawn by product-owner decision: no real Linux host is available. `renameat2(RENAME_NOREPLACE)` has not been exercised for either successful movement or occupied-destination refusal, and this is recorded as a known Linux limitation rather than performed or claimed. Do not mark this step done by running the macOS equivalent — `renameatx_np` evidence never satisfied it, and the step is closed as withdrawn, not as passed.
 
 - [ ] **Step 3: Run private gates read-only when authorized**
 

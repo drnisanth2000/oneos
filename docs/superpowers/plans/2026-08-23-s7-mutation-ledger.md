@@ -1096,10 +1096,14 @@ rather than by adjusting the mutation:
 
 ## What this campaign does not cover
 
-- **Linux `renameat2(RENAME_NOREPLACE)`** — unexercised. This session is
-  macOS, where `renameatx_np(RENAME_EXCL)` was measured directly. Amendment 1
-  makes the Linux success path *and* its occupied-destination refusal a
-  completion condition, not a pre-live-gate item.
+- **Linux `renameat2(RENAME_NOREPLACE)`** — unexercised, and now permanently
+  so within S7. This session is macOS, where `renameatx_np(RENAME_EXCL)` was
+  measured directly. Amendment 1 originally made the Linux success path and its
+  occupied-destination refusal a completion condition; that requirement was
+  **withdrawn on 2026-08-25** by product-owner decision, because no Linux host
+  is available, and is recorded as a known Linux limitation in the design. The
+  campaign therefore certifies nothing about Linux, and no row should be read
+  as doing so.
 - **The private read-only gates** and the **Grey Matter preservation proof** —
   both require `ONEOS_VAULT`, which was deliberately never set in this
   session. Grey Matter was not accessed at any point; that is an absence of
