@@ -1,7 +1,12 @@
 # S7 — Bound Review Tokens
 
 **Status:** APPROVED — conversational and written design approved. Amendment 3
-Stage 2 is designed here but not implemented.
+Stage 2 is implemented and verified: action receipts, quarantine-last,
+`E-APPLIED` and `E-RECEIPT`, the offline receipt validator, and the
+orphan-outcome guard are in the tree, and `E-RETAINED`, `E-STRANDED` and
+`diagnose_quarantined_record` are retired. S7 as a whole is **not** complete —
+the public history audit fails, and the private gates and Grey Matter
+preservation proof remain unproven.
 
 **Amendment 4 (product-owner decision, 2026-08-25):** Linux
 `renameat2(RENAME_NOREPLACE)` verification is **withdrawn as a completion
