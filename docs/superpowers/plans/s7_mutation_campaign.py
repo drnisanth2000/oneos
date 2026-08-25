@@ -49,8 +49,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 MUTATIONS = [
     (
         "M1", "app/outbox.py",
-        "    require_review_match(proposal_state.contents, review_sha256)",
-        "    pass  # MUTANT M1",
+        "    review_digest = require_review_match(proposal_state.contents, review_sha256)",
+        '    review_digest = hashlib.sha256(proposal_state.contents).hexdigest()  # MUTANT M1',
         ["tests/test_outbox.py"],
         [
             ("tests/test_outbox.py::test_actions_refuse_a_malformed_fingerprint_without_mutation[None-approve]",
@@ -61,8 +61,10 @@ MUTATIONS = [
     ),
     (
         "M3", "app/registry.py",
-        "        require_review_match(proposal_state.contents, review_sha256)",
-        "        pass  # MUTANT M3",
+        "        review_digest = require_review_match(\n"
+        "            proposal_state.contents, review_sha256\n"
+        "        )",
+        '        review_digest = "0" * 64  # MUTANT M3',
         ["tests/test_registry.py"],
         [("tests/test_registry.py::test_execute_delete_refuses_a_malformed_fingerprint[None]",
           "DID NOT RAISE InvalidReviewToken")],
@@ -93,8 +95,18 @@ MUTATIONS = [
     ),
     (
         "M6", "app/outbox.py",
-        "        consume_reviewed_proposal(scope.root, proposal_rel, proposal_state)",
-        "        consume_reviewed_proposal(scope.root, proposal_rel, capture_path_state(scope.root, proposal_rel))  # MUTANT M6",
+        "        result = consume_reviewed_proposal(\n"
+        "            scope.root,\n"
+        "            proposal_rel,\n"
+        "            proposal_state,\n"
+        "            preconditions=(_require_unspent_id,),\n"
+        "        )",
+        "        result = consume_reviewed_proposal(\n"
+        "            scope.root,\n"
+        "            proposal_rel,\n"
+        "            capture_path_state(scope.root, proposal_rel),  # MUTANT M6\n"
+        "            preconditions=(_require_unspent_id,),\n"
+        "        )",
         ["tests/test_outbox.py"],
         [("tests/test_outbox.py::test_reject_owns_the_reviewed_state_not_whatever_arrives_later",
           "DID NOT RAISE Exception")],
@@ -141,8 +153,8 @@ MUTATIONS = [
     ),
     (
         "M12", "app/registry.py",
-        "            preconditions=(_require_no_live_references,),\n",
-        "  # MUTANT M12: reference gate no longer runs under the lock\n",
+        "            preconditions=(_require_unspent_id, _require_no_live_references),",
+        "            preconditions=(_require_unspent_id,),  # MUTANT M12",
         ["tests/test_registry.py"],
         [("tests/test_registry.py::test_the_reference_recount_holds_the_approval_lock",
           "the reference count never ran")],
