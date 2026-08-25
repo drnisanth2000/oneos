@@ -761,7 +761,7 @@ Resolve every accepted finding with RED -> fix -> focused green -> mutation proo
 
 **Files:** no product changes. Documentation changes only if verified counts/commands need recording.
 
-- [ ] **Step 1: Run the final public gates**
+- [x] **Step 1: Run the final public gates**
 
 ```bash
 uv run python -m pytest -q
@@ -776,7 +776,7 @@ Read every count from these runs; do not reuse earlier commentary.
 
 Withdrawn by product-owner decision: no real Linux host is available. `renameat2(RENAME_NOREPLACE)` has not been exercised for either successful movement or occupied-destination refusal, and this is recorded as a known Linux limitation rather than performed or claimed. Do not mark this step done by running the macOS equivalent — `renameatx_np` evidence never satisfied it, and the step is closed as withdrawn, not as passed.
 
-- [ ] **Step 3: Run private gates read-only when authorized**
+- [x] **Step 3: Run private gates read-only when authorized**
 
 Only if `ONEOS_VAULT` is set and its HEAD is `2aa8b14` or later:
 
@@ -788,18 +788,18 @@ cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover
 
 Expected: `check_v2` reports 0 errors/0 warnings and 37 private tests pass. These commands are reads; do not run formatters, cleaners, or repair tools.
 
-- [ ] **Step 4: Prove Grey Matter preservation**
+- [x] **Step 4: Prove Grey Matter preservation**
 
 Compare exact pre/post HEAD, porcelain-v2 NUL output, binary working-tree diff, and binary cached diff captured by the trusted local operator. Absence of vault access is not preservation proof.
 
-- [ ] **Step 5: Prepare the handoff without remote or destructive operations**
+- [x] **Step 5: Prepare the handoff without remote or destructive operations**
 
 Report repository root, original `origin/main`/baseline SHA, branch, worktree, verified HEAD, public suite, mutation campaign, Linux result, private gates, Grey Matter preservation, and remaining inherited items 2–4. Do not push, open a PR, merge, delete branches, or remove worktrees without separate authorization.
 
 ## Plan self-review checklist
 
-- [ ] Every Stage 2 design clause maps to a task: schema/HEAD/absence/batching/offline audit (1, 6); taxonomy (2, 3); quarantine-last/crash/revert and retirement/orphan guard (3, 4); three service gates (4); receipt-first presentation (5); live mutation campaign (7); external gates (8).
-- [ ] Search this plan for `TBD`, `TODO`, `implement later`, `similar to`, and `appropriate error`; none may remain as an instruction.
-- [ ] Verify interface names are consistent: `ActionReceipt`, `ReceiptResolution`, `SpentAction`, `TransactionPreconditionRefused`, `PostCommitConsumptionError`, and the two action result unions.
-- [ ] Verify delegated tasks do not edit concurrently and no implementer is their own reviewer.
-- [ ] Verify the plan never treats valid receipt presence as `E-RECEIPT`, never compares stored receipt digest with pending bytes, never enumerates historical receipts in a request, and never restores a quarantine record by name.
+- [x] Every Stage 2 design clause maps to a task: schema/HEAD/absence/batching/offline audit (1, 6); taxonomy (2, 3); quarantine-last/crash/revert and retirement/orphan guard (3, 4); three service gates (4); receipt-first presentation (5); live mutation campaign (7); external gates (8).
+- [x] Search this plan for `TBD`, `TODO`, `implement later`, `similar to`, and `appropriate error`; none may remain as an instruction.
+- [x] Verify interface names are consistent: `ActionReceipt`, `ReceiptResolution`, `SpentAction`, `TransactionPreconditionRefused`, `PostCommitConsumptionError`, and the two action result unions.
+- [x] Verify delegated tasks do not edit concurrently and no implementer is their own reviewer.
+- [x] Verify the plan never treats valid receipt presence as `E-RECEIPT`, never compares stored receipt digest with pending bytes, never enumerates historical receipts in a request, and never restores a quarantine record by name.

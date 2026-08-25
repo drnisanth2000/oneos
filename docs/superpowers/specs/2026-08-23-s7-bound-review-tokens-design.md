@@ -1,12 +1,12 @@
 # S7 — Bound Review Tokens
 
-**Status:** APPROVED — conversational and written design approved. Amendment 3
-Stage 2 is implemented and verified: action receipts, quarantine-last,
-`E-APPLIED` and `E-RECEIPT`, the offline receipt validator, and the
-orphan-outcome guard are in the tree, and `E-RETAINED`, `E-STRANDED` and
-`diagnose_quarantined_record` are retired. S7 as a whole is **not** complete —
-the public history audit fails, and the private gates and Grey Matter
-preservation proof remain unproven.
+**Status:** COMPLETE — the approved design and all final gates are verified.
+Amendment 3 Stage 2 provides action receipts, quarantine-last,
+`E-APPLIED`, `E-RECEIPT`, the offline receipt validator, and the
+orphan-outcome guard. `E-RETAINED`, `E-STRANDED`, and
+`diagnose_quarantined_record` are retired. Final evidence is recorded in the
+implementation plans and mutation ledger. Inherited items 2–4 remain separate
+pre-live-gate work and are not silently claimed complete here.
 
 **Amendment 4 (product-owner decision, 2026-08-25):** Linux
 `renameat2(RENAME_NOREPLACE)` verification is **withdrawn as a completion
@@ -660,12 +660,11 @@ Three consequences follow.
    transient Git failure into manual recovery. Stage 2 exists to make that
    rare.
 
-   *Stage 2 (approved design; not implemented).* Quarantining becomes the
+   *Stage 2 (implemented).* Quarantining becomes the
    **last** mutation, after the commit succeeds. No proposal has been
    quarantined when rollback runs, so no rollback of quarantine is attempted.
-   Stage 1 remains the implemented safety boundary until Stage 2 lands; its
-   protections are retired only in the same change that makes them
-   unreachable, never in advance.
+   Stage 1 remained the safety boundary until Stage 2 landed; its unreachable
+   protections were retired in the same change, never in advance.
 
 #### Stage 2: committed action receipts *(Amendment 3)*
 

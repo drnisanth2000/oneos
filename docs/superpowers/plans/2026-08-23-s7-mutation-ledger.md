@@ -1104,7 +1104,9 @@ rather than by adjusting the mutation:
   is available, and is recorded as a known Linux limitation in the design. The
   campaign therefore certifies nothing about Linux, and no row should be read
   as doing so.
-- **The private read-only gates** and the **Grey Matter preservation proof** —
-  both require `ONEOS_VAULT`, which was deliberately never set in this
-  session. Grey Matter was not accessed at any point; that is an absence of
-  access, not a proof of preservation, and the proof remains outstanding.
+- **Private boundaries are outside the mutation campaign.** They were verified
+  separately at the trusted local boundary: 37 private tests passed,
+  `check_v2` reported 0 errors/0 warnings, the combined repo+vault history
+  audit was clean, and the captured HEAD, porcelain-v2 status, binary worktree
+  diff, and binary cached diff were byte-identical before and after. The
+  campaign itself makes no claim about those private checks.

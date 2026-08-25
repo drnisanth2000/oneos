@@ -57,26 +57,19 @@ This is hardening of Phase 1, not a new feature phase. Complete in this order:
 | S4 | **COMPLETE** | **Fresh, collision-safe proposals.** Store source SHA-256 and use a collision-safe proposal id. | Changed or missing sources are visibly refused at approval; same-second proposals never overwrite each other. |
 | S5 | **COMPLETE** | **Isolated Git transaction and audit.** Commit exactly the reviewed paths, restore filesystem/index/proposal state on failure, and make Gate 3 validate both sanctioned message type and changed paths—including `ingest:` receipts. | Unrelated staged and unstaged changes remain untouched; injected commit failure leaves no partial move; a misleading commit prefix cannot sanction unrelated paths; one revert restores the full approved batch. |
 | S6 | **COMPLETE** | **Visible Console failures.** Return specific safe errors through the Command Center surface. | Stale, invalid, missing, cross-scope, and Git failures are visible and no route silently swallows them. |
-| S7 | **PROPOSED** | **Bound review tokens.** Bind an approval to the exact proposal bytes the operator reviewed, not to a mutable id. | A proposal rewritten between preview and approval, keeping its id and filename, is visibly refused before any mutation; approve, reject, and registry-delete execution all carry the reviewed digest. |
+| S7 | **COMPLETE** | **Bound review tokens.** Bind approve, reject, and registry delete to the exact proposal bytes reviewed; quarantine transactional proposals only after commit; retain tracked action receipts so a committed id cannot act twice. | Same-id rewrites are visibly refused before mutation; spent ids project as non-actionable receipt cards; reject safely quarantines its reviewed record; 1,461 public tests and 48 mutation rows pass, private gates pass, the combined history audit is clean, and Grey Matter's pre-existing state is byte-identical. Linux `renameat2` remains an explicitly accepted unverified limitation. |
 
 S1-S5 are recorded as built, including review findings and intentional threat
 boundaries, in `docs/SAFETY-FOUNDATION-S1-S4.md` and its S5 addendum. Their old
 execution plans are historical records and must not be run again.
 
-S7 was discovered while designing S6 and is **proposed, not designed**. A
-proposal id names a mutable file: `require_proposal_identity` checks id grammar
-and filename equality only, and `approve`, `reject`, and `execute_delete` each
-take an id alone and compare the record only against another read made during
-the same request. Nothing binds an approval to the bytes the operator reviewed,
-so a same-id rewrite between preview and approval passes every existing check.
-
-Three independent reviews confirmed the gap is real, that S6 neither introduces
-nor widens it — the malformed file needed to degrade the listing also makes
-`approve` and `reject` raise for every id — and that S6 may merge with it open.
-The fix mirrors S4 exactly, one artifact further out: S4 bound the source
-receipt with a SHA-256 and refused stale approvals; S7 binds the proposal record
-the same way. It adds a refusal condition and changes three service signatures,
-which is why it is a step and not an S6 edit.
+S7 is complete. Exact-byte review snapshots bind all three reviewed actions;
+quarantine-last prevents destructive rollback; tracked HEAD receipts prevent a
+proposal id from completing twice; receipt-first projection never parses a
+spent record. Independent reviews and the mutation ledger record the correction
+rounds. Linux `renameat2(RENAME_NOREPLACE)` was not exercised because no Linux
+host was available and is documented as a known limitation by product-owner
+decision. Inherited items 2–4 remain separately sequenced before live trials.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved

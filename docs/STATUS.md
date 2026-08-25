@@ -8,17 +8,17 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-08-16, after Safety Foundation S5 merged into `main`.
+Last reconciled: 2026-08-25, after Safety Foundation S7 final gates.
 
 ---
 
 ## Phase 1 triage
 
-Original steps 1-10 and Safety Foundation S1-S6 are complete. S7 — bound
-review tokens — is the next step and is not yet designed. Phase 2 is not
-authorized.
+Original steps 1-10 and Safety Foundation S1-S7 are complete. The separately
+sequenced inherited items 2–4 below remain required before live Phase 1 gate
+trials. Phase 2 is not authorized.
 
-| Safety step | State | Merged outcome |
+| Safety step | State | Outcome |
 |---|---|---|
 | S1 — commit on ingest | **COMPLETE** | Adapter intake creates one redacted receipt-only `ingest:` commit; duplicate intake is a no-op; raw folder archives are contained outside the vault. |
 | S2 — request-local scope | **COMPLETE** | Immutable manifest-backed entity scope owns every request and adapter operation; shared mailbox routing uses exactly one configured recipient owner. |
@@ -26,13 +26,13 @@ authorized.
 | S4 — proposal identity and freshness | **COMPLETE** | Collision-safe proposal IDs, exact-byte source SHA-256, no-follow snapshots, and visible stale/missing refusals are merged. |
 | S5 — Git transaction and audit | **COMPLETE** | Classification approval and registry deletion use exact-path alternate-index transactions with ownership-aware rollback; Gate 3 validates action-specific messages, paths, and dirty-state fingerprints. |
 | S6 — Console failures | **COMPLETE** | Every typed Command Center refusal reaches the operator as a specific, safe, actionable message; no route swallows a failure or returns a raw server fault. Public suite 603 → 832. All public and private gates pass, including the combined repo+vault history audit; Grey Matter fingerprints identical before and after. Per-task review record: `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`. |
-| S7 — bound review tokens | **PROPOSED** | Discovered while designing S6; not designed. See `BUILD.md`. |
+| S7 — bound review tokens | **COMPLETE** | Exact-byte review fingerprints bind approve, reject, and registry delete; quarantine-last and tracked HEAD receipts protect transactional actions from destructive rollback and repeated ids; reject safely quarantines its reviewed record; receipt-backed cards remain non-actionable. Final evidence: 1,461 public tests, 48/48 mutation rows, 37 private tests, `check_v2` 0/0, clean combined history audit, and byte-identical Grey Matter pre/post proof. Linux `renameat2` is an accepted unverified limitation. |
 
-Merged S5 baseline: `0f71cd3`. Fresh verification of this reconciled branch
-recorded 603 public tests. The most recent private gate recorded 37 private
-tests, `check_v2` at 0 errors/0 warnings, policy self-test pass, clean
-Gitleaks/public/private audits, and byte-identical Grey Matter before/after
-fingerprints.
+Merged S5 baseline: `0f71cd3`. S6 is complete. S7 began from the fresh
+merged-S6 baseline `d7ad86b` with 926 public tests.
+Final verification records 1,461 public tests, 48/48 mutation rows, 37 private
+tests, `check_v2` at 0 errors/0 warnings, clean Gitleaks and combined
+repo+vault history audits, and byte-identical Grey Matter before/after proof.
 
 ### Exit gates (spec §11)
 
@@ -88,13 +88,14 @@ unless they demonstrate a reproducible defect in those guarantees.
 - **Console navigation** — the workspace switcher selects an entity or saved
   scope. `Blocks / Modules` are registry-backed views inside that scope.
 
-### Found while designing S6 — defects that predate it
+### Found while designing S6 — historical defect record
 
-These were discovered by review of existing code, not introduced by S6. None is
-fixed yet; each is either scheduled inside S6 or recorded as its own step.
+These were discovered by review of existing code, not introduced by S6. S6
+fixed its in-scope findings; S7 fixed the exact-byte approval boundary. The list
+is retained as a historical record, not as a current defect queue.
 
-- **Approval is not bound to reviewed content.** A proposal id names a mutable
-  file. See S7 in `BUILD.md`. Confirmed real by four independent reviews.
+- **Approval was not bound to reviewed content.** A proposal id named a mutable
+  file. S7 fixed this for approve, reject, and registry delete; see `BUILD.md`.
 - **A missing `modules:` key blanked every Console page.** `Vault._archetypes`
   raised a bare `ValueError` for a hand-edited `archetypes.yaml`, and
   `bundles()` is called unguarded from every page — so one malformed registry
@@ -152,22 +153,12 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-S6 is complete on `codex/s6-visible-console-failures` — every task was
-implemented test-first and passed an independent review, with fix rounds
-recorded in `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`, and every
-public and private gate passes, including the combined repo+vault history
-audit. Its merge/PR state is never recorded here as a point-in-time fact — it
-changes independently of this file and any such claim goes stale the moment
-it does. Check it live instead (`git log origin/main..codex/s6-visible-console-
-failures`, or the hosting UI's pull-request list).
-
-S7 — bound review tokens — is next. Do not begin S7 until S6 is merged into
-`origin/main` and a fresh merged-`main` baseline passes (see "Repository and
-task hygiene" in `AGENTS.md`). What S7 inherits from S6 is recorded below in
-"S7 inherits these from S6".
-
-Do not start Phase 2, deploy, or add deferred UI while S6 is unmerged or the
-live exit gates remain open.
+S7 is complete at its gate-certified branch tip. Its merge/PR state is never
+recorded here as a point-in-time fact; check it live with `git log
+origin/main..<branch>` and the hosting UI. Before live Phase 1 gate trials,
+sequence inherited items 2–4 below as their own reviewed tasks. Do not start
+Phase 2, deploy, or add deferred UI while those items or the live exit gates
+remain open.
 
 ---
 
