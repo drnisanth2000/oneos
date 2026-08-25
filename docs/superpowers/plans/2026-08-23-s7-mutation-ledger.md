@@ -92,12 +92,20 @@ M7   RED then GREEN   M7b  RED then GREEN   M8   RED then GREEN
 M9   RED then GREEN   M10  RED then GREEN   M12  RED then GREEN
 M15  RED then GREEN   M16  RED then GREEN   M17  RED then GREEN
 M20  RED then GREEN   M21  RED then GREEN   M22  RED then GREEN
-M23  RED then GREEN   M11  RED then GREEN
+M23  RED then GREEN   M11  RED then GREEN   M24  RED then GREEN
+M24b RED then GREEN   M25  RED then GREEN   M25b RED then GREEN
+M26  RED then GREEN   M26b RED then GREEN   M27  RED then GREEN
+M28  RED then GREEN   M28b RED then GREEN   M29  RED then GREEN
+M30  RED then GREEN   M31  RED then GREEN   M31b RED then GREEN
+M32  RED then GREEN   M33  RED then GREEN   M34  RED then GREEN
+M35  RED then GREEN   M36  RED then GREEN   M37  RED then GREEN
+M38  RED then GREEN   M39  RED then GREEN   M40  RED then GREEN
+M41  RED then GREEN
 
-all 20 mutations: red under mutation, green once restored
+all 43 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1365 passed in 114.37s (0:01:54)
+  1456 passed in 111.64s (0:01:51)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -134,8 +142,8 @@ above; the script asserts that before substituting.
     — `DID NOT RAISE InvalidReviewToken`
 
 ```diff
--    require_review_match(proposal_state.contents, review_sha256)
-+    pass  # MUTANT M1
+-    review_digest = require_review_match(proposal_state.contents, review_sha256)
++    review_digest = hashlib.sha256(proposal_state.contents).hexdigest()  # MUTANT M1
 ```
 
 M1 breaks the comparison in `_own_reviewed_proposal`, which approve and
@@ -158,8 +166,10 @@ mutant, because a ledger row that mutates nothing is worse than an absent one.
 - **result** RED — `test_execute_delete_refuses_a_malformed_fingerprint[None]`
 
 ```diff
--        require_review_match(proposal_state.contents, review_sha256)
-+        pass  # MUTANT M3
+-        review_digest = require_review_match(
+-            proposal_state.contents, review_sha256
+-        )
++        review_digest = "0" * 64  # MUTANT M3
 ```
 
 ### M4 — RETIRED (historical)
@@ -229,8 +239,18 @@ mutates nothing.
 - **result** RED — `test_reject_owns_the_reviewed_state_not_whatever_arrives_later`
 
 ```diff
--        consume_reviewed_proposal(scope.root, proposal_rel, proposal_state)
-+        consume_reviewed_proposal(scope.root, proposal_rel, capture_path_state(scope.root, proposal_rel))  # MUTANT M6
+-        result = consume_reviewed_proposal(
+-            scope.root,
+-            proposal_rel,
+-            proposal_state,
+-            preconditions=(_require_unspent_id,),
+-        )
++        result = consume_reviewed_proposal(
++            scope.root,
++            proposal_rel,
++            capture_path_state(scope.root, proposal_rel),  # MUTANT M6
++            preconditions=(_require_unspent_id,),
++        )
 ```
 
 ### M7 — classification transport
@@ -328,8 +348,8 @@ satisfy. It now requires it to be an argument of the call that acts.
 - **result** RED — `test_the_reference_recount_holds_the_approval_lock`
 
 ```diff
--            preconditions=(_require_no_live_references,),
-+  # MUTANT M12: reference gate no longer runs under the lock
+-            preconditions=(_require_unspent_id, _require_no_live_references),
++            preconditions=(_require_unspent_id,),  # MUTANT M12
 ```
 
 Counting references before the approval lock leaves a window another
@@ -576,6 +596,352 @@ rewrite keeps the same device, inode and name, so every identity check passes
 while the bytes are no longer the reviewed bytes. Bypassing it lets OneOS
 consume bytes nobody reviewed with no rename involved at all. This is why the
 check survived Amendment 3 even though its old remedy did not.
+
+### M24 — approval receipt omitted from filesystem changes
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_receipt_has_exact_transaction_roles[approve]`
+  — `approval receipt is not a filesystem change`
+
+```diff
+-            PathChange(
+-                receipt_rel,
+-                PathState.absent(),
+-                PathState.regular(render_action_receipt(receipt), 0o644),
+-                create_parent=True,
+-            ),
++            # MUTANT M24: receipt omitted from filesystem changes
+```
+
+### M24b — registry-delete receipt omitted from filesystem changes
+
+- **file** `app/registry.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_receipt_has_exact_transaction_roles[registry-delete]`
+  — `registry deletion receipt is not a filesystem change`
+
+```diff
+-                PathChange(
+-                    receipt_rel,
+-                    PathState.absent(),
+-                    PathState.regular(render_action_receipt(receipt), 0o644),
+-                    create_parent=True,
+-                ),
++                # MUTANT M24b: receipt omitted from filesystem changes
+```
+
+### M25 — approval receipt omitted from exact commit paths
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_receipt_has_exact_transaction_roles[approve]`
+  — `approval receipt is not an exact commit path`
+
+```diff
+-        commit_paths=(prop.src, prop.dst, receipt_rel),
++        commit_paths=(prop.src, prop.dst),  # MUTANT M25
+```
+
+### M25b — registry-delete receipt omitted from exact commit paths
+
+- **file** `app/registry.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_receipt_has_exact_transaction_roles[registry-delete]`
+  — `registry deletion receipt is not an exact commit path`
+
+```diff
+-            commit_paths=(registry_rel, receipt_rel),
++            commit_paths=(registry_rel,),  # MUTANT M25b
+```
+
+### M26 — approval receipt misclassified as an owned change
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_receipt_has_exact_transaction_roles[approve]`
+  — `tracked receipt was misclassified as an untracked owned change`
+
+```diff
+-            PathChange(proposal_rel, proposal_state, PathState.absent()),
++            PathChange(receipt_rel, proposal_state, PathState.absent()),  # MUTANT M26
+```
+
+### M26b — registry-delete receipt misclassified as an owned change
+
+- **file** `app/registry.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_receipt_has_exact_transaction_roles[registry-delete]`
+  — `tracked receipt was misclassified as an untracked owned change`
+
+```diff
+-                PathChange(proposal_rel, proposal_state, PathState.absent()),
++                PathChange(receipt_rel, proposal_state, PathState.absent()),  # MUTANT M26b
+```
+
+M24–M26 each have an independent registry-delete row because approval and
+registry deletion construct their transaction plans at different sites. A
+single approval mutation would not prove the duplicated registry path.
+
+### M27 — receipt authority read from the working tree
+
+- **file** `app/action_receipts.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_receipt_authority_comes_only_from_git_head`
+  — `receipt authority no longer comes from Git HEAD`
+
+```diff
+     expressions = tuple(
+         f"HEAD:{receipt_relative_path(entity, proposal_id)}" for proposal_id in ids
+     )
+-    objects = _batch_objects(vault_path, expressions)
++    objects = tuple(
++        _BatchObject("blob", (vault_path / receipt_relative_path(entity, proposal_id)).read_bytes())
++        if (vault_path / receipt_relative_path(entity, proposal_id)).exists() else None
++        for proposal_id in ids
++    )  # MUTANT M27: working-tree authority
+```
+
+### M28 — approval checks the receipt before the lock
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_spent_id_checks_are_locked_preconditions[approve]`
+  — `approve receipt check no longer runs only under the lock`
+
+```diff
+-        preconditions=(_require_unspent_id,),
++        preconditions=(_require_unspent_id,) if _require_unspent_id() is None else (),  # MUTANT M28
+```
+
+### M28b — registry deletion checks the receipt before the lock
+
+- **file** `app/registry.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_spent_id_checks_are_locked_preconditions[registry-delete]`
+  — `registry delete receipt check no longer runs only under the lock`
+
+```diff
+-            preconditions=(_require_unspent_id, _require_no_live_references),
++            preconditions=(
++                _require_unspent_id, _require_no_live_references
++            ) if _require_unspent_id() is None else (),  # MUTANT M28b
+```
+
+### M29 — reject omits its standalone locked receipt check
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_spent_id_checks_are_locked_preconditions[reject]`
+  — `reject omitted its locked spent-id check`
+
+```diff
+-            preconditions=(_require_unspent_id,),
++            preconditions=(),  # MUTANT M29
+```
+
+### M30 — stored audit digest compared with pending bytes
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_projection.py`
+- **result** RED — `test_receipt_first_projection_never_opens_any_spent_leaf_shape[different]`
+  — `the different spent leaf or its target was opened`
+
+```diff
+-            if resolution.receipt is not None:
++            if (
++                resolution.receipt is not None
++                and resolution.receipt.review_sha256
++                == hashlib.sha256(discovered.read_bytes()).hexdigest()
++            ):  # MUTANT M30: audit digest compared with pending bytes
+```
+
+The first draft merely tested whether the digest string was truthy. That was
+a semantic no-op because the closed schema always supplies 64 hex characters.
+This row performs the forbidden comparison and is killed by the spent-leaf
+no-open proof itself.
+
+### M31 — classification opens the pending record before receipt resolution
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_projection.py`
+- **result** RED — `test_matching_receipt_projects_spent_without_opening_pending_record`
+  — `a spent proposal record was opened`
+
+```diff
++            review_snapshot_for(scope, discovered)  # MUTANT M31
+             if resolution.receipt is not None:
+```
+
+### M31b — registry refresh opens the pending record before receipt resolution
+
+- **file** `app/registry.py`
+- **selection** `tests/test_console_routes.py`
+- **result** RED — `test_delete_refresh_never_opens_any_spent_leaf_shape[different]`
+  — `the different spent delete leaf or its target was opened`
+
+```diff
++    get_delete_review(scope, canonical_id)  # MUTANT M31b: opened before receipt
+     if resolution.receipt is not None:
+         return resolution.receipt
+```
+
+M31 and M31b are separate because classification projection and registry
+refresh have independent receipt-first implementations.
+
+### M32 — non-tree receipt root treated as an empty store
+
+- **file** `app/action_receipts.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_non_tree_receipt_root_fails_closed`
+  — `non-tree receipt root was treated as an empty store`
+
+```diff
+-        raise ReceiptStoreIntegrityError("receipt store root is not a Git tree")
++        return False  # MUTANT M32: non-tree store treated as absent
+```
+
+This is the load-bearing distinction between the forced empty-store rule and
+tampering: an absent tree is a fresh vault; a blob committed at `.receipts`
+must block rather than make every lookup appear absent.
+
+### M33 — one malformed receipt blocks the entire entity
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_malformed_receipt_projection_stays_per_id`
+  — `malformed matching receipt became entity-wide blocking`
+
+```diff
+             if resolution.error is not None:
++                blocked = True  # MUTANT M33
+                 rows.append(
+```
+
+### M34 — proposal quarantine moves before the action commit
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_proposal_quarantine_stays_after_the_action_commit`
+  — `a proposal was quarantined before its action committed`
+
+```diff
++        for change in plan.owned_changes:
++            quarantined.append((
++                change, quarantine_path_if_unchanged(vault, change.path, change.before)
++            ))  # MUTANT M34
+         _checkpoint("filesystem-applied")
+```
+
+The first probe used the existing pre-commit failure test. It went red only
+when that test attempted to read the now-missing proposal, before reaching
+its intended quarantine assertion. The permanent row instead binds to an
+executable-order invariant and its unique diagnostic.
+
+### M35 — post-commit consumption failure rolls back action and receipt
+
+- **file** `app/git_transaction.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_postcommit_consumption_failure_has_no_rollback_path`
+  — `post-commit consumption failure can roll back action and receipt`
+
+```diff
++        _git(vault, "reset", "--hard", start_head)  # MUTANT M35
+         raise applied from exc
+```
+
+### M36 — unresolved consumption mapped as ordinary committed cleanup
+
+- **file** `app/console_errors.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_every_application_exception_resolves_to_its_designed_code`
+  — `PostCommitConsumptionError`
+
+```diff
+-    _git_transaction.PostCommitConsumptionError: _CODES["E-APPLIED"],
++    _git_transaction.PostCommitConsumptionError: _CODES["E-COMMITTED"],  # MUTANT M36
+```
+
+### M37 — HTMX stops swapping 500 attention fragments
+
+- **file** `templates/_head.html`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_receipt_attention_fragments_remain_swappable_at_500`
+  — `E-APPLIED 500 fragment no longer swaps`
+
+```diff
+-{"code":"[45]..","swap":true,"error":true}
++{"code":"[45]..","swap":false,"error":true}
+```
+
+### M38 — spent card regains a live action
+
+- **file** `templates/blocks/action_receipt_card.html`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_action_receipt_card_has_no_review_or_mutation_transport`
+  — `receipt card regained action/review transport: hx-post`
+
+```diff
+ <div class="proposal action-receipt"
+-     id="receipt-card-{{ proposal_id }}-{{ issue }}">
++     id="receipt-card-{{ proposal_id }}-{{ issue }}"
++     hx-post="/outbox/{{ entity }}/approve">  {# MUTANT M38 #}
+```
+
+### M39 — request path enumerates every accumulated receipt
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_full_receipt_store_enumeration_is_offline_audit_only`
+  — `request path enumerates the accumulated receipt store: app/outbox.py`
+
+```diff
++    from .action_receipts import validate_head_receipt_store
++    validate_head_receipt_store(
++        scope.root, scope.current_entity()
++    )  # MUTANT M39: enumerate accumulated receipts in request
+     receipts = resolve_head_receipts(
+         scope.root, scope.current_entity(), canonical_ids.values()
+     )
+```
+
+An earlier mutant aliased the two-argument validator to the three-argument
+batch resolver. It failed on a `TypeError` before enumeration ran, while the
+import-only structural check still went red. This row executes a well-typed
+full-store validation before retaining the normal batched lookup.
+
+### M40 — orphan guard allows a dead outcome
+
+- **file** `tests/test_console_invariants.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_a_dead_mapping_cannot_impersonate_an_executable_producer`
+  — `orphan guard allowed E-APPLIED to impersonate a live outcome`
+
+```diff
+-        - {"E-UNKNOWN", "E-REQUEST"}
++        - {"E-UNKNOWN", "E-REQUEST", "E-APPLIED"}  # MUTANT M40
+```
+
+### M41 — retired outcome returns without an executable producer
+
+- **file** `app/console_errors.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_every_operator_outcome_has_an_executable_producer`
+  — `orphan operator outcome: E-RETAINED`
+
+```diff
++_CODES["E-RETAINED"] = ConsoleError(
++    "E-RETAINED", "integrity", "attention", "retired outcome",
++    "stop", "no", 500,
++)  # MUTANT M41
++
+ UNKNOWN = _CODES["E-UNKNOWN"]
+```
+
+M40 proves the producer guard itself cannot be weakened into an allowlist;
+M41 proves an outcome retired by quarantine-last cannot silently reappear as
+a live taxonomy row. Retired M18/M19 remain historical-only evidence and are
+absent from the runner.
 
 ## M6 — a survivor, and what it cost
 
