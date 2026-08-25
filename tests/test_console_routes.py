@@ -3899,7 +3899,7 @@ def _route_totality_plan(main) -> dict:
                 "/registry/alpha/product/review/"
                 "20260815T090703-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
-            "patch_targets": [(main, "get_delete_review")],
+            "patch_targets": [(main, "get_delete_receipt_or_review")],
         },
         main.pulse: {"request": lambda c: c.get("/blocks/pulse"), "patch_targets": []},
     }
@@ -3957,16 +3957,28 @@ def test_route_totality_from_declared_catches(tmp_path, monkeypatch):
         try:
             for exc_class in catches:
                 for owner, attr in spec["patch_targets"]:
+                    injected = []
+
                     def _raise(*args, __exc=exc_class, **kwargs):
+                        injected.append(True)
                         raise __exc("injected for route totality")
 
                     monkeypatch.setattr(owner, attr, _raise)
                     reached.clear()
-                    spec["request"](client)
+                    response = spec["request"](client)
+                    assert injected, (
+                        f"{endpoint.__qualname__}: {exc_class.__name__} via "
+                        f"{owner!r}.{attr} was not injected"
+                    )
                     assert reached == [], (
                         f"{endpoint.__qualname__}: {exc_class.__name__} via "
                         f"{owner!r}.{attr} reached the global fallback"
                     )
+                    if endpoint is main.registry_delete_review_fragment:
+                        assert 'role="alert"' in response.text
+                        assert not _rendered_control_ids(response.text), response.text
+                        assert "review_sha256" not in response.text
+                        assert "hx-post" not in response.text
         finally:
             # Restore before moving to the next route: several routes share
             # a patch target (`Vault.bundles`, in particular), and a

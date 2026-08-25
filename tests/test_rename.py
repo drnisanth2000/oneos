@@ -5,10 +5,14 @@ never touched. The safety-critical assertion (BUILD §4): an entity rename must
 rewrite BOTH halves of the fail-open action-policy rule atomically — the allow
 `paths:` and its `except:` for `.sensitive/` — with no residual old slug left.
 """
+import os
+import stat
 import textwrap
 
 import pytest
 
+import app.git_transaction as git_transaction
+import app.rename as rename
 from app.rename import (
     RenameError,
     apply_rename,
@@ -20,7 +24,12 @@ from tests.conftest import (
     git_count_commits,
     git_head_message,
     git_is_clean,
+    git_cached_diff,
+    git_head,
+    git_index_entries,
+    git_status_bytes,
     git_vault,
+    git_worktree_diff,
 )
 
 # A throwaway vault whose fail-open rule mirrors the real action-policy.yaml:95.
@@ -98,6 +107,33 @@ ENTITY_FILES = {
 }
 
 
+def _rename_boundary(vault):
+    """Git state and every non-Git vault object, including ignored proposals."""
+    entries = []
+    for path in sorted(vault.rglob("*")):
+        relative = path.relative_to(vault)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        found = os.lstat(path)
+        if stat.S_ISREG(found.st_mode):
+            value = ("file", stat.S_IMODE(found.st_mode), path.read_bytes())
+        elif stat.S_ISDIR(found.st_mode):
+            value = ("directory", stat.S_IMODE(found.st_mode), None)
+        elif stat.S_ISLNK(found.st_mode):
+            value = ("symlink", stat.S_IMODE(found.st_mode), os.readlink(path))
+        else:
+            value = ("other", stat.S_IMODE(found.st_mode), None)
+        entries.append((relative.as_posix(), value))
+    return (
+        git_head(vault),
+        git_index_entries(vault),
+        git_cached_diff(vault),
+        git_worktree_diff(vault),
+        git_status_bytes(vault),
+        tuple(entries),
+    )
+
+
 def test_entity_rename_rewrites_everything_atomically(tmp_path):
     vault = git_vault(tmp_path, ENTITY_FILES)
     apply_rename(vault, plan_rename(vault, "entity", "oldentity", "newentity"))
@@ -131,6 +167,46 @@ def test_entity_rename_updates_both_halves_of_the_fail_open_rule(tmp_path):
     assert 'except: ["newentity/.sensitive/**"]' in pol      # the second half
     assert 'paths: ["newentity/00-inbox/**"]' in pol
     assert "oldentity" not in pol                            # no residual anywhere
+
+
+def test_entity_rename_busy_shared_lock_refuses_before_any_mutation(
+    tmp_path, monkeypatch
+):
+    """The sanctioned root move must cooperate with reviewed actions."""
+    files = dict(ENTITY_FILES)
+    files[".gitignore"] = "*/outbox/*.yaml\n"
+    vault = git_vault(tmp_path, files)
+    proposal = vault / "oldentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_bytes(b"entity: oldentity\nstatus: pending\n")
+    plan = plan_rename(vault, "entity", "oldentity", "newentity")
+    boundary = _rename_boundary(vault)
+    rename_git_calls = []
+    real_git = rename._git
+
+    def record_rename_git_call(vault_arg, *args):
+        rename_git_calls.append(args)
+        return real_git(vault_arg, *args)
+
+    monkeypatch.setattr(rename, "_git", record_rename_git_call)
+    shared_lock = getattr(
+        git_transaction, "action_lock", git_transaction._approval_lock
+    )
+
+    with shared_lock(vault):
+        with pytest.raises(RenameError, match="vault is busy"):
+            apply_rename(vault, plan)
+
+        assert _rename_boundary(vault) == boundary
+        assert (vault / "oldentity").is_dir()
+        assert not (vault / "newentity").exists()
+        assert proposal.read_bytes() == b"entity: oldentity\nstatus: pending\n"
+        assert rename_git_calls == [], (
+            "busy refusal reached the rename Git boundary, where mv, reset, "
+            "clean, or another mutation could run"
+        )
+
+    assert shared_lock is git_transaction.action_lock
 
 
 def test_dry_run_touches_nothing(tmp_path):

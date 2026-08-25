@@ -66,7 +66,6 @@ from .registry import (
     RegistryError,
     execute_delete,
     get_delete_receipt_or_review,
-    get_delete_review,
     products_for,
     propose_delete,
     reference_count,

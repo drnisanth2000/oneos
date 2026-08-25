@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .console_routing import structured_reader
+from .git_transaction import VaultBusyError, action_lock
 
 # Mirror of oneos_wizard.SLUG_RE / RESERVED — the app cannot import from the
 # vault (it is public and vault-path-free), so the grammar is restated and the
@@ -434,29 +435,50 @@ DEFAULT_VALIDATORS = [_validate_check_v2]
 
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
     vault = Path(vault)
-    if not _git_clean(vault):
-        raise RenameError("vault has uncommitted changes; commit or stash first")
-    validators = DEFAULT_VALIDATORS if validators is None else validators
     try:
-        for p, new_text in plan.edits.items():
-            p.write_text(new_text, encoding="utf-8")
-        for src, dst in plan.moves:
-            _git(vault, "mv", str(src.relative_to(vault)), str(dst.relative_to(vault)))
+        with action_lock(vault):
+            if not _git_clean(vault):
+                raise RenameError(
+                    "vault has uncommitted changes; commit or stash first"
+                )
+            validators = DEFAULT_VALIDATORS if validators is None else validators
+            try:
+                for p, new_text in plan.edits.items():
+                    p.write_text(new_text, encoding="utf-8")
+                for src, dst in plan.moves:
+                    _git(
+                        vault,
+                        "mv",
+                        str(src.relative_to(vault)),
+                        str(dst.relative_to(vault)),
+                    )
 
-        residual = grep_gate(vault, plan.old)
-        if residual:
-            raise RenameError(f"residual old slug after rename: {residual[:5]}")
+                residual = grep_gate(vault, plan.old)
+                if residual:
+                    raise RenameError(
+                        f"residual old slug after rename: {residual[:5]}"
+                    )
 
-        for v in validators:
-            v(vault, plan)
+                for v in validators:
+                    v(vault, plan)
 
-        _git(vault, "add", "-A")
-        _git(vault, "commit", "-q", "-m", f"rename: {plan.old} → {plan.new}")
-        return f"rename: {plan.old} → {plan.new}"
-    except Exception:
-        _git(vault, "reset", "-q", "--hard", "HEAD")
-        _git(vault, "clean", "-qfd")
-        raise
+                _git(vault, "add", "-A")
+                _git(
+                    vault,
+                    "commit",
+                    "-q",
+                    "-m",
+                    f"rename: {plan.old} → {plan.new}",
+                )
+                return f"rename: {plan.old} → {plan.new}"
+            except Exception:
+                _git(vault, "reset", "-q", "--hard", "HEAD")
+                _git(vault, "clean", "-qfd")
+                raise
+    except VaultBusyError as exc:
+        raise RenameError(
+            "vault is busy; another OneOS action is already running"
+        ) from exc
 
 
 def main(argv=None) -> int:

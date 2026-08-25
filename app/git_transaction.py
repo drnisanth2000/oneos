@@ -416,8 +416,8 @@ def _open_checked_directory(
 
 
 @contextmanager
-def _approval_lock(vault: Path) -> Iterator[None]:
-    """Acquire the per-vault approval lock without waiting."""
+def action_lock(vault: Path) -> Iterator[None]:
+    """Acquire the shared per-vault OneOS action lock without waiting."""
     try:
         git_dir_output = subprocess.run(
             ["git", "rev-parse", "--path-format=absolute", "--git-dir"],
@@ -472,6 +472,11 @@ def _approval_lock(vault: Path) -> Iterator[None]:
                 raise _ApprovalLockCleanupFailure(cleanup_error) from cleanup_error
 
 
+# Kept as a compatibility alias for existing callers that imported the old
+# private name. Supported OneOS writers use the public interface above.
+_approval_lock = action_lock
+
+
 def execute_transaction(
     vault: Path, plan: TransactionPlan
 ) -> TransactionResult | TransactionPreconditionRefused:
@@ -479,7 +484,7 @@ def execute_transaction(
     vault = Path(vault).resolve()
     result: TransactionResult | None = None
     try:
-        with _approval_lock(vault):
+        with action_lock(vault):
             start_head = _git_text(vault, "rev-parse", "HEAD").strip()
             reviewed_index = _capture_reviewed_index(vault, plan.commit_paths)
             _require_owned_paths_untracked(vault, start_head, plan.owned_changes)
@@ -1760,7 +1765,7 @@ def consume_reviewed_proposal(
     record: QuarantinedRecord | None = None
     try:
         try:
-            with _approval_lock(root):
+            with action_lock(root):
                 for precondition in preconditions:
                     reason = precondition()
                     if reason is not None:
