@@ -581,7 +581,7 @@ MUTATIONS = [
         # Review round 2. Retirement reconciliation is derived from every
         # exact RETIRED ledger heading, not a hand-maintained M18/M19 subset.
         "M44", "docs/superpowers/plans/s7_mutation_campaign.py",
-        '        "M1", "app/outbox.py",',
+        '        "\x4d1", "app/outbox.py",',
         '        "M13", "app/outbox.py",  # MUTANT M44: retired id returned',
         ["tests/test_console_invariants.py"],
         [("tests/test_console_invariants.py::test_stage2_retired_outcomes_are_historical_evidence_only",

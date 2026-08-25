@@ -1174,7 +1174,9 @@ def test_outbox_spent_replay_keeps_the_card_after_the_record_is_consumed(
 
     assert replay.status_code == 200
     assert 'id="outbox-list"' in replay.text
-    assert "An approval has already completed for this proposal ID" in replay.text
+    assert "An approval has already completed for this proposal ID" in replay.text, (
+        "a spent replay lost its receipt-backed card"
+    )
     assert "No pending proposals" not in replay.text, (
         "a spent replay lost its receipt-backed card"
     )
@@ -1208,7 +1210,9 @@ def test_approve_post_move_failure_keeps_applied_alert_and_spent_card(
     assert not proposal.exists(), "setup did not reach the post-move failure"
     assert response.status_code == 500
     assert "E-APPLIED" in response.text
-    assert "An approval has already completed for this proposal ID" in response.text
+    assert "An approval has already completed for this proposal ID" in response.text, (
+        "E-APPLIED lost the acted-on receipt card after consumption"
+    )
     assert "No pending proposals" not in response.text, (
         "E-APPLIED lost the acted-on receipt card after consumption"
     )
