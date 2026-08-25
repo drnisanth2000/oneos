@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import dataclasses
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from app.action_receipts import (
     render_action_receipt,
     resolve_head_receipt,
     resolve_head_receipts,
+    validate_all_head_receipt_stores,
     validate_head_receipt_store,
 )
 from app.review_tokens import InvalidReviewToken
@@ -461,6 +463,31 @@ def test_offline_validator_returns_every_receipt_sorted_by_id(repo):
     ]
 
 
+def test_complete_offline_validator_discovers_stores_from_head_not_manifest(repo):
+    _commit_receipts(repo, {f"{PROPOSAL_ID}.yaml": _receipt_bytes()})
+    manifest = repo / "_system/entities.yaml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text("entities: {}\n", encoding="utf-8")
+
+    assert validate_all_head_receipt_stores(repo) == (
+        ActionReceipt(1, PROPOSAL_ID, DIGEST, "approval"),
+    )
+
+
+def test_complete_offline_validator_rejects_duplicate_ids_across_entities(repo):
+    first = receipt_relative_path(ENTITY, PROPOSAL_ID)
+    second = receipt_relative_path("secondary", PROPOSAL_ID)
+    for relative in (first, second):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_receipt_bytes())
+    _git(repo, "add", "--", first, second)
+    _git(repo, "commit", "-q", "-m", "duplicate cross-entity receipt")
+
+    with pytest.raises(ReceiptStoreIntegrityError, match="more than one entity"):
+        validate_all_head_receipt_stores(repo)
+
+
 def test_offline_validator_accepts_the_forced_empty_store(repo):
     assert validate_head_receipt_store(repo, ENTITY) == ()
 
@@ -485,6 +512,87 @@ def test_offline_validator_rejects_any_malformed_historical_receipt(repo):
         validate_head_receipt_store(repo, ENTITY)
 
 
+@pytest.mark.parametrize(
+    ("case", "filename", "record"),
+    [
+        ("invalid-yaml", f"{PROPOSAL_ID}.yaml", b"[unterminated\n"),
+        (
+            "extra-field",
+            f"{PROPOSAL_ID}.yaml",
+            _receipt_bytes() + b"created: now\n",
+        ),
+        (
+            "missing-field",
+            f"{PROPOSAL_ID}.yaml",
+            b"version: 1\n"
+            + f"proposal_id: {PROPOSAL_ID}\n".encode("ascii")
+            + b"review_sha256: " + DIGEST.encode("ascii") + b"\n",
+        ),
+        (
+            "version-mismatch",
+            f"{PROPOSAL_ID}.yaml",
+            _receipt_bytes().replace(b"version: 1", b"version: 2"),
+        ),
+        (
+            "filename-content-mismatch",
+            f"{OTHER_ID}.yaml",
+            _receipt_bytes(PROPOSAL_ID),
+        ),
+        (
+            "invalid-digest",
+            f"{PROPOSAL_ID}.yaml",
+            _receipt_bytes().replace(DIGEST.encode("ascii"), b"short"),
+        ),
+        (
+            "invalid-action-kind",
+            f"{PROPOSAL_ID}.yaml",
+            _receipt_bytes(action_kind="reject"),
+        ),
+    ],
+)
+def test_offline_validator_rejects_every_historical_record_defect(
+    repo, case, filename, record
+):
+    _commit_receipts(repo, {filename: record})
+
+    with pytest.raises(InvalidActionReceipt, match="action receipt|receipt"):
+        validate_head_receipt_store(repo, ENTITY)
+
+
+def test_offline_validator_rejects_duplicate_receipt_ids(repo, monkeypatch):
+    root = f"{ENTITY}/outbox/.receipts"
+    object_id = "a" * 40
+    root_output = (
+        f"040000 tree {object_id}\t{root}\0".encode("ascii")
+    )
+    path = f"{root}/{PROPOSAL_ID}.yaml"
+    duplicate_entries = (
+        f"100644 blob {object_id}\t{path}\0"
+        f"100644 blob {object_id}\t{path}\0"
+    ).encode("ascii")
+    outputs = iter((root_output, duplicate_entries))
+
+    def fake_git(*_args, **_kwargs):
+        return next(outputs)
+
+    monkeypatch.setattr(action_receipts, "_git", fake_git)
+
+    with pytest.raises(ReceiptStoreUnavailable, match="duplicate receipt path"):
+        validate_head_receipt_store(repo, ENTITY)
+
+
+def test_offline_validator_wrong_object_root_is_not_the_empty_store(repo):
+    assert validate_head_receipt_store(repo, ENTITY) == ()
+    root = repo / ENTITY / "outbox" / ".receipts"
+    root.parent.mkdir(parents=True)
+    root.write_text("blob, not tree\n", encoding="utf-8")
+    _git(repo, "add", "--", f"{ENTITY}/outbox/.receipts")
+    _git(repo, "commit", "-q", "-m", "wrong receipt root object")
+
+    with pytest.raises(ReceiptStoreIntegrityError, match="not a Git tree"):
+        validate_head_receipt_store(repo, ENTITY)
+
+
 def test_offline_validator_reads_head_and_never_changes_the_filesystem(repo):
     _commit_receipts(repo, {f"{PROPOSAL_ID}.yaml": _receipt_bytes()})
     path = repo / receipt_relative_path(ENTITY, PROPOSAL_ID)
@@ -497,6 +605,33 @@ def test_offline_validator_reads_head_and_never_changes_the_filesystem(repo):
     assert receipts == (ActionReceipt(1, PROPOSAL_ID, DIGEST, "approval"),)
     assert _git(repo, "status", "--porcelain=v1", "-z").stdout == status_before
     assert path.read_bytes() == bytes_before
+
+
+def test_offline_validator_has_no_filesystem_write_or_repair_path(
+    repo, monkeypatch
+):
+    _commit_receipts(repo, {f"{PROPOSAL_ID}.yaml": _receipt_bytes()})
+    real_open = builtins.open
+
+    def checked_open(file, mode="r", *args, **kwargs):
+        if any(flag in mode for flag in "wax+"):
+            pytest.fail(f"offline receipt audit opened a writer: {mode}")
+        return real_open(file, mode, *args, **kwargs)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("offline receipt audit attempted filesystem mutation")
+
+    monkeypatch.setattr(builtins, "open", checked_open)
+    monkeypatch.setattr(Path, "write_bytes", forbidden)
+    monkeypatch.setattr(Path, "write_text", forbidden)
+    monkeypatch.setattr(os, "unlink", forbidden)
+    monkeypatch.setattr(os, "replace", forbidden)
+    monkeypatch.setattr(os, "rename", forbidden)
+    monkeypatch.setattr(os, "mkdir", forbidden)
+
+    assert validate_head_receipt_store(repo, ENTITY) == (
+        ActionReceipt(1, PROPOSAL_ID, DIGEST, "approval"),
+    )
 
 
 def test_offline_validator_duplicate_membership_is_constant_time():

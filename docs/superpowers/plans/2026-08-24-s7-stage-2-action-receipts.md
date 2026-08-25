@@ -627,13 +627,17 @@ Reviewer verifies no-open instrumentation is non-vacuous, valid/malformed per-id
 **Owner:** delegated coding agent D.
 
 **Files:**
+- Modify: `tools/gate3_audit.py` (Stage 2 receipt-bearing transaction envelopes)
+- Modify: `tools/public_repo_audit.py` (run the offline receipt audit when a vault is supplied)
 - Modify: `tests/test_gate3_audit.py`
 - Modify: `tests/test_public_repo_audit.py`
 - Modify: `tests/test_action_receipts.py`
 - Modify: `docs/superpowers/plans/2026-08-24-s7-stage-2-action-receipts.md` only if the final command name differs from this plan's declared interface.
 
 **Interfaces:**
-- Consumes: `validate_head_receipt_store(vault, entity) -> tuple[ActionReceipt, ...]`.
+- Consumes: `validate_all_head_receipt_stores(vault) -> tuple[ActionReceipt, ...]`,
+  which discovers canonical entity roots from Git `HEAD` rather than the
+  mutable working-tree manifest.
 - Produces: an offline, read-only O(store) gate that reports schema/version/id/digest/action failures and never repairs.
 
 - [ ] **Step 1: Write RED audit tests**

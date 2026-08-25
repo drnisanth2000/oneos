@@ -16,6 +16,11 @@ import textwrap
 import pytest
 import yaml
 
+from app.action_receipts import (
+    make_action_receipt,
+    render_action_receipt,
+    validate_head_receipt_store,
+)
 from app.outbox import propose_classification
 from app.registry import propose_delete
 from app.rename import AXES, apply_rename, plan_rename
@@ -53,6 +58,8 @@ AUDIT_ENTITIES = textwrap.dedent(
         flags: []
     """
 )
+
+AUDIT_PROPOSAL_ID = "20260824T120000-" + "ab" * 16
 
 RECEIPT = textwrap.dedent(
     """\
@@ -152,6 +159,131 @@ def _record(
     )
 
 
+def test_gate3_pattern_audits_every_accumulated_head_receipt(tmp_path: Path):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    first = "20260824T120000-" + "ab" * 16
+    second = "20260824T120001-" + "cd" * 16
+    records = {
+        first: render_action_receipt(
+            make_action_receipt(first, "a" * 64, "approval")
+        ),
+        second: render_action_receipt(
+            make_action_receipt(second, "b" * 64, "registry deletion")
+        ),
+    }
+    for proposal_id, contents in records.items():
+        path = vault / "synthetic" / "outbox" / ".receipts" / f"{proposal_id}.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    _git(vault, "add", "--", "synthetic/outbox/.receipts")
+    _git(vault, "commit", "-q", "-m", "fixture: accumulated receipts")
+
+    receipts = validate_head_receipt_store(vault, "synthetic")
+
+    assert tuple(receipt.proposal_id for receipt in receipts) == (first, second)
+    assert not (vault / "synthetic" / "outbox" / f"{first}.yaml").exists(), (
+        "offline audit fixture unexpectedly created a pending proposal"
+    )
+
+
+def test_gate3_check_rejects_a_malformed_accumulated_head_receipt(
+    tmp_path: Path, monkeypatch
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    proposal_id = AUDIT_PROPOSAL_ID
+    relative = f"synthetic/outbox/.receipts/{proposal_id}.yaml"
+    path = vault / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not: a closed receipt\n")
+    _git(vault, "add", "--", relative)
+    _git(vault, "commit", "-q", "-m", "fixture: malformed receipt")
+    snapshot = tmp_path / "gate3-snapshot.json"
+    monkeypatch.setenv("ONEOS_VAULT", str(vault))
+    monkeypatch.setenv("GATE3_SNAP", str(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    (vault / "_system/entities.yaml").write_text(
+        'version: "1.0"\nentities: {}\n', encoding="utf-8"
+    )
+
+    assert gate3.main(["check"]) == 2, (
+        "the real Gate 3 command ignored an invalid accumulated receipt"
+    )
+
+
+@pytest.mark.parametrize(
+    ("action_kind", "expected_ok"),
+    [("approval", True), ("registry deletion", False)],
+)
+def test_gate3_approval_envelope_binds_the_receipt_action_kind(
+    tmp_path: Path, action_kind: str, expected_ok: bool
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    before = _git(vault, "rev-parse", "HEAD").strip()
+    source = vault / "synthetic/00-inbox/active/receipt.md"
+    destination = vault / "synthetic/11-library/active/receipt.md"
+    source.replace(destination)
+    receipt = (
+        vault
+        / "synthetic/outbox/.receipts"
+        / f"{AUDIT_PROPOSAL_ID}.yaml"
+    )
+    receipt.parent.mkdir(parents=True)
+    receipt.write_bytes(
+        render_action_receipt(
+            make_action_receipt(AUDIT_PROPOSAL_ID, "a" * 64, action_kind)
+        )
+    )
+    _git(vault, "add", "-A")
+    _git(
+        vault,
+        "commit",
+        "-q",
+        "-m",
+        f"outbox: approve {AUDIT_PROPOSAL_ID} (synthetic receipt)",
+    )
+    after = _git(vault, "rev-parse", "HEAD").strip()
+    records = gate3.collect_commit_records(vault, before, after)
+
+    assert gate3.audit_commits(
+        records, gate3.AuditRules.load(vault), vault
+    ).ok is expected_ok
+
+
+@pytest.mark.parametrize(
+    ("action_kind", "expected_ok"),
+    [("registry deletion", True), ("approval", False)],
+)
+def test_gate3_registry_delete_envelope_binds_the_receipt_action_kind(
+    tmp_path: Path, action_kind: str, expected_ok: bool
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    before = _git(vault, "rev-parse", "HEAD").strip()
+    registry = vault / "_system/products.yaml"
+    registry.write_text(
+        registry.read_text(encoding="utf-8") + "# deletion\n",
+        encoding="utf-8",
+    )
+    receipt = (
+        vault
+        / "synthetic/outbox/.receipts"
+        / f"{AUDIT_PROPOSAL_ID}.yaml"
+    )
+    receipt.parent.mkdir(parents=True)
+    receipt.write_bytes(
+        render_action_receipt(
+            make_action_receipt(AUDIT_PROPOSAL_ID, "a" * 64, action_kind)
+        )
+    )
+    _git(vault, "add", "-A")
+    _git(vault, "commit", "-q", "-m", "registry: delete product unused")
+    after = _git(vault, "rev-parse", "HEAD").strip()
+    records = gate3.collect_commit_records(vault, before, after)
+
+    assert gate3.audit_commits(
+        records, gate3.AuditRules.load(vault), vault
+    ).ok is expected_ok
+
+
 @pytest.mark.parametrize(
     ("message", "changes", "valid"),
     [
@@ -174,12 +306,39 @@ def _record(
             False,
         ),
         (
-            "outbox: approve p",
+            f"outbox: approve {AUDIT_PROPOSAL_ID} (synthetic receipt)",
+            (
+                ("D", "synthetic/00-inbox/active/r.md"),
+                ("A", "synthetic/11-library/active/r.md"),
+                (
+                    "A",
+                    f"synthetic/outbox/.receipts/{AUDIT_PROPOSAL_ID}.yaml",
+                ),
+            ),
+            True,
+        ),
+        (
+            f"outbox: approve {AUDIT_PROPOSAL_ID} (missing receipt)",
             (
                 ("D", "synthetic/00-inbox/active/r.md"),
                 ("A", "synthetic/11-library/active/r.md"),
             ),
-            True,
+            False,
+        ),
+        (
+            f"outbox: approve {AUDIT_PROPOSAL_ID} (wrong receipt id)",
+            (
+                ("D", "synthetic/00-inbox/active/r.md"),
+                ("A", "synthetic/11-library/active/r.md"),
+                (
+                    "A",
+                    "synthetic/outbox/.receipts/"
+                    + "20260824T120001-"
+                    + "cd" * 16
+                    + ".yaml",
+                ),
+            ),
+            False,
         ),
         (
             "outbox: misleading",
@@ -188,8 +347,30 @@ def _record(
         ),
         (
             "registry: delete product x",
-            (("M", "_system/products.yaml"),),
+            (
+                ("M", "_system/products.yaml"),
+                (
+                    "A",
+                    f"synthetic/outbox/.receipts/{AUDIT_PROPOSAL_ID}.yaml",
+                ),
+            ),
             True,
+        ),
+        (
+            "registry: delete product x",
+            (("M", "_system/products.yaml"),),
+            False,
+        ),
+        (
+            "registry: delete product x",
+            (
+                ("M", "_system/products.yaml"),
+                (
+                    "M",
+                    f"synthetic/outbox/.receipts/{AUDIT_PROPOSAL_ID}.yaml",
+                ),
+            ),
+            False,
         ),
         (
             "registry: delete product x",
@@ -210,12 +391,22 @@ def _record(
 )
 def test_message_and_changed_paths_must_both_be_sanctioned(
     tmp_path: Path,
+    monkeypatch,
     message: str,
     changes: tuple[tuple[str, str], ...],
     valid: bool,
 ):
     vault = _audit_vault(tmp_path)
     rules = gate3.AuditRules.load(vault)
+    monkeypatch.setattr(
+        gate3,
+        "_receipt_from_commit",
+        lambda _vault, record, path: make_action_receipt(
+            Path(path).stem,
+            "a" * 64,
+            "approval" if record.message.startswith("outbox:") else "registry deletion",
+        ),
+    )
 
     result = gate3.audit_commits((_record(message, changes),), rules, vault)
 
@@ -233,17 +424,36 @@ def test_message_and_changed_paths_must_both_be_sanctioned(
     ],
 )
 def test_each_registry_action_kind_pair_accepts_only_its_conventional_file(
-    tmp_path: Path, action: str, kind: str, path: str
+    tmp_path: Path, monkeypatch, action: str, kind: str, path: str
 ):
     vault = _audit_vault(tmp_path)
     rules = gate3.AuditRules.load(vault)
-    valid = _record(f"registry: {action} {kind} value", (("M", path),))
+    monkeypatch.setattr(
+        gate3,
+        "_receipt_from_commit",
+        lambda _vault, _record, receipt_path: make_action_receipt(
+            Path(receipt_path).stem, "a" * 64, "registry deletion"
+        ),
+    )
+    receipt_change = (
+        (
+            "A",
+            f"synthetic/outbox/.receipts/{AUDIT_PROPOSAL_ID}.yaml",
+        ),
+    ) if action == "delete" else ()
+    valid = _record(
+        f"registry: {action} {kind} value",
+        (("M", path), *receipt_change),
+    )
     wrong = {
         "workspace": "_system/products.yaml",
         "product": "_system/members.yaml",
         "member": "_system/workspaces.yaml",
     }[kind]
-    invalid = _record(f"registry: {action} {kind} value", (("M", wrong),))
+    invalid = _record(
+        f"registry: {action} {kind} value",
+        (("M", wrong), *receipt_change),
+    )
 
     assert gate3.audit_commits((valid,), rules, vault).ok is True
     assert gate3.audit_commits((invalid,), rules, vault).ok is False

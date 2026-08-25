@@ -761,6 +761,47 @@ def test_receipt_attention_fragments_remain_swappable_at_500():
     assert '"code":"[45]..","swap":true,"error":true' in source
 
 
+def test_full_receipt_store_enumeration_is_offline_audit_only():
+    validators = {"validate_head_receipt_store", "validate_all_head_receipt_stores"}
+
+    def uses_validator(relative: str) -> bool:
+        tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+        return any(
+            isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Name) and node.func.id in validators
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr in validators
+            )
+            for node in ast.walk(tree)
+        )
+
+    def imports_validator(relative: str) -> bool:
+        tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+        return any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "app.action_receipts"
+            and any(alias.name in validators for alias in node.names)
+            for node in ast.walk(tree)
+        )
+
+    for relative in ("app/main.py", "app/outbox.py", "app/registry.py"):
+        assert not uses_validator(relative), (
+            f"request path enumerates the accumulated receipt store: {relative}"
+        )
+        assert not imports_validator(relative), (
+            f"request path imports the offline receipt validator: {relative}"
+        )
+
+    for relative in (
+        "tools/gate3_audit.py",
+        "tools/public_repo_audit.py",
+    ):
+        assert imports_validator(relative) and uses_validator(relative), (
+            f"offline audit pattern does not run the receipt validator: {relative}"
+        )
+
+
 def test_an_unreachable_constructor_cannot_impersonate_a_live_producer():
     reachable = _reachable_call_names(
         {

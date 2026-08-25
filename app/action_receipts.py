@@ -399,3 +399,46 @@ def validate_head_receipt_store(
             raise ReceiptStoreIntegrityError("receipt store entry is not a blob")
         receipts.append(parse_action_receipt(Path(path), batch_object.contents))
     return tuple(sorted(receipts, key=lambda receipt: receipt.proposal_id))
+
+
+def _head_canonical_roots(vault: Path) -> tuple[str, ...]:
+    """Enumerate canonical top-level Git trees without consulting worktree state."""
+    output = _git(Path(vault), "ls-tree", "-z", "HEAD")
+    if output and not output.endswith(b"\0"):
+        raise ReceiptStoreUnavailable("Git returned malformed HEAD roots")
+    roots: list[str] = []
+    for record in output[:-1].split(b"\0") if output else ():
+        try:
+            metadata, raw_name = record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.split(b" ")
+        except ValueError as exc:
+            raise ReceiptStoreUnavailable("Git returned malformed HEAD roots") from exc
+        _require_object_id(object_id)
+        if mode != b"040000" or object_type != b"tree":
+            continue
+        try:
+            name = raw_name.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            continue
+        if _ENTITY.fullmatch(name) is not None:
+            roots.append(name)
+    return tuple(sorted(set(roots)))
+
+
+def validate_all_head_receipt_stores(vault: Path) -> tuple[ActionReceipt, ...]:
+    """Validate every accumulated canonical receipt store in Git ``HEAD``.
+
+    Entity discovery is itself HEAD-backed.  A working-tree manifest edit
+    therefore cannot hide a committed store from either offline audit.
+    """
+    receipts: list[ActionReceipt] = []
+    seen_ids: set[str] = set()
+    for entity in _head_canonical_roots(Path(vault)):
+        for receipt in validate_head_receipt_store(vault, entity):
+            if receipt.proposal_id in seen_ids:
+                raise ReceiptStoreIntegrityError(
+                    "receipt id appears in more than one entity store"
+                )
+            seen_ids.add(receipt.proposal_id)
+            receipts.append(receipt)
+    return tuple(sorted(receipts, key=lambda receipt: receipt.proposal_id))

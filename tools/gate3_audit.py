@@ -27,9 +27,19 @@ import tempfile
 
 import yaml
 
+from app.action_receipts import (
+    ActionReceipt,
+    ReceiptError,
+    parse_action_receipt,
+    validate_all_head_receipt_stores,
+)
 from app.entities import EntityCatalog
 from app.outbox import OutboxError, _require_destination, _to_proposal
-from app.proposal_identity import ProposalIdentityError, require_proposal_identity
+from app.proposal_identity import (
+    ProposalIdentityError,
+    require_proposal_id,
+    require_proposal_identity,
+)
 from app.registry import RegistryError, get_delete_proposal
 from app.rename import AXES, RenameError, plan_rename
 from app.scope import CrossScopeError, Scope
@@ -41,6 +51,7 @@ _OID = re.compile(r"^[0-9a-f]{40,64}$")
 _REGISTRY_MESSAGE = re.compile(
     r"^registry: (add|edit|delete) (workspace|product|member)(?: .*)?$"
 )
+_OUTBOX_APPROVAL_MESSAGE = re.compile(r"^outbox: approve ([^ ]+) \(.*\)$")
 _RENAME_MESSAGE = re.compile(
     r"^rename: ([a-z0-9]+(?:-[a-z0-9]+)*) → "
     r"([a-z0-9]+(?:-[a-z0-9]+)*)$"
@@ -504,29 +515,111 @@ def _sanctioned_ingest(record: CommitRecord, rules: AuditRules) -> bool:
     )
 
 
-def _sanctioned_outbox(record: CommitRecord, rules: AuditRules) -> bool:
-    if len(record.parents) != 1 or len(record.changes) != 2:
+def _receipt_path(path: str, rules: AuditRules) -> tuple[str, str] | None:
+    parts = _path_parts(path)
+    if parts is None or len(parts) != 4:
+        return None
+    entity, outbox, store, leaf = parts
+    if (
+        entity not in rules.entities
+        or outbox != "outbox"
+        or store != ".receipts"
+        or not leaf.endswith(".yaml")
+    ):
+        return None
+    proposal_id = leaf[:-5]
+    try:
+        canonical_id = require_proposal_id(proposal_id)
+    except ProposalIdentityError:
+        return None
+    return entity, canonical_id
+
+
+def _receipt_from_commit(
+    vault: Path, record: CommitRecord, path: str
+) -> ActionReceipt | None:
+    """Read and validate the receipt blob from the commit being audited."""
+    try:
+        contents = _git_bytes(vault, "show", f"{record.oid}:{path}")
+        return parse_action_receipt(Path(path), contents)
+    except (OSError, ReceiptError, subprocess.CalledProcessError):
+        return None
+
+
+def _sanctioned_outbox(
+    record: CommitRecord, rules: AuditRules, vault: Path
+) -> bool:
+    message = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
+    if message is None or len(record.parents) != 1 or len(record.changes) != 3:
         return False
     deleted = [change for change in record.changes if change.status == "D"]
     added = [change for change in record.changes if change.status == "A"]
-    if len(deleted) != 1 or len(added) != 1:
+    if len(deleted) != 1 or len(added) != 2:
         return False
     source = _inbox_path(deleted[0].path, rules)
-    destination = _active_destination(added[0].path, rules)
+    destinations = [
+        value
+        for change in added
+        if (value := _active_destination(change.path, rules)) is not None
+    ]
+    receipts = [
+        (change, value)
+        for change in added
+        if (value := _receipt_path(change.path, rules)) is not None
+    ]
+    receipt = (
+        _receipt_from_commit(vault, record, receipts[0][0].path)
+        if len(receipts) == 1
+        else None
+    )
     return (
         source is not None
-        and destination is not None
-        and source == destination
+        and len(destinations) == 1
+        and len(receipts) == 1
+        and source == destinations[0]
+        and source[0] == receipts[0][1][0]
+        and receipts[0][1][1] == message.group(1)
+        and receipt is not None
+        and receipt.proposal_id == message.group(1)
+        and receipt.action_kind == "approval"
     )
 
 
-def _sanctioned_registry(record: CommitRecord) -> bool:
+def _sanctioned_registry(
+    record: CommitRecord, rules: AuditRules, vault: Path
+) -> bool:
     match = _REGISTRY_MESSAGE.fullmatch(record.message)
-    if match is None or len(record.parents) != 1 or len(record.changes) != 1:
+    if match is None or len(record.parents) != 1:
         return False
-    change = record.changes[0]
+    action = match.group(1)
     kind = match.group(2)
-    return change.status in {"A", "M"} and change.path == _REGISTRY_PATH[kind]
+    registry = [
+        change
+        for change in record.changes
+        if change.status in {"A", "M"} and change.path == _REGISTRY_PATH[kind]
+    ]
+    if len(registry) != 1:
+        return False
+    if action != "delete":
+        return len(record.changes) == 1
+    receipts = [
+        (change, value)
+        for change in record.changes
+        if change.status == "A"
+        and (value := _receipt_path(change.path, rules)) is not None
+    ]
+    receipt = (
+        _receipt_from_commit(vault, record, receipts[0][0].path)
+        if len(receipts) == 1
+        else None
+    )
+    return (
+        len(record.changes) == 2
+        and len(receipts) == 1
+        and receipt is not None
+        and receipt.proposal_id == receipts[0][1][1]
+        and receipt.action_kind == "registry deletion"
+    )
 
 
 def _parent_tree(
@@ -647,9 +740,9 @@ def _commit_is_sanctioned(
     if record.message.startswith("ingest:"):
         return _sanctioned_ingest(record, rules)
     if record.message.startswith("outbox:"):
-        return _sanctioned_outbox(record, rules)
+        return _sanctioned_outbox(record, rules, vault)
     if record.message.startswith("registry:"):
-        return _sanctioned_registry(record)
+        return _sanctioned_registry(record, rules, vault)
     if record.message.startswith("rename:"):
         return _sanctioned_rename(record, vault)
     return False
@@ -826,6 +919,12 @@ def audit_dirty(
     return result
 
 
+def _validate_receipt_stores(vault: Path, rules: AuditRules) -> None:
+    """Run the complete O(store) receipt audit only at Gate 3."""
+    del rules  # Scope comes from HEAD itself, never a mutable manifest.
+    validate_all_head_receipt_stores(vault)
+
+
 def _vault() -> Path:
     return Path(os.environ["ONEOS_VAULT"]).expanduser().resolve()
 
@@ -913,6 +1012,7 @@ def cmd_check() -> int:
     head, before = _load_snapshot(snapshot_path)
     audit_head = _head_oid(vault)
     rules = AuditRules.load(vault)
+    _validate_receipt_stores(vault, rules)
     records = collect_commit_records(vault, head, audit_head)
     after = collect_dirty_fingerprints(vault)
     commit_audit = _audit_commit_history(records, vault)
@@ -954,6 +1054,7 @@ def main(argv: list[str] | None = None) -> int:
         json.JSONDecodeError,
         KeyError,
         OSError,
+        ReceiptError,
         subprocess.CalledProcessError,
         TypeError,
         ValueError,
