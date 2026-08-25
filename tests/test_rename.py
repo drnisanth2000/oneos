@@ -8,6 +8,7 @@ rewrite BOTH halves of the fail-open action-policy rule atomically — the allow
 import os
 from pathlib import Path
 import stat
+import subprocess
 import textwrap
 
 import pytest
@@ -353,6 +354,103 @@ def test_rename_cli_reports_committed_lock_cleanup_failure_without_traceback(
         / "newentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
     ).read_bytes() == b"entity: newentity\nstatus: pending\n"
     assert not any(args[0] in {"reset", "clean"} for args in rename_git_calls)
+
+
+def test_rename_cli_reports_committed_when_postcommit_oid_lookup_fails(
+    tmp_path, monkeypatch, capsys
+):
+    files = dict(ENTITY_FILES)
+    files[".gitignore"] = "*/outbox/*.yaml\n"
+    vault = git_vault(tmp_path, files)
+    pending = vault / "oldentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    pending.parent.mkdir(parents=True)
+    pending.write_bytes(b"entity: oldentity\nstatus: pending\n")
+    real_git = rename._git
+    rename_git_calls = []
+
+    def fail_only_postcommit_oid_lookup(vault_arg, *args):
+        rename_git_calls.append(args)
+        if args == ("rev-parse", "HEAD"):
+            raise subprocess.CalledProcessError(73, ["git", *args])
+        return real_git(vault_arg, *args)
+
+    monkeypatch.setattr(rename, "_git", fail_only_postcommit_oid_lookup)
+
+    result = rename.main(
+        ["entity", "oldentity", "newentity", "--vault-root", str(vault), "--apply"]
+    )
+    output = capsys.readouterr()
+
+    assert result == 2
+    assert "[COMMITTED]" in output.out
+    assert "committed" in output.out.lower()
+    assert "unknown/unavailable" in output.out.lower()
+    assert "do not retry" in output.out.lower()
+    assert "[ABORTED]" not in output.out
+    assert "rolled back" not in output.out.lower()
+    assert output.err == ""
+    assert (vault / "newentity").is_dir()
+    assert not (vault / "oldentity").exists()
+    assert (
+        vault
+        / "newentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    ).read_bytes() == b"entity: newentity\nstatus: pending\n"
+    assert not any(args[0] in {"reset", "clean"} for args in rename_git_calls)
+    assert git_head_message(vault) == "rename: oldentity → newentity"
+    assert git_count_commits(vault) == 2
+    assert git_is_clean(vault)
+
+
+def test_postcommit_oid_lookup_and_unlock_failures_preserve_committed_outcome(
+    tmp_path, monkeypatch
+):
+    files = dict(ENTITY_FILES)
+    files[".gitignore"] = "*/outbox/*.yaml\n"
+    vault = git_vault(tmp_path, files)
+    pending = vault / "oldentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    pending.parent.mkdir(parents=True)
+    pending.write_bytes(b"entity: oldentity\nstatus: pending\n")
+    plan = plan_rename(vault, "entity", "oldentity", "newentity")
+    real_git = rename._git
+    real_flock = git_transaction.fcntl.flock
+    rename_git_calls = []
+
+    def fail_only_postcommit_oid_lookup(vault_arg, *args):
+        rename_git_calls.append(args)
+        if args == ("rev-parse", "HEAD"):
+            raise subprocess.CalledProcessError(74, ["git", *args])
+        return real_git(vault_arg, *args)
+
+    def fail_unlock(descriptor, operation):
+        if operation == git_transaction.fcntl.LOCK_UN:
+            raise OSError("injected cleanup failure after OID lookup failure")
+        return real_flock(descriptor, operation)
+
+    monkeypatch.setattr(rename, "_git", fail_only_postcommit_oid_lookup)
+    monkeypatch.setattr(git_transaction.fcntl, "flock", fail_unlock)
+
+    with pytest.raises(Exception) as raised:
+        apply_rename(vault, plan)
+
+    assert type(raised.value) is rename.RenameCommittedError
+    assert raised.value.commit_oid is None
+    assert "unknown/unavailable" in str(raised.value).lower()
+    assert "committed" in str(raised.value).lower()
+    assert "do not retry" in str(raised.value).lower()
+    assert isinstance(raised.value.__cause__, subprocess.CalledProcessError)
+    notes = getattr(raised.value, "__notes__", ())
+    assert any("approval lock cleanup also failed" in note for note in notes)
+    assert any("injected cleanup failure" in note for note in notes)
+    assert not any(args[0] in {"reset", "clean"} for args in rename_git_calls)
+    assert (vault / "newentity").is_dir()
+    assert not (vault / "oldentity").exists()
+    assert (
+        vault
+        / "newentity/outbox/20260825T120000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.yaml"
+    ).read_bytes() == b"entity: newentity\nstatus: pending\n"
+    assert git_head_message(vault) == "rename: oldentity → newentity"
+    assert git_count_commits(vault) == 2
+    assert git_is_clean(vault)
 
 
 def test_dry_run_touches_nothing(tmp_path):

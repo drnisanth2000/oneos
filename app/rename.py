@@ -62,14 +62,19 @@ class RenameError(Exception):
 
 
 class RenameCommittedError(Exception):
-    """The rename committed, but action-lock cleanup failed afterwards."""
+    """The rename committed, but post-commit confirmation or cleanup failed."""
 
-    def __init__(self, commit_oid: str, cleanup_error: OSError) -> None:
+    def __init__(
+        self, commit_oid: str | None, cleanup_error: OSError | None = None
+    ) -> None:
         self.commit_oid = commit_oid
         self.cleanup_error = cleanup_error
+        commit_id = commit_oid if commit_oid is not None else "unknown/unavailable"
+        detail = (
+            "; action-lock cleanup failed" if cleanup_error is not None else ""
+        )
         super().__init__(
-            f"rename committed as {commit_oid}; action-lock cleanup failed; "
-            "do not retry"
+            f"rename committed (commit id: {commit_id}){detail}; do not retry"
         )
 
 
@@ -452,6 +457,7 @@ DEFAULT_VALIDATORS = [_validate_check_v2]
 
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
     vault = Path(vault)
+    commit_completed = False
     commit_oid: str | None = None
     lock_body_entered = False
     try:
@@ -490,14 +496,18 @@ def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
                     "-m",
                     f"rename: {plan.old} → {plan.new}",
                 )
-                commit_oid = _git(vault, "rev-parse", "HEAD").strip()
-                return f"rename: {plan.old} → {plan.new}"
+                commit_completed = True
             except Exception:
                 _git(vault, "reset", "-q", "--hard", "HEAD")
                 _git(vault, "clean", "-qfd")
                 raise
+            try:
+                commit_oid = _git(vault, "rev-parse", "HEAD").strip()
+            except Exception as exc:
+                raise RenameCommittedError(None) from exc
+            return f"rename: {plan.old} → {plan.new}"
     except ActionLockCleanupFailure as exc:
-        if commit_oid is None:
+        if not commit_completed:
             raise RenameError(
                 "shared action lock cleanup failed before the rename committed"
             ) from exc
@@ -534,9 +544,15 @@ def main(argv=None) -> int:
         print(f"[DONE] {msg}")
         return 0
     except RenameCommittedError as e:
+        commit_id = e.commit_oid if e.commit_oid is not None else "unknown/unavailable"
+        cleanup_detail = (
+            ", and shared action-lock cleanup failed"
+            if e.cleanup_error is not None
+            else ""
+        )
         print(
-            f"[COMMITTED] Rename committed as {e.commit_oid}, but shared "
-            "action-lock cleanup failed. Do not retry this rename."
+            f"[COMMITTED] Rename committed (commit id: {commit_id})"
+            f"{cleanup_detail}. Do not retry this rename."
         )
         return 2
     except RenameError as e:
