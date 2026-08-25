@@ -789,6 +789,7 @@ def project_outbox(scope: Scope) -> OutboxListing:
                 review_sha256=None,
                 proposal_id=row.proposal_id,
                 receipt=row.receipt,
+                record_present=row.record_present,
             )
             for row in rows
         ]

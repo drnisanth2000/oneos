@@ -278,6 +278,36 @@ def test_receipt_first_projection_never_opens_any_spent_leaf_shape(
     assert any(row.proposal and row.proposal.id == unspent.id for row in listing.rows)
 
 
+def test_blocked_listing_preserves_spent_rows_pending_record_evidence(tmp_path):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    spent = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+    sibling = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-b.md"),
+        module="11-library",
+        sub="reference",
+        claimed_block="govern",
+    )
+    _commit_receipt(vault, spent.id, "approval")
+    sibling.path.write_bytes(b"not: [a proposal\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is True
+    spent_row = next(row for row in listing.rows if row.receipt is not None)
+    assert spent.path.is_file(), "setup lost the spent proposal's real leaf"
+    assert spent_row.record_present is True, (
+        "blocked-row reconstruction lost the pending-record evidence"
+    )
+
+
 def test_registry_delete_receipt_is_not_projected_as_a_classification(tmp_path):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)

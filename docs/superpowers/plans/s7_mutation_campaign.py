@@ -587,6 +587,17 @@ MUTATIONS = [
         [("tests/test_console_invariants.py::test_stage2_retired_outcomes_are_historical_evidence_only",
           "M13 returned to the live campaign")],
     ),
+    (
+        # Final review. Entity-wide control withholding must not erase the
+        # independent metadata fact that a spent id still has a real pending
+        # record requiring the persistent do-not-touch explanation.
+        "M45", "app/outbox.py",
+        "                record_present=row.record_present,",
+        "                record_present=False,  # MUTANT M45",
+        ["tests/test_console_projection.py"],
+        [("tests/test_console_projection.py::test_blocked_listing_preserves_spent_rows_pending_record_evidence",
+          "blocked-row reconstruction lost the pending-record evidence")],
+    ),
 ]
 
 
