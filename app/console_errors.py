@@ -148,6 +148,20 @@ _CODES: dict[str, ConsoleError] = {
             "none", "no", 500,
         ),
         ConsoleError(
+            # S7 Amendment 3 Stage 2. A matching receipt disables only its
+            # proposal id, but malformed content cannot truthfully select an
+            # action-specific recovery link. `committed` describes this
+            # request, which refused before mutation, not the earlier action
+            # the invalid receipt may represent.
+            "E-RECEIPT", "integrity", "attention",
+            "OneOS found an invalid action receipt for this proposal ID. It "
+            "cannot safely tell what completed action the receipt represents, "
+            "so the ID is disabled. Do not retry, and do not move or delete "
+            "files by hand. No automated recovery is available. Inspect vault "
+            "state with git status and escalate for verified recovery.",
+            "stop", "no", 500,
+        ),
+        ConsoleError(
             "E-SCOPE", "integrity", "refusal",
             "Refused: the request resolved outside the selected entity.",
             "none", "no", 404,
@@ -281,6 +295,7 @@ MAX_DEPTH = 4
 
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 
+from . import action_receipts as _action_receipts  # noqa: E402
 from . import destinations as _destinations  # noqa: E402
 from . import entities as _entities  # noqa: E402
 from . import git_transaction as _git_transaction  # noqa: E402
@@ -316,6 +331,9 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.QuarantinedRecordRetained: _CODES["E-RETAINED"],
     _git_transaction.AtomicMoveUnavailable: _CODES["E-UNSUPPORTED"],
     _git_transaction._ReviewedIndexOwnershipConflict: _CODES["E-CONFLICT"],
+    _action_receipts.InvalidActionReceipt: _CODES["E-RECEIPT"],
+    _action_receipts.ReceiptStoreIntegrityError: _CODES["E-TAMPER"],
+    _action_receipts.ReceiptStoreUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.StaleProposalSource: _CODES["E-STALE"],
     _outbox.MissingProposalSource: _CODES["E-MISSING"],

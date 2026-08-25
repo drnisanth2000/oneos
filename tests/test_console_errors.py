@@ -573,6 +573,7 @@ def test_closed_family_synthetic_subclass_is_unknown():
 
 def test_abstract_bases_resolve_nowhere_and_are_never_raised():
     from app.console_errors import _EXACT, _MRO
+    from app.action_receipts import ReceiptError
     from app.destinations import InvalidSourceLeaf, UnsafeDestinationPath
     from app.git_transaction import ReviewedStateConflict
     from app.scope import CrossScopeError
@@ -582,6 +583,7 @@ def test_abstract_bases_resolve_nowhere_and_are_never_raised():
         ReviewedStateConflict,
         UnsafeDestinationPath,
         InvalidSourceLeaf,
+        ReceiptError,
     ):
         assert base not in _EXACT
         assert base not in _MRO
@@ -684,3 +686,42 @@ def test_changed_review_message_names_no_bytes_and_promises_no_change():
     assert "Nothing was changed." in message
     assert "sha" not in message.lower()
     assert "/" not in message
+
+
+# --- S7 Amendment 3 Stage 2: committed action receipt outcomes --------------
+
+
+def test_map_InvalidActionReceipt():
+    from app.action_receipts import InvalidActionReceipt
+
+    assert _code_of(InvalidActionReceipt("probe")) == "E-RECEIPT"
+
+
+def test_map_ReceiptStoreIntegrityError():
+    from app.action_receipts import ReceiptStoreIntegrityError
+
+    assert _code_of(ReceiptStoreIntegrityError("probe")) == "E-TAMPER"
+
+
+def test_map_ReceiptStoreUnavailable():
+    from app.action_receipts import ReceiptStoreUnavailable
+
+    assert _code_of(ReceiptStoreUnavailable("probe")) == "E-UNAVAILABLE"
+
+
+def test_invalid_receipt_message_is_the_approved_wording_verbatim():
+    from app.console_errors import _CODES
+
+    error = _CODES["E-RECEIPT"]
+    assert error.message == (
+        "OneOS found an invalid action receipt for this proposal ID. It "
+        "cannot safely tell what completed action the receipt represents, "
+        "so the ID is disabled. Do not retry, and do not move or delete "
+        "files by hand. No automated recovery is available. Inspect vault "
+        "state with git status and escalate for verified recovery."
+    )
+    assert error.tier == "integrity"
+    assert error.severity == "attention"
+    assert error.committed == "no"
+    assert error.retry == "stop"
+    assert error.page_status == 500

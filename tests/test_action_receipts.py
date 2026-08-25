@@ -1,6 +1,7 @@
 """Committed action receipts: closed bytes and current-HEAD authority only."""
 from __future__ import annotations
 
+import ast
 import dataclasses
 import os
 from pathlib import Path
@@ -76,6 +77,34 @@ def _commit_receipts(repo: Path, records: dict[str, bytes]) -> None:
         path.write_bytes(contents)
     _git(repo, "add", "--", f"{ENTITY}/outbox/.receipts")
     _git(repo, "commit", "-q", "-m", "add receipts")
+
+
+def _mktree(repo: Path, entries: bytes = b"") -> str:
+    return subprocess.run(
+        ["git", "mktree", "-z"],
+        cwd=repo,
+        check=True,
+        input=entries,
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+
+
+def _commit_empty_nested_receipt_tree(repo: Path) -> None:
+    empty = _mktree(repo)
+    receipts = _mktree(
+        repo, f"040000 tree {empty}\tempty\0".encode("ascii")
+    )
+    outbox = _mktree(
+        repo, f"040000 tree {receipts}\t.receipts\0".encode("ascii")
+    )
+    entity = _mktree(
+        repo, f"040000 tree {outbox}\toutbox\0".encode("ascii")
+    )
+    root = _mktree(
+        repo, f"040000 tree {entity}\t{ENTITY}\0".encode("ascii")
+    )
+    commit = _git(repo, "commit-tree", root, "-m", "nested receipt tree")
+    _git(repo, "update-ref", "HEAD", commit.stdout.decode("ascii").strip())
 
 
 # --- closed schema and deterministic bytes ----------------------------------
@@ -443,6 +472,13 @@ def test_offline_validator_rejects_non_receipt_store_entries(repo, bad_leaf):
         validate_head_receipt_store(repo, ENTITY)
 
 
+def test_offline_validator_refuses_an_empty_nested_tree(repo):
+    """Restoring recursive-only enumeration must make this test fail."""
+    _commit_empty_nested_receipt_tree(repo)
+    with pytest.raises(ReceiptStoreIntegrityError):
+        validate_head_receipt_store(repo, ENTITY)
+
+
 def test_offline_validator_rejects_any_malformed_historical_receipt(repo):
     _commit_receipts(repo, {f"{PROPOSAL_ID}.yaml": b"not: closed\n"})
     with pytest.raises(InvalidActionReceipt):
@@ -461,3 +497,39 @@ def test_offline_validator_reads_head_and_never_changes_the_filesystem(repo):
     assert receipts == (ActionReceipt(1, PROPOSAL_ID, DIGEST, "approval"),)
     assert _git(repo, "status", "--porcelain=v1", "-z").stdout == status_before
     assert path.read_bytes() == bytes_before
+
+
+def test_offline_validator_duplicate_membership_is_constant_time():
+    """Replacing the seen-path set with ordered-list membership must fail."""
+    source = Path(action_receipts.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    reader = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_head_receipt_entries"
+    )
+    set_names = set()
+    for node in ast.walk(reader):
+        value = getattr(node, "value", None)
+        if not (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "set"
+        ):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        set_names.update(
+            target.id for target in targets if isinstance(target, ast.Name)
+        )
+    membership_targets = {
+        comparator.id
+        for node in ast.walk(reader)
+        if isinstance(node, ast.Compare)
+        and any(isinstance(operator, ast.In) for operator in node.ops)
+        for comparator in node.comparators
+        if isinstance(comparator, ast.Name)
+    }
+    assert set_names & membership_targets, (
+        "full-store duplicate detection does not use constant-time set membership"
+    )

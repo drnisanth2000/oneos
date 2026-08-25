@@ -346,12 +346,16 @@ def resolve_head_receipt(
 
 def _head_receipt_entries(vault: Path, entity: str) -> tuple[str, ...]:
     root = _receipt_root(entity)
-    output = _git(vault, "ls-tree", "-r", "-z", "HEAD", "--", root)
+    # Immediate entries, deliberately not `-r`: recursive enumeration omits
+    # an empty child tree and would misread that structurally invalid store as
+    # empty. Any tree at this level is a nested receipt path and is refused.
+    output = _git(vault, "ls-tree", "-z", "HEAD", "--", f"{root}/")
     if not output:
         return ()
     if not output.endswith(b"\0"):
         raise ReceiptStoreUnavailable("Git returned malformed receipt entries")
     paths: list[str] = []
+    seen_paths: set[str] = set()
     prefix = os.fsencode(root + "/")
     for record in output[:-1].split(b"\0"):
         try:
@@ -371,8 +375,9 @@ def _head_receipt_entries(vault: Path, entity: str) -> tuple[str, ...]:
             decoded = returned_path.decode("utf-8", "strict")
         except UnicodeDecodeError as exc:
             raise ReceiptStoreIntegrityError("receipt path is not UTF-8") from exc
-        if decoded in paths:
+        if decoded in seen_paths:
             raise ReceiptStoreUnavailable("Git returned a duplicate receipt path")
+        seen_paths.add(decoded)
         paths.append(decoded)
     return tuple(paths)
 

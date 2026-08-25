@@ -18,7 +18,7 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 AMBIGUOUS = {"CrossScopeError", "ReviewedStateConflict",
-             "UnsafeDestinationPath", "InvalidSourceLeaf"}
+             "UnsafeDestinationPath", "InvalidSourceLeaf", "ReceiptError"}
 
 
 def test_no_direct_raise_of_an_ambiguous_base():
@@ -107,6 +107,7 @@ def _probe(cls):
 
 
 def _abstract_bases():
+    from app.action_receipts import ReceiptError
     from app.destinations import InvalidSourceLeaf, UnsafeDestinationPath
     from app.git_transaction import ReviewedStateConflict
     from app.scope import CrossScopeError
@@ -116,6 +117,7 @@ def _abstract_bases():
         ReviewedStateConflict,
         UnsafeDestinationPath,
         InvalidSourceLeaf,
+        ReceiptError,
     }
 
 
@@ -123,6 +125,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
     from fastapi.exceptions import RequestValidationError
 
     from app import (
+        action_receipts,
         destinations,
         entities,
         git_transaction,
@@ -199,6 +202,9 @@ def test_every_application_exception_resolves_to_its_designed_code():
         entities.EntitySelectionError: "E-ENTITY",
         registry.RegistryTransactionError: "E-GIT",
         registry.RegistryError: "E-REGISTRY",
+        action_receipts.InvalidActionReceipt: "E-RECEIPT",
+        action_receipts.ReceiptStoreIntegrityError: "E-TAMPER",
+        action_receipts.ReceiptStoreUnavailable: "E-UNAVAILABLE",
         review_tokens.ReviewedProposalChanged: "E-REVIEW",
         review_tokens.InvalidReviewToken: "E-REQUEST",
         review_tokens.ReviewContractViolation: "E-INTERNAL",
