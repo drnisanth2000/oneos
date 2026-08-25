@@ -100,12 +100,13 @@ M30  RED then GREEN   M31  RED then GREEN   M31b RED then GREEN
 M32  RED then GREEN   M33  RED then GREEN   M34  RED then GREEN
 M35  RED then GREEN   M36  RED then GREEN   M37  RED then GREEN
 M38  RED then GREEN   M39  RED then GREEN   M40  RED then GREEN
-M41  RED then GREEN
+M41  RED then GREEN   M42  RED then GREEN   M43  RED then GREEN
+M43b RED then GREEN   M44  RED then GREEN
 
-all 43 mutations: red under mutation, green once restored
+all 47 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1456 passed in 111.64s (0:01:51)
+  1460 passed in 112.54s (0:01:52)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -942,6 +943,80 @@ M40 proves the producer guard itself cannot be weakened into an allowlist;
 M41 proves an outcome retired by quarantine-last cannot silently reappear as
 a live taxonomy row. Retired M18/M19 remain historical-only evidence and are
 absent from the runner.
+
+### M42 — acted-on outbox receipt card is lost after consumption
+
+- **file** `app/main.py`
+- **selection** `tests/test_console_routes.py`
+- **result** RED — both replay nodes report
+  `a spent replay lost its receipt-backed card`; the post-move failure node
+  reports `E-APPLIED lost the acted-on receipt card after consumption`
+
+```diff
+-    rows = _with_action_receipt_row(rows, scope, action_receipt)
++    rows = rows  # MUTANT M42: absent acted-on receipt card
+```
+
+Required exact nodes:
+
+- `test_outbox_spent_replay_keeps_the_card_after_the_record_is_consumed[approve]`
+- `test_outbox_spent_replay_keeps_the_card_after_the_record_is_consumed[reject]`
+- `test_approve_post_move_failure_keeps_applied_alert_and_spent_card`
+
+This proves that a response does not fall back to “No pending proposals” merely
+because quarantine removed the acted-on leaf. Both replay and the
+committed-but-unconsumed `E-APPLIED` response retain the receipt-backed card.
+
+### M43 — spent-card copy treats any name as a pending record
+
+- **file** `templates/blocks/outbox_list.html`
+- **selection** `tests/test_console_routes.py`
+- **result** RED — `test_outbox_receipt_card_does_not_call_a_directory_a_pending_record`
+  — `a non-regular outbox entry was presented as a real pending record`
+
+```diff
+-          record_present=row.record_present %}
++          record_present=true %}  {# MUTANT M43 #}
+```
+
+The lingering-record sentence is presentation evidence, not receipt authority.
+It appears only when checked metadata confirms a real regular pending leaf.
+
+### M43b — projection infers record presence without checked metadata
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_projection.py`
+- **result** RED —
+  `test_receipt_first_projection_never_opens_any_spent_leaf_shape[non-file]`
+  — `the non-file spent row misreported whether a real pending record exists`
+
+```diff
+-                record_present = pending_proposal_entry_exists(
+-                    scope, canonical_id
+-                )
++                record_present = True  # MUTANT M43b
+```
+
+M43 guards the rendered consequence; M43b separately binds the row flag to the
+existing no-follow metadata boundary so template correctness cannot hide a
+false service value.
+
+### M44 — retirement reconciliation returns to a hand-maintained subset
+
+- **file** `docs/superpowers/plans/s7_mutation_campaign.py`
+- **selection** `tests/test_console_invariants.py`
+- **result** RED — `test_stage2_retired_outcomes_are_historical_evidence_only`
+  — `M13 returned to the live campaign`
+
+```diff
+-        "M1", "app/outbox.py",
++        "M13", "app/outbox.py",  # MUTANT M44: retired id returned
+```
+
+The invariant derives every exact `RETIRED (historical)` heading from this
+ledger, checks each heading is unique, and refuses every such id in the live
+runner. It therefore cannot drift back to an M18/M19-only list while older
+retirements silently return.
 
 ## M6 — a survivor, and what it cost
 
