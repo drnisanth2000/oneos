@@ -740,11 +740,19 @@ def test_stage2_retired_outcomes_are_historical_evidence_only():
     mutations = ast.literal_eval(assignment.value)
     live_ids = [mutation[0] for mutation in mutations]
 
-    for retired in ("M18", "M19"):
+    retired_headings = re.findall(
+        r"^### (M\w+) — RETIRED \(historical\)", ledger, re.MULTILINE
+    )
+    retired_counts = {
+        retired: retired_headings.count(retired)
+        for retired in set(retired_headings)
+    }
+    assert retired_counts, "the ledger no longer records any retired evidence"
+    assert all(count == 1 for count in retired_counts.values()), (
+        f"retired mutation headings are missing or duplicated: {retired_counts}"
+    )
+    for retired in sorted(retired_counts):
         assert retired not in live_ids, f"{retired} returned to the live campaign"
-        assert ledger.count(
-            f"### {retired} — RETIRED (historical)"
-        ) == 1, f"{retired} retirement is missing or duplicated"
     # A Stage 2 mutation may deliberately put a retired name in its NEW
     # text to prove that the orphan guard catches resurrection. What must
     # stay absent is a live anchor: no current implementation text or test
@@ -950,6 +958,13 @@ def test_stage2_malformed_receipt_projection_stays_per_id():
         for node in ast.walk(function)
         if isinstance(node, ast.If)
         and "resolution.error is not None" in ast.unparse(node.test)
+        and any(
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+            and statement.value.func.attr == "append"
+            for statement in node.body
+        )
     ]
     assert len(error_branches) == 1
     writes_listing_block = any(

@@ -29,6 +29,7 @@ from .action_receipts import (
     ReceiptStoreIntegrityError,
     ReceiptStoreUnavailable,
     SpentAction,
+    resolve_head_receipt,
 )
 from .classifier import Classifier
 from .config import build_catalog, build_scope
@@ -45,6 +46,7 @@ from .inbox import read_inbox
 from .outbox import (
     OutboxDestinationError,
     OutboxError,
+    OutboxRow,
     UnreadableProposalRecord,
     approve,
     pending_proposal_entry_exists,
@@ -617,12 +619,66 @@ def _outbox_rows(listing):
     return rows, blocked_notice
 
 
+def _with_action_receipt_row(
+    rows: list[tuple[OutboxRow, ConsoleError | None]],
+    scope: Scope,
+    receipt: ActionReceipt | None,
+) -> list[tuple[OutboxRow, ConsoleError | None]]:
+    """Keep the acted-on spent card even when its proposal no longer lists.
+
+    A successful quarantine removes the pending ``*.yaml`` leaf, so a fresh
+    projection has nothing from which to build this row. The action result (or
+    the committed receipt resolved for E-APPLIED) is still authoritative for
+    the response being rendered. Siblings remain the projection's own rows;
+    this appends only the missing acted-on id and never parses its record.
+    """
+    if receipt is None or any(
+        row.proposal_id == receipt.proposal_id for row, _error in rows
+    ):
+        return rows
+    return [
+        *rows,
+        (
+            OutboxRow(
+                proposal=None,
+                diff=None,
+                error=None,
+                can_approve=False,
+                can_reject=False,
+                proposal_id=receipt.proposal_id,
+                receipt=receipt,
+                record_present=pending_proposal_entry_exists(
+                    scope, receipt.proposal_id
+                ),
+            ),
+            None,
+        ),
+    ]
+
+
+def _require_committed_action_receipt(
+    scope: Scope, proposal_id: str
+) -> ActionReceipt:
+    """Resolve the receipt an E-APPLIED response must display from HEAD."""
+    resolution = resolve_head_receipt(
+        scope.root, scope.current_entity(), require_proposal_id(proposal_id)
+    )
+    if resolution.error is not None:
+        raise resolution.error
+    if resolution.receipt is None:
+        raise ReceiptStoreUnavailable(
+            "committed action receipt could not be resolved"
+        )
+    return resolution.receipt
+
+
 def _outbox_list(
     request: Request,
     scope: Scope,
     *,
     approval_error: ConsoleError | None = None,
     approval_error_id: str | None = None,
+    action_receipt: ActionReceipt | None = None,
 ) -> HTMLResponse:
     """Fragment renderer shared by approve and reject (design §8: both swap
     `#outbox-list` `outerHTML`, so the fragment reproduces that root).
@@ -637,6 +693,7 @@ def _outbox_list(
     fragment = is_fragment(request, endpoint)
     listing = project_outbox(scope)
     rows, blocked_notice = _outbox_rows(listing)
+    rows = _with_action_receipt_row(rows, scope, action_receipt)
     if approval_error is not None:
         rows = [
             (
@@ -720,6 +777,7 @@ def _outbox_list_error(
     exc: BaseException,
     *,
     action_error: ConsoleError | None = None,
+    action_receipt: ActionReceipt | None = None,
 ) -> HTMLResponse:
     """Fallback fragment for the rare double-failure where even the
     re-rendered listing itself fails to build (`project_outbox`, called from
@@ -757,12 +815,13 @@ def _outbox_list_error(
     endpoint = _endpoint_for(request)
     fragment = is_fragment(request, endpoint)
     status_source = action_error if action_error is not None else listing_error
+    rows = _with_action_receipt_row([], scope, action_receipt)
     return templates.TemplateResponse(
         request,
         "blocks/outbox_list.html",
         {
             "entity": scope.current_entity(),
-            "rows": (),
+            "rows": rows,
             "blocked": False,
             "blocked_notice": None,
             "approval_error": action_error,
@@ -1274,6 +1333,7 @@ def _outbox_approve_response(
     review_issue: str | None,
 ) -> HTMLResponse:
     approval_error = None
+    action_receipt = None
     try:
         # S7: the operator's own fingerprint, passed through untouched. The
         # route must never derive one — recomputing here would rebind the
@@ -1298,6 +1358,13 @@ def _outbox_approve_response(
             )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
+        if approval_error.code == "E-APPLIED":
+            try:
+                action_receipt = _require_committed_action_receipt(scope, id)
+            except _OUTBOX_CATCHES as render_exc:
+                return _outbox_list_error(
+                    request, scope, render_exc, action_error=approval_error
+                )
     else:
         if isinstance(result, SpentAction):
             # The button targets the whole listing. Re-project from HEAD so
@@ -1305,20 +1372,31 @@ def _outbox_approve_response(
             # every sibling remains present; never reinterpret the receipt
             # as an ordinary successful approval.
             try:
-                return _outbox_list(request, scope)
+                return _outbox_list(
+                    request, scope, action_receipt=result.receipt
+                )
             except _OUTBOX_CATCHES as exc:
-                return _outbox_list_error(request, scope, exc)
+                return _outbox_list_error(
+                    request, scope, exc, action_receipt=result.receipt
+                )
     try:
         return _outbox_list(
             request,
             scope,
             approval_error=approval_error,
             approval_error_id=id,
+            action_receipt=action_receipt,
         )
     except _OUTBOX_CATCHES as exc:
         # I1: the re-render's own failure must not discard approve()'s own
         # refusal — both are carried into the fallback fragment.
-        return _outbox_list_error(request, scope, exc, action_error=approval_error)
+        return _outbox_list_error(
+            request,
+            scope,
+            exc,
+            action_error=approval_error,
+            action_receipt=action_receipt,
+        )
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
@@ -1361,6 +1439,7 @@ def _outbox_reject_response(
     review_issue: str | None,
 ) -> HTMLResponse:
     approval_error = None
+    action_receipt = None
     try:
         # S7: same contract as approve — passed through, never derived.
         result = reject(scope, id, review_sha256)
@@ -1383,23 +1462,41 @@ def _outbox_reject_response(
             )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
+        if approval_error.code == "E-APPLIED":
+            try:
+                action_receipt = _require_committed_action_receipt(scope, id)
+            except _OUTBOX_CATCHES as render_exc:
+                return _outbox_list_error(
+                    request, scope, render_exc, action_error=approval_error
+                )
     else:
         if isinstance(result, SpentAction):
             try:
-                return _outbox_list(request, scope)
+                return _outbox_list(
+                    request, scope, action_receipt=result.receipt
+                )
             except _OUTBOX_CATCHES as exc:
-                return _outbox_list_error(request, scope, exc)
+                return _outbox_list_error(
+                    request, scope, exc, action_receipt=result.receipt
+                )
     try:
         return _outbox_list(
             request,
             scope,
             approval_error=approval_error,
             approval_error_id=id,
+            action_receipt=action_receipt,
         )
     except _OUTBOX_CATCHES as exc:
         # I1: same as approve — the re-render's own failure must not discard
         # reject()'s own refusal.
-        return _outbox_list_error(request, scope, exc, action_error=approval_error)
+        return _outbox_list_error(
+            request,
+            scope,
+            exc,
+            action_error=approval_error,
+            action_receipt=action_receipt,
+        )
 
 
 #: Declared once so the decorator and every route's own `except` cannot

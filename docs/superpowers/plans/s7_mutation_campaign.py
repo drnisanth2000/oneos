@@ -538,6 +538,55 @@ MUTATIONS = [
         [("tests/test_console_invariants.py::test_every_operator_outcome_has_an_executable_producer",
           "orphan operator outcome: E-RETAINED")],
     ),
+    (
+        # Review round 2. Once quarantine removes the acted-on leaf, a fresh
+        # projection cannot reconstruct its spent card. The action receipt
+        # must be composed into both replay and E-APPLIED responses.
+        "M42", "app/main.py",
+        "    rows = _with_action_receipt_row(rows, scope, action_receipt)",
+        "    rows = rows  # MUTANT M42: absent acted-on receipt card",
+        ["tests/test_console_routes.py"],
+        [
+            ("tests/test_console_routes.py::test_outbox_spent_replay_keeps_the_card_after_the_record_is_consumed[approve]",
+             "a spent replay lost its receipt-backed card"),
+            ("tests/test_console_routes.py::test_outbox_spent_replay_keeps_the_card_after_the_record_is_consumed[reject]",
+             "a spent replay lost its receipt-backed card"),
+            ("tests/test_console_routes.py::test_approve_post_move_failure_keeps_applied_alert_and_spent_card",
+             "E-APPLIED lost the acted-on receipt card after consumption"),
+        ],
+    ),
+    (
+        # Review round 2. A directory or symlink-shaped name is not evidence
+        # that a real pending record remains.
+        "M43", "templates/blocks/outbox_list.html",
+        "          record_present=row.record_present %}",
+        "          record_present=true %}  {# MUTANT M43 #}",
+        ["tests/test_console_routes.py"],
+        [("tests/test_console_routes.py::test_outbox_receipt_card_does_not_call_a_directory_a_pending_record",
+          "a non-regular outbox entry was presented as a real pending record")],
+    ),
+    (
+        # Review round 2. The row's flag itself must come from the checked,
+        # no-follow metadata boundary rather than filename presence.
+        "M43b", "app/outbox.py",
+        "                record_present = pending_proposal_entry_exists(\n"
+        "                    scope, canonical_id\n"
+        "                )",
+        "                record_present = True  # MUTANT M43b",
+        ["tests/test_console_projection.py"],
+        [("tests/test_console_projection.py::test_receipt_first_projection_never_opens_any_spent_leaf_shape[non-file]",
+          "the non-file spent row misreported whether a real pending record exists")],
+    ),
+    (
+        # Review round 2. Retirement reconciliation is derived from every
+        # exact RETIRED ledger heading, not a hand-maintained M18/M19 subset.
+        "M44", "docs/superpowers/plans/s7_mutation_campaign.py",
+        '        "M1", "app/outbox.py",',
+        '        "M13", "app/outbox.py",  # MUTANT M44: retired id returned',
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_retired_outcomes_are_historical_evidence_only",
+          "M13 returned to the live campaign")],
+    ),
 ]
 
 

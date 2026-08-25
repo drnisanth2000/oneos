@@ -933,6 +933,24 @@ def test_outbox_matching_receipt_renders_spent_card_without_record_contents(
     assert re.search(rf'id="receipt-card-{re.escape(proposal_id)}-[0-9a-f]{{12}}"', body)
 
 
+def test_outbox_receipt_card_does_not_call_a_directory_a_pending_record(
+    tmp_path, monkeypatch
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    _commit_head_receipt(tmp_path, proposal_id, "approval")
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    proposal.unlink()
+    proposal.mkdir()
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    assert "An approval has already completed for this proposal ID" in response.text
+    assert "A record with this ID is still present" not in response.text, (
+        "a non-regular outbox entry was presented as a real pending record"
+    )
+
+
 @pytest.mark.parametrize("action", ["approve", "reject"])
 def test_outbox_action_spent_result_renders_receipt_backed_listing(
     tmp_path, monkeypatch, action
@@ -1136,6 +1154,66 @@ def test_delete_refresh_never_opens_any_spent_leaf_shape(
     )
     assert "A registry deletion has already completed for this proposal ID" in body
     assert "OUTSIDE-DELETE-SPENT-MARKER" not in body
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_spent_replay_keeps_the_card_after_the_record_is_consumed(
+    tmp_path, monkeypatch, action
+):
+    _main, client, proposal_id = _git_outbox_proposal_client(
+        tmp_path, monkeypatch
+    )
+    data = _action_data(tmp_path, proposal_id)
+
+    first = client.post("/outbox/alpha/approve", data=data)
+    assert first.status_code == 200
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    assert not proposal.exists(), "setup did not consume the proposal record"
+
+    replay = client.post(f"/outbox/alpha/{action}", data=data)
+
+    assert replay.status_code == 200
+    assert 'id="outbox-list"' in replay.text
+    assert "An approval has already completed for this proposal ID" in replay.text
+    assert "No pending proposals" not in replay.text, (
+        "a spent replay lost its receipt-backed card"
+    )
+    assert "A record with this ID is still present" not in replay.text
+    assert "hx-post" not in replay.text
+
+
+def test_approve_post_move_failure_keeps_applied_alert_and_spent_card(
+    tmp_path, monkeypatch
+):
+    import app.git_transaction as transaction
+
+    _main, client, proposal_id = _git_outbox_proposal_client(
+        tmp_path, monkeypatch
+    )
+
+    def fail_after_move(*args, **kwargs):
+        raise transaction.ReviewedPathUnavailable(
+            "injected after quarantine moved the proposal"
+        )
+
+    monkeypatch.setattr(
+        transaction, "_require_quarantined_record_unchanged", fail_after_move
+    )
+
+    response = client.post(
+        "/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id)
+    )
+
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    assert not proposal.exists(), "setup did not reach the post-move failure"
+    assert response.status_code == 500
+    assert "E-APPLIED" in response.text
+    assert "An approval has already completed for this proposal ID" in response.text
+    assert "No pending proposals" not in response.text, (
+        "E-APPLIED lost the acted-on receipt card after consumption"
+    )
+    assert "A record with this ID is still present" not in response.text
+    assert "hx-post" not in response.text
 
 
 def test_delete_refresh_malformed_receipt_renders_linkless_e_receipt_card(

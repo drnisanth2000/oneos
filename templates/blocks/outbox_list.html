@@ -30,7 +30,7 @@
   {% with proposal_id=row.proposal_id,
           receipt=row.receipt,
           receipt_error=error,
-          record_present=true %}
+          record_present=row.record_present %}
   {% include "blocks/action_receipt_card.html" %}
   {% endwith %}
   {% else %}

@@ -270,6 +270,11 @@ def test_receipt_first_projection_never_opens_any_spent_leaf_shape(
     assert [row.receipt.proposal_id for row in listing.rows if row.receipt] == [
         spent.id
     ]
+    expected_present = shape not in {"redirected", "non-file"}
+    spent_row = next(row for row in listing.rows if row.receipt is not None)
+    assert spent_row.record_present is expected_present, (
+        f"the {shape} spent row misreported whether a real pending record exists"
+    )
     assert any(row.proposal and row.proposal.id == unspent.id for row in listing.rows)
 
 

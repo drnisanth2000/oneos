@@ -144,6 +144,10 @@ class OutboxRow:
     #: the current HEAD. It is presentation authority only; its digest is
     #: deliberately never copied into ``review_sha256``.
     receipt: ActionReceipt | None = None
+    #: Presentation evidence only: whether the pending-record name currently
+    #: holds a real regular leaf. Receipt authority is still HEAD; this flag
+    #: controls only the truthful lingering-record sentence on a spent card.
+    record_present: bool = False
 
     def __post_init__(self) -> None:
         # Controls and fingerprint are issued together or not at all. A
@@ -678,6 +682,14 @@ def project_outbox(scope: Scope) -> OutboxListing:
         canonical_id = canonical_ids.get(discovered)
         if canonical_id is not None:
             resolution = receipts[canonical_id]
+            record_present = False
+            if resolution.error is not None or (
+                resolution.receipt is not None
+                and resolution.receipt.action_kind != "registry deletion"
+            ):
+                record_present = pending_proposal_entry_exists(
+                    scope, canonical_id
+                )
             if resolution.error is not None:
                 rows.append(
                     OutboxRow(
@@ -687,6 +699,7 @@ def project_outbox(scope: Scope) -> OutboxListing:
                         can_approve=False,
                         can_reject=False,
                         proposal_id=canonical_id,
+                        record_present=record_present,
                     )
                 )
                 continue
@@ -705,6 +718,7 @@ def project_outbox(scope: Scope) -> OutboxListing:
                         can_reject=False,
                         proposal_id=canonical_id,
                         receipt=resolution.receipt,
+                        record_present=record_present,
                     )
                 )
                 continue
