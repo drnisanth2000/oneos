@@ -211,6 +211,51 @@ def test_entity_rename_busy_shared_lock_refuses_before_any_mutation(
     assert shared_lock is git_transaction.action_lock
 
 
+def test_stale_rename_plan_refuses_before_mutation_and_preserves_newer_commit(
+    tmp_path, monkeypatch
+):
+    """A reviewed plan may apply only to the exact HEAD it was built from."""
+    vault = git_vault(tmp_path, ENTITY_FILES)
+    plan = plan_rename(vault, "entity", "oldentity", "newentity")
+
+    entities = vault / "_system/entities.yaml"
+    newer_bytes = entities.read_bytes().replace(
+        b"label: Old Entity", b"label: Newer Committed Label"
+    )
+    entities.write_bytes(newer_bytes)
+    subprocess.run(
+        ["git", "add", "--", "_system/entities.yaml"], cwd=vault, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "newer relevant change"],
+        cwd=vault,
+        check=True,
+    )
+    assert git_is_clean(vault)
+    boundary = _rename_boundary(vault)
+    rename_git_calls = []
+    real_git = rename._git
+
+    def record_rename_git_call(vault_arg, *args):
+        rename_git_calls.append(args)
+        return real_git(vault_arg, *args)
+
+    monkeypatch.setattr(rename, "_git", record_rename_git_call)
+
+    with pytest.raises(RenameError, match="HEAD changed since this rename was planned"):
+        apply_rename(vault, plan)
+
+    assert _rename_boundary(vault) == boundary
+    assert entities.read_bytes() == newer_bytes
+    assert git_head_message(vault) == "newer relevant change"
+    assert (vault / "oldentity").is_dir()
+    assert not (vault / "newentity").exists()
+    assert rename_git_calls == [
+        ("status", "--short"),
+        ("rev-parse", "HEAD"),
+    ], "stale refusal crossed into Git mutation or cleanup"
+
+
 @pytest.mark.parametrize("failure_point", ("unlock", "close"))
 def test_entity_rename_lock_cleanup_failure_reports_committed_without_rollback(
     tmp_path, monkeypatch, failure_point
@@ -370,7 +415,10 @@ def test_rename_cli_reports_committed_when_postcommit_oid_lookup_fails(
 
     def fail_only_postcommit_oid_lookup(vault_arg, *args):
         rename_git_calls.append(args)
-        if args == ("rev-parse", "HEAD"):
+        if (
+            args == ("rev-parse", "HEAD")
+            and git_head_message(vault_arg) == "rename: oldentity → newentity"
+        ):
             raise subprocess.CalledProcessError(73, ["git", *args])
         return real_git(vault_arg, *args)
 
@@ -417,7 +465,10 @@ def test_postcommit_oid_lookup_and_unlock_failures_preserve_committed_outcome(
 
     def fail_only_postcommit_oid_lookup(vault_arg, *args):
         rename_git_calls.append(args)
-        if args == ("rev-parse", "HEAD"):
+        if (
+            args == ("rev-parse", "HEAD")
+            and git_head_message(vault_arg) == "rename: oldentity → newentity"
+        ):
             raise subprocess.CalledProcessError(74, ["git", *args])
         return real_git(vault_arg, *args)
 

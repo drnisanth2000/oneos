@@ -1455,6 +1455,59 @@ def test_outbox_screen_renders_projection_blocked_listing(tmp_path, monkeypatch)
     assert "-sub: triage" in body
 
 
+def test_blocked_outbox_notice_uses_unreadable_row_not_earlier_receipt_error(
+    tmp_path, monkeypatch
+):
+    """The listing-wide blocker must not be borrowed from another bad row."""
+    _main, client, valid_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    outbox_dir = tmp_path / "alpha/outbox"
+    receipt_id = "20260815T090701-" + "11" * 16
+    receipt_record_marker = "raw-malformed-receipt-record-content-marker"
+    (outbox_dir / f"{receipt_id}.yaml").write_text(
+        receipt_record_marker, encoding="utf-8"
+    )
+    receipt_relative = f"alpha/outbox/.receipts/{receipt_id}.yaml"
+    receipt = tmp_path / receipt_relative
+    receipt.parent.mkdir(mode=0o700, exist_ok=True)
+    receipt.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(
+        ["git", "add", "--", receipt_relative], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed earlier receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    unreadable_id = "20260815T090704-" + "cc" * 16
+    unreadable_content_marker = "raw-unreadable-content-marker"
+    (outbox_dir / f"{unreadable_id}.yaml").write_text(
+        f"{unreadable_content_marker}: [unterminated\n", encoding="utf-8"
+    )
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    alert_codes = re.findall(r'class="alert-code">([^<]+)</span>', body)
+    assert alert_codes[0] == "E-UNREADABLE", (
+        "the listing-level notice did not describe the condition that blocked it"
+    )
+    assert alert_codes.count("E-UNREADABLE") == 1
+    assert alert_codes.count("E-RECEIPT") == 1
+    assert body.count(f"receipt-card-{receipt_id}-") == 1
+    assert valid_id in body
+    assert 'class="approve"' not in body
+    assert 'class="reject"' not in body
+    assert "/outbox/alpha/approve" not in body
+    assert "/outbox/alpha/reject" not in body
+    assert "review_sha256" not in body
+    assert not re.search(r"[0-9a-f]{64}", body)
+    assert unreadable_id not in body
+    assert unreadable_content_marker not in body
+    assert receipt_record_marker not in body
+
+
 def test_outbox_screen_unblocked_listing_keeps_controls(tmp_path, monkeypatch):
     """Sanity counterpart: with no unreadable record, the same valid proposal
     keeps its approve/reject controls — proving the blocked test above is
@@ -3959,8 +4012,10 @@ def test_route_totality_from_declared_catches(tmp_path, monkeypatch):
                 for owner, attr in spec["patch_targets"]:
                     injected = []
 
-                    def _raise(*args, __exc=exc_class, **kwargs):
-                        injected.append(True)
+                    def _raise(
+                        *args, __exc=exc_class, __injected=injected, **kwargs
+                    ):
+                        __injected.append(True)
                         raise __exc("injected for route totality")
 
                     monkeypatch.setattr(owner, attr, _raise)
@@ -4878,10 +4933,10 @@ def test_registry_tamper_preview_swap_removes_its_initiating_delete_control(
             self.children = []
 
     class _BrowserDom(HTMLParser):
-        _VOID = {
+        _VOID = frozenset({
             "area", "base", "br", "col", "embed", "hr", "img", "input",
             "link", "meta", "param", "source", "track", "wbr",
-        }
+        })
 
         def __init__(self, markup):
             super().__init__()

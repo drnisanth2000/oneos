@@ -601,9 +601,9 @@ def _outbox_rows(listing):
 
     Returns `(rows, blocked_notice)`: `rows` pairs each `OutboxRow` with its
     described error (`None` when the row has none); `blocked_notice` is the
-    single listing-level `ConsoleError` for a blocked listing — every
-    unreadable row describes to the same `E-UNREADABLE` code (mro), so any one
-    of them carries the notice.
+    single listing-level `ConsoleError` selected from the raw unreadable-record
+    row that caused blocking. Other proposal-less rows can carry unrelated
+    per-id errors and must not masquerade as the listing-wide reason.
     """
     rows = [
         (row, describe(row.error) if row.error is not None else None)
@@ -612,7 +612,11 @@ def _outbox_rows(listing):
     blocked_notice = None
     if listing.blocked:
         blocked_notice = next(
-            (error for row, error in rows if row.proposal is None and error is not None),
+            (
+                error
+                for row, error in rows
+                if isinstance(row.error, UnreadableProposalRecord)
+            ),
             None,
         )
     return rows, blocked_notice

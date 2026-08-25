@@ -84,6 +84,8 @@ class RenamePlan:
     old: str
     new: str
     vault: Path
+    #: Exact Git state against which the planned edits were reviewed.
+    planned_head: str
     moves: list[tuple[Path, Path]] = field(default_factory=list)
     edits: dict[Path, str] = field(default_factory=dict)  # current path -> new text
     reports: list[str] = field(default_factory=list)
@@ -412,7 +414,14 @@ def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
     if old == new:
         raise RenameError("old and new slug are identical")
     _validate_new_slug(new)
-    plan = RenamePlan(axis=axis, old=old, new=new, vault=vault)
+    planned_head = _git(vault, "rev-parse", "HEAD").strip()
+    plan = RenamePlan(
+        axis=axis,
+        old=old,
+        new=new,
+        vault=vault,
+        planned_head=planned_head,
+    )
     _PLANNERS[axis](plan)
     if not plan.moves and not plan.edits:
         raise RenameError(f"{axis} {old!r} not found — nothing to rename")
@@ -466,6 +475,11 @@ def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
             if not _git_clean(vault):
                 raise RenameError(
                     "vault has uncommitted changes; commit or stash first"
+                )
+            if _git(vault, "rev-parse", "HEAD").strip() != plan.planned_head:
+                raise RenameError(
+                    "HEAD changed since this rename was planned; create and "
+                    "review a fresh plan"
                 )
             validators = DEFAULT_VALIDATORS if validators is None else validators
             try:
