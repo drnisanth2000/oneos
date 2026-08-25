@@ -434,8 +434,7 @@ def _parse_record_bytes(contents: bytes) -> object:
 
     S7's single-read rule lives on this seam: a caller that has captured
     exact bytes must be able to parse *those* bytes, never re-open the path
-    and parse whatever is there now. `_read_record` delegates here so the
-    two cannot drift into two different parsers.
+    and parse whatever is there now.
     """
     try:
         text = contents.decode("utf-8")
@@ -449,21 +448,6 @@ def _parse_record_bytes(contents: bytes) -> object:
         raise UnreadableProposalRecord(
             "proposal record is invalid YAML"
         ) from exc
-
-
-@structured_reader(category="proposal")
-def _read_record(path: Path) -> object:
-    """Read and parse a stored proposal record. A `proposal`-category
-    structured read (design §7 invariant 4): every way reading or shaping it
-    can fail becomes `UnreadableProposalRecord`, never a raw stdlib type."""
-    try:
-        contents = path.read_bytes()
-    except OSError as exc:
-        raise UnreadableProposalRecord(
-            "proposal record could not be read"
-        ) from exc
-    return _parse_record_bytes(contents)
-
 
 def _validate_record(path: Path, record: object) -> Proposal | None:
     """Schema and identity only (design §3 phase 1) — never touches the

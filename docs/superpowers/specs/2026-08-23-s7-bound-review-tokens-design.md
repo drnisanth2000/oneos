@@ -29,8 +29,8 @@ must not be attempted” below.
 **Amendment 3 (APPROVED — architecture, Stage 1, and Stage 2 design):** no
 quarantined record is ever renamed back on the strength of its name. Amendment
 2 closed one of the three places that did so; Stage 1 closed the class
-immediately, and the approved but unimplemented Stage 2 makes quarantine the
-last mutation and uses committed action receipts to prevent a second action.
+immediately, and implemented Stage 2 makes quarantine the last mutation and
+uses committed action receipts to prevent a second action.
 Amended clauses are marked *(Amendment 3)*. Rationale in “Why a name is never
 enough” below.
 

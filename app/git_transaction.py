@@ -360,13 +360,6 @@ def _unsafe_open_failure(exc: OSError, message: str) -> ReviewedStateConflict:
 def _open_checked_directory(
     path: str | Path, description: str, *, dir_fd: int | None = None
 ) -> int:
-    try:
-        checked_stat = os.lstat(path, dir_fd=dir_fd)
-    except OSError as exc:
-        raise ReviewedPathUnavailable(f"{description} is unavailable") from exc
-    if stat.S_ISLNK(checked_stat.st_mode) or not stat.S_ISDIR(checked_stat.st_mode):
-        raise ReviewedPathIntegrityError(f"{description} is not a directory")
-
     flags = (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
@@ -375,24 +368,45 @@ def _open_checked_directory(
     try:
         descriptor = os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.EMLINK, errno.ENOTDIR, errno.ENOENT}:
-            # `lstat` just said this was a real directory, so it has changed
-            # between then and now — swapped for a symlink, for a
-            # non-directory, or removed. That is a redirection finding, not
-            # an "unavailable" one, and the tier matters: the operator must
-            # be told to inspect the vault, not to try again.
+        if exc.errno in {errno.ELOOP, errno.EMLINK, errno.ENOTDIR}:
             raise ReviewedPathIntegrityError(
-                f"{description} changed while being opened"
+                f"{description} is not a directory"
             ) from exc
         raise _unsafe_open_failure(
             exc, f"{description} could not be opened safely"
         ) from exc
     try:
+        try:
+            checked_stat = os.lstat(path, dir_fd=dir_fd)
+        except FileNotFoundError as exc:
+            raise ReviewedPathIntegrityError(
+                f"{description} changed while being captured"
+            ) from exc
+        except OSError as exc:
+            raise ReviewedPathUnavailable(f"{description} is unavailable") from exc
         opened_stat = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(opened_stat.st_mode)
+            or opened_stat.st_nlink == 0
+            or stat.S_ISLNK(checked_stat.st_mode)
+            or not stat.S_ISDIR(checked_stat.st_mode)
             or (opened_stat.st_dev, opened_stat.st_ino)
             != (checked_stat.st_dev, checked_stat.st_ino)
+        ):
+            raise ReviewedPathIntegrityError(f"{description} changed while being captured")
+        try:
+            final_stat = os.lstat(path, dir_fd=dir_fd)
+        except FileNotFoundError as exc:
+            raise ReviewedPathIntegrityError(
+                f"{description} changed while being captured"
+            ) from exc
+        except OSError as exc:
+            raise ReviewedPathUnavailable(f"{description} is unavailable") from exc
+        if (
+            stat.S_ISLNK(final_stat.st_mode)
+            or not stat.S_ISDIR(final_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (final_stat.st_dev, final_stat.st_ino)
         ):
             raise ReviewedPathIntegrityError(f"{description} changed while being captured")
         return descriptor

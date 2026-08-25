@@ -7,6 +7,7 @@ commits (exactly one commit, git-revertible); reject discards the proposal.
 Temp git vaults only; the real vault is never touched.
 """
 import ast
+import errno
 import hashlib
 import inspect
 import os
@@ -2606,7 +2607,7 @@ def test_reject_transaction_failures_stay_inside_the_outbox_family(tmp_path):
 
     def busy(descriptor, operation):
         if operation == gt.fcntl.LOCK_EX | gt.fcntl.LOCK_NB:
-            raise OSError(35, "simulated busy lock")
+            raise OSError(errno.EAGAIN, "simulated busy lock")
         return real_flock(descriptor, operation)
 
     gt.fcntl.flock = busy

@@ -534,11 +534,8 @@ def test_execute_delete_refuses_while_referenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
     scope = Scope(vault, "demo")
     prop = propose_delete(scope, "product", "widgetx")
-    try:
+    with pytest.raises(RegistryError):
         execute_delete(scope, prop.id, _fingerprint_of(scope, prop.id))
-        assert False, "should have refused"
-    except RegistryError:
-        pass
     assert "widgetx:" in (vault / "_system/products.yaml").read_text()
 
 

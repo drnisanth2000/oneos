@@ -2373,13 +2373,14 @@ def test_a_quarantine_creation_race_refuses_rather_than_accepting_it(tmp_path):
 
 @pytest.mark.parametrize("target", ["quarantine", "outbox"])
 @pytest.mark.parametrize("replacement", ["symlink", "real-directory"])
-def test_a_directory_swapped_between_validation_and_open_is_refused(
+def test_a_directory_swapped_between_open_and_name_check_is_refused(
     tmp_path, target, replacement
 ):
     """P1 (review): the required live swap, not a pre-configured symlink.
 
-    The directory is validated, and only then replaced with a symlink
-    pointing outside the entity. Nothing may be written or moved through it.
+    The descriptor is opened first, then its name is checked against it. The
+    directory is replaced between those two operations. Nothing may be
+    written or moved through the replacement.
     """
     import app.git_transaction as gt
     from app.git_transaction import capture_path_state, quarantine_path_if_unchanged
@@ -2402,7 +2403,6 @@ def test_a_directory_swapped_between_validation_and_open_is_refused(
     swapped = []
 
     def lstat_then_swap(path, *args, **kwargs):
-        result = real_lstat(path, *args, **kwargs)
         if path == watched and not swapped:
             swapped.append(True)
             victim = outbox / gt.QUARANTINE_DIRECTORY if target == "quarantine" else outbox
@@ -2416,14 +2416,14 @@ def test_a_directory_swapped_between_validation_and_open_is_refused(
                 # re-verifying the descriptor's identity against what was
                 # validated can catch this one.
                 victim.mkdir()
-        return result
+        return real_lstat(path, *args, **kwargs)
 
     gt.os.lstat = lstat_then_swap
     try:
-        # Every swap is refused, symlink or not. The descriptor is verified
-        # against the stat taken *before* the swap, so a substituted real
-        # directory has a different inode and is just as detectable as a
-        # redirection — sameness of path is not sameness of file.
+        # Every swap is refused, symlink or not. The opened descriptor is
+        # verified against the name after the swap, so a substituted real
+        # directory is just as detectable as a redirection — sameness of
+        # path is not sameness of file.
         with pytest.raises(gt.ReviewedPathIntegrityError) as raised:
             quarantine_path_if_unchanged(vault, "outbox/record.yaml", expected)
     finally:
