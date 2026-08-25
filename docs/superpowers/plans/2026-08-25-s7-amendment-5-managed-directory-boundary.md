@@ -178,10 +178,11 @@ git diff --check
 git status --porcelain
 ```
 
-Measured completion: `1470 passed in 141.98s (0:02:21)`; all 48 mutations RED
-then GREEN; the restored campaign closing suite recorded `1470 passed in
-144.43s (0:02:24)`; and Gitleaks plus public current-tree/history audits were
-CLEAN. The restored worktree was clean. Record these final counts only.
+Measured completion: `1473 passed in 130.03s`; all 48 mutations RED then
+GREEN; the restored campaign closing suite recorded `1473 passed in 110.35s`;
+Gitleaks scanned 343 reachable commits with no leaks; and public
+current-tree/history audits were CLEAN. The restored worktree was clean. Record
+these final counts only.
 
 - [x] **Step 2: Run private gates inside a new preservation envelope**
 
@@ -194,11 +195,12 @@ uv run python -m tools.public_repo_audit --repo . --vault "$ONEOS_VAULT" --histo
 ```
 
 Measured completion: `check_v2` reported 0 errors/0 warnings; unittest
-discovery ran 37 tests and reported OK; the combined history audit was CLEAN;
-and HEAD, porcelain-v2 NUL status, binary worktree diff, and binary cached diff
-were byte-identical before and after, with all pre-existing edits preserved.
-The final scoped review found no open Critical or Important findings. The proof
-location is intentionally not tracked.
+discovery ran 37 tests in 0.194s and reported OK; the combined history audit
+was CLEAN; and HEAD, porcelain-v2 NUL status, binary worktree diff, and binary
+cached diff were byte-identical before and after, with all pre-existing edits
+preserved. Independent scoped reviews found no Critical, Important, or Minor
+findings. The proof is retained outside the repository; its location is not
+tracked.
 
 - [x] **Step 3: Record measured completion**
 

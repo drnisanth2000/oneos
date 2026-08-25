@@ -1,13 +1,14 @@
 # S7 — Bound Review Tokens
 
 **Status:** S7 COMPLETE — Amendment 5 verified. Final verification recorded
-1,470 public tests passed in 141.98s (0:02:21); all 48 mutation rows RED then
-GREEN; Gitleaks and public current-tree/history audits were clean; private
-gates recorded `check_v2` 0/0 and 37 tests; the combined repo-plus-vault
-history audit was clean; Grey Matter's HEAD, status, worktree diff, and cached
-diff were byte-identical before and after, preserving pre-existing edits; and
-the final scoped review found no open Critical or Important findings. Amendment
-3 Stage 2 provides action receipts, quarantine-last,
+1,473 public tests passed in 130.03s; all 48 mutation rows RED then GREEN;
+Gitleaks scanned 343 reachable commits with no leaks; public current-tree and
+history audits were clean; private gates recorded `check_v2` 0/0 and 37 tests
+in 0.194s; the combined repo-plus-vault history audit was clean; Grey Matter's
+HEAD, status, worktree diff, and cached diff were byte-identical before and
+after, preserving pre-existing edits; and independent scoped reviews found no
+Critical, Important, or Minor findings. Amendment 3 Stage 2 provides action
+receipts, quarantine-last,
 `E-APPLIED`, `E-RECEIPT`, the offline receipt validator, and the
 orphan-outcome guard. `E-RETAINED`, `E-STRANDED`, and
 `diagnose_quarantined_record` are retired. Final evidence is recorded in the

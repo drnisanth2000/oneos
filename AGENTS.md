@@ -34,13 +34,14 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
 The **Safety Foundation S1-S7 is complete** at its gate-certified branch tip:
-the final public suite recorded 1,470 passed in 141.98s (0:02:21); all 48
-mutation rows went RED then GREEN; Gitleaks plus current-tree and history
-public audits were clean; and the private gates recorded `check_v2` 0/0 and 37
-tests. The combined repo-plus-vault history audit was clean and Grey Matter's
-HEAD, status, worktree diff, and cached diff were byte-identical before and
-after, preserving pre-existing edits. The final scoped review found no open
-Critical or Important findings. The macOS no-overwrite path was exercised;
+the exact-head public suite recorded 1,473 passed in 130.03s; all 48 mutation
+rows went RED then GREEN; Gitleaks scanned 343 reachable commits with no leaks;
+current-tree and history public audits were clean; and the private gates
+recorded `check_v2` 0/0 and 37 tests in 0.194s. The combined repo-plus-vault
+history audit was clean and Grey Matter's HEAD, status, worktree diff, and
+cached diff were byte-identical before and after, preserving pre-existing
+edits. Independent scoped reviews found no Critical, Important, or Minor
+findings. The macOS no-overwrite path was exercised;
 Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
 user/platform limitation. The separately sequenced inherited items 2–4 in
 `docs/STATUS.md` remain required before live Phase 1 gate trials.

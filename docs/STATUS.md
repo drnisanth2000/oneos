@@ -26,18 +26,19 @@ trials. Phase 2 is not authorized.
 | S4 — proposal identity and freshness | **COMPLETE** | Collision-safe proposal IDs, exact-byte source SHA-256, no-follow snapshots, and visible stale/missing refusals are merged. |
 | S5 — Git transaction and audit | **COMPLETE** | Classification approval and registry deletion use exact-path alternate-index transactions with ownership-aware rollback; Gate 3 validates action-specific messages, paths, and dirty-state fingerprints. |
 | S6 — Console failures | **COMPLETE** | Every typed Command Center refusal reaches the operator as a specific, safe, actionable message; no route swallows a failure or returns a raw server fault. Public suite 603 → 832. All public and private gates pass, including the combined repo+vault history audit; Grey Matter fingerprints identical before and after. Per-task review record: `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`. |
-| S7 — bound review tokens | **COMPLETE** | Exact-byte review fingerprints bind approve, reject, and registry delete; quarantine-last and tracked HEAD receipts protect transactional actions from destructive rollback and repeated ids; reject safely quarantines its reviewed record; receipt-backed cards remain non-actionable. Final evidence: 1,470 public tests, all 48 mutation rows RED then GREEN, 37 private tests, `check_v2` 0/0, clean Gitleaks plus public current-tree/history and combined history audits, byte-identical Grey Matter HEAD/status/worktree/cached proof, and no open Critical or Important scoped-review finding. The macOS no-overwrite path was exercised; Linux `renameat2` is an accepted unexercised user/platform limitation. |
+| S7 — bound review tokens | **COMPLETE** | Exact-byte review fingerprints bind approve, reject, and registry delete; quarantine-last and tracked HEAD receipts protect transactional actions from destructive rollback and repeated ids; reject safely quarantines its reviewed record; receipt-backed cards remain non-actionable. Final evidence: 1,473 public tests, all 48 mutation rows RED then GREEN, 37 private tests in 0.194s, `check_v2` 0/0, Gitleaks clean across 343 reachable commits, clean public current-tree/history and combined history audits, byte-identical Grey Matter HEAD/status/worktree/cached proof, and no Critical, Important, or Minor scoped-review finding. The macOS no-overwrite path was exercised; Linux `renameat2` is an accepted unexercised user/platform limitation. |
 
 Merged S5 baseline: `0f71cd3`. S6 is complete. S7 began from the fresh
 merged-S6 baseline `d7ad86b` with 926 public tests.
-Final verification records 1,470 public tests in 141.98s (0:02:21), all 48
-mutation rows RED then GREEN, 37 private tests, `check_v2` at 0 errors/0
-warnings, clean Gitleaks, public current-tree/history, and combined repo+vault
-history audits, and byte-identical Grey Matter HEAD/status/worktree/cached
-before/after proof preserving pre-existing edits. The final scoped review found
-no open Critical or Important findings. Supported writers cooperate through
-OneOS interfaces and the shared action lock; deliberate post-final-check
-ancestor relocation is outside that boundary.
+Final verification records 1,473 public tests in 130.03s, all 48 mutation
+rows RED then GREEN, 37 private tests in 0.194s, `check_v2` at 0 errors/0
+warnings, Gitleaks clean across 343 reachable commits, clean public
+current-tree/history and combined repo+vault history audits, and byte-identical
+Grey Matter HEAD/status/worktree/cached before/after proof preserving
+pre-existing edits. Independent scoped reviews found no Critical, Important, or
+Minor findings. Supported writers cooperate through OneOS interfaces and the
+shared action lock; deliberate post-final-check ancestor relocation is outside
+that boundary.
 
 ### Exit gates (spec §11)
 
@@ -83,6 +84,10 @@ unless they demonstrate a reproducible defect in those guarantees.
 - **Gate 3 authority** — a sanctioned prefix alone is never enough. The audit
   validates each new commit's action-specific path set and detects changes to
   staged, unstaged, or untracked state captured at session start.
+- **Gate 3 historical-replay correction** — planned-head live lookup initially
+  broke historical-tree audit replay. The audit now uses an explicit immutable
+  parent OID builder; the correction was developed test-first and independently
+  reviewed.
 - **Publication gates** — pinned Gitleaks owns general credential and reachable
   history scanning. `tools/public_repo_audit.py` owns finite OneOS privacy
   rules; trusted local review adds private registry-derived terms.
