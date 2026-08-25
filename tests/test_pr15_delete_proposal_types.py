@@ -19,6 +19,7 @@ never validated as persisted data, since it never comes from the record.
 from __future__ import annotations
 
 import hashlib
+import subprocess
 
 import pytest
 
@@ -32,6 +33,25 @@ def _scope(tmp_path):
 
     write_vault(tmp_path, ENTITIES)
     (tmp_path / "demo").mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "add", "-A"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
     return Scope(tmp_path, "demo")
 
 

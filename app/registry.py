@@ -16,6 +16,14 @@ from pathlib import Path
 
 import yaml
 
+from .action_receipts import (
+    ActionReceipt,
+    SpentAction,
+    make_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
+    resolve_head_receipt,
+)
 from .git_transaction import (
     GitTransactionError,
     PathChange,
@@ -23,6 +31,7 @@ from .git_transaction import (
     ReviewedPathIntegrityError,
     ReviewedPathUnavailable,
     TransactionPlan,
+    TransactionPreconditionRefused,
     capture_path_state,
     execute_transaction,
 )
@@ -99,6 +108,34 @@ class DeleteProposal:
     slug: str
     total: int
     sources: dict[str, int]
+
+
+RegistryDeleteResult = DeleteProposal | SpentAction
+
+
+def _head_action_receipt(
+    scope: Scope, proposal_id: str
+) -> ActionReceipt | None:
+    """Resolve one spent-id fact from committed history, never the worktree."""
+    try:
+        canonical_id = require_proposal_id(proposal_id)
+    except ProposalIdentityError as exc:
+        raise RegistryError("delete proposal id is not canonical") from exc
+    resolution = resolve_head_receipt(
+        scope.root, scope.current_entity(), canonical_id
+    )
+    if resolution.error is not None:
+        raise resolution.error
+    return resolution.receipt
+
+
+def _spent_action_from_refusal(
+    refusal: TransactionPreconditionRefused, proposal_id: str
+) -> SpentAction:
+    reason = refusal.reason
+    if not isinstance(reason, ActionReceipt) or reason.proposal_id != proposal_id:
+        raise RuntimeError("receipt precondition returned an invalid reason")
+    return SpentAction(reason)
 
 
 def _git(vault: Path, *args: str) -> str:
@@ -492,6 +529,30 @@ def get_delete_review(
     return make_review_snapshot(proposal, state.contents)
 
 
+def get_delete_receipt_or_review(
+    scope: Scope, proposal_id: str
+) -> ActionReceipt | ReviewSnapshot[DeleteProposal]:
+    """Resolve committed spent-id authority before touching the proposal.
+
+    A matching receipt is sufficient to withhold every action, so the
+    working-tree record is deliberately neither located nor opened in that
+    branch. Malformed matching receipts and store failures propagate; only an
+    absent matching receipt delegates to the ordinary review reader.
+    """
+    try:
+        canonical_id = require_proposal_id(proposal_id)
+    except ProposalIdentityError as exc:
+        raise RegistryError("invalid delete proposal id") from exc
+    resolution = resolve_head_receipt(
+        scope.root, scope.current_entity(), canonical_id
+    )
+    if resolution.error is not None:
+        raise resolution.error
+    if resolution.receipt is not None:
+        return resolution.receipt
+    return get_delete_review(scope, canonical_id)
+
+
 def get_delete_proposal(scope: Scope, proposal_id: str) -> DeleteProposal:
     """The validated value alone, for callers that will not act on it.
 
@@ -545,7 +606,7 @@ def _remove_scoped_registry_value(
 @structured_reader(category="proposal")
 def execute_delete(
     scope: Scope, proposal_id: str, review_sha256: object
-) -> DeleteProposal:
+) -> RegistryDeleteResult:
     """On approval: refuse if references remain (recomputed fresh), else remove
     the value from its registry and commit.
 
@@ -557,6 +618,10 @@ def execute_delete(
     kind/value existence, current registry state, a freshly repeated
     reference count and transaction-owned state all remain independent gates.
     """
+    spent_receipt = _head_action_receipt(scope, proposal_id)
+    if spent_receipt is not None:
+        return SpentAction(spent_receipt)
+
     vault = scope.root
     path = _delete_proposal_path(scope, proposal_id)
     proposal_rel = path.relative_to(vault).as_posix()
@@ -565,7 +630,9 @@ def execute_delete(
         # the consumption are all about THIS state; a later reread may never
         # replace it.
         proposal_state = _capture_delete_proposal_state(scope, path, proposal_id)
-        require_review_match(proposal_state.contents, review_sha256)
+        review_digest = require_review_match(
+            proposal_state.contents, review_sha256
+        )
         prop = _validate_delete_record(
             scope, path, _parse_delete_record(proposal_state.contents)
         )
@@ -600,6 +667,9 @@ def execute_delete(
                     f"refusing to delete — references remain.\n{report.as_text()}"
                 )
 
+        def _require_unspent_id() -> ActionReceipt | None:
+            return _head_action_receipt(scope, prop.id)
+
         filename = _REGISTRY_FILE.get(prop.kind)
         if filename is None:
             raise RegistryError(f"delete not supported for kind {prop.kind!r}")
@@ -611,6 +681,10 @@ def execute_delete(
         rendered_registry_bytes = _remove_scoped_registry_value(
             scope, prop.kind, prop.slug, registry_state.contents
         )
+        receipt = make_action_receipt(
+            prop.id, review_digest, "registry deletion"
+        )
+        receipt_rel = receipt_relative_path(prop.entity, prop.id)
         plan = TransactionPlan(
             message=f"registry: delete {prop.kind} {prop.slug}",
             changes=(
@@ -621,16 +695,24 @@ def execute_delete(
                         rendered_registry_bytes, registry_state.mode
                     ),
                 ),
+                PathChange(
+                    receipt_rel,
+                    PathState.absent(),
+                    PathState.regular(render_action_receipt(receipt), 0o644),
+                    create_parent=True,
+                ),
             ),
-            commit_paths=(registry_rel,),
+            commit_paths=(registry_rel, receipt_rel),
             owned_changes=(
                 PathChange(proposal_rel, proposal_state, PathState.absent()),
             ),
-            preconditions=(_require_no_live_references,),
+            preconditions=(_require_unspent_id, _require_no_live_references),
         )
-        execute_transaction(vault, plan)
+        result = execute_transaction(vault, plan)
     except GitTransactionError as exc:
         raise RegistryTransactionError(
             "registry deletion transaction failed"
         ) from exc
+    if isinstance(result, TransactionPreconditionRefused):
+        return _spent_action_from_refusal(result, prop.id)
     return prop

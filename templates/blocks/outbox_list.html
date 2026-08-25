@@ -26,6 +26,13 @@
   {% for row, error in rows %}
   {% if row.proposal %}
   {% include "blocks/outbox_card.html" %}
+  {% elif row.proposal_id %}
+  {% with proposal_id=row.proposal_id,
+          receipt=row.receipt,
+          receipt_error=error,
+          record_present=true %}
+  {% include "blocks/action_receipt_card.html" %}
+  {% endwith %}
   {% else %}
   <div class="proposal proposal-unreadable">
     <p class="muted">An item in this outbox could not be read as a proposal.</p>

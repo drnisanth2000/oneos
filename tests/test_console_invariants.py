@@ -252,13 +252,656 @@ def test_closed_family_every_subclass_has_exact_entry():
         assert cls in ALLOWLIST, f"{cls.__qualname__} is not allowlisted"
 
 
+def _reachable_call_names(sources: dict[str, str]) -> set[str]:
+    """Conservatively walk qualified calls from application entry points.
+
+    Function names are not process-global. A bare-name graph merged
+    ``live.helper`` and ``dead.helper`` into one node, so reaching the former
+    made exception constructors in the latter look executable. Keep modules,
+    imports and class methods in the node identity instead.
+    """
+
+    def module_name(relative: str) -> str:
+        parts = list(pathlib.PurePosixPath(relative).with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts.pop()
+        return ".".join(parts)
+
+    parsed = {
+        module_name(relative): ast.parse(source)
+        for relative, source in sources.items()
+    }
+    definitions: dict[str, set[str]] = {}
+    imports: dict[str, dict[str, str]] = {}
+    classes: set[str] = set()
+
+    for module, tree in parsed.items():
+        names: set[str] = set()
+        aliases: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.add(node.name)
+                if isinstance(node, ast.ClassDef):
+                    classes.add(f"{module}.{node.name}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    parent = module.split(".")[:-node.level]
+                    imported_module = ".".join(
+                        [*parent, *([node.module] if node.module else [])]
+                    )
+                else:
+                    imported_module = node.module or ""
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    aliases[local] = ".".join(
+                        part for part in (imported_module, alias.name) if part
+                    )
+        definitions[module] = names
+        imports[module] = aliases
+
+    def resolve(
+        module: str,
+        expression: ast.expr,
+        *,
+        class_name: str | None = None,
+        local_types: dict[str, str] | None = None,
+        local_symbols: dict[str, str] | None = None,
+    ) -> str | None:
+        if isinstance(expression, ast.Name):
+            if local_symbols is not None and expression.id in local_symbols:
+                return local_symbols[expression.id]
+            if local_types is not None and expression.id in local_types:
+                return local_types[expression.id]
+            if expression.id in imports[module]:
+                return imports[module][expression.id]
+            if expression.id in definitions[module]:
+                return f"{module}.{expression.id}"
+            return None
+        if not isinstance(expression, ast.Attribute):
+            return None
+        if (
+            isinstance(expression.value, ast.Name)
+            and expression.value.id in {"self", "cls"}
+            and class_name is not None
+        ):
+            qualified_class = (
+                class_name
+                if class_name.startswith(f"{module}.")
+                else f"{module}.{class_name}"
+            )
+            return f"{qualified_class}.{expression.attr}"
+        if isinstance(expression.value, ast.Call):
+            base = resolve(
+                module,
+                expression.value.func,
+                class_name=class_name,
+                local_types=local_types,
+                local_symbols=local_symbols,
+            )
+        else:
+            base = resolve(
+                module,
+                expression.value,
+                class_name=class_name,
+                local_types=local_types,
+                local_symbols=local_symbols,
+            )
+        return f"{base}.{expression.attr}" if base is not None else None
+
+    def local_types_in(
+        module: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        class_name: str | None = None,
+    ) -> dict[str, str]:
+        inferred: dict[str, str] = {}
+        arguments = (
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        )
+        for argument in arguments:
+            if argument.annotation is None:
+                continue
+            annotation = resolve(module, argument.annotation, class_name=class_name)
+            if annotation in classes:
+                inferred[argument.arg] = annotation
+        for assignment in ast.walk(node):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = assignment.value
+            if not isinstance(value, ast.Call):
+                continue
+            called = resolve(
+                module, value.func, class_name=class_name, local_types=inferred
+            )
+            inferred_type = None
+            if called in classes:
+                inferred_type = called
+            elif isinstance(value.func, ast.Attribute):
+                owner = resolve(
+                    module,
+                    value.func.value,
+                    class_name=class_name,
+                    local_types=inferred,
+                )
+                if owner in classes:
+                    inferred_type = owner
+            if inferred_type is None:
+                continue
+            targets = (
+                assignment.targets
+                if isinstance(assignment, ast.Assign)
+                else (assignment.target,)
+            )
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    inferred[target.id] = inferred_type
+        return inferred
+
+    functions: dict[str, set[str]] = {}
+
+    def calls_in(
+        module: str,
+        node: ast.AST,
+        *,
+        owner: str,
+        class_name: str | None = None,
+        local_types: dict[str, str] | None = None,
+    ) -> set[str]:
+        body = getattr(node, "body", ())
+        statements = body if isinstance(body, list) else (node,)
+        local_symbols: dict[str, str] = {}
+        lambda_nodes: dict[int, str] = {}
+        nested_classes: dict[int, str] = {}
+
+        class LocalSymbols(ast.NodeVisitor):
+            def visit_FunctionDef(self, nested: ast.FunctionDef) -> None:
+                local_symbols[nested.name] = (
+                    f"{owner}.<locals>.{nested.name}"
+                )
+                # A nested callable is its own graph node. Its body cannot
+                # contribute more symbols to the enclosing callable.
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, nested: ast.ClassDef) -> None:
+                qualified = f"{owner}.<locals>.{nested.name}"
+                local_symbols[nested.name] = qualified
+                nested_classes[id(nested)] = qualified
+                # Methods are separate graph nodes, just like nested
+                # functions. Do not merge their bodies into this scope.
+
+            def _record_lambda(
+                self, targets: tuple[ast.expr, ...], value: ast.expr | None
+            ) -> None:
+                if not isinstance(value, ast.Lambda):
+                    return
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        qualified = f"{owner}.<lambda@{value.lineno}>"
+                        local_symbols[target.id] = qualified
+                        lambda_nodes[id(value)] = qualified
+
+            def visit_Assign(self, assignment: ast.Assign) -> None:
+                self._record_lambda(tuple(assignment.targets), assignment.value)
+                self.generic_visit(assignment)
+
+            def visit_AnnAssign(self, assignment: ast.AnnAssign) -> None:
+                self._record_lambda((assignment.target,), assignment.value)
+                self.generic_visit(assignment)
+
+            def visit_Lambda(self, nested: ast.Lambda) -> None:
+                # The lambda's defaults execute here; its body does not.
+                for default in (
+                    *nested.args.defaults,
+                    *(value for value in nested.args.kw_defaults if value is not None),
+                ):
+                    self.visit(default)
+
+        symbol_visitor = LocalSymbols()
+        for statement in statements:
+            symbol_visitor.visit(statement)
+        effective_local_types = dict(local_types or {})
+
+        collected: set[str] = set()
+
+        def visit_definition_expressions(
+            visitor: ast.NodeVisitor,
+            definition: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+        ) -> None:
+            for default in (
+                *definition.args.defaults,
+                *(value for value in definition.args.kw_defaults if value is not None),
+            ):
+                visitor.visit(default)
+            if not isinstance(definition, ast.Lambda):
+                for decorator in definition.decorator_list:
+                    visitor.visit(decorator)
+
+        class Calls(ast.NodeVisitor):
+            def _record_assigned_type(
+                self, targets: tuple[ast.expr, ...], value: ast.expr | None
+            ) -> None:
+                if not isinstance(value, ast.Call):
+                    return
+                called = resolve(
+                    module,
+                    value.func,
+                    class_name=class_name,
+                    local_types=effective_local_types,
+                    local_symbols=local_symbols,
+                )
+                if called not in nested_classes.values() and called not in classes:
+                    return
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        effective_local_types[target.id] = called
+
+            def visit_Assign(self, assignment: ast.Assign) -> None:
+                self._record_assigned_type(
+                    tuple(assignment.targets), assignment.value
+                )
+                self.generic_visit(assignment)
+
+            def visit_AnnAssign(self, assignment: ast.AnnAssign) -> None:
+                self._record_assigned_type((assignment.target,), assignment.value)
+                self.generic_visit(assignment)
+
+            def visit_Call(self, call: ast.Call) -> None:
+                target = resolve(
+                    module,
+                    call.func,
+                    class_name=class_name,
+                    local_types=effective_local_types,
+                    local_symbols=local_symbols,
+                )
+                if target is not None:
+                    collected.add(target)
+                # watchdog calls ``on_created`` after a handler instance is
+                # passed to Observer.schedule. Model that known registration
+                # explicitly; constructing an arbitrary local class does not
+                # make all of its methods executable.
+                if (
+                    isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "schedule"
+                    and call.args
+                    and isinstance(call.args[0], ast.Call)
+                ):
+                    handler_class = resolve(
+                        module,
+                        call.args[0].func,
+                        class_name=class_name,
+                        local_types=effective_local_types,
+                        local_symbols=local_symbols,
+                    )
+                    callback = (
+                        f"{handler_class}.on_created"
+                        if handler_class is not None
+                        else None
+                    )
+                    if callback in functions:
+                        collected.add(callback)
+                self.generic_visit(call)
+
+            def visit_FunctionDef(self, nested: ast.FunctionDef) -> None:
+                visit_definition_expressions(self, nested)
+                qualified = local_symbols[nested.name]
+                functions[qualified] = calls_in(
+                    module,
+                    nested,
+                    owner=qualified,
+                    class_name=class_name,
+                    local_types=local_types_in(
+                        module, nested, class_name=class_name
+                    ),
+                )
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_ClassDef(self, nested: ast.ClassDef) -> None:
+                for expression in (
+                    *nested.decorator_list,
+                    *nested.bases,
+                    *(keyword.value for keyword in nested.keywords),
+                ):
+                    self.visit(expression)
+                qualified_class = nested_classes[id(nested)]
+                methods = {
+                    f"{qualified_class}.{member.name}"
+                    for member in nested.body
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and member.name in {"__init__", "__post_init__"}
+                }
+                functions[qualified_class] = methods
+                for member in nested.body:
+                    if not isinstance(
+                        member, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        continue
+                    qualified = f"{qualified_class}.{member.name}"
+                    functions[qualified] = calls_in(
+                        module,
+                        member,
+                        owner=qualified,
+                        class_name=qualified_class,
+                        local_types=local_types_in(
+                            module, member, class_name=qualified_class
+                        ),
+                    )
+
+            def visit_Lambda(self, nested: ast.Lambda) -> None:
+                visit_definition_expressions(self, nested)
+                qualified = lambda_nodes.get(id(nested))
+                if qualified is None:
+                    return
+                functions[qualified] = calls_in(
+                    module,
+                    nested.body,
+                    owner=qualified,
+                    class_name=class_name,
+                    local_types=local_types,
+                )
+
+        visitor = Calls()
+        for statement in statements:
+            visitor.visit(statement)
+        return collected
+
+    seeds: set[str] = set()
+    for module, tree in parsed.items():
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualified = f"{module}.{node.name}"
+                functions[qualified] = calls_in(
+                    module,
+                    node,
+                    owner=qualified,
+                    local_types=local_types_in(module, node),
+                )
+                if any(
+                    isinstance(decorator, ast.Call)
+                    and getattr(decorator.func, "attr", "")
+                    in {"get", "post", "exception_handler"}
+                    for decorator in node.decorator_list
+                ):
+                    seeds.add(qualified)
+            elif isinstance(node, ast.ClassDef):
+                initializers = {
+                    f"{module}.{node.name}.{member.name}"
+                    for member in node.body
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and member.name in {"__init__", "__post_init__"}
+                }
+                functions[f"{module}.{node.name}"] = initializers
+                for member in node.body:
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        qualified = f"{module}.{node.name}.{member.name}"
+                        functions[qualified] = calls_in(
+                            module,
+                            member,
+                            owner=qualified,
+                            class_name=node.name,
+                            local_types=local_types_in(
+                                module, member, class_name=node.name
+                            ),
+                        )
+            else:
+                seeds.update(calls_in(module, node, owner=module))
+
+    # The supported folder-ingest process entry point is not an HTTP route.
+    folder_watch = "app.ingest.adapters.folder.watch"
+    if folder_watch in functions:
+        seeds.add(folder_watch)
+
+    reachable = set(seeds)
+    while True:
+        discovered = {
+            called
+            for function in reachable
+            for called in functions.get(function, ())
+        } - reachable
+        if not discovered:
+            return reachable
+        reachable.update(discovered)
+
+
+def _executable_operator_outcomes() -> set[str]:
+    """Return codes whose exception constructors are entry-point reachable."""
+    from app.console_errors import _EXACT, _MRO
+
+    sources = {
+        path.relative_to(_REPO_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in (_REPO_ROOT / "app").rglob("*.py")
+        if path.name != "console_errors.py"
+    }
+    called_names = _reachable_call_names(sources)
+    produced = {
+        outcome.code
+        for exception_class, outcome in _EXACT.items()
+        if f"{exception_class.__module__}.{exception_class.__name__}" in called_names
+    }
+    produced.update(
+        outcome.code
+        for exception_class, outcome in _MRO.items()
+        if f"{exception_class.__module__}.{exception_class.__name__}" in called_names
+        or any(
+            f"{subtype.__module__}.{subtype.__name__}" in called_names
+            for subtype in _transitive_subclasses(exception_class)
+        )
+    )
+    return produced
+
+
+def _orphan_operator_outcomes() -> list[str]:
+    from app.console_errors import _CODES
+
+    # E-UNKNOWN is the deliberate global fallback. E-REQUEST is also
+    # framework-produced rather than constructed directly by application
+    # code. Every other row needs an executable application producer.
+    return sorted(
+        set(_CODES)
+        - _executable_operator_outcomes()
+        - {"E-UNKNOWN", "E-REQUEST"}
+    )
+
+
 def test_every_operator_outcome_has_an_executable_producer():
     """A live taxonomy row may not outlast every path that can produce it."""
-    from app.console_errors import _CODES, _EXACT, _MRO
-
-    produced = {outcome.code for outcome in (*_EXACT.values(), *_MRO.values())}
-    orphaned = sorted(set(_CODES) - produced - {"E-UNKNOWN"})
+    orphaned = _orphan_operator_outcomes()
     assert not orphaned, f"orphan operator outcome: {', '.join(orphaned)}"
+
+
+def test_a_dead_mapping_cannot_impersonate_an_executable_producer(monkeypatch):
+    import app.console_errors as errors
+    from app.git_transaction import PostCommitConsumptionError
+
+    class DeadOutcome(Exception):
+        pass
+
+    monkeypatch.delitem(errors._EXACT, PostCommitConsumptionError)
+    monkeypatch.setitem(
+        errors._EXACT, DeadOutcome, errors._CODES["E-APPLIED"]
+    )
+
+    assert "E-APPLIED" in _orphan_operator_outcomes()
+
+
+def test_action_receipt_card_has_no_review_or_mutation_transport():
+    source = (_REPO_ROOT / "templates/blocks/action_receipt_card.html").read_text(
+        encoding="utf-8"
+    )
+
+    for forbidden in (
+        "review_sha256",
+        "hx-post",
+        "hx-put",
+        "hx-delete",
+        "<button",
+        "Check again",
+        "reconfirm",
+    ):
+        assert forbidden not in source, (
+            f"receipt card regained action/review transport: {forbidden}"
+        )
+    assert "receipt-card-{{ proposal_id }}-{{ issue }}" in source
+    assert "receipt.review_sha256" not in source
+    assert "If the item still needs classifying" in source
+    assert "If the entry still needs deleting" in source
+
+
+def test_receipt_attention_fragments_remain_swappable_at_500():
+    source = (_REPO_ROOT / "templates/_head.html").read_text(encoding="utf-8")
+
+    assert '"code":"[45]..","swap":true,"error":true' in source
+
+
+def test_an_unreachable_constructor_cannot_impersonate_a_live_producer():
+    reachable = _reachable_call_names(
+        {
+            "app/synthetic.py": """
+class LiveOutcome(Exception):
+    pass
+
+class DeadOutcome(Exception):
+    pass
+
+def live_helper():
+    raise LiveOutcome()
+
+def dead_diagnosis():
+    raise DeadOutcome()
+
+@app.get('/synthetic')
+def route():
+    live_helper()
+"""
+        }
+    )
+
+    assert "app.synthetic.LiveOutcome" in reachable
+    assert "app.synthetic.DeadOutcome" not in reachable
+
+
+def test_same_named_helper_in_another_module_does_not_become_reachable():
+    reachable = _reachable_call_names(
+        {
+            "app/live.py": """
+class LiveOutcome(Exception):
+    pass
+
+def helper():
+    raise LiveOutcome()
+
+@app.get('/live')
+def route():
+    helper()
+""",
+            "app/dead.py": """
+class DeadOutcome(Exception):
+    pass
+
+def helper():
+    raise DeadOutcome()
+""",
+        }
+    )
+
+    assert "app.live.LiveOutcome" in reachable
+    assert "app.dead.DeadOutcome" not in reachable, (
+        "a reachable helper name leaked across module boundaries"
+    )
+
+
+def test_uncalled_nested_callable_bodies_do_not_produce_live_outcomes():
+    reachable = _reachable_call_names(
+        {
+            "app/nested.py": """
+class DefaultOutcome(Exception):
+    pass
+
+class DecoratorOutcome(Exception):
+    pass
+
+class NestedBodyOutcome(Exception):
+    pass
+
+class LambdaBodyOutcome(Exception):
+    pass
+
+class CalledNestedBodyOutcome(Exception):
+    pass
+
+class CalledLambdaBodyOutcome(Exception):
+    pass
+
+def decorate(value):
+    return lambda function: function
+
+@app.get('/nested')
+def route():
+    @decorate(DecoratorOutcome())
+    def never_called(value=DefaultOutcome()):
+        raise NestedBodyOutcome()
+
+    unused = lambda value=DefaultOutcome(): LambdaBodyOutcome()
+
+    def called():
+        raise CalledNestedBodyOutcome()
+
+    used = lambda: CalledLambdaBodyOutcome()
+    called()
+    used()
+    return None
+"""
+        }
+    )
+
+    assert "app.nested.DefaultOutcome" in reachable
+    assert "app.nested.DecoratorOutcome" in reachable
+    assert "app.nested.NestedBodyOutcome" not in reachable
+    assert "app.nested.LambdaBodyOutcome" not in reachable
+    assert "app.nested.CalledNestedBodyOutcome" in reachable
+    assert "app.nested.CalledLambdaBodyOutcome" in reachable
+
+
+def test_local_class_construction_reaches_only_called_methods_and_initializers():
+    reachable = _reachable_call_names(
+        {
+            "app/local_class.py": """
+class LiveOutcome(Exception):
+    pass
+
+class DeadOutcome(Exception):
+    pass
+
+@app.get('/local-class')
+def route():
+    class Ordinary:
+        def __init__(self):
+            return None
+
+        def called(self):
+            raise LiveOutcome()
+
+        def never_called(self):
+            raise DeadOutcome()
+
+    ordinary = Ordinary()
+    ordinary.called()
+"""
+        }
+    )
+
+    assert "app.local_class.LiveOutcome" in reachable
+    assert "app.local_class.DeadOutcome" not in reachable, (
+        "constructing a local class made every method look executable"
+    )
 
 
 def test_review_token_family_every_subclass_has_exact_entry():

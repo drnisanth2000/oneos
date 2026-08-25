@@ -990,13 +990,17 @@ occupies the id:
 - registry deletion: "A registry deletion has already completed for this
   proposal ID, so it cannot be used again."
 
-Every persistent spent card then says, verbatim: "A record with this ID is
-still present. OneOS will not act on it. Do not move or delete it by hand."
-That sentence cannot drift out of truth because this card renders only when a
-pending record exists; a fully consumed record is under `.consumed/` and does
-not project. OneOS cannot distinguish failed consumption from a later
-recreated id without reading the record, which this design forbids, so the
-single conservative instruction is the only honest one.
+When a real pending-record leaf is established without opening or parsing it,
+the spent card also says, verbatim: "A record with this ID is still present.
+OneOS will not act on it. Do not move or delete it by hand." Projection of a
+pending row establishes that fact by construction. Direct action and refresh
+responses may also render the card after the record was fully consumed; those
+responses omit the sentence when a no-follow metadata check cannot prove a
+real leaf is present. That optional presentation evidence never overrides the
+receipt in `HEAD` and never authorizes an action. OneOS cannot distinguish a
+failed consumption from a later recreated id without reading the record,
+which this design forbids, so whenever the sentence is shown the single
+conservative instruction is the only honest one.
 
 The affirmative path is conditional and read-only, reusing existing Console
 wording rather than implying that completed work must be repeated:

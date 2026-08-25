@@ -6,6 +6,7 @@ commits (exactly one commit, git-revertible); reject discards the proposal.
 
 Temp git vaults only; the real vault is never touched.
 """
+import ast
 import hashlib
 import inspect
 import os
@@ -27,6 +28,14 @@ from app.git_transaction import (
     GitTransactionFailure,
     ReviewedStateConflict,
     VaultBusyError,
+)
+from app.action_receipts import (
+    InvalidActionReceipt,
+    SpentAction,
+    make_action_receipt,
+    parse_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
 )
 from app.scope import CrossScopeError, Scope
 from app.destinations import DestinationError
@@ -1024,7 +1033,10 @@ def test_approval_with_unrelated_staged_unstaged_and_untracked_work_commits_only
 
     approve(scope, prop.id, _fp(scope, prop.id))
 
-    assert git_changed_paths(vault) == sorted([prop.src, prop.dst])
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert git_changed_paths(vault) == sorted(
+        [prop.src, prop.dst, receipt_path]
+    )
     assert subprocess.run(
         ["git", "rev-list", "--count", f"{head_before}..HEAD"],
         cwd=vault,
@@ -1226,7 +1238,10 @@ def test_classification_approval_still_creates_exactly_one_commit_and_one_revert
         capture_output=True,
         text=True,
     ).stdout.strip() == "1"
-    assert git_changed_paths(vault, approval_oid) == sorted([prop.src, prop.dst])
+    receipt_path = receipt_relative_path("synthetic", prop.id)
+    assert git_changed_paths(vault, approval_oid) == sorted(
+        [prop.src, prop.dst, receipt_path]
+    )
     assert unrelated.read_bytes() == unrelated_bytes
 
     subprocess.run(
@@ -1236,6 +1251,8 @@ def test_classification_approval_still_creates_exactly_one_commit_and_one_revert
     assert result.path.exists()
     assert triage_rel in git_tracked_paths(vault)
     assert not (vault / prop.dst).exists()
+    assert not (vault / receipt_path).exists()
+    assert not prop.path.exists()
     assert unrelated.read_bytes() == unrelated_bytes
 
 
@@ -1784,9 +1801,74 @@ def test_get_proposal_delegates_to_the_review_reader(tmp_path):
 
     assert outbox.get_proposal(scope, prop.id) == get_proposal_review(scope, prop.id).value
 
-    source = inspect.getsource(outbox.get_proposal)
-    assert "get_proposal_review" in source
-    assert "load_proposals" not in source.split("get_proposal_review")[-1]
+    tree = ast.parse(Path(outbox.__file__).read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_proposal"
+    )
+    calls = {
+        call.func.id
+        for call in ast.walk(function)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+    assert "get_proposal_review" in calls
+    assert "load_proposals" not in calls
+
+
+def test_pending_presence_never_uses_a_swapped_outbox_target(
+    tmp_path, monkeypatch
+):
+    scope, prop = _propose(_vault(tmp_path))
+    assert outbox.pending_proposal_entry_exists(scope, prop.id), (
+        "positive control: the real pending leaf was not observed"
+    )
+
+    lexical = tmp_path / "demo/outbox"
+    held = tmp_path / "demo/outbox-held"
+    outside = tmp_path / "outside-outbox"
+    outside.mkdir()
+    (outside / prop.path.name).write_bytes(b"outside-metadata-marker")
+    real_require = outbox._require_outbox_path
+    swapped = False
+
+    def swap_after_validation(*args, **kwargs):
+        nonlocal swapped
+        result = real_require(*args, **kwargs)
+        if not swapped:
+            lexical.rename(held)
+            lexical.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(outbox, "_require_outbox_path", swap_after_validation)
+
+    assert not outbox.pending_proposal_entry_exists(scope, prop.id), (
+        "an outside leaf supplied pending-record presentation evidence"
+    )
+    assert swapped, "the probe never swapped the validated outbox"
+
+
+def test_pending_presence_cleanup_failure_never_overrides_receipt_evidence(
+    tmp_path, monkeypatch
+):
+    scope, prop = _propose(_vault(tmp_path))
+    real_close = outbox.os.close
+    raised = False
+
+    def close_then_fail_once(descriptor):
+        nonlocal raised
+        real_close(descriptor)
+        if not raised:
+            raised = True
+            raise OSError("synthetic descriptor cleanup failure")
+
+    monkeypatch.setattr(outbox.os, "close", close_then_fail_once)
+
+    assert not outbox.pending_proposal_entry_exists(scope, prop.id), (
+        "optional presence cleanup overrode the conservative presentation result"
+    )
+    assert raised, "the cleanup-failure probe never fired"
 
 
 # --- S7 Task 2 review findings: the strict scan ------------------------------
@@ -2025,6 +2107,108 @@ def test_approve_still_moves_and_commits_when_the_review_matches(tmp_path):
     assert not (vault / prop.src).exists()
     assert (vault / prop.dst).exists()
     assert not prop.path.exists()
+
+
+def test_approve_commits_the_exact_review_receipt_with_the_action(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+
+    approved = approve(scope, prop.id, review.sha256)
+
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert git_changed_paths(vault) == sorted(
+        (approved.src, approved.dst, receipt_path)
+    )
+    receipt_bytes = git_bytes(vault, "show", f"HEAD:{receipt_path}")
+    receipt = parse_action_receipt(Path(receipt_path), receipt_bytes)
+    assert receipt.proposal_id == prop.id
+    assert receipt.review_sha256 == review.sha256
+    assert receipt.action_kind == "approval"
+
+
+@pytest.mark.parametrize("action", [approve, reject])
+def test_classification_action_refuses_a_receipt_committed_before_the_lock(
+    tmp_path, action
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    receipt = make_action_receipt(prop.id, "0" * 64, "approval")
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(render_action_receipt(receipt))
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant spent receipt")
+    head_before = git_head(vault)
+    stored.unlink()
+    malformed = b"not: [a proposal\n"
+    prop.path.write_bytes(malformed)
+
+    result = action(scope, prop.id, review.sha256)
+
+    assert result == SpentAction(receipt)
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == malformed
+    assert not _quarantined(vault)
+
+
+@pytest.mark.parametrize("action", [approve, reject])
+def test_classification_action_rechecks_receipts_under_its_lock(
+    tmp_path, monkeypatch, action
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    receipt = make_action_receipt(prop.id, review.sha256, "approval")
+    receipt_path = receipt_relative_path("demo", prop.id)
+    real_lookup = outbox._head_action_receipt
+    lookups = []
+
+    def plant_on_locked_lookup(scope_arg, proposal_id):
+        lookups.append(proposal_id)
+        if len(lookups) == 1:
+            return None
+        stored = vault / receipt_path
+        stored.parent.mkdir(mode=0o700)
+        stored.write_bytes(render_action_receipt(receipt))
+        git_bytes(vault, "add", receipt_path)
+        git_bytes(vault, "commit", "-q", "-m", "race in spent receipt")
+        return real_lookup(scope_arg, proposal_id)
+
+    monkeypatch.setattr(outbox, "_head_action_receipt", plant_on_locked_lookup)
+
+    result = action(scope, prop.id, review.sha256)
+
+    assert lookups == [prop.id, prop.id]
+    assert result == SpentAction(receipt)
+    assert prop.path.exists()
+    assert not _quarantined(vault)
+
+
+@pytest.mark.parametrize("action", [approve, reject])
+def test_classification_action_fails_closed_on_a_malformed_matching_receipt(
+    tmp_path, action
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    review = _review_of(scope, prop)
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant malformed receipt")
+    head_before = git_head(vault)
+
+    with pytest.raises(InvalidActionReceipt):
+        action(scope, prop.id, review.sha256)
+
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert not _quarantined(vault)
 
 
 def test_reject_still_discards_when_the_review_matches(tmp_path):
@@ -2367,7 +2551,7 @@ def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
     leftovers = sorted(
         entry.name
         for entry in prop.path.parent.iterdir()
-        if entry.name != _gt.QUARANTINE_DIRECTORY
+        if entry.name not in {_gt.QUARANTINE_DIRECTORY, ".receipts"}
     )
     # Empty now, not the record's own name: the record was consumed and
     # retained rather than renamed back.
@@ -2747,7 +2931,8 @@ def test_an_unmovable_record_is_a_refusal_not_an_unhandled_error(tmp_path, actio
     if action == "approve":
         assert after["head"] != before["head"]
         assert after["index"] == before["index"]
-        assert after["status"] == before["status"]
+        receipt_path = receipt_relative_path("demo", prop.id)
+        assert receipt_path in git_changed_paths(vault)
         assert after["worktree"] == before["worktree"]
         assert not (vault / prop.src).exists()
         assert (vault / prop.dst).exists()

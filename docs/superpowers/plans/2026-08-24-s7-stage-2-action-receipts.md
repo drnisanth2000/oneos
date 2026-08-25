@@ -551,13 +551,19 @@ The valid receipt card must contain:
 
 - approval: `An approval has already completed for this proposal ID, so it cannot be used again.`
 - registry deletion: `A registry deletion has already completed for this proposal ID, so it cannot be used again.`
-- exact persistent copy: `A record with this ID is still present. OneOS will not act on it. Do not move or delete it by hand.`
+- when no-follow metadata proves a real pending-record leaf is present, exact
+  persistent copy: `A record with this ID is still present. OneOS will not act
+  on it. Do not move or delete it by hand.` Direct spent responses after full
+  consumption omit this sentence; this presentation-only check never weakens
+  the receipt in `HEAD`.
 - approval conditional link: `If the item still needs classifying, start again from triage — that allocates a new proposal.`
 - delete conditional link: `If the entry still needs deleting, start a new deletion from the registry.`
 
 Assert no 64-hex run, `hx-post`, fingerprint field, button, reconfirmation, or `Check again`. Element id must be `receipt-card-<validated-id>-<server-issue>`; hostile raw filenames never reach it.
 
-Malformed matching receipts render the exact `E-RECEIPT` alert, the persistent record copy, no guessed link, no action, and do not disable a valid sibling id.
+Malformed matching receipts found while projecting a pending row render the
+exact `E-RECEIPT` alert, the persistent record copy, no guessed link, no
+action, and do not disable a valid sibling id.
 
 - [ ] **Step 3: Implement receipt-first outbox projection**
 

@@ -14,8 +14,10 @@ strict loader (`get_proposal`, `load_proposals`, `preview_diff`). Rows carry
 
 Temp git vaults only; the real vault is never touched.
 """
+import builtins
 import os
 import stat
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -23,6 +25,13 @@ import pytest
 import yaml
 
 import app.outbox as outbox
+from app.action_receipts import (
+    InvalidActionReceipt,
+    ReceiptStoreUnavailable,
+    make_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
+)
 from app.console_errors import describe
 from app.outbox import (
     approve,
@@ -136,6 +145,237 @@ def _delete_record(delete_id: str) -> str:
             "impact": {},
         }
     )
+
+
+def _commit_receipt(vault: Path, proposal_id: str, action_kind: str) -> None:
+    receipt = make_action_receipt(proposal_id, "a" * 64, action_kind)
+    relative = receipt_relative_path("demo", proposal_id)
+    stored = vault / relative
+    stored.parent.mkdir(mode=0o700, exist_ok=True)
+    stored.write_bytes(render_action_receipt(receipt))
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "fixture receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+
+def test_matching_receipt_projects_spent_without_opening_pending_record(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    _commit_receipt(vault, prop.id, "approval")
+    prop.path.write_bytes(b"not: [a proposal\n")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a spent proposal record was opened")
+
+    monkeypatch.setattr(outbox, "review_snapshot_for", forbidden)
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is False
+    assert len(listing.rows) == 1
+    row = listing.rows[0]
+    assert row.proposal is None
+    assert row.receipt is not None
+    assert row.receipt.proposal_id == prop.id
+    assert row.proposal_id == prop.id
+    assert not row.can_approve and not row.can_reject
+    assert row.review_sha256 is None
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["same", "different", "malformed", "redirected", "non-file", "recreated"],
+)
+def test_receipt_first_projection_never_opens_any_spent_leaf_shape(
+    tmp_path, monkeypatch, shape
+):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    spent = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+    unspent = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-b.md"),
+        module="11-library",
+        sub="reference",
+        claimed_block="govern",
+    )
+    _commit_receipt(vault, spent.id, "approval")
+
+    outside = vault / "outside-receipt-target.yaml"
+    outside.write_bytes(b"OUTSIDE-SPENT-MARKER\n")
+    if shape == "different":
+        spent.path.write_bytes(b"different but still bytes\n")
+    elif shape == "malformed":
+        spent.path.write_bytes(b"not: [a proposal\n")
+    elif shape == "redirected":
+        spent.path.unlink()
+        spent.path.symlink_to(outside)
+    elif shape == "non-file":
+        spent.path.unlink()
+        spent.path.mkdir()
+    elif shape == "recreated":
+        original = spent.path.read_bytes()
+        spent.path.unlink()
+        spent.path.write_bytes(original)
+
+    opened: list[tuple[int, int]] = []
+
+    def record(descriptor):
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            return
+        opened.append((info.st_dev, info.st_ino))
+
+    real_os_open = os.open
+    real_builtin_open = builtins.open
+
+    def spy_os_open(*args, **kwargs):
+        descriptor = real_os_open(*args, **kwargs)
+        record(descriptor)
+        return descriptor
+
+    def spy_builtin_open(*args, **kwargs):
+        handle = real_builtin_open(*args, **kwargs)
+        try:
+            record(handle.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return handle
+
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_builtin_open)
+
+    positive = unspent.path.stat()
+    forbidden = (outside if shape == "redirected" else spent.path).stat()
+    listing = project_outbox(scope)
+
+    assert (positive.st_dev, positive.st_ino) in opened, (
+        "positive control: the spy did not observe the unspent proposal read"
+    )
+    assert (forbidden.st_dev, forbidden.st_ino) not in opened, (
+        f"the {shape} spent leaf or its target was opened"
+    )
+    assert [row.receipt.proposal_id for row in listing.rows if row.receipt] == [
+        spent.id
+    ]
+    assert any(row.proposal and row.proposal.id == unspent.id for row in listing.rows)
+
+
+def test_registry_delete_receipt_is_not_projected_as_a_classification(tmp_path):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    _commit_receipt(vault, prop.id, "registry deletion")
+    prop.path.write_bytes(b"not: [a proposal\n")
+
+    listing = project_outbox(scope)
+
+    assert listing.rows == ()
+    assert listing.blocked is False
+
+
+def test_malformed_matching_receipt_is_one_linkless_row_without_proposal_read(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    relative = receipt_relative_path("demo", prop.id)
+    stored = vault / relative
+    stored.parent.mkdir(mode=0o700, exist_ok=True)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a malformed-receipt proposal record was opened")
+
+    monkeypatch.setattr(outbox, "review_snapshot_for", forbidden)
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is False
+    assert len(listing.rows) == 1
+    row = listing.rows[0]
+    assert row.proposal_id == prop.id
+    assert row.receipt is None
+    assert isinstance(row.error, InvalidActionReceipt)
+    assert not row.can_approve and not row.can_reject
+
+
+def test_receipt_store_failure_aborts_the_whole_entity_projection(
+    tmp_path, monkeypatch
+):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+
+    def unavailable(*args, **kwargs):
+        raise ReceiptStoreUnavailable("receipt authority unavailable")
+
+    monkeypatch.setattr(outbox, "resolve_head_receipts", unavailable)
+
+    with pytest.raises(ReceiptStoreUnavailable):
+        project_outbox(scope)
+
+
+def test_malformed_matching_receipt_does_not_disable_a_valid_sibling(tmp_path):
+    vault = _two_note_vault(tmp_path)
+    scope = Scope(vault, "demo")
+    bad = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-a.md"),
+        module="11-knowledge",
+        sub="kb",
+        claimed_block="govern",
+    )
+    good = propose_classification(
+        scope,
+        scope.resolve("00-inbox", "active", "note-b.md"),
+        module="11-library",
+        sub="reference",
+        claimed_block="govern",
+    )
+    relative = receipt_relative_path("demo", bad.id)
+    stored = vault / relative
+    stored.parent.mkdir(mode=0o700, exist_ok=True)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+    listing = project_outbox(scope)
+
+    assert listing.blocked is False
+    malformed = next(row for row in listing.rows if row.proposal_id == bad.id)
+    sibling = next(row for row in listing.rows if row.proposal and row.proposal.id == good.id)
+    assert isinstance(malformed.error, InvalidActionReceipt)
+    assert not malformed.can_approve and not malformed.can_reject
+    assert sibling.can_approve and sibling.can_reject
+    assert sibling.review_sha256 is not None
 
 
 # --- unblocked listing -------------------------------------------------------

@@ -23,6 +23,13 @@ from fastapi.templating import Jinja2Templates
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .action_receipts import (
+    ActionReceipt,
+    InvalidActionReceipt,
+    ReceiptStoreIntegrityError,
+    ReceiptStoreUnavailable,
+    SpentAction,
+)
 from .classifier import Classifier
 from .config import build_catalog, build_scope
 from .console_errors import ConsoleError, describe
@@ -40,17 +47,23 @@ from .outbox import (
     OutboxError,
     UnreadableProposalRecord,
     approve,
+    pending_proposal_entry_exists,
     preview_diff,
     project_outbox,
     propose_classification,
     reject,
 )
 from .proposal_identity import ProposalIdentityError, require_proposal_id
-from .review_tokens import ReviewedProposalChanged, ReviewTokenError
+from .review_tokens import (
+    ReviewedProposalChanged,
+    ReviewTokenError,
+    require_review_sha256,
+)
 from .registry import (
     MissingDeleteProposal,
     RegistryError,
     execute_delete,
+    get_delete_receipt_or_review,
     get_delete_review,
     products_for,
     propose_delete,
@@ -575,6 +588,7 @@ _OUTBOX_CATCHES = (
     OutboxError, CrossScopeError, DestinationRegistryError,
     SystemRegistryPathError,  # see _TRIAGE_CATCHES
     ReviewTokenError,
+    InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
 
 
@@ -608,6 +622,7 @@ def _outbox_list(
     scope: Scope,
     *,
     approval_error: ConsoleError | None = None,
+    approval_error_id: str | None = None,
 ) -> HTMLResponse:
     """Fragment renderer shared by approve and reject (design §8: both swap
     `#outbox-list` `outerHTML`, so the fragment reproduces that root).
@@ -622,6 +637,20 @@ def _outbox_list(
     fragment = is_fragment(request, endpoint)
     listing = project_outbox(scope)
     rows, blocked_notice = _outbox_rows(listing)
+    if approval_error is not None:
+        rows = [
+            (
+                row,
+                None
+                if (
+                    error is not None
+                    and error.code == approval_error.code
+                    and row.proposal_id == approval_error_id
+                )
+                else error,
+            )
+            for row, error in rows
+        ]
     if (
         blocked_notice is not None
         and approval_error is not None
@@ -752,9 +781,70 @@ def _review_row(scope: Scope, proposal_id: str):
     second opinion assembled elsewhere.
     """
     for row in project_outbox(scope).rows:
-        if row.proposal is not None and row.proposal.id == proposal_id:
+        if (
+            (row.proposal is not None and row.proposal.id == proposal_id)
+            or row.proposal_id == proposal_id
+        ):
             return row
     return None
+
+
+def _action_receipt_response(
+    request: Request,
+    scope: Scope,
+    proposal_id: str,
+    *,
+    receipt: ActionReceipt | None,
+    receipt_error: ConsoleError | None = None,
+    issue: str | None = None,
+    status_code: int | None = None,
+    retarget: str | None = None,
+    record_present: bool | None = None,
+) -> HTMLResponse:
+    """Render the shared non-actionable spent/malformed receipt card."""
+    canonical_id = require_proposal_id(proposal_id)
+    if record_present is None:
+        record_present = pending_proposal_entry_exists(scope, canonical_id)
+    fragment = is_fragment(request, _endpoint_for(request))
+    status = (
+        status_code
+        if status_code is not None
+        else (
+            status_for(receipt_error, fragment)
+            if receipt_error is not None
+            else 200
+        )
+    )
+    response = templates.TemplateResponse(
+        request,
+        "blocks/action_receipt_card.html",
+        {
+            "entity": scope.current_entity(),
+            "proposal_id": canonical_id,
+            "receipt": receipt,
+            "receipt_error": receipt_error,
+            "record_present": record_present,
+            "issue": issue or _new_issue(),
+        },
+        status_code=status,
+    )
+    if retarget is not None:
+        response.headers["HX-Retarget"] = retarget
+        response.headers["HX-Reswap"] = "outerHTML"
+    return response
+
+
+def _review_card_selector(
+    proposal_id: str, review_sha256: object, issue: object
+) -> str | None:
+    """Name a card the browser could actually hold, without reflecting junk."""
+    if not isinstance(issue, str) or _ISSUE.fullmatch(issue) is None:
+        return None
+    try:
+        digest = require_review_sha256(review_sha256)
+    except ReviewTokenError:
+        return None
+    return f"#review-card-{require_proposal_id(proposal_id)}-{digest}-{issue}"
 
 
 #: How each compared field is named to an operator, and how its value is
@@ -911,8 +1001,27 @@ def _outbox_review_changed(
     error: ConsoleError,
     reviewed: dict[str, str | None],
 ) -> HTMLResponse:
+    current_row = _review_row(scope, proposal_id)
+    if current_row is not None and current_row.proposal_id is not None:
+        if current_row.receipt is None:
+            if current_row.error is not None:
+                raise current_row.error
+            raise OutboxError("receipt-backed row has no receipt outcome")
+        return _action_receipt_response(
+            request,
+            scope,
+            current_row.proposal_id,
+            receipt=current_row.receipt,
+            receipt_error=error,
+            retarget=_review_card_selector(
+                current_row.proposal_id,
+                stale_review_sha256,
+                stale_issue,
+            ),
+        )
+
     def context():
-        row = _review_row(scope, proposal_id)
+        row = current_row
         if row is None:
             raise OutboxError("no pending proposal for this entity")
         return {
@@ -1086,6 +1195,16 @@ def outbox_review_fragment(
         return _review_unavailable_response(
             request, scope, proposal_id, describe(exc)
         )
+    if row is not None and row.proposal_id is not None:
+        return _action_receipt_response(
+            request,
+            scope,
+            row.proposal_id,
+            receipt=row.receipt,
+            receipt_error=(
+                describe(row.error) if row.error is not None else None
+            ),
+        )
     if row is None:
         # An id the projection does not hold names no *readable* proposal.
         # Which of those two words applies matters to the operator: if the
@@ -1159,7 +1278,7 @@ def _outbox_approve_response(
         # S7: the operator's own fingerprint, passed through untouched. The
         # route must never derive one — recomputing here would rebind the
         # action to whatever is on disk now, which is the defect S7 closes.
-        approve(scope, id, review_sha256)
+        result = approve(scope, id, review_sha256)
     except ReviewedProposalChanged as exc:
         # Not a list re-render: the operator keeps the version they reviewed
         # on screen and reconfirms against the current one beside it.
@@ -1179,8 +1298,23 @@ def _outbox_approve_response(
             )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
+    else:
+        if isinstance(result, SpentAction):
+            # The button targets the whole listing. Re-project from HEAD so
+            # the matching pending id becomes the shared spent card while
+            # every sibling remains present; never reinterpret the receipt
+            # as an ordinary successful approval.
+            try:
+                return _outbox_list(request, scope)
+            except _OUTBOX_CATCHES as exc:
+                return _outbox_list_error(request, scope, exc)
     try:
-        return _outbox_list(request, scope, approval_error=approval_error)
+        return _outbox_list(
+            request,
+            scope,
+            approval_error=approval_error,
+            approval_error_id=id,
+        )
     except _OUTBOX_CATCHES as exc:
         # I1: the re-render's own failure must not discard approve()'s own
         # refusal — both are carried into the fallback fragment.
@@ -1229,7 +1363,7 @@ def _outbox_reject_response(
     approval_error = None
     try:
         # S7: same contract as approve — passed through, never derived.
-        reject(scope, id, review_sha256)
+        result = reject(scope, id, review_sha256)
     except ReviewedProposalChanged as exc:
         # Not a list re-render: the operator keeps the version they reviewed
         # on screen and reconfirms against the current one beside it.
@@ -1249,8 +1383,19 @@ def _outbox_reject_response(
             )
     except _OUTBOX_CATCHES as exc:
         approval_error = describe(exc)
+    else:
+        if isinstance(result, SpentAction):
+            try:
+                return _outbox_list(request, scope)
+            except _OUTBOX_CATCHES as exc:
+                return _outbox_list_error(request, scope, exc)
     try:
-        return _outbox_list(request, scope, approval_error=approval_error)
+        return _outbox_list(
+            request,
+            scope,
+            approval_error=approval_error,
+            approval_error_id=id,
+        )
     except _OUTBOX_CATCHES as exc:
         # I1: same as approve — the re-render's own failure must not discard
         # reject()'s own refusal.
@@ -1287,6 +1432,7 @@ _REGISTRY_PRODUCTS_CATCHES = (
 _REGISTRY_DELETE_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError, UnreadableProposalRecord,
     ReviewTokenError,
+    InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
 
 
@@ -1334,9 +1480,17 @@ def registry_delete_preview(
         # and the fingerprint the button carries. A second live count taken
         # here would describe state the button is not bound to, so the
         # operator would review one thing and act on another.
-        review = get_delete_review(scope, written.id)
+        review_or_receipt = get_delete_receipt_or_review(scope, written.id)
     except _REGISTRY_DELETE_CATCHES as exc:
         return _render_console_error(request, describe(exc))
+    if isinstance(review_or_receipt, ActionReceipt):
+        return _action_receipt_response(
+            request,
+            scope,
+            review_or_receipt.proposal_id,
+            receipt=review_or_receipt,
+        )
+    review = review_or_receipt
     return templates.TemplateResponse(
         request, "blocks/delete_impact.html",
         # No submitted value reaches the fragment: the slug on screen is the
@@ -1357,12 +1511,27 @@ def _delete_review_changed(
     error: ConsoleError,
     reviewed: dict[str, str | None],
 ) -> HTMLResponse:
+    review_or_receipt = get_delete_receipt_or_review(scope, proposal_id)
+    if isinstance(review_or_receipt, ActionReceipt):
+        return _action_receipt_response(
+            request,
+            scope,
+            review_or_receipt.proposal_id,
+            receipt=review_or_receipt,
+            receipt_error=error,
+            retarget=_review_card_selector(
+                review_or_receipt.proposal_id,
+                stale_review_sha256,
+                stale_issue,
+            ),
+        )
+    current_review = review_or_receipt
+
     def context():
-        review = get_delete_review(scope, proposal_id)
         return {
-            "prop": review.value,
-            "review_sha256": review.sha256,
-            "impact_signature": _impact_signature(review.value.sources),
+            "prop": current_review.value,
+            "review_sha256": current_review.sha256,
+            "impact_signature": _impact_signature(current_review.value.sources),
         }
 
     def fields(ctx):
@@ -1411,12 +1580,28 @@ def registry_delete_review_fragment(
     page, so the operator keeps somewhere to check again from.
     """
     try:
-        review = get_delete_review(scope, proposal_id)
+        review_or_receipt = get_delete_receipt_or_review(scope, proposal_id)
+    except InvalidActionReceipt as exc:
+        return _action_receipt_response(
+            request,
+            scope,
+            require_proposal_id(proposal_id),
+            receipt=None,
+            receipt_error=describe(exc),
+        )
     except _REGISTRY_DELETE_CATCHES as exc:
         return _review_unavailable_response(
             request, scope, proposal_id, describe(exc), review_path="registry",
             record_missing=isinstance(exc, MissingDeleteProposal),
         )
+    if isinstance(review_or_receipt, ActionReceipt):
+        return _action_receipt_response(
+            request,
+            scope,
+            review_or_receipt.proposal_id,
+            receipt=review_or_receipt,
+        )
+    review = review_or_receipt
     return templates.TemplateResponse(
         request,
         "blocks/delete_impact.html",
@@ -1466,7 +1651,42 @@ def registry_delete_execute(
                 request, describe(render_exc), action_error=review_error
             )
     except _REGISTRY_DELETE_CATCHES as exc:
-        return _render_console_error(request, describe(exc))
+        action_error = describe(exc)
+        if action_error.code == "E-APPLIED":
+            try:
+                receipt_or_review = get_delete_receipt_or_review(scope, id)
+                if not isinstance(receipt_or_review, ActionReceipt):
+                    raise ReceiptStoreUnavailable(
+                        "committed action receipt could not be resolved"
+                    )
+            except _REGISTRY_DELETE_CATCHES as render_exc:
+                return _render_console_error(
+                    request, describe(render_exc), action_error=action_error
+                )
+            return _action_receipt_response(
+                request,
+                scope,
+                receipt_or_review.proposal_id,
+                receipt=receipt_or_review,
+                receipt_error=action_error,
+                status_code=action_error.page_status,
+                retarget=_review_card_selector(
+                    receipt_or_review.proposal_id,
+                    review_sha256,
+                    review_issue,
+                ),
+            )
+        return _render_console_error(request, action_error)
+    if isinstance(prop, SpentAction):
+        return _action_receipt_response(
+            request,
+            scope,
+            prop.receipt.proposal_id,
+            receipt=prop.receipt,
+            retarget=_review_card_selector(
+                prop.receipt.proposal_id, review_sha256, review_issue
+            ),
+        )
     return templates.TemplateResponse(
         request, "blocks/delete_success.html",
         {"kind": prop.kind, "slug": prop.slug},

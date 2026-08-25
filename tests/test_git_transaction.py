@@ -194,6 +194,89 @@ def test_a_postcommit_consumption_failure_preserves_commit_and_receipt(
     assert not (proposal.parent / ".consumed").exists()
 
 
+def test_transaction_reverifies_the_quarantine_entry_after_the_move_returns(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    real_quarantine = transaction.quarantine_path_if_unchanged
+    decoy = b"DECOY-AFTER-QUARANTINE-RETURN\n"
+    replaced = []
+
+    def quarantine_then_replace(vault_arg, relative_path, expected):
+        record = real_quarantine(vault_arg, relative_path, expected)
+        landed = vault / transaction.quarantine_destination(relative_path)
+        substitute = landed.with_name(landed.name + ".substitute")
+        substitute.write_bytes(decoy)
+        os.replace(substitute, landed)
+        replaced.append(record)
+        return record
+
+    monkeypatch.setattr(
+        transaction, "quarantine_path_if_unchanged", quarantine_then_replace
+    )
+
+    with pytest.raises(transaction.PostCommitConsumptionError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert replaced, "the quarantine entry was never replaced"
+    assert isinstance(
+        raised.value.consumption_error, transaction.QuarantineEntrySubstituted
+    )
+    assert raised.value.consumption_error.condition == "replaced"
+    assert git_head(vault) == raised.value.commit_oid
+    assert not proposal.exists()
+    landed = vault / transaction.quarantine_destination(
+        plan.owned_changes[0].path
+    )
+    assert landed.read_bytes() == decoy
+
+
+def test_transaction_rechecks_head_after_the_final_quarantine_verification(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    proposal = _write_proposal(vault)
+    plan = _approval_plan_with_receipt()
+    real_verify = transaction._require_quarantined_record_unchanged
+    newer_head = []
+
+    def verify_then_advance(vault_arg, record):
+        real_verify(vault_arg, record)
+        if newer_head:
+            return
+        transaction_head = git_head(vault)
+        tree = git_bytes(
+            vault, "rev-parse", f"{transaction_head}^{{tree}}"
+        ).decode("ascii").strip()
+        advanced = git_bytes(
+            vault,
+            "commit-tree",
+            tree,
+            "-p",
+            transaction_head,
+            "-m",
+            "concurrent head after quarantine verification",
+        ).decode("ascii").strip()
+        git_bytes(vault, "update-ref", "HEAD", advanced, transaction_head)
+        newer_head.append(advanced)
+
+    monkeypatch.setattr(
+        transaction,
+        "_require_quarantined_record_unchanged",
+        verify_then_advance,
+    )
+
+    with pytest.raises(transaction.PostCommitConsumptionError) as raised:
+        transaction.execute_transaction(vault, plan)
+
+    assert newer_head, "the final quarantine verifier never advanced HEAD"
+    assert git_head(vault) == newer_head[0]
+    assert raised.value.commit_oid != newer_head[0]
+    assert not proposal.exists()
+
+
 def test_standalone_consumption_returned_precondition_refuses_under_lock(tmp_path):
     from app.action_receipts import make_action_receipt
 

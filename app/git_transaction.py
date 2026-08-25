@@ -96,14 +96,15 @@ class AtomicMoveUnavailable(GitTransactionError):
 class QuarantineEntrySubstituted(GitTransactionError):
     """The quarantine location no longer holds the exact reviewed proposal.
 
-    S7 Amendment 2, generalised by Amendment 3. Covers all three ways that
+    S7 Amendment 2, generalised by Amendment 3. Covers every way that
     can be true, because the operator's position is identical in each:
 
     - `"replaced"` — the name resolves to a different inode;
     - `"absent"` — the name resolves to nothing; or
     - `"rewritten"` — the same inode, whose bytes changed in place. Identity
       alone cannot see this one, which is why the contents check survives
-      Amendment 3 even though its old remedy did not.
+      Amendment 3 even though its old remedy did not; or
+    - `"unavailable"` — OneOS cannot complete either check reliably.
 
     Detected after the move, so the move is *not* undone. Undoing it by name
     would relocate whatever now holds that name under the reviewed record's
@@ -476,6 +477,7 @@ def execute_transaction(
                 reason = precondition()
                 if reason is not None:
                     return TransactionPreconditionRefused(reason)
+            _require_receipt_creation_states(vault, plan)
             _require_reviewed_index_matches_head(
                 vault, start_head, plan.commit_paths
             )
@@ -664,6 +666,9 @@ def _execute_locked_body(
             )
         _require_final_states(vault, plan)
         _require_unrelated_state_unchanged(vault, unrelated, plan)
+        _require_head_matches(vault, result.commit_oid)
+        for _change, record in quarantined:
+            _require_quarantined_record_unchanged(vault, record)
         _require_head_matches(vault, result.commit_oid)
     except Exception as exc:
         applied = PostCommitConsumptionError(result, exc)
@@ -1190,8 +1195,31 @@ def _fingerprint_path(
         os.close(directory_descriptor)
 
 
-def _require_expected_states(vault: Path, plan: TransactionPlan) -> None:
+def _require_expected_states(
+    vault: Path,
+    plan: TransactionPlan,
+) -> None:
     for change in plan.changes + plan.owned_changes:
+        if change.create_parent:
+            continue
+        if _capture_change_state(vault, change) != change.before:
+            raise ReviewedStateChanged(
+                f"reviewed path does not match expected state: {change.path}"
+            )
+
+
+def _require_receipt_creation_states(vault: Path, plan: TransactionPlan) -> None:
+    """Check new receipt leaves only after HEAD-backed preconditions pass.
+
+    A committed receipt must win even when its working-tree copy was removed.
+    Checking a receipt creation path before the HEAD lookup would instead
+    turn that spent action into a generic working-tree conflict. Once the
+    lookup proves the id unspent, this second gate refuses any untracked or
+    raced working-tree object before mutation.
+    """
+    for change in plan.changes:
+        if not change.create_parent:
+            continue
         if _capture_change_state(vault, change) != change.before:
             raise ReviewedStateChanged(
                 f"reviewed path does not match expected state: {change.path}"
@@ -1398,6 +1426,67 @@ def quarantine_destination(relative_path: str) -> str:
     return (leaf.parent / QUARANTINE_DIRECTORY / leaf.name).as_posix()
 
 
+def _quarantine_substitution(
+    record: QuarantinedRecord, condition: str
+) -> QuarantineEntrySubstituted:
+    """Describe a failed held-record check without resolving another name."""
+    try:
+        link_count = os.fstat(record.descriptor).st_nlink
+    except OSError:
+        link_count = -1
+    return QuarantineEntrySubstituted(
+        record.relative_path, link_count, condition
+    )
+
+
+def _require_quarantined_record_unchanged(
+    vault: Path, record: QuarantinedRecord
+) -> None:
+    """Reverify the consumed name and held bytes at the final success gate.
+
+    The quarantine name supplies identity only. Contents are always read
+    through the descriptor opened before the move, so a replacement can
+    never become the object OneOS verifies. This is deliberately the last
+    post-commit check before success is returned.
+    """
+    try:
+        parent_descriptor, _leaf = _walk_to_parent(vault, record.relative_path)
+    except (OSError, GitTransactionError) as exc:
+        raise _quarantine_substitution(record, "unavailable") from exc
+    try:
+        try:
+            quarantine_descriptor = _open_checked_directory(
+                QUARANTINE_DIRECTORY,
+                "quarantine",
+                dir_fd=parent_descriptor,
+            )
+        except (OSError, GitTransactionError) as exc:
+            raise _quarantine_substitution(record, "unavailable") from exc
+        try:
+            try:
+                landed = os.lstat(record.name, dir_fd=quarantine_descriptor)
+                held_identity = os.fstat(record.descriptor)
+            except FileNotFoundError as exc:
+                raise _quarantine_substitution(record, "absent") from exc
+            except OSError as exc:
+                raise _quarantine_substitution(record, "unavailable") from exc
+            if (landed.st_dev, landed.st_ino) != (
+                held_identity.st_dev,
+                held_identity.st_ino,
+            ):
+                raise _quarantine_substitution(record, "replaced")
+            try:
+                held_state = _held_state(record.descriptor)
+            except (OSError, GitTransactionError) as exc:
+                raise _quarantine_substitution(record, "unavailable") from exc
+            if held_state != record.expected:
+                raise _quarantine_substitution(record, "rewritten")
+        finally:
+            os.close(quarantine_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
 def _open_quarantine(parent_descriptor: int) -> int:
     """Open the quarantine directory, creating it only when it is absent.
 
@@ -1477,10 +1566,10 @@ def _quarantine_reviewed_leaf(
     name while the real record was gone. The docstring claimed the
     guarantee the code did not implement.
 
-    The single name lookup that remains has the opposite job: confirming
+    The name lookup has the opposite job: confirming
     that the quarantined name resolves to the very inode held open. If it
-    does not, something other than the reviewed object is sitting there and
-    the move is undone.
+    does not, something other than the reviewed object is sitting there.
+    Nothing is moved back; the caller reports the conservative outcome.
 
     No step unlinks anything, so losing a race costs a refusal rather than
     a file.

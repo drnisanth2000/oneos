@@ -823,7 +823,7 @@ def _action_data(tmp_path, proposal_id, entity="alpha"):
 
 def _outbox_proposal_client(tmp_path, monkeypatch, *, proposal_id=None):
     """A vault with one active module and one valid, loadable outbox
-    proposal, in an initialised (but uncommitted) Git repository.
+    proposal, in a committed Git vault while the proposal stays untracked.
 
     Sufficient for every test that monkeypatches
     `app.outbox.execute_transaction` (or `main.approve`/`main.reject`
@@ -866,8 +866,454 @@ def _outbox_proposal_client(tmp_path, monkeypatch, *, proposal_id=None):
         encoding="utf-8",
     )
     if not (tmp_path / ".git").exists():
+        (tmp_path / ".gitignore").write_text(
+            "*/outbox/*.yaml\n", encoding="utf-8"
+        )
         subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "test"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "fixture"],
+            cwd=tmp_path,
+            check=True,
+        )
     return main, TestClient(main.app), proposal_id
+
+
+def _commit_head_receipt(vault: Path, proposal_id: str, action_kind: str) -> None:
+    from app.action_receipts import (
+        make_action_receipt,
+        receipt_relative_path,
+        render_action_receipt,
+    )
+
+    receipt = make_action_receipt(proposal_id, "a" * 64, action_kind)
+    relative = receipt_relative_path("alpha", proposal_id)
+    path = vault / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(render_action_receipt(receipt))
+    subprocess.run(["git", "add", "--", relative], cwd=vault, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "fixture receipt"],
+        cwd=vault,
+        check=True,
+    )
+
+
+def test_outbox_matching_receipt_renders_spent_card_without_record_contents(
+    tmp_path, monkeypatch
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    _commit_head_receipt(tmp_path, proposal_id, "approval")
+    proposal = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    marker = "hostile-unreviewed-record-marker"
+    proposal.write_text(marker, encoding="utf-8")
+
+    response = client.get("/outbox/alpha")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "An approval has already completed for this proposal ID" in body
+    assert "A record with this ID is still present" in body
+    assert "If the item still needs classifying" in body
+    assert 'href="/triage/alpha"' in body
+    assert marker not in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+    assert not re.search(r"[0-9a-f]{64}", body)
+    assert re.search(rf'id="receipt-card-{re.escape(proposal_id)}-[0-9a-f]{{12}}"', body)
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_spent_result_renders_receipt_backed_listing(
+    tmp_path, monkeypatch, action
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    _commit_head_receipt(tmp_path, proposal_id, "approval")
+
+    response = client.post(
+        f"/outbox/alpha/{action}",
+        data={"id": proposal_id, "review_sha256": _UNBOUND_FINGERPRINT},
+    )
+
+    assert response.status_code == 200
+    assert 'id="outbox-list"' in response.text
+    assert "An approval has already completed for this proposal ID" in response.text
+    assert "hx-post" not in response.text
+    assert "review_sha256" not in response.text
+
+
+def test_outbox_malformed_matching_receipt_renders_linkless_e_receipt_card(
+    tmp_path, monkeypatch
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    relative = f"alpha/outbox/.receipts/{proposal_id}.yaml"
+    path = tmp_path / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    body = client.get("/outbox/alpha").text
+
+    assert "E-RECEIPT" in body
+    assert "No automated recovery is available" in body
+    assert "A record with this ID is still present" in body
+    assert "If the item still needs classifying" not in body
+    assert "If the entry still needs deleting" not in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+def test_outbox_action_reports_a_malformed_matching_receipt_once(
+    tmp_path, monkeypatch, action
+):
+    _main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    relative = f"alpha/outbox/.receipts/{proposal_id}.yaml"
+    path = tmp_path / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    response = client.post(
+        f"/outbox/alpha/{action}",
+        data={"id": proposal_id, "review_sha256": _UNBOUND_FINGERPRINT},
+    )
+
+    assert response.status_code == 500
+    assert response.text.count("E-RECEIPT") == 1, (
+        "one malformed receipt condition rendered more than one alert"
+    )
+    assert "hx-post" not in response.text
+
+
+def test_one_action_error_does_not_hide_a_sibling_receipt_error(
+    tmp_path, monkeypatch
+):
+    _main, client, acted_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    sibling_id = "20260815T090704-" + "bb" * 16
+    sibling = tmp_path / "alpha/outbox" / f"{sibling_id}.yaml"
+    sibling.write_bytes(b"receipt-first means these bytes stay unread")
+
+    for proposal_id in (acted_id, sibling_id):
+        relative = f"alpha/outbox/.receipts/{proposal_id}.yaml"
+        path = tmp_path / relative
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+        subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "two malformed receipts"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    response = client.post(
+        "/outbox/alpha/approve",
+        data={"id": acted_id, "review_sha256": _UNBOUND_FINGERPRINT},
+    )
+
+    assert response.status_code == 500
+    assert response.text.count("E-RECEIPT") == 2, (
+        "deduplicating the acted-on alert hid a sibling receipt failure"
+    )
+    assert f"receipt-card-{acted_id}-" in response.text
+    assert f"receipt-card-{sibling_id}-" in response.text
+
+
+def test_delete_refresh_matching_receipt_renders_spent_card_without_record_parse(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(_main, client, tmp_path, slug)
+    _commit_head_receipt(tmp_path, values["id"], "registry deletion")
+    proposal = tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    marker = "hostile-unreviewed-delete-marker"
+    proposal.write_text(marker, encoding="utf-8")
+
+    response = client.get(
+        f"/registry/alpha/product/review/{values['id']}"
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "A registry deletion has already completed for this proposal ID" in body
+    assert "If the entry still needs deleting" in body
+    assert 'href="/registry/alpha/products"' in body
+    assert marker not in body
+    assert "hx-post" not in body
+    assert "review_sha256" not in body
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["same", "different", "malformed", "redirected", "non-file", "recreated"],
+)
+def test_delete_refresh_never_opens_any_spent_leaf_shape(
+    tmp_path, monkeypatch, shape
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(_main, client, tmp_path, slug)
+    proposal = tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    url = f"/registry/alpha/product/review/{values['id']}"
+    outside = tmp_path / "outside-delete-receipt-target.yaml"
+    outside.write_bytes(b"OUTSIDE-DELETE-SPENT-MARKER\n")
+
+    opened: list[tuple[int, int]] = []
+
+    def record(descriptor):
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            return
+        opened.append((info.st_dev, info.st_ino))
+
+    real_os_open = os.open
+    real_builtin_open = builtins.open
+
+    def spy_os_open(*args, **kwargs):
+        descriptor = real_os_open(*args, **kwargs)
+        record(descriptor)
+        return descriptor
+
+    def spy_builtin_open(*args, **kwargs):
+        handle = real_builtin_open(*args, **kwargs)
+        try:
+            record(handle.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return handle
+
+    monkeypatch.setattr(os, "open", spy_os_open)
+    monkeypatch.setattr(builtins, "open", spy_builtin_open)
+
+    healthy = proposal.stat()
+    client.get(url)
+    assert (healthy.st_dev, healthy.st_ino) in opened, (
+        "positive control: the spy did not observe the unspent delete proposal"
+    )
+
+    _commit_head_receipt(tmp_path, values["id"], "registry deletion")
+    if shape == "different":
+        proposal.write_bytes(b"different but still bytes\n")
+    elif shape == "malformed":
+        proposal.write_bytes(b"not: [a delete proposal\n")
+    elif shape == "redirected":
+        proposal.unlink()
+        proposal.symlink_to(outside)
+    elif shape == "non-file":
+        proposal.unlink()
+        proposal.mkdir()
+    elif shape == "recreated":
+        original = proposal.read_bytes()
+        proposal.unlink()
+        proposal.write_bytes(original)
+
+    forbidden = (outside if shape == "redirected" else proposal).stat()
+    opened.clear()
+    body = client.get(url).text
+
+    assert (forbidden.st_dev, forbidden.st_ino) not in opened, (
+        f"the {shape} spent delete leaf or its target was opened"
+    )
+    assert "A registry deletion has already completed for this proposal ID" in body
+    assert "OUTSIDE-DELETE-SPENT-MARKER" not in body
+
+
+def test_delete_refresh_malformed_receipt_renders_linkless_e_receipt_card(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    values = _delete_preview_values(_main, client, tmp_path, slug)
+    relative = f"alpha/outbox/.receipts/{values['id']}.yaml"
+    path = tmp_path / relative
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    subprocess.run(["git", "add", "--", relative], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "malformed receipt"],
+        cwd=tmp_path,
+        check=True,
+    )
+
+    response = client.get(
+        f"/registry/alpha/product/review/{values['id']}"
+    )
+
+    assert response.status_code == 500
+    assert "E-RECEIPT" in response.text
+    assert "No automated recovery is available" in response.text
+    assert "If the item still needs classifying" not in response.text
+    assert "If the entry still needs deleting" not in response.text
+    assert "hx-post" not in response.text
+
+
+def test_delete_execute_spent_result_renders_receipt_card_not_success_copy(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+    _commit_head_receipt(tmp_path, values["id"], "registry deletion")
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert response.status_code == 200
+    assert "A registry deletion has already completed for this proposal ID" in response.text
+    assert "Deleted" not in response.text
+    assert "hx-post" not in response.text
+    assert response.headers["HX-Retarget"] == (
+        f"#review-card-{values['id']}-{values['review_sha256']}-{issue}"
+    )
+    assert response.headers["HX-Reswap"] == "outerHTML"
+
+
+def test_delete_replay_does_not_claim_the_consumed_record_is_still_present(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+
+    first = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+    assert first.status_code == 200
+    assert not (
+        tmp_path / "alpha/outbox" / f"{values['id']}.yaml"
+    ).exists()
+
+    replay = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert replay.status_code == 200
+    assert "A registry deletion has already completed" in replay.text
+    assert "A record with this ID is still present" not in replay.text
+
+
+def test_delete_receipt_stays_authoritative_when_optional_presence_is_unsafe(
+    tmp_path, monkeypatch
+):
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+    first = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+    assert first.status_code == 200
+
+    outbox = tmp_path / "alpha/outbox"
+    held = tmp_path / "alpha/outbox-held"
+    outside = tmp_path / "outside-outbox"
+    outside.mkdir()
+    outbox.rename(held)
+    outbox.symlink_to(outside, target_is_directory=True)
+
+    replay = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert replay.status_code == 200
+    assert "A registry deletion has already completed" in replay.text
+    assert "A record with this ID is still present" not in replay.text
+    assert not any(outside.iterdir()), "optional presentation evidence wrote outside"
+
+
+def test_approve_post_commit_consumption_failure_shows_applied_and_spent_card(
+    tmp_path, monkeypatch
+):
+    import app.git_transaction as transaction
+
+    _main, client, proposal_id = _git_outbox_proposal_client(
+        tmp_path, monkeypatch
+    )
+
+    def fail_consumption(*args, **kwargs):
+        raise transaction.ReviewedPathUnavailable("injected consumption failure")
+
+    monkeypatch.setattr(transaction, "quarantine_path_if_unchanged", fail_consumption)
+
+    response = client.post(
+        "/outbox/alpha/approve", data=_action_data(tmp_path, proposal_id)
+    )
+
+    assert response.status_code == 500
+    assert "E-APPLIED" in response.text
+    assert "An approval has already completed for this proposal ID" in response.text
+    assert "hx-post" not in response.text
+    assert (tmp_path / "alpha/outbox" / f"{proposal_id}.yaml").exists()
+
+
+def test_delete_post_commit_consumption_failure_composes_applied_and_spent_card(
+    tmp_path, monkeypatch
+):
+    import app.git_transaction as transaction
+
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    preview = client.post(
+        "/registry/alpha/product/delete-preview", data={"slug": slug}
+    ).text
+    values = json.loads(_hx_vals(preview)[0])
+    issue = _card_issue(preview)
+    acted_on = f"review-card-{values['id']}-{values['review_sha256']}-{issue}"
+    assert acted_on in set(re.findall(r'id="([^"]+)"', preview))
+
+    def fail_consumption(*args, **kwargs):
+        raise transaction.ReviewedPathUnavailable("injected consumption failure")
+
+    monkeypatch.setattr(transaction, "quarantine_path_if_unchanged", fail_consumption)
+
+    response = client.post(
+        "/registry/alpha/product/delete-execute",
+        data={**values, "review_issue": issue},
+    )
+
+    assert response.status_code == 500
+    assert "E-APPLIED" in response.text
+    assert "A registry deletion has already completed for this proposal ID" in response.text
+    assert "hx-post" not in response.text
+    assert (tmp_path / "alpha/outbox" / f"{values['id']}.yaml").exists()
+    assert response.headers["HX-Retarget"] == f"#{acted_on}"
+    assert response.headers["HX-Reswap"] == "outerHTML"
+    assert re.search(
+        rf'id="receipt-card-{re.escape(values["id"])}-[0-9a-f]{{12}}"',
+        response.text,
+    )
 
 
 def _git_outbox_proposal_client(tmp_path, monkeypatch):
@@ -876,15 +1322,6 @@ def _git_outbox_proposal_client(tmp_path, monkeypatch):
     case must be a genuine post-commit cleanup failure, not a monkeypatched
     `execute_transaction`, which produces no commit at all)."""
     main, client, proposal_id = _outbox_proposal_client(tmp_path, monkeypatch)
-    (tmp_path / ".gitignore").write_text("*/outbox/*.yaml\n", encoding="utf-8")
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.invalid"],
-        cwd=tmp_path, check=True,
-    )
-    subprocess.run(["git", "config", "user.name", "test"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=tmp_path, check=True)
     return main, client, proposal_id
 
 
@@ -1097,7 +1534,11 @@ def test_approve_committed_cleanup_shows_e_committed(tmp_path, monkeypatch):
     new_head = git_head(vault)
     assert new_head != head_before
     assert git_changed_paths(vault, new_head) == sorted(
-        ["alpha/00-inbox/active/marker.md", "alpha/02-work/active/marker.md"]
+        [
+            "alpha/00-inbox/active/marker.md",
+            "alpha/02-work/active/marker.md",
+            f"alpha/outbox/.receipts/{proposal_id}.yaml",
+        ]
     )
     assert source.exists() is False
     assert destination.exists() is True
@@ -1927,7 +2368,9 @@ def _state_proof_proposal_written_registry_delete_preview(tmp_path, monkeypatch)
     # S7: the route's post-persist step is now the review read, not a live
     # reference count — the failure must be injected where it still reads, or
     # this cell proves nothing about "persisted, then failed".
-    monkeypatch.setattr(main, "get_delete_review", _fail_after_persisting)
+    monkeypatch.setattr(
+        main, "get_delete_receipt_or_review", _fail_after_persisting
+    )
 
     response = client.post(
         "/registry/alpha/product/delete-preview", data={"slug": slug}
@@ -2718,7 +3161,10 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
     assert git_count_commits(vault) == commits_before + 1
     new_head = git_head(vault)
     assert new_head != head_before
-    assert git_changed_paths(vault, new_head) == [reviewed_path]
+    receipt_path = f"alpha/outbox/.receipts/{proposal.id}.yaml"
+    assert git_changed_paths(vault, new_head) == sorted(
+        [reviewed_path, receipt_path]
+    )
 
     assert git_worktree_diff(vault) == worktree_before
     assert git_cached_diff(vault) == cached_before
@@ -2726,6 +3172,8 @@ def _state_proof_committed_registry_delete_execute(tmp_path, monkeypatch):
     index_after = _index_entries_by_path(git_index_entries(vault))
     index_before.pop(reviewed_path, None)
     index_after.pop(reviewed_path, None)
+    index_before.pop(receipt_path, None)
+    index_after.pop(receipt_path, None)
     assert index_after == index_before
 
     assert slug.encode("utf-8") not in registry_path.read_bytes()
@@ -5385,13 +5833,13 @@ def test_a_failed_delete_current_review_render_keeps_both_outcomes(
     monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
 
     calls = []
-    real_review = main.get_delete_review
-
     def fail_the_second_read(scope, proposal_id):
         calls.append(1)
         raise DestinationRegistryError("registries unreadable during re-render")
 
-    monkeypatch.setattr(main, "get_delete_review", fail_the_second_read)
+    monkeypatch.setattr(
+        main, "get_delete_receipt_or_review", fail_the_second_read
+    )
 
     response = client.post(
         "/registry/alpha/product/delete-execute", data=stale

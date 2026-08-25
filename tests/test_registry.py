@@ -21,6 +21,14 @@ from app.git_transaction import (
     ReviewedStateConflict,
     VaultBusyError,
 )
+from app.action_receipts import (
+    InvalidActionReceipt,
+    SpentAction,
+    make_action_receipt,
+    parse_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
+)
 from app.scope import CrossScopeError, Scope
 from app.registry import (
     RegistryError,
@@ -557,6 +565,156 @@ def test_execute_delete_removes_when_unreferenced(tmp_path):
     assert git_is_clean_apart_from_quarantine(vault)
 
 
+def test_execute_delete_commits_the_exact_review_receipt_with_the_action(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+
+    deleted = execute_delete(scope, prop.id, review.sha256)
+
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert git_changed_paths(vault) == sorted(
+        ("_system/products.yaml", receipt_path)
+    )
+    receipt_bytes = git_bytes(vault, "show", f"HEAD:{receipt_path}")
+    receipt = parse_action_receipt(Path(receipt_path), receipt_bytes)
+    assert deleted.id == prop.id
+    assert receipt.proposal_id == prop.id
+    assert receipt.review_sha256 == review.sha256
+    assert receipt.action_kind == "registry deletion"
+
+
+def test_execute_delete_refuses_a_receipt_committed_before_the_lock(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    receipt = make_action_receipt(prop.id, "0" * 64, "registry deletion")
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(render_action_receipt(receipt))
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant spent receipt")
+    head_before = git_head(vault)
+    stored.unlink()
+    malformed = b"not: [a delete proposal\n"
+    prop.path.write_bytes(malformed)
+
+    result = execute_delete(scope, prop.id, review.sha256)
+
+    assert result == SpentAction(receipt)
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert prop.path.read_bytes() == malformed
+    assert not list(vault.rglob(".consumed/*.yaml"))
+
+
+def test_execute_delete_rechecks_receipts_under_its_lock(tmp_path, monkeypatch):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    receipt = make_action_receipt(
+        prop.id, review.sha256, "registry deletion"
+    )
+    receipt_path = receipt_relative_path("demo", prop.id)
+    real_lookup = registry._head_action_receipt
+    lookups = []
+
+    def plant_on_locked_lookup(scope_arg, proposal_id):
+        lookups.append(proposal_id)
+        if len(lookups) == 1:
+            return None
+        stored = vault / receipt_path
+        stored.parent.mkdir(mode=0o700)
+        stored.write_bytes(render_action_receipt(receipt))
+        git_bytes(vault, "add", receipt_path)
+        git_bytes(vault, "commit", "-q", "-m", "race in spent receipt")
+        return real_lookup(scope_arg, proposal_id)
+
+    monkeypatch.setattr(registry, "_head_action_receipt", plant_on_locked_lookup)
+
+    result = execute_delete(scope, prop.id, review.sha256)
+
+    assert lookups == [prop.id, prop.id]
+    assert result == SpentAction(receipt)
+    assert prop.path.exists()
+    assert not list(vault.rglob(".consumed/*.yaml"))
+
+
+def test_execute_delete_fails_closed_on_a_malformed_matching_receipt(tmp_path):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    receipt_path = receipt_relative_path("demo", prop.id)
+    stored = vault / receipt_path
+    stored.parent.mkdir(mode=0o700)
+    stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
+    git_bytes(vault, "add", receipt_path)
+    git_bytes(vault, "commit", "-q", "-m", "plant malformed receipt")
+    head_before = git_head(vault)
+
+    with pytest.raises(InvalidActionReceipt):
+        execute_delete(scope, prop.id, review.sha256)
+
+    assert git_head(vault) == head_before
+    assert prop.path.exists()
+    assert not list(vault.rglob(".consumed/*.yaml"))
+
+
+def test_reverting_a_post_commit_consumption_failure_reenables_the_pending_delete(
+    tmp_path, monkeypatch
+):
+    vault = _products_vault(tmp_path, referenced=False)
+    scope = Scope(vault, "demo")
+    prop = propose_delete(scope, "product", "widgetx")
+    review = registry.get_delete_review(scope, prop.id)
+    real_quarantine = git_transaction.quarantine_path_if_unchanged
+
+    def fail_consumption(*args, **kwargs):
+        raise git_transaction.ReviewedPathUnavailable(
+            "injected post-commit consumption failure"
+        )
+
+    monkeypatch.setattr(
+        git_transaction, "quarantine_path_if_unchanged", fail_consumption
+    )
+
+    with pytest.raises(registry.RegistryTransactionError) as raised:
+        execute_delete(scope, prop.id, review.sha256)
+
+    assert isinstance(
+        raised.value.__cause__, git_transaction.PostCommitConsumptionError
+    )
+    action_oid = git_head(vault)
+    receipt_path = receipt_relative_path("demo", prop.id)
+    assert (vault / receipt_path).exists()
+    assert prop.path.exists()
+
+    subprocess.run(
+        ["git", "revert", "--no-edit", action_oid],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+    )
+    assert not (vault / receipt_path).exists()
+    assert prop.path.exists()
+    assert "widgetx:" in scope.system_path("products.yaml").read_text()
+
+    monkeypatch.setattr(
+        git_transaction,
+        "quarantine_path_if_unchanged",
+        real_quarantine,
+    )
+    result = execute_delete(scope, prop.id, review.sha256)
+
+    assert isinstance(result, registry.DeleteProposal)
+    assert not prop.path.exists()
+
+
 def test_delete_with_unrelated_staged_unstaged_and_untracked_work_commits_only_registry_file(
     tmp_path,
 ):
@@ -568,7 +726,10 @@ def test_delete_with_unrelated_staged_unstaged_and_untracked_work_commits_only_r
 
     execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
-    assert git_changed_paths(vault) == ["_system/products.yaml"]
+    receipt_path = receipt_relative_path("demo", proposal.id)
+    assert git_changed_paths(vault) == sorted(
+        ["_system/products.yaml", receipt_path]
+    )
     assert subprocess.run(
         ["git", "rev-list", "--count", f"{head_before}..HEAD"],
         cwd=vault,
@@ -679,7 +840,10 @@ def test_registry_delete_is_one_commit_and_one_revert_restores_every_registry_ke
         capture_output=True,
         text=True,
     ).stdout.strip() == "1"
-    assert git_changed_paths(vault, approval_oid) == ["_system/products.yaml"]
+    receipt_path = receipt_relative_path("alpha", proposal.id)
+    assert git_changed_paths(vault, approval_oid) == sorted(
+        ["_system/products.yaml", receipt_path]
+    )
     assert proposal.path.exists() is False
     subprocess.run(
         ["git", "revert", "--no-edit", approval_oid],
@@ -688,6 +852,8 @@ def test_registry_delete_is_one_commit_and_one_revert_restores_every_registry_ke
         capture_output=True,
     )
     assert registry_path.read_bytes() == registry_before
+    assert not (vault / receipt_path).exists()
+    assert not proposal.path.exists()
 
 
 def test_direct_registry_add_still_uses_existing_direct_flow(

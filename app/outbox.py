@@ -22,6 +22,15 @@ from pathlib import Path
 
 import yaml
 
+from .action_receipts import (
+    ActionReceipt,
+    SpentAction,
+    make_action_receipt,
+    receipt_relative_path,
+    render_action_receipt,
+    resolve_head_receipt,
+    resolve_head_receipts,
+)
 from .console_routing import structured_reader
 from .git_transaction import (
     GitTransactionError,
@@ -31,6 +40,8 @@ from .git_transaction import (
     ReviewedPathIntegrityError,
     ReviewedPathUnavailable,
     TransactionPlan,
+    TransactionPreconditionRefused,
+    _open_checked_directory,
     capture_path_state,
     execute_transaction,
     consume_reviewed_proposal,
@@ -40,6 +51,7 @@ from .destinations import DestinationError, resolve_classification_destination
 from .proposal_identity import (
     ProposalIdentityError,
     proposal_id_candidates,
+    require_proposal_id,
     require_proposal_identity,
 )
 from .review_tokens import (
@@ -104,6 +116,9 @@ class Proposal:
     status: str = "pending"
 
 
+ClassificationActionResult = Proposal | SpentAction
+
+
 @dataclass(frozen=True)
 class OutboxRow:
     """One outbox entry as the Console can safely present it. Rows carry
@@ -120,6 +135,15 @@ class OutboxRow:
     #: authorises nothing on its own (threat model, design §Threat model).
     #: `None` means no action is offered.
     review_sha256: str | None = None
+    #: The scan-validated proposal id, carried separately because a matching
+    #: receipt must short-circuit parsing the working-tree proposal entirely.
+    #: A malformed matching receipt likewise needs a safe per-id card without
+    #: opening the proposal record to reconstruct an id from its contents.
+    proposal_id: str | None = None
+    #: A valid committed receipt makes this id permanently non-actionable at
+    #: the current HEAD. It is presentation authority only; its digest is
+    #: deliberately never copied into ``review_sha256``.
+    receipt: ActionReceipt | None = None
 
     def __post_init__(self) -> None:
         # Controls and fingerprint are issued together or not at all. A
@@ -133,6 +157,10 @@ class OutboxRow:
             raise ValueError("an actionable row must carry its review fingerprint")
         if not actionable and self.review_sha256 is not None:
             raise ValueError("a row without controls must not carry a fingerprint")
+        if self.proposal is not None and self.receipt is not None:
+            raise ValueError("a row cannot present a proposal and receipt together")
+        if self.receipt is not None and self.proposal_id != self.receipt.proposal_id:
+            raise ValueError("a receipt row must carry its validated proposal id")
 
 
 @dataclass(frozen=True)
@@ -194,6 +222,52 @@ def _require_outbox_path(
     elif require_leaf:
         raise OutboxError("proposal leaf no longer exists")
     return candidate
+
+
+def pending_proposal_entry_exists(scope: Scope, proposal_id: str) -> bool:
+    """Report whether a real pending-record leaf is present, without reading it.
+
+    This is presentation evidence only.  A committed receipt remains the sole
+    authority for whether the id is spent; this check merely keeps the
+    receipt card's lingering-file sentence truthful.  ``lstat`` deliberately
+    does not follow a redirected leaf and no proposal bytes are parsed.
+    """
+    canonical_id = require_proposal_id(proposal_id)
+    descriptors: list[int] = []
+    present = False
+    try:
+        # Retain the established lexical checks, then bind every subsequent
+        # lookup to checked directory descriptors.  ``lstat(path)`` would
+        # protect only the final leaf: an outbox swapped for a symlink after
+        # validation could otherwise make an outside file prove "present".
+        _require_outbox_path(scope)
+        descriptor = _open_checked_directory(scope.root, "vault root")
+        descriptors.append(descriptor)
+        for part in (scope.current_entity(), "outbox"):
+            descriptor = _open_checked_directory(
+                part, "pending-record parent", dir_fd=descriptor
+            )
+            descriptors.append(descriptor)
+        state = os.lstat(
+            f"{canonical_id}.yaml", dir_fd=descriptors[-1]
+        )
+    except (OSError, CrossScopeError, ReviewedPathUnavailable, ReviewedPathIntegrityError):
+        # If presence cannot be proved, omit the sentence.  This read is not
+        # an authorization gate and must never weaken the HEAD receipt.
+        present = False
+    else:
+        present = stat.S_ISREG(state.st_mode)
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                # Cleanup belongs to optional presentation evidence too.  A
+                # close failure must not replace the receipt-backed outcome
+                # with an unrelated exception or make the lingering sentence
+                # claim evidence whose acquisition did not finish cleanly.
+                present = False
+    return present
 
 
 def _read_no_follow_bytes(root: Path, relative: str) -> bytes:
@@ -584,9 +658,56 @@ def project_outbox(scope: Scope) -> OutboxListing:
     if not outbox.exists():
         return OutboxListing(rows=(), blocked=False)
 
+    discovered_paths = sorted(outbox.glob("*.yaml"))
+    canonical_ids: dict[Path, str] = {}
+    for discovered in discovered_paths:
+        try:
+            canonical_ids[discovered] = require_proposal_id(discovered.stem)
+        except ProposalIdentityError:
+            # Preserve the existing unreadable-record handling for a leaf
+            # whose filename is not an id. It cannot have a matching receipt,
+            # and its unvalidated stem must never reach Git or the template.
+            continue
+    receipts = resolve_head_receipts(
+        scope.root, scope.current_entity(), canonical_ids.values()
+    )
+
     rows: list[OutboxRow] = []
     blocked = False
-    for discovered in sorted(outbox.glob("*.yaml")):
+    for discovered in discovered_paths:
+        canonical_id = canonical_ids.get(discovered)
+        if canonical_id is not None:
+            resolution = receipts[canonical_id]
+            if resolution.error is not None:
+                rows.append(
+                    OutboxRow(
+                        proposal=None,
+                        diff=None,
+                        error=resolution.error,
+                        can_approve=False,
+                        can_reject=False,
+                        proposal_id=canonical_id,
+                    )
+                )
+                continue
+            if resolution.receipt is not None:
+                # Registry deletion receipts belong on the registry surface,
+                # not in the classification listing. Both kinds still stop
+                # before any pending-record path check or byte read.
+                if resolution.receipt.action_kind == "registry deletion":
+                    continue
+                rows.append(
+                    OutboxRow(
+                        proposal=None,
+                        diff=None,
+                        error=None,
+                        can_approve=False,
+                        can_reject=False,
+                        proposal_id=canonical_id,
+                        receipt=resolution.receipt,
+                    )
+                )
+                continue
         path = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
             # S7: the shared constructor — the same snapshot the strict
@@ -652,6 +773,8 @@ def project_outbox(scope: Scope) -> OutboxListing:
                 # listing has refused to offer would describe a review that
                 # is not on offer.
                 review_sha256=None,
+                proposal_id=row.proposal_id,
+                receipt=row.receipt,
             )
             for row in rows
         ]
@@ -765,7 +888,7 @@ def _own_reviewed_proposal(
     scope: Scope,
     proposal_id: str,
     review_sha256: object,
-) -> tuple[str, PathState, Proposal]:
+) -> tuple[str, PathState, Proposal, str]:
     """Take ownership of the exact proposal state the operator reviewed.
 
     This is S7's boundary, and the order is normative (design §3):
@@ -784,14 +907,48 @@ def _own_reviewed_proposal(
     proposal_rel = _locate_proposal(scope, proposal_id)
 
     proposal_state = _capture_proposal_state(scope, proposal_rel)
-    require_review_match(proposal_state.contents, review_sha256)
+    review_digest = require_review_match(proposal_state.contents, review_sha256)
     record = _parse_record_bytes(proposal_state.contents)
     proposal = _require_destination(scope, _to_proposal(vault / proposal_rel, record))
-    return proposal_rel, proposal_state, proposal
+    return proposal_rel, proposal_state, proposal, review_digest
+
+
+def _head_action_receipt(
+    scope: Scope, proposal_id: str
+) -> ActionReceipt | None:
+    """Resolve one spent-id fact from committed history, never the worktree."""
+    try:
+        canonical_id = require_proposal_id(proposal_id)
+    except ProposalIdentityError as exc:
+        raise OutboxError("proposal id is not canonical") from exc
+    resolution = resolve_head_receipt(
+        scope.root, scope.current_entity(), canonical_id
+    )
+    if resolution.error is not None:
+        raise resolution.error
+    return resolution.receipt
+
+
+def _spent_action_before_review(
+    scope: Scope, proposal_id: str
+) -> SpentAction | None:
+    receipt = _head_action_receipt(scope, proposal_id)
+    return None if receipt is None else SpentAction(receipt)
+
+
+def _spent_action_from_refusal(
+    refusal: TransactionPreconditionRefused, proposal_id: str
+) -> SpentAction:
+    reason = refusal.reason
+    if not isinstance(reason, ActionReceipt) or reason.proposal_id != proposal_id:
+        raise RuntimeError("receipt precondition returned an invalid reason")
+    return SpentAction(reason)
 
 
 @structured_reader(category="proposal")
-def approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
+def approve(
+    scope: Scope, proposal_id: str, review_sha256: object
+) -> ClassificationActionResult:
     """Perform the proposed move and commit it — exactly one revertible commit.
     The proposal is transaction-owned but never enters the approval commit.
 
@@ -799,8 +956,11 @@ def approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
     required, is compared against the state the transaction will own, and
     has no default or id-only fallback.
     """
+    spent = _spent_action_before_review(scope, proposal_id)
+    if spent is not None:
+        return spent
     vault = scope.root
-    proposal_rel, proposal_state, prop = _own_reviewed_proposal(
+    proposal_rel, proposal_state, prop, review_digest = _own_reviewed_proposal(
         scope, proposal_id, review_sha256
     )
     _require_destination(scope, prop)
@@ -834,6 +994,12 @@ def approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
     # was parsed, and it is handed to the transaction unchanged. Replacing
     # it here with a fresh capture would mean approving bytes nobody
     # reviewed — the exact defect S7 closes.
+    receipt = make_action_receipt(prop.id, review_digest, "approval")
+    receipt_rel = receipt_relative_path(prop.entity, prop.id)
+
+    def _require_unspent_id() -> ActionReceipt | None:
+        return _head_action_receipt(scope, prop.id)
+
     plan = TransactionPlan(
         message=f"outbox: approve {prop.id} ({prop.src} → {prop.dst})",
         changes=(
@@ -843,22 +1009,33 @@ def approve(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
                 PathState.absent(),
                 PathState.regular(approved_bytes, source_state.mode),
             ),
+            PathChange(
+                receipt_rel,
+                PathState.absent(),
+                PathState.regular(render_action_receipt(receipt), 0o644),
+                create_parent=True,
+            ),
         ),
-        commit_paths=(prop.src, prop.dst),
+        commit_paths=(prop.src, prop.dst, receipt_rel),
         owned_changes=(
             PathChange(proposal_rel, proposal_state, PathState.absent()),
         ),
+        preconditions=(_require_unspent_id,),
     )
     try:
-        execute_transaction(vault, plan)
+        result = execute_transaction(vault, plan)
     except GitTransactionError as exc:
         raise OutboxTransactionError(
             "classification approval transaction failed"
         ) from exc
+    if isinstance(result, TransactionPreconditionRefused):
+        return _spent_action_from_refusal(result, prop.id)
     return prop
 
 
-def reject(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
+def reject(
+    scope: Scope, proposal_id: str, review_sha256: object
+) -> ClassificationActionResult:
     """Discard the proposal. No move, no commit — the proposal was never
     tracked.
 
@@ -868,12 +1045,24 @@ def reject(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
     the move is a refusal, never permission to consume whatever took its
     place — and refusing costs nothing, because no step deletes.
     """
-    proposal_rel, proposal_state, prop = _own_reviewed_proposal(
+    spent = _spent_action_before_review(scope, proposal_id)
+    if spent is not None:
+        return spent
+    proposal_rel, proposal_state, prop, _review_digest = _own_reviewed_proposal(
         scope, proposal_id, review_sha256
     )
     _require_outbox_path(scope, prop.path, require_leaf=True)
+
+    def _require_unspent_id() -> ActionReceipt | None:
+        return _head_action_receipt(scope, prop.id)
+
     try:
-        consume_reviewed_proposal(scope.root, proposal_rel, proposal_state)
+        result = consume_reviewed_proposal(
+            scope.root,
+            proposal_rel,
+            proposal_state,
+            preconditions=(_require_unspent_id,),
+        )
     except GitTransactionError as exc:
         # Reject takes the approval lock now, so lock outcomes are reachable
         # through it. Wrapped the way approve wraps its transaction, so the
@@ -882,4 +1071,6 @@ def reject(scope: Scope, proposal_id: str, review_sha256: object) -> Proposal:
         raise OutboxTransactionError(
             "proposal rejection could not complete"
         ) from exc
+    if isinstance(result, TransactionPreconditionRefused):
+        return _spent_action_from_refusal(result, prop.id)
     return prop
