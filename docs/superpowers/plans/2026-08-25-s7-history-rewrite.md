@@ -32,7 +32,7 @@ the least disruptive moment to rewrite.
 
 ## Scope
 
-Exactly one substitution, applied across the whole branch range:
+Two deterministic string substitutions, applied across the whole branch range:
 
 - the home-directory fixture path → `/vault-root/holder/secret.md`
 - its leading segment in the assertion → `"/vault-root/"`
@@ -77,6 +77,22 @@ The approved documents record when review happened — "Amendment 1 (APPROVED at
 historical facts. Rewriting them to the new SHAs would assert that approvals
 were given against commits that did not exist when they were given, so the
 originals stay as written and this table carries the correspondence.
+
+### Recovery bundle
+
+A bundle of the complete pre-rewrite history was written outside the
+repository before any history was touched. Its location is deliberately not
+recorded here; the evidence that identifies it is:
+
+```
+sha256                543856feb85710677c24a0cc760a1294d99722fd17703c05e36571bde044767b
+git bundle verify     22 refs; records a complete history; hash algorithm sha1
+```
+
+`refs/original/refs/heads/codex/s7-bound-review-tokens` still points at the
+pre-rewrite tip, giving a second, in-repository recovery path. It affects
+neither audit and Gitleaks remains clean with it present. **Do not remove it
+without separate authorization.**
 
 **A fresh clone will not resolve the original SHAs.** They currently resolve in
 the rewriting clone only because `filter-branch` left its backup ref at
