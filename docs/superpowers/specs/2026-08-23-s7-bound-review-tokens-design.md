@@ -1,12 +1,25 @@
 # S7 — Bound Review Tokens
 
-**Status:** COMPLETE — the approved design and all final gates are verified.
-Amendment 3 Stage 2 provides action receipts, quarantine-last,
+**Status:** AMENDMENT 5 PROPOSED — the previously approved design and gates
+remain recorded below, but S7 closure is paused until Amendment 5 is approved,
+implemented, and reverified. Amendment 3 Stage 2 provides action receipts, quarantine-last,
 `E-APPLIED`, `E-RECEIPT`, the offline receipt validator, and the
 orphan-outcome guard. `E-RETAINED`, `E-STRANDED`, and
 `diagnose_quarantined_record` are retired. Final evidence is recorded in the
 implementation plans and mutation ledger. Inherited items 2–4 remain separate
 pre-live-gate work and are not silently claimed complete here.
+
+**Amendment 5 (PROPOSED, pending written-artifact approval, 2026-08-25):**
+managed ancestor directories are stable for the duration of a reviewed action.
+Every supported OneOS, Hermes, parser, browser-extension, and external-agent
+writer must use OneOS interfaces and the shared action lock; none may rename an
+entity root, `outbox/`, or `.consumed/` while an action holds that lock. A local
+actor with filesystem authority that relocates one of those directories after
+OneOS's final identity check deliberately bypasses that coordination boundary
+and is outside S7's threat model. Detectable moves still fail closed as
+`E-TAMPER`; symlinks remain refused; recovery guidance never moves or deletes
+content automatically. Rationale and the exact operator behavior appear in
+“Managed-directory stability boundary” and “Moved-folder recovery guidance”.
 
 **Amendment 4 (product-owner decision, 2026-08-25):** Linux
 `renameat2(RENAME_NOREPLACE)` verification is **withdrawn as a completion
@@ -164,6 +177,30 @@ a proposal after it was displayed while preserving its id and filename. It
 also protects the smaller race between the action's first read and its first
 mutation: the state compared must be the same state conditionally removed or
 transaction-owned.
+
+### Managed-directory stability boundary *(Amendment 5)*
+
+S7 continues to protect proposal-leaf replacement, in-place rewriting, type
+changes, symlink substitution, and a managed-directory replacement detected
+while that directory is being opened and verified. Amendment 5 does not narrow
+those guarantees.
+
+It does state one filesystem limit explicitly. A directory descriptor binds an
+inode, not that inode's continuing ancestry beneath the vault root. Linux
+`renameat2` and macOS `renameatx_np` can act relative to that descriptor, but
+neither can atomically require that another local process has not renamed its
+directory outside the vault after the final name-and-identity check. Rechecking
+the name narrows the interval but cannot close it; checking after the move is
+too late to support a “never moved” claim.
+
+Therefore all supported writers cooperate with the action lock and never
+rename an entity root, `outbox/`, or `.consumed/` while an action is active.
+An authorized local process that deliberately violates this rule is bypassing
+OneOS in the same sense as the already excluded operator who deliberately
+bypasses the UI. S7 makes no claim that application code can contain that
+actor. This exclusion is limited to **ancestor-directory relocation after the
+final check**; it is not a general exclusion for concurrent proposal edits or
+directory substitutions that OneOS can detect before acting.
 
 The review fingerprint is not a password, capability, or proof of attention.
 It does not prove that the operator read the screen, and it does not protect a
@@ -1012,8 +1049,38 @@ proposal, curated content, registry, Git, or recovery state.
   explicit action and allocates a new id.
 - A damaged proposal remains preserved for diagnosis; S7 does not infer bytes
   from a browser copy.
-- A cross-scope proposal is never moved. OneOS may direct the operator to a
-  safely identified workspace, but must not disclose or guess a private path.
+- Within the supported managed-directory boundary, a proposal that resolves
+  cross-scope is never moved. OneOS may direct the operator to a safely
+  identified workspace, but must not disclose or guess a private path. S7 does
+  not claim containment against the deliberate post-check ancestor relocation
+  excluded by Amendment 5.
+
+#### Moved-folder recovery guidance *(Amendment 5)*
+
+When OneOS detects that a managed file or directory is missing, moved,
+replaced, or redirected, the affected entity remains visible but read-only.
+The response carries no review fingerprint and offers no approve, reject,
+registry-delete, bulk, or other mutation control. It uses the existing
+`E-TAMPER` surface and tells the operator to:
+
+1. stop OneOS and every connected writer;
+2. restore an internal managed file or directory to its canonical location;
+3. if the **whole vault** intentionally moved, update `ONEOS_VAULT`, restart
+   OneOS, and rerun the trusted local verification gates;
+4. never substitute a symlink for a managed directory; and
+5. not retry while the warning remains.
+
+OneOS does not search the disk for a guessed replacement, follow a newly known
+external location, create a symlink, move content back automatically, or delete
+anything. “Remove from OneOS” means configuration-only removal, but building a
+configuration-removal control would add workspace CRUD and is explicitly not
+part of this amendment; S7 provides guidance only.
+
+If a directory relocation is detected only after an action may have begun,
+OneOS reports the existing conservative committed/unknown outcome appropriate
+to that action and tells the operator not to retry until vault state is
+inspected. It never reports a definite rollback merely because the canonical
+name is missing.
 
 ### Receipt-backed spent state *(Amendment 3, Stage 2)*
 
@@ -1256,6 +1323,14 @@ S7 is complete only when all of the following are true:
     Linux limitation" above). macOS `renameatx_np(RENAME_EXCL)` has been
     exercised; the Linux path has not, and is documented as unverified rather
     than claimed.
+17. *(Amendment 5)* A detectable moved, replaced, missing, or redirected
+    managed path leaves the affected entity visible and read-only, with no
+    fingerprint or mutation control. `E-TAMPER` gives the approved restore or
+    whole-vault reconfiguration guidance, symlinks remain refused, and no
+    configuration-removal control or automatic recovery is added. The spec
+    makes no containment claim against deliberate ancestor-directory
+    relocation after the final check by an actor that bypasses the required
+    action-lock coordination boundary.
 
 Only after these criteria pass may S7 be called complete. S7 does not itself
 authorize live gate trials until the separately sequenced inherited items 2–4
