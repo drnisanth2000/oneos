@@ -19,6 +19,7 @@ from app.review_tokens import (
     ReviewSnapshot,
     ReviewTokenError,
     make_review_snapshot,
+    require_review_sha256,
     require_review_match,
 )
 
@@ -84,6 +85,19 @@ def test_the_digest_is_lowercase_sha256_hex():
 
 
 # --- the submitted fingerprint ----------------------------------------------
+
+
+@pytest.mark.parametrize("token", [None, "", "0" * 63, "G" * 64, "g" * 64, 123])
+def test_review_sha256_shape_is_strict_without_comparing_contents(token):
+    """Removing strict stored-digest validation must make this fail."""
+    with pytest.raises(InvalidReviewToken):
+        require_review_sha256(token)
+
+
+def test_review_sha256_shape_returns_the_canonical_digest():
+    """Returning a normalized or replacement digest must make this fail."""
+    digest = "a" * 64
+    assert require_review_sha256(digest) == digest
 
 
 @pytest.mark.parametrize("token", [None, "", "0" * 63, "G" * 64, "g" * 64, 123])

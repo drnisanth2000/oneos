@@ -105,6 +105,13 @@ def make_review_snapshot(value: T, contents: bytes) -> ReviewSnapshot[T]:
     return ReviewSnapshot(value, raw, hashlib.sha256(raw).hexdigest())
 
 
+def require_review_sha256(value: object) -> str:
+    """Return `value` only when it is canonical lowercase SHA-256 hex."""
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise InvalidReviewToken("invalid review fingerprint")
+    return value
+
+
 def require_review_match(contents: bytes, submitted: object) -> str:
     """Return `submitted` only if it is the digest of exactly `contents`.
 
@@ -114,8 +121,7 @@ def require_review_match(contents: bytes, submitted: object) -> str:
     bytes, paths, or the digests themselves.
     """
     raw = _require_bytes(contents)  # the caller's own contract, checked first
-    if not isinstance(submitted, str) or _SHA256.fullmatch(submitted) is None:
-        raise InvalidReviewToken("invalid review fingerprint")
-    if hashlib.sha256(raw).hexdigest() != submitted:
+    token = require_review_sha256(submitted)
+    if hashlib.sha256(raw).hexdigest() != token:
         raise ReviewedProposalChanged("proposal changed since review")
-    return submitted
+    return token
