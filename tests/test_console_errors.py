@@ -49,10 +49,40 @@ def _committed_error():
     )
 
 
+def _post_commit_consumption_error():
+    from app.git_transaction import PostCommitConsumptionError, TransactionResult
+
+    return PostCommitConsumptionError(
+        TransactionResult("a" * 64, ("probe/path.md",)), OSError("probe")
+    )
+
+
 # One test per row of the design's normative class map.
 
 def test_map_GitTransactionCommittedError():
     assert _code_of(_committed_error()) == "E-COMMITTED"
+
+
+def test_map_PostCommitConsumptionError():
+    assert _code_of(_post_commit_consumption_error()) == "E-APPLIED"
+
+
+def test_e_applied_contract_is_exact_and_committed():
+    from app.console_errors import describe
+
+    outcome = describe(_post_commit_consumption_error())
+    assert outcome == ConsoleError(
+        "E-APPLIED",
+        "committed",
+        "attention",
+        "The action completed, but OneOS could not verify that its proposal "
+        "was safely consumed. Its receipt prevents this proposal ID from "
+        "being used again. Do not retry or move files by hand. Inspect vault "
+        "state with git status.",
+        "stop",
+        "yes",
+        500,
+    )
 
 
 def test_map_GitTransactionRecoveryError():

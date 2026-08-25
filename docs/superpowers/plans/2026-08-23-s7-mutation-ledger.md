@@ -339,18 +339,22 @@ expected states — the registry file and the proposal record — untouched, so
 they still match and the deletion proceeds, orphaning it. Acceptance
 criterion 5 is about the instant before mutation.
 
-### M13 — a stranded record collapses into a generic recovery outcome
+### M13 — RETIRED (historical): stranded record collapses into recovery
 
 - **file** `app/git_transaction.py`
 - **selection** `tests/test_outbox.py`
 - **result** RED — `test_a_rollback_that_cannot_restore_the_record_reports_it_as_stranded`
+
+Not in the campaign after S7 Stage 2. Quarantine now happens only after the
+commit succeeds, so rollback cannot own a quarantined proposal and cannot
+produce the stranded state this row guarded.
 
 ```diff
 -        if stranded_records:
 +        if False:  # MUTANT M13
 ```
 
-### M14 — a simultaneous cleanup failure overwrites the stranded outcome
+### M14 — RETIRED (historical): cleanup overwrites stranded outcome
 
 - **file** `app/git_transaction.py`
 - **selection** `tests/test_outbox.py`
@@ -365,6 +369,9 @@ A leftover temporary index is a diagnostic detail; a consumed record
 stranded in quarantine is an indeterminate state. Reporting the first and
 discarding the second says "nothing was changed" while a record sits in
 `.consumed/`.
+
+Not in the campaign after S7 Stage 2, for the same reachability reason as
+M13: the transaction cannot strand a proposal during rollback.
 
 ---
 
@@ -441,7 +448,7 @@ not distinguish the reviewed record surviving from a substitute standing in
 its place, which is the only question the scenario asks. The replacement
 names every inode and asserts which object is where.
 
-### M18 — rollback diagnosis ignores identity
+### M18 — RETIRED (historical): rollback diagnosis ignores identity
 
 - **file** `app/git_transaction.py`
 - **selection** `tests/test_outbox.py tests/test_registry.py`
@@ -463,7 +470,11 @@ retained and claims `committed=no` — a claim resting on the reviewed bytes
 being verifiably in quarantine, which they are not. Both nodes are required,
 because the row asserts the guarantee for approve *and* registry delete.
 
-### M19 — a rollback failure stops outranking the retained record
+Not in the campaign after S7 Stage 2. The diagnosis function and both
+transactional rollback seams were removed when quarantine became the final
+post-commit mutation.
+
+### M19 — RETIRED (historical): rollback failure outranks retained record
 
 - **file** `app/git_transaction.py`
 - **selection** `tests/test_outbox.py`
@@ -478,6 +489,17 @@ because the row asserts the guarantee for approve *and* registry delete.
 `E-RETAINED`'s third precondition is that every other change rolled back.
 When one did not, `committed=no` is unavailable and the indeterminate outcome
 must take over, with the retained record composed onto it rather than dropped.
+
+Not in the campaign after S7 Stage 2. `E-RETAINED` and its only producer were
+removed with the rollback diagnosis path.
+
+Retirement was measured before deletion, not inferred from the call graph.
+Replacing the `QuarantinedRecordRetained` producer, then independently the
+`QuarantineRestorationBlocked` producer, left the complete action-level
+transaction selection green both times: `108 passed, 7 deselected`. The seven
+deselected nodes called the historical diagnosis function directly. This
+deliberate ALIVE result is why M13, M14, M18, and M19 are historical evidence
+rather than live campaign rows.
 
 ### M20 — transaction-owned descriptors are never released
 

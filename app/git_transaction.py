@@ -61,6 +61,24 @@ class GitTransactionCommittedError(GitTransactionError):
         super().__init__("approval transaction committed but cleanup failed")
 
 
+class PostCommitConsumptionError(GitTransactionError):
+    """The action committed, but its proposal was not verifiably consumed.
+
+    `applied` in the operator taxonomy means committed here. It is distinct
+    from the pre-commit `applied_changes` vocabulary used later in this file.
+    The durable result is retained so callers can never roll the action back
+    or report that nothing changed merely because quarantine failed.
+    """
+
+    def __init__(
+        self, result: TransactionResult, cause: BaseException
+    ) -> None:
+        self.result = result
+        self.commit_oid = result.commit_oid
+        self.consumption_error = cause
+        super().__init__("action committed but proposal consumption failed")
+
+
 class _ApprovalLockCleanupFailure(GitTransactionFailure):
     def __init__(self, cleanup_error: OSError) -> None:
         self.cleanup_error = cleanup_error
@@ -106,42 +124,6 @@ class QuarantineEntrySubstituted(GitTransactionError):
         super().__init__(
             f"quarantined record is not the reviewed proposal ({condition})"
         )
-
-
-class QuarantinedRecordRetained(GitTransactionError):
-    """The action did not complete; the record is retained in quarantine.
-
-    S7 Amendment 3, stage 1. Rollback no longer renames a quarantined
-    record back — there is no rename bound to an inode, so collecting by
-    name can move something other than the record. The record therefore
-    stays where it is and this says so.
-
-    `committed=no` is a claim with preconditions (design §3): the
-    quarantine location must hold the exact reviewed bytes, verified
-    through the descriptor still open on the record; the original name
-    must be observed empty; and every other change must have rolled back.
-    The caller checks the first two before raising this and must not raise
-    it when the third fails — an accompanying rollback failure makes the
-    state indeterminate, and only this outcome is outranked by it.
-    """
-
-    def __init__(self, path: str, quarantined_name: str) -> None:
-        self.path = path
-        self.quarantined_name = quarantined_name
-        super().__init__("reviewed record is retained in quarantine")
-
-
-class QuarantineRestorationBlocked(GitTransactionError):
-    """A consumed record could not be returned to its own name.
-
-    Both files survive — the record in quarantine and whatever took its
-    name — and neither is deleted to tidy up. The state is indeterminate and
-    must be reported as such, never as "nothing was changed".
-    """
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-        super().__init__("reviewed record could not be restored to its name")
 
 
 class QuarantineCleanupError(GitTransactionFailure):
@@ -200,6 +182,20 @@ class PathChange:
     path: str
     before: PathState
     after: PathState
+    create_parent: bool = False
+
+
+@dataclass(frozen=True)
+class TransactionPreconditionRefused:
+    reason: object
+
+
+Precondition = Callable[[], object | None]
+
+
+_RECEIPT_CREATION_PATH = re.compile(
+    r"[^/]+/outbox/\.receipts/[^/]+\.yaml\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -214,7 +210,7 @@ class TransactionPlan:
     #: evaluated before the lock: another approval can commit between the
     #: check and the lock, and the transaction's own expected states would
     #: still match. Each callable raises to refuse; none may mutate.
-    preconditions: tuple[Callable[[], None], ...] = ()
+    preconditions: tuple[Precondition, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.message, str) or not self.message or "\n" in self.message:
@@ -238,6 +234,17 @@ class TransactionPlan:
             raise ValueError("commit paths must be duplicate-free")
         if set(self.commit_paths) != {change.path for change in self.changes}:
             raise ValueError("commit paths must equal reviewed change paths")
+        for change in self.changes + self.owned_changes:
+            if not change.create_parent:
+                continue
+            if (
+                change.before.contents is not None
+                or change.after.contents is None
+                or _RECEIPT_CREATION_PATH.fullmatch(change.path) is None
+            ):
+                raise ValueError(
+                    "only an absent action receipt may create its parent"
+                )
 
 
 @dataclass(frozen=True)
@@ -450,7 +457,9 @@ def _approval_lock(vault: Path) -> Iterator[None]:
                 raise _ApprovalLockCleanupFailure(cleanup_error) from cleanup_error
 
 
-def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult:
+def execute_transaction(
+    vault: Path, plan: TransactionPlan
+) -> TransactionResult | TransactionPreconditionRefused:
     """Commit exactly the reviewed paths while preserving unrelated Git state."""
     vault = Path(vault).resolve()
     result: TransactionResult | None = None
@@ -464,7 +473,9 @@ def execute_transaction(vault: Path, plan: TransactionPlan) -> TransactionResult
             # Under the lock, before anything is applied: the last moment at
             # which a refusal still costs nothing.
             for precondition in plan.preconditions:
-                precondition()
+                reason = precondition()
+                if reason is not None:
+                    return TransactionPreconditionRefused(reason)
             _require_reviewed_index_matches_head(
                 vault, start_head, plan.commit_paths
             )
@@ -541,19 +552,6 @@ def _execute_locked_body(
                     (change, state)
                 ),
             )
-        # Amendment 1: owned changes are proposal records, and a proposal
-        # record is consumed by moving it into quarantine — never unlinked.
-        # Amendment 3, stage 1: a rollback does *not* move it back. There is
-        # no rename bound to an inode, so collecting it by name could move
-        # whatever holds that name; rollback diagnoses instead, and the
-        # record stays where it is.
-        for change in plan.owned_changes:
-            quarantined.append(
-                (
-                    change,
-                    quarantine_path_if_unchanged(vault, change.path, change.before),
-                )
-            )
         _checkpoint("filesystem-applied")
 
         descriptor, temporary_index = tempfile.mkstemp(prefix="oneos-index-")
@@ -603,70 +601,27 @@ def _execute_locked_body(
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
         _checkpoint("real-index-synchronized")
         _require_unrelated_state_unchanged(vault, unrelated, plan)
-        _require_final_states(vault, plan)
+        _require_committed_states(vault, plan)
         _require_head_matches(vault, commit_oid)
         result = TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
     except Exception as exc:
         transaction_cause = exc
-        rolled_back_paths, stranded_records = _rollback_transaction(
-                vault,
-                start_head,
-                commit_oid,
-                commit_created,
-                commit_output,
-                reviewed_index,
-                transaction_index,
-                unrelated,
-                plan,
-                applied_changes,
-                quarantined,
+        rolled_back_paths = _rollback_transaction(
+            vault,
+            start_head,
+            commit_oid,
+            commit_created,
+            commit_output,
+            reviewed_index,
+            transaction_index,
+            unrelated,
+            plan,
+            applied_changes,
         )
         blocked_paths = set(rolled_back_paths)
         if isinstance(exc, _ReviewedIndexOwnershipConflict):
             blocked_paths.update(exc.paths)
-        if stranded_records:
-            # What became of the record is more specific than "rollback was
-            # blocked", and is the only fact that says where the record is.
-            # It outranks the generic recovery outcome.
-            #
-            # Amendment 3: a *simultaneous* rollback failure outranks
-            # E-RETAINED alone, because what it invalidates is that
-            # outcome's `committed=no` claim — precondition 3, that every
-            # other change rolled back. It must not replace E-SUBSTITUTED
-            # or E-STRANDED: both already report `committed=unknown`, and
-            # both say something more specific than "a rollback failed".
-            primary = _rank_quarantine_outcomes(stranded_records)
-            # `blocked_paths` now holds only genuine failures to roll back
-            # *other* owned paths, so any entry in it is the simultaneous
-            # failure that invalidates E-RETAINED's `committed=no`.
-            if isinstance(primary, QuarantinedRecordRetained) and blocked_paths:
-                transaction_error = GitTransactionRecoveryError(
-                    tuple(blocked_paths)
-                )
-                transaction_error.add_note(
-                    "The reviewed record is retained in quarantine as "
-                    f"{primary.quarantined_name!r}; other changes did not "
-                    "roll back, so the state is indeterminate."
-                )
-            else:
-                transaction_error = primary
-                if blocked_paths:
-                    # Composed, never discarded. These outcomes stay primary
-                    # because they already report `committed=unknown` and say
-                    # more than "a rollback failed" — but the paths that did
-                    # not roll back are still part of what happened, and were
-                    # previously dropped on the floor here.
-                    #
-                    # This note is *diagnostic*: nothing in the Console reads
-                    # `__notes__`, so it reaches logs and tracebacks, not the
-                    # operator. What reaches the operator is the primary
-                    # outcome, whose message already directs them to inspect
-                    # vault state — which is where these paths show up.
-                    transaction_error.add_note(
-                        "these paths also did not roll back: "
-                        + ", ".join(sorted(blocked_paths))
-                    )
-        elif blocked_paths:
+        if blocked_paths:
             transaction_error = GitTransactionRecoveryError(tuple(blocked_paths))
         else:
             transaction_error = GitTransactionFailure(
@@ -679,28 +634,7 @@ def _execute_locked_body(
 
     if transaction_error is not None:
         if cleanup_error is not None:
-            if isinstance(
-                transaction_error,
-                (
-                    QuarantineRestorationBlocked,
-                    QuarantineEntrySubstituted,
-                    QuarantinedRecordRetained,
-                ),
-            ):
-                # A consumed record stranded in quarantine outranks a
-                # leftover temporary index. Replacing it here would report
-                # "the commit failed and was rolled back; nothing was
-                # changed" while a record sits in `.consumed/` and something
-                # else holds its name — false, and it would lose the one
-                # outcome that says where the record is. The cleanup failure
-                # is composed onto it rather than over it; the operator is
-                # already told to inspect the vault, which is where the
-                # leftover index becomes visible.
-                transaction_error.add_note(
-                    "the transaction's temporary index could not be removed "
-                    f"either: {cleanup_error}"
-                )
-            elif isinstance(transaction_error, GitTransactionRecoveryError):
+            if isinstance(transaction_error, GitTransactionRecoveryError):
                 transaction_error = GitTransactionRecoveryError(
                     transaction_error.paths,
                     temporary_index_cleanup_failed=True,
@@ -712,35 +646,37 @@ def _execute_locked_body(
                 )
         raise transaction_error from transaction_cause
 
-    if cleanup_error is not None:
-        if result is None:
-            raise GitTransactionFailure(
-                "approval transaction cleanup failed without a result"
-            ) from cleanup_error
-        raise GitTransactionCommittedError(result, cleanup_error) from cleanup_error
     if result is None:
         raise GitTransactionFailure("approval transaction produced no result")
+
+    # Stage 2: the action and its receipt are already committed. Proposal
+    # consumption is the final vault mutation under this same approval lock.
+    # Any failure here preserves the commit and receipt and never invokes
+    # rollback or a name-based rename-back.
+    try:
+        _checkpoint("before-proposal-quarantine")
+        for change in plan.owned_changes:
+            quarantined.append(
+                (
+                    change,
+                    quarantine_path_if_unchanged(vault, change.path, change.before),
+                )
+            )
+        _require_final_states(vault, plan)
+        _require_unrelated_state_unchanged(vault, unrelated, plan)
+        _require_head_matches(vault, result.commit_oid)
+    except Exception as exc:
+        applied = PostCommitConsumptionError(result, exc)
+        if cleanup_error is not None:
+            applied.add_note(
+                "the transaction's temporary index could not be removed "
+                f"either: {cleanup_error}"
+            )
+        raise applied from exc
+
+    if cleanup_error is not None:
+        raise GitTransactionCommittedError(result, cleanup_error) from cleanup_error
     return result
-
-
-def _rank_quarantine_outcomes(
-    outcomes: tuple[GitTransactionError, ...],
-) -> GitTransactionError:
-    """The most specific thing that can truthfully be said.
-
-    A record whose quarantine location no longer holds it outranks one
-    whose original name is occupied, which outranks one merely retained:
-    each says strictly more about what an operator will find.
-    """
-    for kind in (
-        QuarantineEntrySubstituted,
-        QuarantineRestorationBlocked,
-        QuarantinedRecordRetained,
-    ):
-        for outcome in outcomes:
-            if isinstance(outcome, kind):
-                return outcome
-    return outcomes[0]
 
 
 def _rollback_transaction(
@@ -754,27 +690,8 @@ def _rollback_transaction(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
     applied_changes: list[tuple[PathChange, PathState]],
-    quarantined: list[tuple[PathChange, QuarantinedRecord]] = (),
-) -> tuple[tuple[str, ...], tuple[GitTransactionError, ...]]:
+) -> tuple[str, ...]:
     blocked_paths: set[str] = set()
-    stranded: list[GitTransactionError] = []
-
-    # Amendment 3, stage 1: a rolled-back approval no longer moves the
-    # record back. There is no rename bound to an inode, so collecting it by
-    # name can move whatever holds that name — the defect Amendment 2
-    # removed from the consumption path, reached through rollback instead.
-    # The record stays in quarantine and rollback only says what became of
-    # it, reading through the descriptor it has held since before the move.
-    for _change, record in reversed(list(quarantined)):
-        # Deliberately *not* added to `blocked_paths`. That set means
-        # "rollback was attempted on this path and blocked by an unexpected
-        # concurrent state". Amendment 3 does not attempt proposal
-        # restoration at all, so a retained record is a matter of policy,
-        # not a blocked rollback — and putting it there would silently
-        # redefine what every existing path tuple means. What became of the
-        # record is carried by its own outcome instead, which says more
-        # than the generic set ever could.
-        stranded.append(diagnose_quarantined_record(vault, record))
 
     for change, state_written in reversed(applied_changes):
         try:
@@ -843,7 +760,7 @@ def _rollback_transaction(
     else:
         blocked_paths.update(_changed_unrelated_paths(unrelated, current_unrelated))
 
-    return tuple(sorted(blocked_paths)), tuple(stranded)
+    return tuple(sorted(blocked_paths))
 
 
 def _entries_by_path(
@@ -1275,10 +1192,37 @@ def _fingerprint_path(
 
 def _require_expected_states(vault: Path, plan: TransactionPlan) -> None:
     for change in plan.changes + plan.owned_changes:
-        if capture_path_state(vault, change.path) != change.before:
+        if _capture_change_state(vault, change) != change.before:
             raise ReviewedStateChanged(
                 f"reviewed path does not match expected state: {change.path}"
             )
+
+
+def _capture_change_state(vault: Path, change: PathChange) -> PathState:
+    """Capture a change, admitting only its declared absent receipt parent."""
+    if not change.create_parent:
+        return capture_path_state(vault, change.path)
+
+    parts = PurePosixPath(change.path).parts
+    directory_descriptor = _open_checked_directory(vault, "vault root")
+    try:
+        for part in parts[:-2]:
+            next_descriptor = _open_checked_directory(
+                part, "reviewed parent", dir_fd=directory_descriptor
+            )
+            os.close(directory_descriptor)
+            directory_descriptor = next_descriptor
+        try:
+            os.lstat(parts[-2], dir_fd=directory_descriptor)
+        except FileNotFoundError:
+            return PathState.absent()
+        except OSError as exc:
+            raise ReviewedPathUnavailable(
+                "receipt parent is unavailable"
+            ) from exc
+    finally:
+        os.close(directory_descriptor)
+    return capture_path_state(vault, change.path)
 
 
 def _capture_leaf_state(directory_descriptor: int, leaf: str) -> PathState:
@@ -1696,8 +1640,12 @@ def quarantine_path_if_unchanged(
 
 
 def consume_reviewed_proposal(
-    vault: Path, relative_path: str, expected: PathState
-) -> str:
+    vault: Path,
+    relative_path: str,
+    expected: PathState,
+    *,
+    preconditions: tuple[Precondition, ...] = (),
+) -> str | TransactionPreconditionRefused:
     """Quarantine one reviewed record under the per-vault approval lock.
 
     The lock is taken here rather than inside `quarantine_path_if_unchanged`
@@ -1710,6 +1658,10 @@ def consume_reviewed_proposal(
     try:
         try:
             with _approval_lock(root):
+                for precondition in preconditions:
+                    reason = precondition()
+                    if reason is not None:
+                        return TransactionPreconditionRefused(reason)
                 record = quarantine_path_if_unchanged(root, relative_path, expected)
         except _ApprovalLockCleanupFailure as exc:
             # Mirrors `execute_transaction`: once the work has happened, a
@@ -1724,106 +1676,6 @@ def consume_reviewed_proposal(
         # consumption is. Closed on every path, exactly once.
         if record is not None:
             os.close(record.descriptor)
-
-
-def diagnose_quarantined_record(
-    vault: Path, record: QuarantinedRecord
-) -> GitTransactionError:
-    """Say what became of one quarantined record. Mutates nothing.
-
-    S7 Amendment 3, stage 1. This replaces `restore_quarantined_leaf`,
-    which renamed the record back using only the quarantine name and so
-    could move an object substituted after verification — the same defect
-    Amendment 2 removed from the consumption path, reached through
-    rollback instead.
-
-    Every question is answered by reading: the bytes through the
-    descriptor held since before the move, and the two names by `stat`.
-    Nothing is renamed, created or removed.
-    """
-    # Does the quarantine location still hold the exact reviewed proposal?
-    # Identity by name, bytes by descriptor — never bytes by name.
-    #
-    # Totality matters here: this runs during rollback, once per quarantined
-    # record, and an exception escaping it would abandon the diagnosis of
-    # every record after it. `_walk_to_parent` opens directories and can
-    # raise, so it is inside the guard, not before it.
-    try:
-        parent_descriptor, leaf = _walk_to_parent(vault, record.relative_path)
-    except (OSError, GitTransactionError):
-        # The record's own directory cannot even be reached, so nothing can
-        # be established about either location. `committed=unknown` is the
-        # only truthful shape, and E-STRANDED is the wrong one — it would
-        # claim another file occupies the name and that both survive.
-        return QuarantineEntrySubstituted(record.relative_path, -1, "unknown")
-    try:
-        try:
-            identity = os.fstat(record.descriptor)
-            link_count = identity.st_nlink
-        except OSError:
-            return QuarantineEntrySubstituted(record.relative_path, -1, "absent")
-
-        try:
-            quarantine_descriptor = _open_checked_directory(
-                QUARANTINE_DIRECTORY, "quarantine", dir_fd=parent_descriptor
-            )
-        except (OSError, GitTransactionError):
-            return QuarantineEntrySubstituted(
-                record.relative_path, link_count, "absent"
-            )
-        try:
-            try:
-                landed = os.lstat(record.name, dir_fd=quarantine_descriptor)
-            except FileNotFoundError:
-                return QuarantineEntrySubstituted(
-                    record.relative_path, link_count, "absent"
-                )
-            except OSError:
-                # A permission or I/O error here says nothing about what the
-                # entry holds — only that it could not be inspected. Letting
-                # it escape would abandon the diagnosis of every record
-                # behind this one in the rollback loop.
-                return QuarantineEntrySubstituted(
-                    record.relative_path, link_count, "unknown"
-                )
-            if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):
-                return QuarantineEntrySubstituted(
-                    record.relative_path, link_count, "replaced"
-                )
-            try:
-                if _held_state(record.descriptor) != record.expected:
-                    return QuarantineEntrySubstituted(
-                        record.relative_path, link_count, "rewritten"
-                    )
-            except (OSError, GitTransactionError):
-                return QuarantineEntrySubstituted(
-                    record.relative_path, link_count, "rewritten"
-                )
-        finally:
-            os.close(quarantine_descriptor)
-
-        # The record is intact and where we left it. Is its own name free?
-        try:
-            os.lstat(leaf, dir_fd=parent_descriptor)
-        except FileNotFoundError:
-            # Observed empty. With the bytes verified above and the caller
-            # checking that everything else rolled back, E-RETAINED's three
-            # preconditions hold.
-            return QuarantinedRecordRetained(record.relative_path, record.name)
-        except OSError:
-            # An I/O or permission error is not evidence that another file
-            # holds the name, and E-STRANDED would assert exactly that —
-            # "something else now holds its name. Both it and that file are
-            # preserved." Nothing here proves either half. It also does not
-            # prove the record is safely retained, so E-RETAINED's
-            # `committed=no` cannot be claimed. What is true is that the
-            # original name could not be established at all.
-            return QuarantineEntrySubstituted(record.relative_path, link_count, "unknown")
-        # Something occupies it. Both files were observed and neither was
-        # touched, which is exactly what E-STRANDED says.
-        return QuarantineRestorationBlocked(record.relative_path)
-    finally:
-        os.close(parent_descriptor)
 
 
 def _read_open_file(descriptor: int) -> bytes:
@@ -1858,10 +1710,33 @@ def _apply_state(
     parts = PurePosixPath(change.path).parts
     directory_descriptor = _open_checked_directory(vault, "vault root")
     try:
-        for part in parts[:-1]:
-            next_descriptor = _open_checked_directory(
-                part, "reviewed parent", dir_fd=directory_descriptor
-            )
+        parents = parts[:-1]
+        for index, part in enumerate(parents):
+            try:
+                next_descriptor = _open_checked_directory(
+                    part, "reviewed parent", dir_fd=directory_descriptor
+                )
+            except ReviewedPathUnavailable as exc:
+                may_create = (
+                    change.create_parent
+                    and index == len(parents) - 1
+                    and isinstance(exc.__cause__, FileNotFoundError)
+                )
+                if not may_create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=directory_descriptor)
+                except FileExistsError as race:
+                    raise ReviewedPathIntegrityError(
+                        "receipt parent changed while being created"
+                    ) from race
+                except OSError as failure:
+                    raise ReviewedPathUnavailable(
+                        "receipt parent could not be created"
+                    ) from failure
+                next_descriptor = _open_checked_directory(
+                    part, "receipt parent", dir_fd=directory_descriptor
+                )
             os.close(directory_descriptor)
             directory_descriptor = next_descriptor
 
@@ -2048,6 +1923,15 @@ def _require_final_states(vault: Path, plan: TransactionPlan) -> None:
         if capture_path_state(vault, change.path) != change.after:
             raise GitTransactionFailure(
                 f"transaction-owned path changed before success: {change.path}"
+            )
+
+
+def _require_committed_states(vault: Path, plan: TransactionPlan) -> None:
+    """Verify only the action and receipt before proposal consumption."""
+    for change in plan.changes:
+        if capture_path_state(vault, change.path) != change.after:
+            raise GitTransactionFailure(
+                f"committed path changed before consumption: {change.path}"
             )
 
 

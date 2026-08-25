@@ -148,22 +148,6 @@ MUTATIONS = [
           "the reference count never ran")],
     ),
     (
-        "M13", "app/git_transaction.py",
-        "        if stranded_records:",
-        "        if False:  # MUTANT M13: stranded record collapses into E-RECOVER",
-        ["tests/test_outbox.py"],
-        [("tests/test_outbox.py::test_a_rollback_that_cannot_restore_the_record_reports_it_as_stranded",
-          "E-STRANDED")],
-    ),
-    (
-        "M14", "app/git_transaction.py",
-        "                    QuarantinedRecordRetained,\n                ),\n            ):",
-        "                    QuarantinedRecordRetained,\n                ),\n            ) and False:  # MUTANT M14",
-        ["tests/test_outbox.py"],
-        [("tests/test_outbox.py::test_a_stranded_record_survives_a_simultaneous_cleanup_failure",
-          "the stranded outcome was overwritten")],
-    ),
-    (
         # The two action-boundary parses. Both were equivalent mutants until
         # M15/M16's tests existed: `PathState` compares full contents, so a
         # replacement still on disk at transaction time is refused either
@@ -207,31 +191,6 @@ MUTATIONS = [
             ("tests/test_outbox.py::test_reject_refuses_every_post_move_quarantine_condition[replaced]",
              "a substitute was renamed back under the record's name"),
         ],
-    ),
-    (
-        # Amendment 3. Rollback diagnosis must see a substitution that
-        # landed after consumption; without the identity check it reports
-        # the record safely retained and claims committed=no.
-        "M18", "app/git_transaction.py",
-        "            if (landed.st_dev, landed.st_ino) != (identity.st_dev, identity.st_ino):",
-        "            if False:  # MUTANT M18: rollback ignores identity",
-        ["tests/test_outbox.py", "tests/test_registry.py"],
-        [
-            ("tests/test_outbox.py::test_approve_reports_a_substitution_that_lands_before_rollback",
-             "assert 'E-RETAINED' == 'E-SUBSTITUTED'"),
-            ("tests/test_registry.py::test_delete_reports_a_substitution_that_lands_before_rollback",
-             "assert 'E-RETAINED' == 'E-SUBSTITUTED'"),
-        ],
-    ),
-    (
-        # Amendment 3. A simultaneous failure to roll back another path
-        # invalidates E-RETAINED's committed=no and must outrank it.
-        "M19", "app/git_transaction.py",
-        "            if isinstance(primary, QuarantinedRecordRetained) and blocked_paths:",
-        "            if False:  # MUTANT M19: retained outranks a rollback failure",
-        ["tests/test_outbox.py"],
-        [("tests/test_outbox.py::test_a_rollback_failure_composes_onto_the_retained_record",
-          "QuarantinedRecordRetained")],
     ),
     (
         # Amendment 3. The transaction owns each quarantined record's

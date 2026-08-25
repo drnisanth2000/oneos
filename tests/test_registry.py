@@ -651,17 +651,11 @@ def test_registry_delete_commit_failure_restores_registry_and_proposal_bytes(
     with pytest.raises(registry.RegistryTransactionError) as raised:
         execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
-    # Amendment 3, stage 1: as above — the record stays in quarantine.
-    assert isinstance(
-        raised.value.__cause__, git_transaction.QuarantinedRecordRetained
-    )
+    assert isinstance(raised.value.__cause__, git_transaction.GitTransactionFailure)
     assert git_head(vault) == head_before
     assert registry_path.read_bytes() == registry_bytes
-    # The record is retained in quarantine, unchanged, rather than
-    # renamed back (Amendment 3, stage 1).
-    assert not proposal.path.exists(), proposal.path.read_bytes()
-    quarantined = sorted((proposal.path.parent / ".consumed").glob("*.yaml"))
-    assert [q.read_bytes() for q in quarantined] == [proposal_bytes]
+    assert proposal.path.read_bytes() == proposal_bytes
+    assert not (proposal.path.parent / ".consumed").exists()
     _assert_unrelated_git_dirt(vault, unrelated, unrelated_index)
 
 
@@ -1552,59 +1546,3 @@ def test_execute_delete_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
     remaining = products.read_text(encoding="utf-8")
     assert "widgetx:" not in remaining
     assert "other:" in remaining, "deleted a product nobody reviewed"
-
-
-def test_delete_reports_a_substitution_that_lands_before_rollback(tmp_path, monkeypatch):
-    """Amendment 3, through registry delete's own transaction.
-
-    The same seam as approve's, on the other action that runs a
-    transaction: the record is consumed, the transaction fails, and a
-    writer replaces the quarantine entry before rollback diagnoses it.
-    Rollback must see the substitution rather than reporting the record
-    safely retained, and must rename nothing back.
-    """
-    import os
-
-    import app.git_transaction as gt
-    from app.console_errors import describe
-
-    vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
-    prop = propose_delete(scope, "product", "widgetx")
-    fingerprint = _fingerprint_of(scope, prop.id)
-    products = vault / "_system/products.yaml"
-    registry_before = products.read_bytes()
-    head_before = git_head_message(vault)
-    decoy = b"SUBSTITUTED-BEFORE-ROLLBACK\n"
-    substituted = []
-
-    def substitute_then_fail(name: str) -> None:
-        if name != "filesystem-applied":
-            return
-        landed = next((prop.path.parent / gt.QUARANTINE_DIRECTORY).iterdir())
-        other = landed.with_name(landed.name + ".other")
-        other.write_bytes(decoy)
-        os.replace(other, landed)
-        substituted.append(landed.name)
-        raise OSError("injected after consumption")
-
-    monkeypatch.setattr(gt, "_checkpoint", substitute_then_fail)
-
-    with pytest.raises(Exception) as raised:
-        execute_delete(scope, prop.id, fingerprint)
-
-    # Asserted before the outcome: a probe that fails for its own reasons
-    # (this one first raised NameError, since the module has no `os`) makes
-    # the transaction fail too, and an outcome assertion alone cannot tell
-    # that apart from the substitution actually landing.
-    assert substituted, f"the substitution never happened: {raised.value!r}"
-    outcome = describe(raised.value)
-    assert outcome.code == "E-SUBSTITUTED", outcome.code
-    assert outcome.committed == "unknown"
-
-    # Nothing renamed back, and the registry is exactly as it was.
-    assert not prop.path.exists(), prop.path.read_bytes()
-    quarantined = sorted((prop.path.parent / ".consumed").glob("*"))
-    assert [q.read_bytes() for q in quarantined] == [decoy]
-    assert products.read_bytes() == registry_before
-    assert git_head_message(vault) == head_before

@@ -2856,35 +2856,27 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
     # appear as a new untracked entry in status — excluded from the
     # comparison rather than asserted byte-identical, the same "excluding
     # the reviewed/owned path" shape I1's registry fix uses.
-    # Amendment 3, stage 1: the record is retained in quarantine rather
-    # than renamed back, so its own quarantine destination is expected in
-    # status too. Excluded by exact path, never by pattern — a blanket
-    # `.consumed/` skip would also hide unrelated entities' records, wrong
-    # suffixes and nested files, and this proof exists to catch those.
-    from app.git_transaction import quarantine_destination
-
-    retained = quarantine_destination(
-        f"alpha/outbox/{proposal_id}.yaml"
-    )
     assert _status_lines_excluding(
-        git_status_bytes(vault), destination_relative, retained
-    ) == _status_lines_excluding(status_before, destination_relative, retained)
+        git_status_bytes(vault), destination_relative
+    ) == _status_lines_excluding(status_before, destination_relative)
 
     # And the exclusion is exact: a decoy alongside it, and one under
     # another entity, must both still be seen.
     decoy = vault / "alpha/outbox/.consumed/not-this-record.yaml"
+    decoy.parent.mkdir()
     decoy.write_bytes(b"decoy\n")
     other = vault / "beta/outbox/.consumed"
     other.mkdir(parents=True, exist_ok=True)
     (other / "another-entity.yaml").write_bytes(b"decoy\n")
     try:
         seen = _status_lines_excluding(
-            git_status_bytes(vault), destination_relative, retained
+            git_status_bytes(vault), destination_relative
         )
         assert any(b"not-this-record.yaml" in line for line in seen), seen
         assert any(b"another-entity.yaml" in line for line in seen), seen
     finally:
         decoy.unlink()
+        decoy.parent.rmdir()
         (other / "another-entity.yaml").unlink()
         other.rmdir()
 
@@ -2892,11 +2884,9 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
     # bytes. This is the disjunct `_state_proof_unknown` cannot exercise.
     assert destination.read_bytes() == concurrent_bytes
     assert source.read_bytes() == source_before
-    # Amendment 3, stage 1: the record is retained in quarantine, with the
-    # exact bytes it had, rather than renamed back under its own name.
-    assert not proposal_path.exists(), proposal_path.read_bytes()
-    quarantined = sorted((proposal_path.parent / ".consumed").glob("*.yaml"))
-    assert [q.read_bytes() for q in quarantined] == [proposal_before]
+    # Stage 2: pre-commit failures never consume the proposal.
+    assert proposal_path.read_bytes() == proposal_before
+    assert not (proposal_path.parent / ".consumed").exists()
 
 
 def _state_proof_shell_and_triage_default(tmp_path, monkeypatch):

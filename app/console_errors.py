@@ -57,6 +57,18 @@ _CODES: dict[str, ConsoleError] = {
             "stop", "yes", 500,
         ),
         ConsoleError(
+            # Stage 2. `applied` means committed here, despite the
+            # pre-commit `applied_changes` vocabulary in git_transaction.
+            # The action and receipt are durable; proposal consumption is
+            # the unresolved post-commit step, so retrying could act twice.
+            "E-APPLIED", "committed", "attention",
+            "The action completed, but OneOS could not verify that its "
+            "proposal was safely consumed. Its receipt prevents this "
+            "proposal ID from being used again. Do not retry or move files "
+            "by hand. Inspect vault state with git status.",
+            "stop", "yes", 500,
+        ),
+        ConsoleError(
             # S7 Amendment 1. Reject makes no Git commit, so E-COMMITTED's
             # "the commit succeeded" would be untrue — but the consumption
             # itself is done, which is the fact the operator has to act on.
@@ -69,18 +81,6 @@ _CODES: dict[str, ConsoleError] = {
             "effect, and the record is retained. Inspect vault state with "
             "git status.",
             "stop", "yes", 500,
-        ),
-        ConsoleError(
-            # S7 Amendment 1. A mismatch was found, but the record could not
-            # be returned to its own name because something else now holds
-            # it. Both files survive and neither is deleted to tidy up; the
-            # state is genuinely indeterminate and is reported as such.
-            "E-STRANDED", "recovery", "attention",
-            "The reviewed proposal could not be returned to its place, "
-            "because something else now holds its name. Both it and that "
-            "file are preserved. Do not retry. Inspect vault state with git "
-            "status.",
-            "stop", "unknown", 500,
         ),
         ConsoleError(
             # S7 Amendment 2, generalised by Amendment 3. One outcome for
@@ -97,8 +97,6 @@ _CODES: dict[str, ConsoleError] = {
             # Amendment 2 itself left. Deliberately does not say "replaced",
             # which was true of only one of the three.
             #
-            # Distinct from E-STRANDED and never folded into it: that
-            # outcome promises both files survive, and this one cannot.
             "E-SUBSTITUTED", "recovery", "attention",
             "The reviewed proposal was moved, but OneOS cannot verify that "
             "its quarantine location still holds it unchanged. The reviewed "
@@ -106,24 +104,6 @@ _CODES: dict[str, ConsoleError] = {
             "No automated recovery is available. Inspect vault state with "
             "git status and escalate for verified recovery.",
             "stop", "unknown", 500,
-        ),
-        ConsoleError(
-            # S7 Amendment 3, stage 1. Rollback no longer renames a
-            # quarantined record back, so the ordinary outcome of a failed
-            # transaction is that the record stays put. E-STRANDED does not
-            # fit: it says another file holds the proposal name and that
-            # both were preserved, and after a plain failure the name is
-            # empty and there is no second file. `integrity` rather than
-            # `recovery` because this state is determinate: recovery outcomes
-            # must report committed=unknown, and this one truthfully reports
-            # no, under the three preconditions in design §3.
-            "E-RETAINED", "integrity", "attention",
-            "The action did not complete. The reviewed proposal is retained "
-            "unchanged in the quarantine area, and its original name is "
-            "empty. Do not retry or move files by hand. No automated "
-            "recovery is available. Inspect vault state with git status and "
-            "escalate for verified recovery.",
-            "stop", "no", 500,
         ),
         ConsoleError(
             # S7 Amendment 1. Fails closed: OneOS refuses rather than
@@ -316,6 +296,7 @@ CLOSED_FAMILY = _git_transaction.GitTransactionError
 #: `exact` — the entry applies to that class only, never through MRO.
 _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.GitTransactionCommittedError: _CODES["E-COMMITTED"],
+    _git_transaction.PostCommitConsumptionError: _CODES["E-APPLIED"],
     _git_transaction.GitTransactionRecoveryError: _CODES["E-RECOVER"],
     _git_transaction.ReviewedPathIntegrityError: _CODES["E-TAMPER"],
     _git_transaction.ReviewedPathUnavailable: _CODES["E-UNAVAILABLE"],
@@ -326,9 +307,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _git_transaction.GitTransactionError: _CODES["E-GIT"],
     _git_transaction._ApprovalLockCleanupFailure: _CODES["E-GIT"],
     _git_transaction.QuarantineCleanupError: _CODES["E-QUARANTINED"],
-    _git_transaction.QuarantineRestorationBlocked: _CODES["E-STRANDED"],
     _git_transaction.QuarantineEntrySubstituted: _CODES["E-SUBSTITUTED"],
-    _git_transaction.QuarantinedRecordRetained: _CODES["E-RETAINED"],
     _git_transaction.AtomicMoveUnavailable: _CODES["E-UNSUPPORTED"],
     _git_transaction._ReviewedIndexOwnershipConflict: _CODES["E-CONFLICT"],
     _action_receipts.InvalidActionReceipt: _CODES["E-RECEIPT"],

@@ -167,6 +167,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
     # a *wrong* non-unknown code fails here.
     expected = {
         git_transaction.GitTransactionCommittedError: "E-COMMITTED",
+        git_transaction.PostCommitConsumptionError: "E-APPLIED",
         git_transaction.GitTransactionRecoveryError: "E-RECOVER",
         git_transaction.ReviewedPathIntegrityError: "E-TAMPER",
         git_transaction.ReviewedPathUnavailable: "E-UNAVAILABLE",
@@ -249,6 +250,15 @@ def test_closed_family_every_subclass_has_exact_entry():
     # is a deliberate member.
     for cls in _transitive_subclasses(GitTransactionFailure):
         assert cls in ALLOWLIST, f"{cls.__qualname__} is not allowlisted"
+
+
+def test_every_operator_outcome_has_an_executable_producer():
+    """A live taxonomy row may not outlast every path that can produce it."""
+    from app.console_errors import _CODES, _EXACT, _MRO
+
+    produced = {outcome.code for outcome in (*_EXACT.values(), *_MRO.values())}
+    orphaned = sorted(set(_CODES) - produced - {"E-UNKNOWN"})
+    assert not orphaned, f"orphan operator outcome: {', '.join(orphaned)}"
 
 
 def test_review_token_family_every_subclass_has_exact_entry():
