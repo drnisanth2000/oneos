@@ -717,6 +717,308 @@ def test_every_operator_outcome_has_an_executable_producer():
     assert not orphaned, f"orphan operator outcome: {', '.join(orphaned)}"
 
 
+def test_stage2_retired_outcomes_are_historical_evidence_only():
+    runner_path = (
+        _REPO_ROOT / "docs/superpowers/plans/s7_mutation_campaign.py"
+    )
+    ledger_path = (
+        _REPO_ROOT
+        / "docs/superpowers/plans/2026-08-23-s7-mutation-ledger.md"
+    )
+    runner = runner_path.read_text(encoding="utf-8")
+    ledger = ledger_path.read_text(encoding="utf-8")
+    tree = ast.parse(runner)
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "MUTATIONS"
+            for target in node.targets
+        )
+    )
+    mutations = ast.literal_eval(assignment.value)
+    live_ids = [mutation[0] for mutation in mutations]
+
+    for retired in ("M18", "M19"):
+        assert retired not in live_ids, f"{retired} returned to the live campaign"
+        assert ledger.count(
+            f"### {retired} — RETIRED (historical)"
+        ) == 1, f"{retired} retirement is missing or duplicated"
+    # A Stage 2 mutation may deliberately put a retired name in its NEW
+    # text to prove that the orphan guard catches resurrection. What must
+    # stay absent is a live anchor: no current implementation text or test
+    # selection may claim that the retired path still exists.
+    live_anchors = "\n".join(
+        str((mutation[1], mutation[2], mutation[4]))
+        for mutation in mutations
+    )
+    for removed in (
+        "E-RETAINED",
+        "E-STRANDED",
+        "diagnose_quarantined_record",
+    ):
+        assert removed not in live_anchors, (
+            f"a live mutation still claims the retired {removed} path"
+        )
+
+
+def _source_function(relative: str, name: str) -> ast.FunctionDef:
+    tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+    matches = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    assert len(matches) == 1, f"expected one {relative}:{name}, saw {len(matches)}"
+    return matches[0]
+
+
+def _single_named_call(function: ast.FunctionDef, name: str) -> ast.Call:
+    matches = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == name
+    ]
+    assert len(matches) == 1, (
+        f"expected one {name} call in {function.name}, saw {len(matches)}"
+    )
+    return matches[0]
+
+
+@pytest.mark.parametrize(
+    ("relative", "function_name", "label"),
+    (
+        ("app/outbox.py", "approve", "approval"),
+        ("app/registry.py", "execute_delete", "registry deletion"),
+    ),
+    ids=("approve", "registry-delete"),
+)
+def test_stage2_receipt_has_exact_transaction_roles(
+    relative, function_name, label
+):
+    """A tracked receipt is a change and exact commit path, never owned state."""
+    function = _source_function(relative, function_name)
+    plan = _single_named_call(function, "TransactionPlan")
+    keywords = {keyword.arg: keyword.value for keyword in plan.keywords}
+
+    changes = ast.unparse(keywords["changes"])
+    commit_paths = ast.unparse(keywords["commit_paths"])
+    owned_changes = ast.unparse(keywords["owned_changes"])
+    assert "receipt_rel" in changes, (
+        f"{label} receipt is not a filesystem change"
+    )
+    assert "receipt_rel" in commit_paths, (
+        f"{label} receipt is not an exact commit path"
+    )
+    assert "receipt_rel" not in owned_changes, (
+        "tracked receipt was misclassified as an untracked owned change"
+    )
+    assert "proposal_rel" in owned_changes, (
+        f"{label} proposal stopped being the transaction-owned record"
+    )
+
+
+@pytest.mark.parametrize(
+    ("relative", "function_name", "acting_call", "expected", "label"),
+    (
+        (
+            "app/outbox.py",
+            "approve",
+            "TransactionPlan",
+            ("_require_unspent_id",),
+            "approve",
+        ),
+        (
+            "app/registry.py",
+            "execute_delete",
+            "TransactionPlan",
+            ("_require_unspent_id", "_require_no_live_references"),
+            "registry delete",
+        ),
+        (
+            "app/outbox.py",
+            "reject",
+            "consume_reviewed_proposal",
+            ("_require_unspent_id",),
+            "reject",
+        ),
+    ),
+    ids=("approve", "registry-delete", "reject"),
+)
+def test_stage2_spent_id_checks_are_locked_preconditions(
+    relative, function_name, acting_call, expected, label
+):
+    function = _source_function(relative, function_name)
+    action = _single_named_call(function, acting_call)
+    keyword = next(
+        (keyword.value for keyword in action.keywords if keyword.arg == "preconditions"),
+        None,
+    )
+    direct_checks = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_require_unspent_id"
+    ]
+    assert not direct_checks, f"{label} receipt check no longer runs only under the lock"
+
+    names = (
+        tuple(
+            element.id if isinstance(element, ast.Name) else ""
+            for element in keyword.elts
+        )
+        if isinstance(keyword, ast.Tuple)
+        else ()
+    )
+    assert names == expected, f"{label} omitted its locked spent-id check"
+
+
+def test_stage2_receipt_authority_comes_only_from_git_head():
+    function = _source_function("app/action_receipts.py", "resolve_head_receipts")
+    joined_literals = {
+        value.value
+        for node in ast.walk(function)
+        if isinstance(node, ast.JoinedStr)
+        for value in node.values
+        if isinstance(value, ast.Constant) and isinstance(value.value, str)
+    }
+    forbidden_readers = {
+        "open",
+        "read_bytes",
+        "read_text",
+        "lstat",
+        "stat",
+    }
+    readers = {
+        node.func.attr
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in forbidden_readers
+    }
+    readers.update(
+        node.func.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "open"
+    )
+
+    assert "HEAD:" in joined_literals and not readers, (
+        "receipt authority no longer comes from Git HEAD"
+    )
+
+
+def test_stage2_receipt_digest_remains_audit_only():
+    offenders = []
+    for relative in ("app/outbox.py", "app/registry.py", "app/main.py"):
+        tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "review_sha256":
+                base = ast.unparse(node.value)
+                if "receipt" in base:
+                    offenders.append(f"{relative}:{node.lineno}:{base}")
+    assert not offenders, f"audit-only receipt digest entered a decision: {offenders}"
+
+
+def test_stage2_non_tree_receipt_root_fails_closed():
+    function = _source_function("app/action_receipts.py", "_head_root_exists")
+    guarded_raises = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and "object_type != b'tree'" in ast.unparse(node.test)
+        and any(
+            isinstance(child, ast.Raise)
+            and isinstance(child.exc, ast.Call)
+            and isinstance(child.exc.func, ast.Name)
+            and child.exc.func.id == "ReceiptStoreIntegrityError"
+            for child in node.body
+        )
+    ]
+    assert guarded_raises, "non-tree receipt root was treated as an empty store"
+
+
+def test_stage2_malformed_receipt_projection_stays_per_id():
+    function = _source_function("app/outbox.py", "project_outbox")
+    error_branches = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.If)
+        and "resolution.error is not None" in ast.unparse(node.test)
+    ]
+    assert len(error_branches) == 1
+    writes_listing_block = any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id == "blocked"
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else (node.target,)
+            )
+        )
+        for node in ast.walk(error_branches[0])
+    )
+    assert not writes_listing_block, (
+        "malformed matching receipt became entity-wide blocking"
+    )
+
+
+def test_stage2_postcommit_consumption_failure_has_no_rollback_path():
+    function = _source_function("app/git_transaction.py", "_execute_locked_body")
+    applied_handlers = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.ExceptHandler)
+        and any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "PostCommitConsumptionError"
+            for child in ast.walk(node)
+        )
+    ]
+    assert len(applied_handlers) == 1
+    forbidden = {
+        node.func.id
+        for node in ast.walk(applied_handlers[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"_git", "_rollback_transaction", "_apply_state"}
+    }
+    assert not forbidden, (
+        "post-commit consumption failure can roll back action and receipt"
+    )
+
+
+def test_stage2_proposal_quarantine_stays_after_the_action_commit():
+    function = _source_function("app/git_transaction.py", "_execute_locked_body")
+    commit_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_git"
+        and any(
+            isinstance(argument, ast.Constant) and argument.value == "commit"
+            for argument in node.args
+        )
+    ]
+    quarantine_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "quarantine_path_if_unchanged"
+    ]
+    assert len(commit_calls) == 1 and quarantine_calls
+    assert min(node.lineno for node in quarantine_calls) > commit_calls[0].lineno, (
+        "a proposal was quarantined before its action committed"
+    )
+
+
 def test_a_dead_mapping_cannot_impersonate_an_executable_producer(monkeypatch):
     import app.console_errors as errors
     from app.git_transaction import PostCommitConsumptionError
@@ -729,7 +1031,9 @@ def test_a_dead_mapping_cannot_impersonate_an_executable_producer(monkeypatch):
         errors._EXACT, DeadOutcome, errors._CODES["E-APPLIED"]
     )
 
-    assert "E-APPLIED" in _orphan_operator_outcomes()
+    assert "E-APPLIED" in _orphan_operator_outcomes(), (
+        "orphan guard allowed E-APPLIED to impersonate a live outcome"
+    )
 
 
 def test_action_receipt_card_has_no_review_or_mutation_transport():
@@ -758,7 +1062,9 @@ def test_action_receipt_card_has_no_review_or_mutation_transport():
 def test_receipt_attention_fragments_remain_swappable_at_500():
     source = (_REPO_ROOT / "templates/_head.html").read_text(encoding="utf-8")
 
-    assert '"code":"[45]..","swap":true,"error":true' in source
+    assert '"code":"[45]..","swap":true,"error":true' in source, (
+        "E-APPLIED 500 fragment no longer swaps"
+    )
 
 
 def test_full_receipt_store_enumeration_is_offline_audit_only():
@@ -780,7 +1086,10 @@ def test_full_receipt_store_enumeration_is_offline_audit_only():
         tree = ast.parse((_REPO_ROOT / relative).read_text(encoding="utf-8"))
         return any(
             isinstance(node, ast.ImportFrom)
-            and node.module == "app.action_receipts"
+            and (
+                node.module == "app.action_receipts"
+                or node.level == 1 and node.module == "action_receipts"
+            )
             and any(alias.name in validators for alias in node.names)
             for node in ast.walk(tree)
         )

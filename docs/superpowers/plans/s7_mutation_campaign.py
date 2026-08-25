@@ -247,6 +247,285 @@ MUTATIONS = [
         [("tests/test_console_invariants.py::test_every_reviewed_route_requires_and_passes_the_fingerprint",
           "never passes review_sha256 to execute_delete")],
     ),
+    (
+        # Stage 2. A receipt omitted from `changes` can never be written by
+        # the transaction, even if somebody leaves it in `commit_paths`.
+        "M24", "app/outbox.py",
+        "            PathChange(\n"
+        "                receipt_rel,\n"
+        "                PathState.absent(),\n"
+        "                PathState.regular(render_action_receipt(receipt), 0o644),\n"
+        "                create_parent=True,\n"
+        "            ),",
+        "            # MUTANT M24: receipt omitted from filesystem changes",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_receipt_has_exact_transaction_roles[approve]",
+          "approval receipt is not a filesystem change")],
+    ),
+    (
+        "M24b", "app/registry.py",
+        "                PathChange(\n"
+        "                    receipt_rel,\n"
+        "                    PathState.absent(),\n"
+        "                    PathState.regular(render_action_receipt(receipt), 0o644),\n"
+        "                    create_parent=True,\n"
+        "                ),",
+        "                # MUTANT M24b: receipt omitted from filesystem changes",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_receipt_has_exact_transaction_roles[registry-delete]",
+          "registry deletion receipt is not a filesystem change")],
+    ),
+    (
+        # Stage 2. The receipt must be inside the exact commit, not merely
+        # left as an untracked working-tree side effect.
+        "M25", "app/outbox.py",
+        "        commit_paths=(prop.src, prop.dst, receipt_rel),",
+        "        commit_paths=(prop.src, prop.dst),  # MUTANT M25",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_receipt_has_exact_transaction_roles[approve]",
+          "approval receipt is not an exact commit path")],
+    ),
+    (
+        "M25b", "app/registry.py",
+        "            commit_paths=(registry_rel, receipt_rel),",
+        "            commit_paths=(registry_rel,),  # MUTANT M25b",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_receipt_has_exact_transaction_roles[registry-delete]",
+          "registry deletion receipt is not an exact commit path")],
+    ),
+    (
+        # Stage 2. `owned_changes` are required to be untracked and are
+        # consumed after commit. A tracked receipt belongs to `changes`.
+        "M26", "app/outbox.py",
+        "            PathChange(proposal_rel, proposal_state, PathState.absent()),",
+        "            PathChange(receipt_rel, proposal_state, PathState.absent()),  # MUTANT M26",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_receipt_has_exact_transaction_roles[approve]",
+          "tracked receipt was misclassified as an untracked owned change")],
+    ),
+    (
+        "M26b", "app/registry.py",
+        "                PathChange(proposal_rel, proposal_state, PathState.absent()),",
+        "                PathChange(receipt_rel, proposal_state, PathState.absent()),  # MUTANT M26b",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_receipt_has_exact_transaction_roles[registry-delete]",
+          "tracked receipt was misclassified as an untracked owned change")],
+    ),
+    (
+        # Stage 2. Deleting or replacing a working-tree receipt must not
+        # re-enable an id whose receipt remains committed in HEAD.
+        "M27", "app/action_receipts.py",
+        "    expressions = tuple(\n"
+        "        f\"HEAD:{receipt_relative_path(entity, proposal_id)}\" for proposal_id in ids\n"
+        "    )\n"
+        "    objects = _batch_objects(vault_path, expressions)",
+        "    expressions = tuple(\n"
+        "        f\"HEAD:{receipt_relative_path(entity, proposal_id)}\" for proposal_id in ids\n"
+        "    )\n"
+        "    objects = tuple(\n"
+        "        _BatchObject(\"blob\", (vault_path / receipt_relative_path(entity, proposal_id)).read_bytes())\n"
+        "        if (vault_path / receipt_relative_path(entity, proposal_id)).exists() else None\n"
+        "        for proposal_id in ids\n"
+        "    )  # MUTANT M27: working-tree authority",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_receipt_authority_comes_only_from_git_head",
+          "receipt authority no longer comes from Git HEAD")],
+    ),
+    (
+        # Stage 2. Evaluating the precondition while constructing the plan
+        # recreates the check-before-lock race even if the tuple remains.
+        "M28", "app/outbox.py",
+        "        owned_changes=(\n"
+        "            PathChange(proposal_rel, proposal_state, PathState.absent()),\n"
+        "        ),\n"
+        "        preconditions=(_require_unspent_id,),",
+        "        owned_changes=(\n"
+        "            PathChange(proposal_rel, proposal_state, PathState.absent()),\n"
+        "        ),\n"
+        "        preconditions=(_require_unspent_id,) if _require_unspent_id() is None else (),  # MUTANT M28",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_spent_id_checks_are_locked_preconditions[approve]",
+          "approve receipt check no longer runs only under the lock")],
+    ),
+    (
+        "M28b", "app/registry.py",
+        "            preconditions=(_require_unspent_id, _require_no_live_references),",
+        "            preconditions=(\n"
+        "                _require_unspent_id, _require_no_live_references\n"
+        "            ) if _require_unspent_id() is None else (),  # MUTANT M28b",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_spent_id_checks_are_locked_preconditions[registry-delete]",
+          "registry delete receipt check no longer runs only under the lock")],
+    ),
+    (
+        # Stage 2. Reject has no TransactionPlan; its locked consume helper
+        # is the only place its spent-id precondition can run safely.
+        "M29", "app/outbox.py",
+        "            preconditions=(_require_unspent_id,),",
+        "            preconditions=(),  # MUTANT M29",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_spent_id_checks_are_locked_preconditions[reject]",
+          "reject omitted its locked spent-id check")],
+    ),
+    (
+        # Stage 2. A committed receipt digest is audit evidence only. It must
+        # never be compared with or used to classify the pending record.
+        "M30", "app/outbox.py",
+        "            if resolution.receipt is not None:",
+        "            if (\n"
+        "                resolution.receipt is not None\n"
+        "                and resolution.receipt.review_sha256\n"
+        "                == hashlib.sha256(discovered.read_bytes()).hexdigest()\n"
+        "            ):  # MUTANT M30: audit digest compared with pending bytes",
+        ["tests/test_console_projection.py"],
+        [("tests/test_console_projection.py::test_receipt_first_projection_never_opens_any_spent_leaf_shape[different]",
+          "the different spent leaf or its target was opened")],
+    ),
+    (
+        # Stage 2. Receipt-first projection must stop before opening or
+        # parsing whatever currently occupies the pending-record name.
+        "M31", "app/outbox.py",
+        "            if resolution.receipt is not None:",
+        "            review_snapshot_for(scope, discovered)  # MUTANT M31\n"
+        "            if resolution.receipt is not None:",
+        ["tests/test_console_projection.py"],
+        [("tests/test_console_projection.py::test_matching_receipt_projects_spent_without_opening_pending_record",
+          "a spent proposal record was opened")],
+    ),
+    (
+        "M31b", "app/registry.py",
+        "    if resolution.receipt is not None:\n"
+        "        return resolution.receipt",
+        "    get_delete_review(scope, canonical_id)  # MUTANT M31b: opened before receipt\n"
+        "    if resolution.receipt is not None:\n"
+        "        return resolution.receipt",
+        ["tests/test_console_routes.py"],
+        [("tests/test_console_routes.py::test_delete_refresh_never_opens_any_spent_leaf_shape[different]",
+          "the different spent delete leaf or its target was opened")],
+    ),
+    (
+        # Stage 2. A committed blob at `.receipts` is not an empty store; it
+        # is an integrity failure that must block the entity.
+        "M32", "app/action_receipts.py",
+        '        raise ReceiptStoreIntegrityError("receipt store root is not a Git tree")',
+        "        return False  # MUTANT M32: non-tree store treated as absent",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_non_tree_receipt_root_fails_closed",
+          "non-tree receipt root was treated as an empty store")],
+    ),
+    (
+        # Stage 2. A malformed matching receipt withholds only its own card;
+        # unrelated pending ids remain independently actionable.
+        "M33", "app/outbox.py",
+        "            if resolution.error is not None:\n"
+        "                rows.append(",
+        "            if resolution.error is not None:\n"
+        "                blocked = True  # MUTANT M33\n"
+        "                rows.append(",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_malformed_receipt_projection_stays_per_id",
+          "malformed matching receipt became entity-wide blocking")],
+    ),
+    (
+        # Stage 2. Quarantine-last is the crash-safety boundary: no proposal
+        # may be consumed before its action and receipt commit exists.
+        "M34", "app/git_transaction.py",
+        '        _checkpoint("filesystem-applied")',
+        "        for change in plan.owned_changes:\n"
+        "            quarantined.append((\n"
+        "                change, quarantine_path_if_unchanged(vault, change.path, change.before)\n"
+        "            ))  # MUTANT M34\n"
+        '        _checkpoint("filesystem-applied")',
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_proposal_quarantine_stays_after_the_action_commit",
+          "a proposal was quarantined before its action committed")],
+    ),
+    (
+        # Stage 2. Once commit+receipt are durable, a consumption failure is
+        # reported without rolling either of them back.
+        "M35", "app/git_transaction.py",
+        "        raise applied from exc",
+        '        _git(vault, "reset", "--hard", start_head)  # MUTANT M35\n'
+        "        raise applied from exc",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_stage2_postcommit_consumption_failure_has_no_rollback_path",
+          "post-commit consumption failure can roll back action and receipt")],
+    ),
+    (
+        # Stage 2. Consumption unresolved is not cleanup-after-success;
+        # E-APPLIED and E-COMMITTED make different factual claims.
+        "M36", "app/console_errors.py",
+        '    _git_transaction.PostCommitConsumptionError: _CODES["E-APPLIED"],',
+        '    _git_transaction.PostCommitConsumptionError: _CODES["E-COMMITTED"],  # MUTANT M36',
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_every_application_exception_resolves_to_its_designed_code",
+          "PostCommitConsumptionError")],
+    ),
+    (
+        # Stage 2. The persistent applied/spent fragment is HTTP 500, so the
+        # app-level HTMX override is what keeps it visible on the same screen.
+        "M37", "templates/_head.html",
+        '{"code":"[45]..","swap":true,"error":true}',
+        '{"code":"[45]..","swap":false,"error":true}',
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_receipt_attention_fragments_remain_swappable_at_500",
+          "E-APPLIED 500 fragment no longer swaps")],
+    ),
+    (
+        # Stage 2. A spent-id card is navigation-only and must never regain
+        # a fingerprint or mutation transport.
+        "M38", "templates/blocks/action_receipt_card.html",
+        '<div class="proposal action-receipt"\n'
+        '     id="receipt-card-{{ proposal_id }}-{{ issue }}">',
+        '<div class="proposal action-receipt"\n'
+        '     id="receipt-card-{{ proposal_id }}-{{ issue }}"\n'
+        '     hx-post="/outbox/{{ entity }}/approve">  {# MUTANT M38 #}',
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_action_receipt_card_has_no_review_or_mutation_transport",
+          "receipt card regained action/review transport: hx-post")],
+    ),
+    (
+        # Stage 2. Full-store enumeration is an offline audit responsibility,
+        # never work performed in a request path whose cost grows forever.
+        "M39", "app/outbox.py",
+        "    receipts = resolve_head_receipts(\n"
+        "        scope.root, scope.current_entity(), canonical_ids.values()\n"
+        "    )",
+        "    from .action_receipts import validate_head_receipt_store\n"
+        "    validate_head_receipt_store(\n"
+        "        scope.root, scope.current_entity()\n"
+        "    )  # MUTANT M39: enumerate accumulated receipts in request\n"
+        "    receipts = resolve_head_receipts(\n"
+        "        scope.root, scope.current_entity(), canonical_ids.values()\n"
+        "    )",
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_full_receipt_store_enumeration_is_offline_audit_only",
+          "request path enumerates the accumulated receipt store: app/outbox.py")],
+    ),
+    (
+        # Stage 2. Removing the last executable producer must make a code an
+        # orphan; an allowlist cannot make dead taxonomy look live.
+        "M40", "tests/test_console_invariants.py",
+        '        - {"E-UNKNOWN", "E-REQUEST"}',
+        '        - {"E-UNKNOWN", "E-REQUEST", "E-APPLIED"}  # MUTANT M40',
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_a_dead_mapping_cannot_impersonate_an_executable_producer",
+          "orphan guard allowed E-APPLIED to impersonate a live outcome")],
+    ),
+    (
+        # Stage 2. Retired outcomes may remain in historical prose, never in
+        # the live taxonomy without an executable producer.
+        "M41", "app/console_errors.py",
+        'UNKNOWN = _CODES["E-UNKNOWN"]',
+        '_CODES["E-RETAINED"] = ConsoleError(\n'
+        '    "E-RETAINED", "integrity", "attention", "retired outcome",\n'
+        '    "stop", "no", 500,\n'
+        ')  # MUTANT M41\n\n'
+        'UNKNOWN = _CODES["E-UNKNOWN"]',
+        ["tests/test_console_invariants.py"],
+        [("tests/test_console_invariants.py::test_every_operator_outcome_has_an_executable_producer",
+          "orphan operator outcome: E-RETAINED")],
+    ),
 ]
 
 
