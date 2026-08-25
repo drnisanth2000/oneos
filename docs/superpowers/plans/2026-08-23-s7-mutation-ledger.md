@@ -106,7 +106,7 @@ M43b RED then GREEN   M44  RED then GREEN   M45  RED then GREEN
 all 48 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1475 passed in 107.56s
+  1476 passed in 107.32s
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -1104,12 +1104,11 @@ rather than by adjusting the mutation:
   is available, and is recorded as a known Linux limitation in the design. The
   campaign therefore certifies nothing about Linux, and no row should be read
   as doing so.
-- **Private boundaries are outside the mutation campaign.** Prior trusted-local
-  evidence recorded 37 private tests, `check_v2` at 0 errors/0 warnings, a
+- **Private boundaries are outside the mutation campaign.** Final trusted-local
+  evidence records 37 private tests, `check_v2` at 0 errors/0 warnings, a
   clean combined repo+vault history audit, and byte-identical HEAD,
   porcelain-v2 status, binary worktree diff, and binary cached diff before and
-  after. The final post-cross-vault private rerun is pending. The campaign
-  itself makes no claim about those private checks.
+  after. The campaign itself makes no claim about those private checks.
 
 ### Focused cross-vault rename-plan proof — outside this campaign
 

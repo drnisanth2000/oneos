@@ -178,14 +178,15 @@ git diff --check
 git status --porcelain
 ```
 
-Measured public completion: `1475 passed`; all 48 campaign mutations RED then
-GREEN; the restored campaign closing suite recorded `1475 passed in 107.56s`;
+Measured public completion: `1476 passed`; all 48 campaign mutations RED then
+GREEN; the restored campaign closing suite recorded `1476 passed in 107.32s`;
 Gitleaks found no leaks; and public current-tree/history audits were CLEAN. The
 restored worktree was clean. The focused cross-vault rename-plan mutation is
 separate from the 48-row campaign: two distinct same-HEAD repositories refuse
 before lock, Git, or mutation, while same-root relative/absolute aliases still
-work; that focused mutation went RED then GREEN. Record these final public
-results only.
+work; that focused mutation went RED then GREEN. A separate caller-alias
+retarget regression also went RED then GREEN and keeps execution on the plan's
+canonical vault. Record these final public results only.
 
 - [x] **Step 2: Run private gates inside a new preservation envelope**
 
@@ -197,13 +198,12 @@ cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover
 uv run python -m tools.public_repo_audit --repo . --vault "$ONEOS_VAULT" --history
 ```
 
-Prior private-gate evidence recorded `check_v2` at 0 errors/0 warnings;
-unittest discovery at 37 tests in 0.194s and OK; a CLEAN combined history
+Final private-gate evidence records `check_v2` at 0 errors/0 warnings;
+unittest discovery at 37 tests in 0.174s and OK; a CLEAN combined history
 audit; and byte-identical HEAD, porcelain-v2 NUL status, binary worktree diff,
-and binary cached diff before and after, preserving pre-existing edits. The
-final post-cross-vault private rerun is pending. Independent scoped review PASS
-found no Critical or Important finding and resolved its report-scope minor. The
-proof is retained outside the repository; its location is not tracked.
+and binary cached diff before and after, preserving pre-existing edits.
+Independent scoped review PASS found no findings. The proof is retained outside
+the repository; its location is not tracked.
 
 - [x] **Step 3: Record measured completion**
 

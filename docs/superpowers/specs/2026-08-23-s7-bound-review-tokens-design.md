@@ -1,14 +1,15 @@
 # S7 — Bound Review Tokens
 
 **Status:** S7 COMPLETE — Amendment 5 verified. Current public verification
-records 1,475 tests passed; all 48 campaign rows RED then GREEN; the restored
-closing suite recorded 1,475 passed in 107.56s; Gitleaks found no leaks; and
+records 1,476 tests passed; all 48 campaign rows RED then GREEN; the restored
+closing suite recorded 1,476 passed in 107.32s; Gitleaks found no leaks; and
 public current-tree/history audits were clean. A separate focused cross-vault
 rename-plan mutation went RED then GREEN: two distinct same-HEAD repositories
 refuse before lock, Git, or mutation, while same-root relative/absolute aliases
-remain valid. Prior private-gate evidence remains recorded, but the final
-post-correction private rerun is pending. Independent scoped review PASS found
-no Critical or Important finding and resolved its report-scope minor. Amendment
+remain valid. A caller-alias retarget regression also went RED then GREEN and
+keeps execution on the plan's canonical vault. Final private gates record 37
+tests, `check_v2` 0/0, a clean combined history audit, and byte-identical Grey
+Matter state. Independent scoped review PASS found no findings. Amendment
 3 Stage 2 provides action receipts, quarantine-last,
 `E-APPLIED`, `E-RECEIPT`, the offline receipt validator, and the
 orphan-outcome guard. `E-RETAINED`, `E-STRANDED`, and

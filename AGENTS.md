@@ -34,15 +34,14 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
 The **Safety Foundation S1-S7 is complete** at its gate-certified branch tip.
-The current cross-vault correction checkpoint's public suite recorded 1,475
+The final rename-root correction checkpoint's public suite recorded 1,476
 passed; all 48 campaign rows went RED then GREEN; its restored closing suite
-recorded 1,475 passed in 107.56s; Gitleaks found no leaks; and current-tree and
-history public audits were clean. The most recent private-gate evidence,
-recorded before this correction, was `check_v2` 0/0, 37 tests in 0.194s, a clean
-combined repo-plus-vault history audit, and byte-identical Grey Matter HEAD,
-status, worktree diff, and cached diff preserving pre-existing edits. The final
-post-cross-vault private rerun remains pending. Independent scoped review PASS
-found no Critical or Important findings; its report-scope minor was resolved.
+recorded 1,476 passed in 107.32s; Gitleaks found no leaks; and current-tree and
+history public audits were clean. The final private-gate evidence was
+`check_v2` 0/0, 37 tests in 0.174s, a clean combined repo-plus-vault history
+audit, and byte-identical Grey Matter HEAD, status, worktree diff, and cached
+diff preserving pre-existing edits. Independent scoped review PASS found no
+Critical, Important, or Minor findings on the final rename-root correction.
 The macOS no-overwrite path was exercised;
 Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
 user/platform limitation. The separately sequenced inherited items 2–4 in
