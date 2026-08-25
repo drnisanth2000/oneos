@@ -421,7 +421,10 @@ def build_rename_plan(
     HEAD; offline history audits supply the immutable parent commit whose tree
     they materialized.
     """
-    vault = Path(vault)
+    try:
+        vault = Path(vault).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RenameError("rename vault root could not be resolved") from exc
     if axis not in AXES:
         raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
     if old == new:
@@ -441,7 +444,10 @@ def build_rename_plan(
 
 
 def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
-    vault = Path(vault)
+    try:
+        vault = Path(vault).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RenameError("rename vault root could not be resolved") from exc
     if axis not in AXES:
         raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
     if old == new:
@@ -502,10 +508,10 @@ def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
         raise RenameError("rename vault root could not be resolved") from exc
     if planned_root != execution_root:
         raise RenameError("rename plan belongs to a different vault")
-    # Keep the plan's own path spelling: its edit/move paths were constructed
-    # beneath this value. The resolved roots above prove it names the same
-    # repository the caller requested, including relative/absolute aliases.
-    vault = Path(plan.vault)
+    # Plans store their canonical root, so a symlink alias used by the caller
+    # cannot be retargeted after this comparison to redirect the lock, Git
+    # commands, or the already-planned edit/move paths into another vault.
+    vault = planned_root
     commit_completed = False
     commit_oid: str | None = None
     lock_body_entered = False

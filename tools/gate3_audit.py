@@ -695,8 +695,9 @@ def _rename_envelope(
         new,
         planned_head=parent_oid,
     )
+    planned_root = plan.vault
     moves = tuple(
-        (source.relative_to(tree), destination.relative_to(tree))
+        (source.relative_to(planned_root), destination.relative_to(planned_root))
         for source, destination in plan.moves
     )
     envelope: set[tuple[str, str]] = set()
@@ -709,7 +710,7 @@ def _rename_envelope(
                 envelope.add(("A", (destination / tail).as_posix()))
                 break
     for edited in plan.edits:
-        relative = edited.relative_to(tree)
+        relative = edited.relative_to(planned_root)
         if any(_relative_to(relative, source) is not None for source, _ in moves):
             continue
         envelope.add(("M", relative.as_posix()))

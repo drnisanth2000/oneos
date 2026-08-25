@@ -312,6 +312,41 @@ def test_rename_plan_accepts_relative_and_absolute_names_for_same_vault(
     assert git_is_clean(vault)
 
 
+def test_rename_keeps_planned_vault_when_symlink_alias_is_retargeted_before_lock(
+    tmp_path, monkeypatch
+):
+    planned_vault = git_vault(tmp_path / "planned", ENTITY_FILES)
+    alternate_vault = tmp_path / "alternate"
+    subprocess.run(
+        ["git", "clone", "-q", str(planned_vault), str(alternate_vault)],
+        check=True,
+    )
+    alias = tmp_path / "vault-alias"
+    alias.symlink_to(planned_vault, target_is_directory=True)
+    plan = plan_rename(alias, "entity", "oldentity", "newentity")
+    alternate_boundary = _rename_boundary(alternate_vault)
+    real_action_lock = rename.action_lock
+    retargeted = False
+
+    def retarget_before_lock(vault_arg):
+        nonlocal retargeted
+        alias.unlink()
+        alias.symlink_to(alternate_vault, target_is_directory=True)
+        retargeted = True
+        return real_action_lock(vault_arg)
+
+    monkeypatch.setattr(rename, "action_lock", retarget_before_lock)
+
+    apply_rename(alias, plan)
+
+    assert retargeted, "the test never retargeted the vault alias before locking"
+    assert (planned_vault / "newentity").is_dir()
+    assert not (planned_vault / "oldentity").exists()
+    assert _rename_boundary(alternate_vault) == alternate_boundary, (
+        "retargeting the alias redirected the reviewed rename into another vault"
+    )
+
+
 @pytest.mark.parametrize("failure_point", ("unlock", "close"))
 def test_entity_rename_lock_cleanup_failure_reports_committed_without_rollback(
     tmp_path, monkeypatch, failure_point
