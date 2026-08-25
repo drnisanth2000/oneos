@@ -4849,6 +4849,116 @@ def test_outbox_screen_real_symlinked_outbox_shows_e_tamper(tmp_path, monkeypatc
     assert "outside-outbox-screen-marker" not in response.text
 
 
+def test_registry_tamper_preview_swap_removes_its_initiating_delete_control(
+    tmp_path, monkeypatch
+):
+    """A 409 fragment swaps into the control's page target, not an isolated
+    response document. The initiated delete control must therefore be absent
+    from the browser's resulting DOM while unrelated registry actions remain
+    outside this amendment's scope."""
+    from app.console_errors import _CODES
+
+    class _Node:
+        def __init__(self, tag, attrs, parent=None):
+            self.tag = tag
+            self.attrs = dict(attrs)
+            self.parent = parent
+            self.children = []
+
+    class _BrowserDom(HTMLParser):
+        _VOID = {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }
+
+        def __init__(self, markup):
+            super().__init__()
+            self.root = _Node("document", [])
+            self.stack = [self.root]
+            self.feed(markup)
+
+        def handle_starttag(self, tag, attrs):
+            node = _Node(tag, attrs, self.stack[-1])
+            self.stack[-1].children.append(node)
+            if tag not in self._VOID:
+                self.stack.append(node)
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+            if tag not in self._VOID:
+                self.stack.pop()
+
+        def handle_endtag(self, tag):
+            for index in range(len(self.stack) - 1, 0, -1):
+                if self.stack[index].tag == tag:
+                    del self.stack[index:]
+                    return
+
+        def nodes(self):
+            pending = list(self.root.children)
+            while pending:
+                node = pending.pop(0)
+                yield node
+                pending[0:0] = node.children
+
+        def node_with_id(self, element_id):
+            return next(
+                node for node in self.nodes() if node.attrs.get("id") == element_id
+            )
+
+        def swap(self, element_id, markup, strategy):
+            target = self.node_with_id(element_id)
+            replacement = type(self)(markup).root.children
+            if strategy == "innerHTML":
+                target.children = replacement
+                for node in replacement:
+                    node.parent = target
+                return
+            assert strategy == "outerHTML"
+            parent = target.parent
+            index = parent.children.index(target)
+            parent.children[index:index + 1] = replacement
+            for node in replacement:
+                node.parent = parent
+
+    _main, client, slug = _registry_client(tmp_path, monkeypatch)
+    page = client.get("/registry/alpha/products")
+    assert page.status_code == 200
+
+    before = _BrowserDom(page.text)
+    delete_url = "/registry/alpha/product/delete-preview"
+    control = next(
+        node
+        for node in before.nodes()
+        if node.attrs.get("hx-post") == delete_url
+        and json.loads(node.attrs.get("hx-vals", "{}")) == {"slug": slug}
+    )
+    target_id = control.attrs["hx-target"].removeprefix("#")
+    swap_strategy = control.attrs["hx-swap"]
+    assert before.node_with_id(target_id)
+
+    outbox_dir = tmp_path / "alpha/outbox"
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-outbox-preview-marker"
+    outside.mkdir()
+    if outbox_dir.exists():
+        import shutil
+
+        shutil.rmtree(outbox_dir)
+    outbox_dir.symlink_to(outside)
+
+    response = client.post(delete_url, data={"slug": slug})
+    assert response.status_code == _CODES["E-TAMPER"].page_status
+    assert "E-TAMPER" in response.text
+
+    after = _BrowserDom(page.text)
+    after.swap(target_id, response.text, swap_strategy)
+    assert not any(
+        node.attrs.get("hx-post") == delete_url
+        and json.loads(node.attrs.get("hx-vals", "{}")) == {"slug": slug}
+        for node in after.nodes()
+    )
+
+
 def test_registry_delete_preview_real_symlinked_outbox_shows_e_tamper(
     tmp_path, monkeypatch
 ):

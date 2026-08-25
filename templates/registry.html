@@ -19,13 +19,15 @@
       <li class="triage-item">
         <div class="ti-head"><span class="ti-title">{{ slug }}</span></div>
         {% set delete_preview_values = {"slug": slug} %}
-        <div class="prop-actions">
-          <button class="reject"
-                  hx-post="/registry/{{ entity }}/product/delete-preview"
-                  hx-vals='{{ delete_preview_values | tojson }}'
-                  hx-target="#impact-{{ loop.index0 }}" hx-swap="innerHTML">Delete…</button>
+        <div id="delete-preview-{{ loop.index0 }}">
+          <div class="prop-actions">
+            <button class="reject"
+                    hx-post="/registry/{{ entity }}/product/delete-preview"
+                    hx-vals='{{ delete_preview_values | tojson }}'
+                    hx-target="#delete-preview-{{ loop.index0 }}" hx-swap="outerHTML">Delete…</button>
+          </div>
+          <div id="impact-{{ loop.index0 }}"></div>
         </div>
-        <div id="impact-{{ loop.index0 }}"></div>
       </li>
       {% endfor %}
     </ul>

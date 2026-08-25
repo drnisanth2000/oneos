@@ -534,8 +534,15 @@ def test_execute_delete_refuses_while_referenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
     scope = Scope(vault, "demo")
     prop = propose_delete(scope, "product", "widgetx")
-    with pytest.raises(RegistryError):
-        execute_delete(scope, prop.id, _fingerprint_of(scope, prop.id))
+    review_sha256 = _fingerprint_of(scope, prop.id)
+    assert registry.reference_count(scope, prop.kind, prop.slug).total > 0
+
+    with pytest.raises(
+        RegistryError,
+        match="this proposal was reviewed while references remained",
+    ):
+        execute_delete(scope, prop.id, review_sha256)
+
     assert "widgetx:" in (vault / "_system/products.yaml").read_text()
 
 
