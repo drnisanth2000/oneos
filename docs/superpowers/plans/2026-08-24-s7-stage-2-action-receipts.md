@@ -35,7 +35,7 @@ All implementation work is **sequential in this shared worktree**. Do not let tw
 | Task | Implementer | Reviewer |
 |---|---|---|
 | 1. Receipt domain and `HEAD` reader | delegated coding agent A | fresh review agent, not A |
-| 2. Receipt taxonomy contracts | delegated coding agent B | fresh review agent, not B |
+| 2. Taxonomy sequencing checkpoint | no code task; receipt mappings closed in Task 1 and `E-APPLIED` lands with its Task 3 producer | primary plan review |
 | 3. Quarantine-last transaction core | primary Codex agent | fresh transaction-focused review agent |
 | 4. Approval/reject/delete service integration | primary Codex agent | fresh service-boundary review agent |
 | 5. Receipt-first projection and UI | delegated coding agent C | fresh presentation/security review agent, not C |
@@ -120,6 +120,9 @@ If unset, mark private gates and preservation proof blocked and continue only wi
 - Create: `tests/test_action_receipts.py`
 - Modify: `app/review_tokens.py`
 - Modify: `tests/test_review_tokens.py`
+- Modify: `app/console_errors.py`
+- Modify: `tests/test_console_errors.py`
+- Modify: `tests/test_console_invariants.py`
 
 **Interfaces:**
 - Consumes: `proposal_identity.require_proposal_id`, `proposal_identity.require_proposal_identity`, strict SHA-256 validation from `app.review_tokens`, Git CLI, PyYAML.
@@ -277,9 +280,16 @@ uv run python -m pytest \
 
 ```bash
 git add app/action_receipts.py app/review_tokens.py \
-  tests/test_action_receipts.py tests/test_review_tokens.py
+  app/console_errors.py tests/test_action_receipts.py tests/test_review_tokens.py \
+  tests/test_console_errors.py tests/test_console_invariants.py
 git commit -m "feat: add committed action receipt reader"
 ```
+
+If independent review finds a Task 1 defect, correct it in a second focused
+commit rather than rewriting the reviewed history. The actual Task 1 review
+required `fix: close action receipt review findings` to close concrete
+exception mappings, empty nested-tree visibility, and O(store) duplicate
+tracking before the checkpoint became green.
 
 - [ ] **Step 10: Independent Task 1 review**
 
@@ -287,91 +297,20 @@ Dispatch a fresh reviewer to check protocol totality, exact filename binding, fo
 
 ---
 
-### Task 2: Add truthful receipt outcomes and taxonomy tests
+### Task 2: Taxonomy sequencing checkpoint — no separate code task
 
-**Owner:** delegated coding agent B.
+Independent Task 1 review proved that concrete receipt exceptions cannot wait
+for a later taxonomy commit: the repository's full-suite invariant requires
+every concrete application exception to have its truthful mapping in the same
+green checkpoint that introduces it. Task 1 therefore owns exact
+`E-RECEIPT`, `InvalidActionReceipt -> E-RECEIPT`,
+`ReceiptStoreIntegrityError -> E-TAMPER`, and
+`ReceiptStoreUnavailable -> E-UNAVAILABLE`.
 
-**Files:**
-- Modify: `app/console_errors.py`
-- Modify: `tests/test_console_errors.py`
-- Modify: `tests/test_console_invariants.py`
-
-**Interfaces:**
-- Consumes: `InvalidActionReceipt`, `ReceiptStoreIntegrityError`, `ReceiptStoreUnavailable`. Task 3 adds the `PostCommitConsumptionError` mapping when it creates that class.
-- Produces: exact `E-RECEIPT` and `E-APPLIED` contracts; mappings `InvalidActionReceipt -> E-RECEIPT`, `ReceiptStoreIntegrityError -> E-TAMPER`, `ReceiptStoreUnavailable -> E-UNAVAILABLE`, and later `PostCommitConsumptionError -> E-APPLIED`.
-
-- [ ] **Step 1: Write RED taxonomy tests with verbatim copy**
-
-```python
-def test_e_receipt_contract_is_exact():
-    error = _CODES["E-RECEIPT"]
-    assert (error.tier, error.severity, error.retry,
-            error.committed, error.page_status) == (
-        "integrity", "attention", "stop", "no", 500
-    )
-    assert error.message == (
-        "OneOS found an invalid action receipt for this proposal ID. "
-        "It cannot safely tell what completed action the receipt represents, "
-        "so the ID is disabled. Do not retry, and do not move or delete files "
-        "by hand. No automated recovery is available. Inspect vault state "
-        "with git status and escalate for verified recovery."
-    )
-
-
-def test_e_applied_contract_is_exact():
-    error = _CODES["E-APPLIED"]
-    assert (error.tier, error.severity, error.retry,
-            error.committed, error.page_status) == (
-        "committed", "attention", "stop", "yes", 500
-    )
-    assert error.message == (
-        "The action completed, but OneOS could not verify that its proposal "
-        "was safely consumed. Its receipt prevents this proposal ID from "
-        "being used again. Do not retry or move files by hand. Inspect vault "
-        "state with git status."
-    )
-```
-
-Assert `committed=no` for `E-RECEIPT` describes the current request, while `E-APPLIED` always means the commit is durable despite pre-commit names such as `applied_changes`.
-
-- [ ] **Step 2: Run RED**
-
-```bash
-uv run python -m pytest tests/test_console_errors.py tests/test_console_invariants.py -q
-```
-
-- [ ] **Step 3: Add codes and receipt reader mappings**
-
-Add both exact `ConsoleError` rows. Import `action_receipts` in the composition root and map:
-
-```python
-_action_receipts.InvalidActionReceipt: _CODES["E-RECEIPT"],
-_action_receipts.ReceiptStoreIntegrityError: _CODES["E-TAMPER"],
-_action_receipts.ReceiptStoreUnavailable: _CODES["E-UNAVAILABLE"],
-```
-
-Add `ReceiptError` to `_abstract_bases()` and `AMBIGUOUS`; add an AST guard that it is never raised directly. Do not map a valid receipt to `E-RECEIPT`: valid receipt presence uses `SpentAction` and a receipt-backed card, because calling it invalid would be false.
-
-- [ ] **Step 4: Update exact class-map transcription and closed-family checks**
-
-Add the three concrete receipt exceptions to the test's expected design map. Do not remove Stage 1 outcomes yet. The `PostCommitConsumptionError` mapping lands with Task 3 so no import points at a nonexistent class.
-
-- [ ] **Step 5: Run focused taxonomy tests**
-
-```bash
-uv run python -m pytest tests/test_console_errors.py tests/test_console_invariants.py -q
-```
-
-- [ ] **Step 6: Commit Task 2**
-
-```bash
-git add app/console_errors.py tests/test_console_errors.py tests/test_console_invariants.py
-git commit -m "feat: add action receipt outcomes"
-```
-
-- [ ] **Step 7: Independent Task 2 review**
-
-Reviewer checks constructibility, verbatim copy, current-request semantics, valid-receipt non-use of `E-RECEIPT`, store-integrity attribution, and no premature Stage 1 retirement.
+`E-APPLIED` must not be added here because it would have no producer. Task 3
+adds the code, exact contract tests, `PostCommitConsumptionError`, mapping,
+and producer evidence together. This checkpoint has no files, command, or
+commit; proceed directly from accepted Task 1 to Task 3.
 
 ---
 
