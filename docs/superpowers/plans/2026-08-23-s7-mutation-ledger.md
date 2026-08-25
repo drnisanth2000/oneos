@@ -101,12 +101,12 @@ M32  RED then GREEN   M33  RED then GREEN   M34  RED then GREEN
 M35  RED then GREEN   M36  RED then GREEN   M37  RED then GREEN
 M38  RED then GREEN   M39  RED then GREEN   M40  RED then GREEN
 M41  RED then GREEN   M42  RED then GREEN   M43  RED then GREEN
-M43b RED then GREEN   M44  RED then GREEN
+M43b RED then GREEN   M44  RED then GREEN   M45  RED then GREEN
 
-all 47 mutations: red under mutation, green once restored
+all 48 mutations: red under mutation, green once restored
 
 full public suite after the restored campaign group:
-  1460 passed in 112.54s (0:01:52)
+  1461 passed in 135.21s (0:02:15)
 ```
 
 The runner's own guards were exercised too, since a harness that cannot fail
@@ -1017,6 +1017,24 @@ The invariant derives every exact `RETIRED (historical)` heading from this
 ledger, checks each heading is unique, and refuses every such id in the live
 runner. It therefore cannot drift back to an M18/M19-only list while older
 retirements silently return.
+
+### M45 — blocked-list rebuilding drops pending-record evidence
+
+- **file** `app/outbox.py`
+- **selection** `tests/test_console_projection.py`
+- **result** RED —
+  `test_blocked_listing_preserves_spent_rows_pending_record_evidence`
+  — `blocked-row reconstruction lost the pending-record evidence`
+
+```diff
+-                record_present=row.record_present,
++                record_present=False,  # MUTANT M45
+```
+
+Entity-wide blocking withholds controls and review fingerprints, but it must
+not erase the independent checked-metadata fact used by the persistent receipt
+card. Otherwise one malformed sibling makes the real lingering proposal file
+disappear from the operator's do-not-touch explanation.
 
 ## M6 — a survivor, and what it cost
 
