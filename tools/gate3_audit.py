@@ -41,7 +41,7 @@ from app.proposal_identity import (
     require_proposal_identity,
 )
 from app.registry import RegistryError, get_delete_proposal
-from app.rename import AXES, RenameError, plan_rename
+from app.rename import AXES, RenameError, build_rename_plan
 from app.scope import CrossScopeError, Scope
 from app.vault import DestinationRegistryError, Vault
 
@@ -685,8 +685,16 @@ def _rename_envelope(
     axis: str,
     old: str,
     new: str,
+    *,
+    parent_oid: str,
 ) -> frozenset[tuple[str, str]]:
-    plan = plan_rename(tree, axis, old, new)
+    plan = build_rename_plan(
+        tree,
+        axis,
+        old,
+        new,
+        planned_head=parent_oid,
+    )
     moves = tuple(
         (source.relative_to(tree), destination.relative_to(tree))
         for source, destination in plan.moves
@@ -721,7 +729,14 @@ def _sanctioned_rename(record: CommitRecord, vault: Path) -> bool:
         temporary, tree, tracked = _parent_tree(vault, record.parents[0])
         for axis in sorted(AXES):
             try:
-                expected = _rename_envelope(tree, tracked, axis, old, new)
+                expected = _rename_envelope(
+                    tree,
+                    tracked,
+                    axis,
+                    old,
+                    new,
+                    parent_oid=record.parents[0],
+                )
             except (OSError, RenameError, UnicodeError, sqlite3.Error):
                 continue
             if expected and actual == expected:

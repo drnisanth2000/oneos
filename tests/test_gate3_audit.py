@@ -674,6 +674,36 @@ def _rename_files(axis: str) -> tuple[dict[str, str], str, str]:
     raise AssertionError(f"unhandled rename axis {axis}")
 
 
+def test_offline_rename_envelope_uses_explicit_parent_oid_without_git_repo(
+    tmp_path: Path,
+):
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path, files)
+    parent_oid = _git(vault, "rev-parse", "HEAD").strip()
+    apply_rename(
+        vault,
+        plan_rename(vault, "entity", old, new),
+        validators=[],
+    )
+    record = gate3.collect_commit_records(vault, parent_oid)[0]
+    temporary, tree, tracked = gate3._parent_tree(vault, parent_oid)
+    try:
+        assert not (tree / ".git").exists()
+        expected = gate3._rename_envelope(
+            tree,
+            tracked,
+            "entity",
+            old,
+            new,
+            parent_oid=parent_oid,
+        )
+    finally:
+        temporary.cleanup()
+
+    actual = frozenset((change.status, change.path) for change in record.changes)
+    assert expected == actual
+
+
 @pytest.mark.parametrize("axis", sorted(AXES))
 def test_existing_rename_planner_commit_has_one_exact_accepted_envelope(
     tmp_path: Path, axis: str

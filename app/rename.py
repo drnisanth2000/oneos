@@ -407,14 +407,26 @@ _PLANNERS = {
 
 # --- public API ------------------------------------------------------------
 
-def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
+def build_rename_plan(
+    vault: Path | str,
+    axis: str,
+    old: str,
+    new: str,
+    *,
+    planned_head: str,
+) -> RenamePlan:
+    """Build from tree bytes explicitly identified by ``planned_head``.
+
+    This constructor does not inspect Git. The live planner supplies current
+    HEAD; offline history audits supply the immutable parent commit whose tree
+    they materialized.
+    """
     vault = Path(vault)
     if axis not in AXES:
         raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
     if old == new:
         raise RenameError("old and new slug are identical")
     _validate_new_slug(new)
-    planned_head = _git(vault, "rev-parse", "HEAD").strip()
     plan = RenamePlan(
         axis=axis,
         old=old,
@@ -426,6 +438,23 @@ def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
     if not plan.moves and not plan.edits:
         raise RenameError(f"{axis} {old!r} not found — nothing to rename")
     return plan
+
+
+def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
+    vault = Path(vault)
+    if axis not in AXES:
+        raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
+    if old == new:
+        raise RenameError("old and new slug are identical")
+    _validate_new_slug(new)
+    planned_head = _git(vault, "rev-parse", "HEAD").strip()
+    return build_rename_plan(
+        vault,
+        axis,
+        old,
+        new,
+        planned_head=planned_head,
+    )
 
 
 def render_diff(plan: RenamePlan) -> str:
