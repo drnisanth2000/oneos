@@ -4841,6 +4841,11 @@ def test_outbox_screen_real_symlinked_outbox_shows_e_tamper(tmp_path, monkeypatc
     assert response.status_code == _CODES["E-TAMPER"].page_status
     assert 'role="alert"' in response.text
     assert "E-TAMPER" in response.text
+    assert _CODES["E-TAMPER"].message in response.text
+    assert "ONEOS_VAULT" in response.text
+    assert "symlink" in response.text
+    assert "hx-post" not in response.text
+    assert "review_sha256" not in response.text
     assert "outside-outbox-screen-marker" not in response.text
 
 
@@ -4913,6 +4918,11 @@ def test_registry_delete_preview_real_symlinked_outbox_shows_e_tamper(
     assert response.status_code == _CODES["E-TAMPER"].page_status
     assert 'role="alert"' in response.text
     assert "E-TAMPER" in response.text
+    assert _CODES["E-TAMPER"].message in response.text
+    assert "ONEOS_VAULT" in response.text
+    assert "symlink" in response.text
+    assert "hx-post" not in response.text
+    assert "review_sha256" not in response.text
     assert "outside-outbox-preview-marker" not in response.text
 
     # persistence=none: nothing was written anywhere, including the real

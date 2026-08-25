@@ -85,6 +85,26 @@ def test_e_applied_contract_is_exact_and_committed():
     )
 
 
+def test_e_tamper_contract_gives_moved_folder_recovery_guidance():
+    from app.console_errors import ConsoleError, describe
+    from app.git_transaction import ReviewedPathIntegrityError
+
+    assert describe(ReviewedPathIntegrityError("probe")) == ConsoleError(
+        "E-TAMPER",
+        "integrity",
+        "attention",
+        "Refused: a managed file or folder is missing, moved, replaced, or "
+        "redirected. Reviewed actions for the affected entity are read-only. "
+        "Stop OneOS and every connected writer. Restore the item to its "
+        "expected location. If the whole vault intentionally moved, update "
+        "ONEOS_VAULT, restart OneOS, and rerun verification. Do not use a "
+        "symlink or retry while this warning remains.",
+        "stop",
+        "no",
+        409,
+    )
+
+
 def test_map_GitTransactionRecoveryError():
     from app.git_transaction import GitTransactionRecoveryError
 

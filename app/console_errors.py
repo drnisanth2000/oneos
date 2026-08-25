@@ -148,8 +148,12 @@ _CODES: dict[str, ConsoleError] = {
         ),
         ConsoleError(
             "E-TAMPER", "integrity", "attention",
-            "Refused: a file involved in this action is not where it should "
-            "be. Do not retry. Inspect the vault before continuing.",
+            "Refused: a managed file or folder is missing, moved, replaced, or "
+            "redirected. Reviewed actions for the affected entity are read-only. "
+            "Stop OneOS and every connected writer. Restore the item to its "
+            "expected location. If the whole vault intentionally moved, update "
+            "ONEOS_VAULT, restart OneOS, and rerun verification. Do not use a "
+            "symlink or retry while this warning remains.",
             "stop", "no", 409,
         ),
         ConsoleError(

@@ -1,15 +1,17 @@
 # S7 — Bound Review Tokens
 
-**Status:** AMENDMENT 5 PROPOSED — the previously approved design and gates
-remain recorded below, but S7 closure is paused until Amendment 5 is approved,
-implemented, and reverified. Amendment 3 Stage 2 provides action receipts, quarantine-last,
+**Status:** AMENDMENT 5 APPROVED — implementation complete, final verification
+pending. The previously approved design and gates remain recorded below as
+historical evidence until Task 3 refreshes the final verification. Amendment 3
+Stage 2 provides action receipts, quarantine-last,
 `E-APPLIED`, `E-RECEIPT`, the offline receipt validator, and the
 orphan-outcome guard. `E-RETAINED`, `E-STRANDED`, and
 `diagnose_quarantined_record` are retired. Final evidence is recorded in the
 implementation plans and mutation ledger. Inherited items 2–4 remain separate
 pre-live-gate work and are not silently claimed complete here.
 
-**Amendment 5 (PROPOSED, pending written-artifact approval, 2026-08-25):**
+**Amendment 5 (APPROVED — implementation complete, final verification pending,
+2026-08-25):**
 managed ancestor directories are stable for the duration of a reviewed action.
 Every supported OneOS, Hermes, parser, browser-extension, and external-agent
 writer must use OneOS interfaces and the shared action lock; none may rename an
