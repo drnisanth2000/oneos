@@ -494,7 +494,18 @@ DEFAULT_VALIDATORS = [_validate_check_v2]
 
 
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
-    vault = Path(vault)
+    execution_vault = Path(vault)
+    try:
+        planned_root = Path(plan.vault).resolve(strict=True)
+        execution_root = execution_vault.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RenameError("rename vault root could not be resolved") from exc
+    if planned_root != execution_root:
+        raise RenameError("rename plan belongs to a different vault")
+    # Keep the plan's own path spelling: its edit/move paths were constructed
+    # beneath this value. The resolved roots above prove it names the same
+    # repository the caller requested, including relative/absolute aliases.
+    vault = Path(plan.vault)
     commit_completed = False
     commit_oid: str | None = None
     lock_body_entered = False

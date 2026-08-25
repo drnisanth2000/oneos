@@ -256,6 +256,62 @@ def test_stale_rename_plan_refuses_before_mutation_and_preserves_newer_commit(
     ], "stale refusal crossed into Git mutation or cleanup"
 
 
+def test_rename_plan_from_another_vault_refuses_before_lock_or_mutation(
+    tmp_path, monkeypatch
+):
+    planned_vault = git_vault(tmp_path / "planned", ENTITY_FILES)
+    execution_vault = tmp_path / "execution"
+    subprocess.run(
+        ["git", "clone", "-q", str(planned_vault), str(execution_vault)],
+        check=True,
+    )
+    assert git_head(planned_vault) == git_head(execution_vault)
+    plan = plan_rename(
+        planned_vault, "entity", "oldentity", "newentity"
+    )
+    planned_boundary = _rename_boundary(planned_vault)
+    execution_boundary = _rename_boundary(execution_vault)
+    lock_calls = []
+    git_calls = []
+    real_git = rename._git
+
+    def forbidden_action_lock(vault_arg):
+        lock_calls.append(vault_arg)
+        raise AssertionError("cross-vault refusal reached action_lock")
+
+    def record_rename_git_call(vault_arg, *args):
+        git_calls.append((vault_arg, args))
+        return real_git(vault_arg, *args)
+
+    monkeypatch.setattr(rename, "action_lock", forbidden_action_lock)
+    monkeypatch.setattr(rename, "_git", record_rename_git_call)
+
+    with pytest.raises(RenameError, match="different vault"):
+        apply_rename(execution_vault, plan)
+
+    assert lock_calls == []
+    assert git_calls == []
+    assert _rename_boundary(planned_vault) == planned_boundary
+    assert _rename_boundary(execution_vault) == execution_boundary
+
+
+def test_rename_plan_accepts_relative_and_absolute_names_for_same_vault(
+    tmp_path, monkeypatch
+):
+    vault = git_vault(tmp_path / "same-vault", ENTITY_FILES)
+    monkeypatch.chdir(tmp_path)
+    plan = plan_rename(
+        Path("same-vault"), "entity", "oldentity", "newentity"
+    )
+
+    apply_rename(vault.resolve(), plan)
+
+    assert (vault / "newentity").is_dir()
+    assert not (vault / "oldentity").exists()
+    assert git_head_message(vault) == "rename: oldentity → newentity"
+    assert git_is_clean(vault)
+
+
 @pytest.mark.parametrize("failure_point", ("unlock", "close"))
 def test_entity_rename_lock_cleanup_failure_reports_committed_without_rollback(
     tmp_path, monkeypatch, failure_point
