@@ -1,8 +1,8 @@
 # Short-Identifier Cutover
 
-**Status:** DESIGN — public design task only. No implementation plan exists
-yet, no application code or test has been modified, and no migration has been
-executed.
+**Status:** DESIGN — public design task only, revision 2. No implementation
+plan exists yet, no application code or test has been modified, and no
+migration has been executed.
 
 **Base:** freshly fetched merged `origin/main` at
 `e4478fc1beef985fecc16e485b0974568b4fc004`. Fresh public baseline:
@@ -15,16 +15,21 @@ executed.
 **Prerequisite state:** inherited Item 2 is implemented and parked, unpushed,
 on branch `codex/inherited-item-2-prose-leakage` at
 `cfed17fffd9f00e0036e7877ab6aa8b5342f93bc`. Its public gates passed. Its
-trusted-local run reported current-tree and historical findings caused by
-private registry identifiers shorter than the audit's long-term threshold.
-This cutover exists to remove that class of identifier at the source rather
-than to weaken the audit that found it.
+trusted-local run reported publication-audit findings caused by private
+registry identifiers shorter than the audit's long-term threshold. This cutover
+removes that class of identifier at the source rather than weakening the audit
+that found it.
+
+**Revision 2 incorporates four owner corrections** — no vault-wide word
+replacement, a corrected history-audit expectation, an isolated mutable copy
+for dry-run, and removal of live-vault destructive rollback — **and the
+approved `books.db` decision.**
 
 ## Objective
 
 Raise every Grey Matter registry identifier to a minimum length so that no
-registry-derived term can ever again be short enough to escape whole-text
-matching, and do it as one reviewable, reversible private commit.
+registry-derived term can again be short enough to escape whole-text matching,
+and do it as one reviewable, reversible private commit.
 
 This is a data and convention migration plus the public code that enforces the
 new rule. It adds no product surface, no dependency, no schema, and no second
@@ -32,7 +37,7 @@ scanner.
 
 ## Approved product decisions
 
-These were decided by the product owner and are inputs, not open questions:
+Decided by the product owner. These are inputs, not open questions.
 
 1. Registry identifiers must contain at least five characters.
 2. Clean cutover: no aliases and no compatibility fallback.
@@ -46,23 +51,28 @@ These were decided by the product owner and are inputs, not open questions:
    approved before it is applied.
 9. The parked Item 2 branch resumes only after this cutover is complete.
 10. Independent review and mutation-tested verification remain mandatory.
+11. Only identifiers shorter than five characters are rewritten; identifiers
+    already at or above the floor keep their current value.
+12. `former_slugs` is retained as unread provenance only, never as an alias.
+13. Matching product and member values inside `books.db` are migrated in the
+    same reversible cutover commit, under the narrow allowlist rules below.
 
 ## Identifier format and the five-character minimum
 
 The grammar is unchanged: lowercase ASCII letters and digits in hyphen-joined
 tokens, matching the existing expression `^[a-z0-9]+(?:-[a-z0-9]+)*$`. The
-cutover adds one rule on top of it: the whole identifier must be at least five
-characters long, counting hyphens.
+cutover adds one rule: the whole identifier must be at least five characters
+long, counting hyphens.
 
 Five is deliberately one character above the publication audit's long-term
 threshold of four. The audit classifies a term of four or more characters as a
-long term and matches it in every tracked text file; a term of three or fewer
-is a short term. A four-character floor would sit exactly on that boundary and
-would leave no margin if the audit's own classification is ever retuned. Five
-guarantees every registry identifier is matched everywhere by the strongest
-rule the audit has, with one character to spare.
+long term and matches it in every tracked text file; three or fewer makes it a
+short term. A four-character floor would sit exactly on that boundary with no
+margin if the classification is ever retuned. Five guarantees every registry
+identifier is matched by the strongest rule the audit has, with one character
+to spare.
 
-The floor applies to all four registry axes this cutover governs: entity,
+The floor applies to the four registry axes this cutover governs: entity,
 product, member, and workspace. The `project` axis that `app/rename.py` also
 knows about is a directory name inside a bundle pipeline, not a registry
 identifier, and is out of scope.
@@ -73,94 +83,173 @@ Reserved names remain reserved regardless of length.
 
 ### Which identifiers are rewritten
 
-**Only identifiers shorter than five characters are rewritten.** An identifier
-that already satisfies the floor keeps its current value.
+Only identifiers shorter than five characters are rewritten. An identifier that
+already satisfies the floor keeps its current value.
 
-The alternative — suffixing every identifier uniformly so that shape always
-reveals type — was considered and rejected. It would rewrite every identifier
-in the vault instead of a small minority, which enlarges a single reversible
-commit into a whole-vault rewrite, multiplies the chance of a missed reference,
-and makes owner review of the mapping far harder. The suffix exists to add
-length, not to encode type, so there is no correctness reason to apply it where
-length is already sufficient. If the owner prefers uniform suffixing, that is a
-product decision that changes this design and must be settled before any
-implementation plan is written.
+Uniform suffixing of every identifier was considered and rejected: it would
+turn a small, reviewable commit into a whole-vault rewrite, multiply the chance
+of a missed reference, and make owner review far harder. The suffix exists to
+add length, not to encode type, so there is no correctness reason to apply it
+where length already suffices.
 
 ### The mapping function
 
 For an identifier `old` on axis `axis`, the new value is `f"{old}-{axis}"`,
 where `axis` is exactly one of `entity`, `product`, `member`, `workspace`.
 
-The function is total, deterministic, and depends only on the pair
-`(axis, old)`. It performs no lookup, consults no counter, and has no
-tie-breaking branch. The same inventory always produces the same mapping, which
-is what makes the dry-run output a trustworthy preview of the apply.
+The function is total, deterministic, and depends only on `(axis, old)`. It
+performs no lookup, consults no counter, and has no tie-breaking branch. The
+same inventory always produces the same mapping, which is what lets the
+dry-run diff be trusted as a preview of the apply.
 
-The suffixes are seven to ten characters long, so the shortest possible output
-is a one-character identifier plus the seven-character `-entity` or `-member`
-suffix — eight characters, comfortably above the floor. The mapping therefore
-never needs a second pass and never produces a value that still violates the
-rule.
+The suffixes are seven to ten characters, so the shortest possible output is a
+one-character identifier plus the seven-character `-entity` or `-member`
+suffix — eight characters, comfortably above the floor. The mapping never needs
+a second pass and never produces a value that still violates the rule.
 
 ### Already-suffixed values
 
-No in-scope identifier can already carry an axis suffix, and the arithmetic is
-what guarantees it: every suffix is at least seven characters, so any
-identifier ending in one is at least eight characters, which is above the floor
-and therefore never in scope. An identifier such as `ab-entity` is simply left
-alone.
+No in-scope identifier can already carry an axis suffix, and arithmetic
+guarantees it: every suffix is at least seven characters, so any identifier
+ending in one is at least eight characters, above the floor and therefore never
+in scope. An identifier such as `ab-entity` is left alone.
 
 The implementation must still assert this rather than rely on the arithmetic
-holding after some future edit. If an in-scope identifier ends in `-entity`,
+surviving a future edit. If an in-scope identifier ends in `-entity`,
 `-product`, `-member`, or `-workspace`, the tool refuses and escalates instead
-of appending a second suffix.
+of appending a second suffix. Double-suffixing is never performed.
 
-Double-suffixing is never performed. There is no `-entity-entity` outcome in
-this design.
+## Scoped replacement — no vault-wide word substitution
+
+**A short identifier may also be an ordinary English word.** Blind
+whole-vault token replacement would corrupt unrelated notes, and the corruption
+would be invisible: a note whose prose contained the word would be silently
+edited, and no gate keyed to that same token could tell the difference.
+
+The cutover therefore rewrites an identifier **only** where a registry
+identifier is structurally required. Nothing is rewritten because it merely
+looks like the identifier.
+
+This is a deliberate departure from `app/rename.py`, whose entity planner
+performs a boundaried whole-vault token sweep. That sweep is acceptable for a
+one-off rename of a distinctive multi-token slug chosen by an operator; it is
+not acceptable for a bulk cutover of identifiers selected precisely because
+they are short.
+
+### The enumerated rewrite locations
+
+Only these locations are rewritten. The list is closed: a location not on it is
+never modified automatically.
+
+**Entity axis**
+
+- `_system/entities.yaml` — the top-level key under `entities:`.
+- The bundle directory name at the vault root, and therefore every path
+  beneath it, including `outbox/`, `staging/`, `.receipts/`, and `books.db`.
+- `_system/products.yaml` and `_system/members.yaml` — the per-entity grouping
+  key.
+- `_system/workspaces.yaml` — `entity:` and `primary_entity:` values.
+- Markdown front matter — the `entity:` field value.
+- Outbox proposal records — the `entity:` field value, and the first path
+  component of `src:` and `dst:`.
+- `_system/scripts/action-policy.yaml` — the first path component of each
+  pattern in `paths:` and in `except:`. Both are rewritten in the same pass;
+  see the fail-open rule below.
+
+**Product axis**
+
+- `_system/products.yaml` — the product key within its entity's mapping.
+- Markdown front matter — the `product:` field value.
+- `_system/workspaces.yaml` — `product:` values, and an `id:` whose entry is a
+  product-kind workspace.
+- Approved `books.db` `(table, column)` pairs only.
+
+**Member axis**
+
+- `_system/members.yaml` — the entry `id:` value within its entity's list.
+- Markdown front matter — the `member:` field value.
+- `_system/workspaces.yaml` — `member:` values.
+- Approved `books.db` `(table, column)` pairs only.
+
+**Workspace axis**
+
+- `_system/workspaces.yaml` — the entry `id:` value.
+
+Values are matched as exact whole field values, not as substrings of them. A
+front-matter `entity:` whose value merely contains the identifier is not a
+match and is not rewritten.
+
+### The fail-open rule
+
+`BUILD.md` §4 names the danger precisely: renaming an allow rule's `paths:`
+while missing its `except:` for `.sensitive/` converts a deny into an allow.
+Both keys are rewritten in the same pass over the same rule, and a public test
+must assert that a `.sensitive/` read is still denied after the cutover. This
+is the rename test `AGENTS.md` requires, and it is mandatory here.
+
+### The advisory report
+
+Scoped replacement means the cutover no longer reaches an identifier hardcoded
+somewhere unstructured — a vault script constant, for example, which the old
+whole-vault sweep did reach. Silently losing that coverage would be worse than
+the sweep it replaces.
+
+The inventory and dry-run therefore produce an **advisory report**: every
+occurrence of an in-scope identifier, matched as a whole token with the
+existing boundary pattern, that lies **outside** the enumerated locations,
+grouped by file and line.
+
+The report is never acted on automatically. The owner dispositions each
+occurrence as either:
+
+- **structural** — a genuine reference. The owner either extends the approved
+  location list to cover that exact file and field, or fixes it by hand in a
+  separate commit before the cutover; or
+- **incidental** — an ordinary word that must be left exactly as it is.
+
+Every occurrence must carry a disposition before apply. The dispositions are
+part of the approval manifest and are bound by its digest, so the tree that is
+migrated is the tree whose incidental words the owner actually reviewed.
 
 ## Collisions
 
-Three distinct collision classes exist, and each is a hard refusal rather than
-a resolution. The tool never invents a disambiguating suffix, counter, or
-alternate spelling: silently choosing a different identifier than the one the
-owner approved is exactly the failure this design must not have.
+Three collision classes are checked during inventory, before any mapping is
+shown and long before any write. The tool never invents a disambiguating
+suffix, counter, or alternate spelling.
 
-**1. New-value collides with an existing identifier on the same axis.** The
-mapping is injective on distinct inputs, so this can only happen when the new
-value equals another object's *current* identifier. Example: on the entity
-axis, `ab` maps to `ab-entity`, and an entity literally named `ab-entity`
-already exists. Applying this would reuse an existing identifier for a
-different object, violating approved decision 7. Refuse.
+**1. A new value collides with an existing identifier on the same axis.** The
+mapping is injective on distinct inputs, so this arises only when the new value
+equals another object's current identifier — for example, entity `ab` maps to
+`ab-entity` while an entity named `ab-entity` already exists. Applying it would
+reuse an existing identifier for a different object, violating decision 7.
+Refuse.
 
-**2. New-value collides with another new value.** Impossible for distinct
-inputs on one axis, because appending a constant suffix preserves distinctness.
-It is checked anyway, because a mapping table assembled from a faulty inventory
-could contain duplicate inputs, and a silent duplicate is worse than a noisy
-refusal.
+**2. A new value collides with another new value.** Impossible for distinct
+inputs on one axis, since appending a constant suffix preserves distinctness.
+Checked anyway: a mapping assembled from a faulty inventory could contain
+duplicate inputs, and a silent duplicate is worse than a noisy refusal.
 
-**3. The same literal identifier exists on more than one axis.** This is the
-dangerous one, and it is a property of the *source* data rather than of the
-mapping. The entity planner in `app/rename.py` performs a boundaried
-whole-vault token sweep, because entity slugs are path components and must be
-rewritten inside hardcoded script constants and inside the `paths:`/`except:`
-pair of a policy rule. The product and member planners are deliberately scoped
-to a front-matter field and one registry, precisely because those values can be
-short. If one literal is both an entity and a product, the entity sweep will
-rewrite the product's occurrences too, and the product will silently acquire the
-entity's suffix. Refuse before planning, and escalate to the owner.
+**3. The same literal exists on more than one axis.** In revision 1 this was a
+hard refusal, because the whole-vault entity sweep would have rewritten a
+same-named product's occurrences and silently given it the entity's suffix.
+**Scoped replacement removes that hazard.** Each axis now touches only its own
+structurally-typed locations: `entity:` and `product:` are distinct front-matter
+fields, and their registry homes are distinct files or distinct nesting levels.
+An entity `ab` and a product `ab` migrate independently and correctly.
 
-All three checks run during inventory, before any mapping is shown to the owner
-and long before any write.
+It is therefore no longer a refusal. It remains a reportable condition: the
+inventory must surface it so the owner sees that one literal carries two
+meanings, and the residual gate attributes findings per axis and per location
+rather than per token.
 
 ## Affected interfaces
 
 The inventory below is the result of reading the public source at the recorded
-base. It is what the implementation plan must cover.
+base.
 
 ### Identifier validation — five copies that must agree
 
-The same grammar is currently restated in five places, none of which enforces
-any length:
+The same grammar is restated in five places, none enforcing any length:
 
 | Site | Symbol |
 |---|---|
@@ -174,348 +263,480 @@ A sixth restatement lives in the vault's own wizard, which `app/rename.py`
 documents as a mirror it cannot import. That copy is private and is the trusted
 local agent's responsibility; this repository must not read it.
 
-AGENTS.md records the exact failure mode that duplicated rules produce: when
-the sidebar and the validator disagree about what exists, the disagreement is
-invisible until something breaks. Five independent length checks would
-reproduce it. The floor must therefore be expressed once and consumed by every
-site, and a public structural test must assert that no module defines its own
-registry-identifier length rule.
+`AGENTS.md` records the failure mode duplicated rules produce: when the sidebar
+and the validator disagree about what exists, the disagreement stays invisible
+until something breaks. Five independent length checks would reproduce it. The
+floor must be expressed once and consumed by every site, and a public
+structural test must assert no module defines its own registry-identifier
+length rule.
 
-Whether the five grammar copies are also collapsed into one shared definition
-is a broader refactor than this cutover needs. The design requires only that
-the *length* rule is single-sourced; the grammar copies may stay where they
-are, provided the shared validator is what every site calls.
+Collapsing the five grammar copies is a broader refactor than this cutover
+needs. Only the length rule must be single-sourced.
 
-### Values, paths, and records
+### Records and paths
 
-- **Registries.** `_system/entities.yaml` keys, `_system/products.yaml` keys
-  nested per entity, `_system/members.yaml` entry `id:` values,
-  `_system/workspaces.yaml` entry `id:` values and their `entity:` /
-  `primary_entity:` / `product:` / `member:` references, and
-  `_system/scripts/action-policy.yaml` rule paths.
-- **Directory names.** An entity slug is a top-level bundle directory. An
-  entity rename is a directory move, and every module, `outbox/`, `staging/`,
-  `.receipts/`, and `books.db` beneath it moves with it.
-- **Front matter.** `entity:`, `product:`, and `member:` field values across
-  every tracked Markdown file. `schema.py` lists `entity` and `product` among
-  its required fields.
-- **Proposals.** Outbox records carry `entity`, and `src`/`dst` stored paths
-  whose first component is the entity slug. `Scope.resolve_stored` enforces
-  that first component, so a stale prefix becomes a cross-scope refusal rather
-  than a silent mis-resolution.
-- **Review tokens.** S7 binds an approval to the exact proposal bytes. The
-  cutover rewrites pending proposal records, so every review token issued
-  before the cutover is invalidated by it. This is correct fail-closed
-  behaviour and must be stated to the operator, not engineered around: an
-  operator holding a pre-cutover token must review again.
+- **Review tokens.** S7 binds an approval to exact proposal bytes. The cutover
+  rewrites pending proposal records, invalidating every review token issued
+  before it. This is correct fail-closed behaviour and must be stated to the
+  operator, never engineered around.
 - **Receipts.** `receipt_relative_path` is
-  `<entity>/outbox/.receipts/<proposal_id>.yaml`. Receipt *content* carries no
-  entity value, so an entity rename moves receipts without rewriting them, and
-  spent-id facts survive the cutover because the move and the commit are the
-  same commit. A public test must prove a spent id is still refused after the
-  cutover.
-- **Saved workspaces.** Saved scopes reference entity, product, and member
-  values and are rewritten on all three axes.
-- **`books.db`.** See the open decision below.
+  `<entity>/outbox/.receipts/<proposal_id>.yaml`. Receipt content carries no
+  entity value, so an entity migration moves receipts without rewriting them,
+  and spent-id facts survive because the move and the commit are one commit. A
+  public test must prove a spent id is still refused afterwards.
+- **Stored paths.** `Scope.resolve_stored` requires a stored path's first
+  component to equal the current entity, so a stale prefix becomes a
+  cross-scope refusal rather than a silent mis-resolution.
 
-### `books.db` — an unresolved decision, not a design gap
+### `books.db` — approved, under a narrow writer allowlist
 
-`app/rename.py` deliberately does not modify `books.db`; it counts and reports
-matching rows and defers the column update. That deferral is safe for a
-one-off rename, where the old value merely becomes historical. It is **not**
-safe for a clean cutover with no compatibility fallback: rows still carrying a
-retired product or member value would reference a registry value that no longer
-exists, and no alias resolves them.
+Leaving `books.db` untouched would leave rows referencing registry values that
+no longer exist, with no alias to resolve them — incompatible with decision 2.
+Migrating it is approved. It is `UPDATE`-only: no `CREATE`, `ALTER`, or `DROP`,
+and therefore no schema change.
 
-Three options exist — migrate the columns inside the same commit; refuse the
-cutover while any row references an in-scope value; or accept the orphans. The
-first changes stored data beyond the approved decision list, the second may be
-impossible to satisfy without a separate data task, and the third contradicts
-approved decision 2.
+The danger is that migrating it naively reproduces exactly the error correction
+1 forbids, in a binary file where no text gate can see it. Two public-source
+facts make this concrete:
 
-**This is an unresolved product decision and a hard stop.** The inventory must
-report the affected row counts per axis and value, the owner must choose before
-approving the mapping, and the tool must refuse to apply until the choice is
-recorded. No implementation plan may be written that silently picks one.
+- [app/registry.py:56](app/registry.py:56) counts references over
+  `product: ("product", "tag")` and `member: ("member", "member_id")`.
+- [app/rename.py:182](app/rename.py:182) says of that same set that the column
+  update is deferred "and `fund_holdings.member_id` is opaque, not the registry
+  id".
+
+A column named `member_id` is therefore already documented in-tree as **not**
+necessarily a registry identifier, and a column named `tag` may hold free text
+that merely coincides with a product id. Updating either by name would corrupt
+rows silently.
+
+The rules are binding:
+
+1. Migrate only explicitly approved `(table, column)` pairs proven to store
+   OneOS registry identifiers.
+2. Neither `registry.py::_DB_COLUMNS` nor `rename.py`'s broad column-name
+   counter may be reused as the writer allowlist.
+3. `fund_holdings.member_id` is excluded.
+4. `tag` columns are excluded by default. One may be included only if the
+   trusted-local schema inventory proves that exact table and column stores
+   product registry identifiers and the owner approves it.
+5. A column name is never evidence. The allowlist identifies exact
+   `(table, column)` pairs.
+6. `books.db` must be Git-tracked. Ignored, untracked, unreadable, or
+   concurrently changed databases are hard stops.
+7. After updating, every approved pair is re-queried and must return zero
+   remaining old registry values.
+8. Reference counting may stay deliberately broad. Over-counting only causes a
+   refusal, which is safe; writing must stay narrowly allowlisted.
+
+Rule 6 is partly self-enforcing under the isolated-build architecture below: an
+untracked `books.db` never appears in the isolated worktree at all, which makes
+its absence immediately detectable rather than silently skipped.
+
+Values are updated with parameter-bound `UPDATE` statements matching the exact
+old value. Table and column identifiers are quoted using the existing
+`_quote_identifier` rule, because an identifier cannot be parameter-bound.
 
 ## Migration scope: current tree only
 
 Only the working tree at the cutover commit's parent is migrated. Grey Matter
 history is not rewritten, so historical commits retain their original
-identifiers permanently and by design.
+identifiers permanently and by design. Rewriting the system of record's history
+to satisfy a scanner would destroy the audit trail invariant 2 exists to
+protect.
 
-The consequence must be stated plainly because it bounds what this cutover can
-claim: a history-mode audit of Grey Matter will still find the old short
-identifiers in historical commits. The cutover fixes the current tree and every
-future commit. It does not and cannot retroactively clean history without the
-rewrite that approved decision 5 forbids.
+### The combined history audit must be clean — no expected residue
 
-This is the correct trade. Rewriting the system-of-record's history to satisfy
-a scanner would destroy the audit trail that invariant 2 exists to protect.
+Revision 1 claimed the combined history audit would still report historical
+occurrences and that this residue should be recorded as expected. **That was
+wrong, and the corrected expectation is stricter: the combined public history
+audit must be clean.**
 
-## Dry-run and explicit apply
+The mechanism is the audit's term seeding. `load_instance_terms` builds its
+term set from the **current** registries at gate time — entity keys, product
+keys, member ids, workspace ids. After the cutover those registries contain
+only the new identifiers. The retired short identifiers are no longer registry
+values, so they are never seeded as terms, and the history scan never looks for
+them. Old identifiers remain in Grey Matter's history, but they are not terms,
+so they produce no findings.
 
-The existing rename tool's separation is the model and is kept: dry-run is the
-default and `--apply` is explicit.
+The audit is therefore clean, not clean-with-exceptions. Any finding after the
+cutover is a real finding and must be investigated. It must never be recorded
+as expected residue, suppressed, exempted, or added to `.gitleaksignore`.
 
-The cutover adds a stage before both, because a mapping must be approved before
-it can be previewed as a diff:
+Two consequences are load-bearing and must be pinned by tests:
 
-1. **Inventory** — read-only. Enumerate in-scope identifiers per axis, run all
-   three collision checks, count `books.db` references, and emit the proposed
-   mapping table. Writes nothing, commits nothing, and never requires the
-   action lock.
-2. **Owner approval** — the owner reviews the mapping table and records an
-   explicit approval. The approved mapping becomes a fixed input; the tool does
-   not recompute it later from a possibly-changed vault.
-3. **Dry run** — default. Plan every mapping against the current tree and
-   render the full combined diff and move list. Writes nothing.
-4. **Apply** — explicit `--apply`. Requires the approved mapping and a vault
-   whose HEAD matches the one the dry run was planned against.
+- **Term collection must not change.** If `former_slugs` values — or any other
+  retained provenance — were ever added to term collection, the retired
+  identifiers would be seeded again and the audit would go red. A public test
+  must assert that term collection reads only entity keys, product keys, member
+  ids, and workspace ids.
+- **New identifiers are long terms.** Every post-cutover identifier is at least
+  five characters, so the audit matches it in all tracked text, not only
+  Markdown. The public repository must contain none of them.
 
-Stages 3 and 4 must produce identical plans for an unchanged tree. Because the
-mapping function is deterministic and the mappings are applied in a fixed
-order — entity, then product, then member, then workspace, and within each axis
-sorted by old identifier — the dry-run output is a faithful preview.
+## Dry-run, approval, and explicit apply
 
-## One reversible commit
+Revision 1 described a dry-run that "writes nothing" while also requiring each
+mapping to be applied before the next is planned. Those cannot both be true:
+the planners read from disk. The contradiction is resolved by giving the
+dry-run its own mutable copy.
 
-### Why the existing tool cannot simply be looped
+### Isolated mutable copy
+
+Every planning and building step operates on a **temporary isolated worktree**
+created from the recorded source HEAD, never on the live vault. It is
+materialised with Git's own worktree mechanism so it shares the vault's object
+database — which is what later makes promotion a pure ref update rather than a
+file copy — while having a completely separate working tree and index.
+
+The live vault is not written, not locked, and not read for mutation during
+planning. It is read once, at the start, to record HEAD and confirm a clean
+status.
+
+The temporary worktree is removed when the operation ends, in success or
+failure.
+
+### The four stages
+
+1. **Inventory** — read-only against the live vault. Enumerate in-scope
+   identifiers per axis, run the three collision checks, produce the advisory
+   report, and produce the `books.db` schema inventory and reference counts.
+   Emits the proposed mapping and the proposed `(table, column)` allowlist.
+   Writes nothing, commits nothing, takes no lock.
+2. **Owner approval** — the owner reviews and explicitly approves a single
+   canonical **approval manifest**. See its binding below.
+3. **Dry run** — default. In a temporary isolated worktree at the manifest's
+   source HEAD, apply every mapping in the fixed order and render the complete
+   combined diff, move list, and `books.db` row-change summary. Discard the
+   worktree.
+4. **Apply** — explicit `--apply`. Build and verify in isolation, then promote.
+
+Stages 3 and 4 build identically, because the mapping function is
+deterministic and the order is fixed: entity, then product, then member, then
+workspace, and within each axis sorted by old identifier.
+
+### What owner approval binds
+
+Approval is not a verbal yes to a table on screen. It binds one canonical
+manifest whose SHA-256 is recorded, and the tool refuses to apply anything
+whose manifest digest, or whose live HEAD, does not match. The manifest binds:
+
+- the **source HEAD** the mapping was derived from;
+- the exact **old → new mappings**, per axis;
+- the exact approved **`books.db` `(table, column)` pairs**;
+- the **disposition of every advisory-report occurrence**; and
+- the **SHA-256 of the canonical manifest** itself.
+
+The manifest is serialised canonically — fixed key order, fixed encoding — so
+its digest is reproducible. The tool never recomputes the mapping from a
+possibly-changed vault at apply time; it uses the approved manifest and refuses
+if the vault has moved beneath it.
+
+The advisory dispositions are an addition to the four bindings the owner
+specified. They are included because the enumerated-location rule makes the
+set of deliberately-untouched occurrences part of what is being approved; if
+that set is unbound, a note could change between review and apply and the
+cutover would not notice.
+
+## One reversible commit: build in isolation, then promote
+
+### Why the existing tool cannot be looped
 
 `apply_rename` commits once per rename. Running it N times produces N commits,
-which violates approved decision 6. Squashing afterwards is worse: the
-intermediate states are not required to be valid, so a mid-sequence validator
-run could fail on a tree that was only ever meant to be transient.
+violating decision 6. Squashing afterwards is worse: intermediate states are
+not required to be valid, so a mid-sequence validator run could fail on a tree
+that was only ever meant to be transient.
 
-### The architecture
+### Build
 
-One combined operation, inside one acquisition of the shared action lock:
+In the temporary isolated worktree at the manifest's source HEAD:
 
-1. Acquire the shared action lock, so no approval, deletion, or rename can
-   interleave.
-2. Refuse unless the tree is clean, exactly as `apply_rename` does. A clean
-   tree is what makes `git reset --hard` a complete undo.
-3. Pin HEAD and refuse if it differs from the HEAD the plan was built against.
-4. For each mapping in the fixed order, plan it against the **current tree
-   state** and apply its edits and moves immediately, before planning the next.
+1. Verify the manifest digest and that the worktree HEAD equals the manifest's
+   source HEAD.
+2. For each mapping in the fixed order, plan it against the **current state of
+   the isolated worktree** and apply its edits and moves immediately, before
+   planning the next.
 
-   Sequential application is what makes plan composition correct. The existing
-   planners read from disk; if all plans were built up-front against the
-   original tree and merged, two mappings touching the same file would produce
-   two different full-file texts and the second would silently discard the
-   first. Applying each mapping before planning the next means every planner
-   observes its true input.
-5. After all mappings are applied, run the residual gate once over the union of
-   every old identifier.
-6. Run the validators once, on the fully migrated tree.
-7. `git add -A` and create exactly one commit.
+   Sequential application is what makes composition correct. The planners read
+   from disk; building all plans up front against the original tree and merging
+   them would mean two mappings touching one file produce two different
+   full-file texts, and the second would silently discard the first.
+3. Apply the approved `books.db` updates, once, in this worktree. The resulting
+   SQLite artifact is the one that will be committed and promoted. It is never
+   regenerated.
+4. Run the scoped residual gate and the in-database residual query.
+5. Run the validators on the fully migrated tree.
+6. Commit exactly once in the isolated worktree.
 
-Failure at any point rolls the tree back with `git reset --hard HEAD` and
-`git clean -fd`, the same rollback the rename tool already uses.
+Because the isolated worktree shares the vault's object database, this commit
+already exists as an object in the vault repository. Nothing has been written
+to the live working tree.
 
-The result is one commit that a single `git revert` undoes.
+### Promote
+
+Under the live shared action lock, and only then:
+
+1. Re-read live HEAD and live status.
+2. Refuse unless HEAD is byte-identical to the manifest's source HEAD and the
+   status is unchanged from the pre-build capture.
+3. Fast-forward the live branch to the built commit with `git merge --ff-only`.
+
+`git merge --ff-only` is the right primitive because it enforces the same
+guarantees independently: it refuses if the target is not a fast-forward, and
+Git's own checkout safety refuses to overwrite a modified or untracked file. So
+the precheck and the primitive must both agree before anything moves.
+
+The SQLite artifact is promoted as the exact bytes that were verified. The
+transformation is never re-run against the live database. This also disposes of
+SQLite's page-level non-determinism: two runs of the same `UPDATE` need not
+produce identical bytes, so verifying one artifact and then rebuilding another
+would verify something that was never shipped.
+
+### No destructive rollback on the live vault
+
+Revision 1 rolled back with `git reset --hard HEAD` and `git clean -fd` on the
+live vault. **That is removed.** `clean -fd` deletes untracked files, and a
+concurrent process or an operator could have created one; a safety mechanism
+must not be able to destroy data the cutover never owned.
+
+It is not needed. Every failure before promotion happens inside the temporary
+worktree, which is simply discarded. The live vault was never written, so there
+is nothing to undo. The built commit, if one exists, remains an unreferenced
+object and is collected by Git's ordinary maintenance.
+
+The one destructive operation that remains permitted is the removal of the
+temporary worktree itself.
 
 ### Exact detection of unresolved old identifiers
 
-The residual gate is the cutover's fail-closed guarantee and runs before the
-commit, never after.
+Two gates run in the isolated worktree before the commit, never after.
 
-It searches every non-binary tracked file outside the skip set for any old
-identifier in the mapping, matched as a whole token using the existing
-boundaried pattern `(?<![\w-])<old>(?![\w-])`. A non-empty result aborts the
-cutover and rolls back.
+**1. The scoped residual gate.** For every enumerated rewrite location, assert
+that no old identifier remains. The gate is scoped to the same locations as the
+writer, and this symmetry is essential: a whole-vault text gate would refuse
+forever on any short identifier that is also an ordinary word appearing in
+prose — precisely the values this cutover exists to retire. A gate that cannot
+pass is not a safety mechanism.
 
-The boundary rule is what makes the gate usable, and the reason is worth
-stating because a naive implementation would break it. A bare escaped search
-for `ab` would match inside the tool's own output `ab-entity` and report every
-successful rewrite as a residual. The lookahead `(?![\w-])` fails on the hyphen
-that begins the suffix, so a correctly migrated occurrence never trips the
-gate, while a genuinely missed bare `ab` still does. A public test must pin this
-distinction directly, and a mutation that drops the boundary must turn it red.
+Within those locations, matching is by exact whole field value, or by exact
+path component for paths.
 
-Binary files are excluded from the gate by construction. `books.db` is
-therefore invisible to it, which is a second reason the `books.db` decision
-above must be settled before apply rather than after.
+The advisory report is regenerated and compared against the manifest's
+dispositions. Any occurrence outside the enumerated locations that was not
+dispositioned in the approved manifest aborts the build.
 
-`former_slugs:` lines are exempt, for the reason in the next section.
+The boundary pattern used for the advisory scan is the existing
+`(?<![\w-])<old>(?![\w-])`. Its behaviour matters and must be pinned: a
+migrated `ab-entity` does not match a scan for `ab`, because the lookahead
+fails on the hyphen, while a bare `ab` still does. A naive escaped search would
+report every successful rewrite as a residual.
+
+**2. The in-database residual query.** For every approved `(table, column)`
+pair, query for any remaining old registry value and require zero rows. The
+text gate skips binaries and can never see inside `books.db`, so without this
+query the database half of the migration would have no fail-closed check at
+all.
+
+Either gate failing aborts the build and discards the temporary worktree.
 
 ### `former_slugs` is provenance, not an alias
 
-The rename tool records `former_slugs: [old]` on the renamed registry key and
-exempts that line from its residual gate. The cutover keeps this.
+The cutover records `former_slugs: [old]` on the migrated registry key and
+exempts that line from the residual gate.
 
 This is not a compatibility fallback and must never become one. No code path
-resolves `former_slugs` today — it is written and gate-exempted, and never
-read. It is inert provenance that makes the mapping legible in the vault and
-supports manual reconciliation after a revert.
+resolves `former_slugs` today: it is written and gate-exempted, never read. It
+is inert provenance that makes the mapping legible in the vault and supports
+reconciliation after a revert.
 
-Two constraints follow, and both are testable:
+Two testable constraints follow:
 
-- No reader may ever resolve an identifier through `former_slugs`. A public
-  test must assert that no lookup path consults it, so decision 2 cannot be
-  eroded later by a well-meaning fallback.
-- Retained old values must not re-enter the publication audit's term set. The
-  audit seeds terms from entity keys, product keys, member ids, and workspace
-  ids. `former_slugs` values are none of those, so they are not seeded — which
-  is precisely why Item 2's findings clear once the registry keys themselves
-  are long. The implementation must not change how terms are collected.
+- No reader may ever resolve an identifier through `former_slugs`, so decision
+  2 cannot be eroded later by a well-meaning fallback.
+- Retained values must not enter the publication audit's term set, as the
+  history-audit section above requires.
 
-## Rollback and interruption
+## Interruption behaviour
 
-**Before the commit.** Any failure — a planner error, a collision discovered
-late, a residual, a validator failure, an interrupted process — leaves the tree
-dirty and uncommitted. Recovery is `git reset --hard HEAD` followed by
-`git clean -fd`. The tool performs this itself on every handled failure. An
-operator recovering from a killed process performs it manually, and the
-requirement that the tree be clean before starting is what guarantees this
-restores the exact pre-cutover state.
+**During inventory, dry run, or build.** The live vault was never written.
+Recovery is to delete the temporary worktree; the vault needs no action. A
+partially built commit, if any, is unreferenced.
 
-**After the commit.** `git revert` of the single cutover commit restores every
-identifier. Because history is not rewritten and the commit is one atomic unit,
-the revert is complete and needs no manual cleanup — the revert test that
-`AGENTS.md` names as one of the two tests that matter more than coverage.
+**Before promotion.** Identical: nothing to undo.
 
-**The window between commit and confirmation.** The rename tool already models
-this: if the commit succeeded but reading back the resulting commit id or
-releasing the lock failed, that is a distinct outcome from a failed cutover and
-must not be retried. The cutover reuses that distinction. Retrying a cutover
-that already committed would attempt to rewrite identifiers that no longer
-exist and would fail the inventory's own checks, but the operator must be told
-"committed, do not retry" rather than left to infer it.
+**During promotion.** The window is one fast-forward. Git's checkout is
+crash-safe at the ref level: either the ref moved or it did not. An operator
+who finds an interrupted promotion inspects `git status` and `git log` and
+resolves it with ordinary Git commands. They must **not** run `reset --hard` or
+`clean -fd` as a recovery step; that is the same destructive action this design
+removed, and it is no safer when performed by hand.
 
-**Interaction with in-flight work.** The action lock and the clean-tree
-requirement together mean a cutover cannot interleave with an approval. A
-pending proposal is rewritten by the cutover, which invalidates any review
-token already issued for it. That is fail-closed and correct.
+**After promotion.** `git revert` of the single cutover commit restores every
+identifier, including the `books.db` blob, because the database is tracked and
+the commit is one atomic unit. This is the revert test `AGENTS.md` names as one
+of the two tests that matter more than coverage.
+
+**A committed-but-unconfirmed promotion** — the ref moved but reading back the
+commit id or releasing the lock failed — is a distinct outcome from a failed
+cutover and must be reported as "committed, do not retry". Retrying would
+attempt to migrate identifiers that no longer exist and would fail inventory,
+but the operator must be told rather than left to infer it.
 
 ## Public synthetic tests
 
-All tests use synthetic vaults built in temporary directories, following the
-existing rename tests. No test may read a real vault, a real registry, or a
-real identifier.
+All tests use synthetic vaults in temporary directories, following the existing
+rename tests. No test may read a real vault, registry, or identifier.
 
 Required coverage:
 
-- **Mapping.** Determinism for a fixed inventory; the suffix per axis;
-  identifiers at or above the floor are untouched; every output satisfies the
-  floor.
-- **Collisions.** Each of the three classes refuses, with its own diagnostic,
-  before any write.
+- **Mapping.** Determinism; the suffix per axis; identifiers at or above the
+  floor untouched; every output satisfies the floor.
+- **Collisions.** Classes 1 and 2 refuse with distinct diagnostics before any
+  write. Class 3 does **not** refuse: an entity and a product sharing one
+  literal migrate independently and correctly, and this test is what pins
+  scoped replacement.
+- **Scoped replacement.** A note whose prose contains a short identifier as an
+  ordinary word is byte-identical after the cutover. A front-matter field whose
+  value merely contains the identifier is unchanged. Only enumerated locations
+  change.
+- **Advisory report.** An occurrence outside the enumerated locations is
+  reported, not rewritten; an undispositioned occurrence aborts the build.
 - **Already-suffixed.** An in-scope identifier ending in any axis suffix
   refuses rather than double-suffixing.
 - **Floor enforcement.** Every validation site rejects a sub-floor identifier,
   and a structural test asserts the length rule is single-sourced.
-- **One commit.** A multi-mapping cutover on a synthetic vault produces exactly
-  one new commit, and `git revert` of it restores the tree.
-- **Residual gate.** A deliberately missed occurrence aborts and rolls back; a
+- **One commit.** A multi-mapping cutover produces exactly one new commit, and
+  `git revert` restores the tree including `books.db`.
+- **Isolation.** A failure injected at every stage before promotion leaves the
+  live vault byte-identical, with untracked files intact. A test must assert
+  the cutover never invokes `reset --hard` or `clean -fd` against the live
+  vault.
+- **Promotion refusal.** A live HEAD that moved, or a live status that changed,
+  refuses promotion and leaves the vault untouched.
+- **Approval binding.** A manifest whose digest, source HEAD, mappings,
+  `(table, column)` pairs, or dispositions differ from the approved one is
+  refused before any build.
+- **Residual gates.** A deliberately missed enumerated location aborts; a
   correctly migrated occurrence does not trip the gate; a bare old token inside
-  a longer token is not a residual.
-- **Rollback.** An injected failure after partial application leaves the tree
-  byte-identical to HEAD.
-- **Ordering.** Dry-run and apply produce identical plans for an unchanged
-  tree.
+  a longer token is not a residual; an in-database old value aborts.
+- **`books.db`.** Approved pairs are updated; a non-allowlisted column with a
+  matching name is **not** updated; an untracked or unreadable database is a
+  hard stop; the promoted artifact is byte-identical to the verified one.
+- **Ordering.** Dry-run and apply build identical trees for an unchanged
+  source HEAD.
 - **Receipts.** A spent proposal id is still refused after an entity cutover.
-- **Proposals.** Stored `src`/`dst` prefixes are rewritten, and a pre-cutover
+- **Proposals.** Stored `src`/`dst` prefixes are rewritten and a pre-cutover
   review token is refused afterwards.
-- **`former_slugs`.** No resolver consults it, and retained values do not enter
-  the audit's term set.
+- **`former_slugs`.** No resolver consults it, and term collection reads only
+  entity keys, product keys, member ids, and workspace ids.
 - **Fail-open guard.** A policy rule's `paths:` and its `except:` for
   `.sensitive/` are rewritten in the same pass, and a `.sensitive/` read is
-  still denied after the cutover — the rename test that `AGENTS.md` requires.
+  still denied afterwards.
 
 Mutation evidence is mandatory and must include at least: removing the length
-floor from the shared validator; dropping the boundary from the residual gate;
-removing one collision check; and replacing sequential application with
-up-front plan composition so that two mappings touching one file lose the first
-rewrite. Each names the exact test that must go red, and each target file is
-restored byte-for-byte before the suite is re-run green.
+floor from the shared validator; widening the writer allowlist to a
+column-name match so a non-allowlisted column is updated; skipping the
+in-database residual query; dropping the boundary from the advisory scan;
+removing a collision check; replacing sequential application with up-front plan
+composition so two mappings touching one file lose the first rewrite; and
+removing the promotion precheck so a moved HEAD is accepted. Each names the
+exact test that must go red, and each target file is restored byte-for-byte
+before the suite is re-run green.
 
 ## Public release sequencing
 
-The public change cannot ship as one release, and the reason is easy to miss.
+The public change cannot ship as one release. If read-time floor enforcement
+and the cutover tool ship together, the tool cannot read the vault it must
+migrate: the pre-cutover vault contains sub-floor identifiers, and
+`EntityCatalog.load` would reject the manifest before inventory could run. The
+app would refuse to start against the very vault awaiting migration.
 
-If read-time floor enforcement and the cutover tool ship together, the tool
-cannot read the vault it is meant to migrate: the pre-cutover vault contains
-sub-floor identifiers, and `EntityCatalog.load` would reject the manifest
-before the tool could inventory it. The app would refuse to start against the
-very vault awaiting migration.
-
-Two stages are therefore required:
-
-- **Stage A** — the inventory, mapping, dry-run, apply, and residual machinery,
-  plus its synthetic tests. No read-time floor. The tool must be able to read a
-  pre-cutover vault.
+- **Stage A** — inventory, manifest, dry-run, build, promote, both residual
+  gates, and the synthetic tests. No read-time floor; the tool must be able to
+  read a pre-cutover vault.
+- **Private cutover** runs between the stages.
 - **Stage B** — floor enforcement at every validation site, plus the public
   synthetic fixtures that currently use sub-floor slugs.
 
-The private cutover runs between them. Stage B merges only after the cutover
-commit exists.
-
-Stage B has bounded, mechanical public churn: the dominant synthetic entity
+Stage B's public churn is bounded and mechanical: the dominant synthetic entity
 slug in the existing suite is four characters and appears in the low hundreds
-of occurrences, and a small number of other fixture slugs are also sub-floor.
-This churn is expected and is not evidence of a problem. It must be a
-fixture-only change: if enforcing the floor requires altering application logic
-beyond the validation sites, stop and re-open the design.
+of occurrences, with a small number of other sub-floor fixture slugs. This
+churn is expected. It must remain fixture-only: if enforcing the floor requires
+application logic changes beyond the validation sites, stop and re-open the
+design.
 
 ## Trusted-local sequence
 
 The public agent's role ends at a reviewed public branch. Everything touching
-Grey Matter is the trusted local agent's, and no part of it may be delegated to
-a cloud task.
+Grey Matter belongs to the trusted local agent and may never be delegated to a
+cloud task.
 
 1. **Inventory (private, read-only).** Run the Stage A tool against the live
-   vault. Produce the mapping table and the `books.db` reference counts.
-   Nothing is written.
-2. **Owner approval.** Present the mapping and the `books.db` decision. The
-   owner approves explicitly. An unapproved or partially approved mapping is
-   not executable.
-3. **Pre-cutover proof.** Capture opaque `git status --porcelain=v2
+   vault. Produce the mapping, the advisory report, the `books.db` schema
+   inventory with reference counts, and the proposed `(table, column)`
+   allowlist. Nothing is written.
+2. **`books.db` proof.** Confirm the database is Git-tracked and readable, and
+   prove for each proposed pair that it stores OneOS registry identifiers.
+   `fund_holdings.member_id` stays excluded; a `tag` column is included only
+   with proof and explicit approval.
+3. **Owner approval.** Present the mapping, the dispositions, and the
+   allowlist. The owner approves the canonical manifest; record its SHA-256.
+4. **Pre-cutover proof.** Capture opaque `git status --porcelain=v2
    --untracked-files=all`, worktree and cached binary diffs, outside both
    repositories, per `BUILD.md`.
-4. **Dry run.** Review the full combined diff.
-5. **Apply.** One commit. Record its id.
-6. **Private gates.** The vault's own suite, `check_v2` at 0 errors and 0
-   warnings, and the combined repo+vault audit in both current-tree and history
-   modes. The current-tree audit must now be clean of the short-identifier
-   findings; the history audit will still report historical occurrences, and
-   that expected residue must be recorded rather than treated as a failure or
-   suppressed.
-7. **Preservation comparison.** Compare the opaque snapshots. A clean vault
+5. **Dry run.** Review the full combined diff and the row-change summary.
+6. **Build and promote.** One commit. Record its id.
+7. **Private gates.** The vault's own suite, `check_v2` at 0 errors and 0
+   warnings, and the combined repo+vault audit in **both** current-tree and
+   history modes. Both must be clean. A finding is a real finding.
+8. **Preservation comparison.** Compare the opaque snapshots. A clean vault
    stays clean apart from the single cutover commit; a vault with approved
    pre-existing edits retains exactly those edits.
-8. **Independent review.** A reviewer independently re-derives the mapping from
+9. **Independent review.** A reviewer independently re-derives the mapping from
    the inventory, re-runs the public suite and the mutation campaign, and
    checks every factual claim.
 
 ## Sequencing with the inherited items
 
-1. This cutover completes: Stage A merged, private cutover committed and
+1. This cutover completes: Stage A merged, private cutover promoted and
    verified, Stage B merged.
 2. **Item 2 resumes.** The parked branch is rebased onto the resulting
-   `origin/main` and its trusted-local audit is re-run. The current-tree
-   findings should now be absent. Item 2 merges only on that evidence.
+   `origin/main` and its trusted-local audit is re-run. Both audit modes must
+   now be clean. Item 2 merges only on that evidence.
 3. **Item 4** — dependency-time filesystem outcomes.
 4. **Item 3** — declaration completeness.
 
 The 2 → 4 → 3 order is unchanged from the inherited design. This cutover is
-inserted before Item 2's merge, not in place of any item.
-
-Item 2's branch must not be modified while this cutover is in progress.
+inserted before Item 2's merge, not in place of any item. Item 2's branch must
+not be modified while this cutover is in progress.
 
 ## Stop conditions
 
 Work halts and returns to the product owner on any of these:
 
-- **The `books.db` decision is unresolved.** No plan, no apply.
-- Any collision of the three classes above.
+- A `books.db` pair proposed for the writer allowlist without proof that the
+  exact table and column store registry identifiers.
+- Any attempt to derive the writer allowlist from `registry.py::_DB_COLUMNS`,
+  from `rename.py`'s column-name counter, or from column names alone.
+- A proposal to include `fund_holdings.member_id`, or a `tag` column without
+  proof and explicit approval.
+- `books.db` ignored, untracked, unreadable, or changed concurrently.
+- A non-zero in-database residual after the update.
+- Any collision of class 1 or class 2.
 - An in-scope identifier that already carries an axis suffix.
+- An undispositioned advisory occurrence, or any proposal to rewrite outside
+  the enumerated locations.
 - A request to add an alias, a fallback resolver, a `former_slugs` lookup, or
   any dual-read compatibility path.
-- A request to weaken the publication audit, add an exemption or allowlist
-  entry, or lower the five-character floor.
-- A request to rewrite Grey Matter history.
-- Any need to migrate anything beyond the current tree.
+- A request to weaken the publication audit, add an exemption or
+  `.gitleaksignore` entry, lower the five-character floor, or record a
+  post-cutover audit finding as expected residue.
+- A request to rewrite Grey Matter history, or to migrate beyond the current
+  tree.
+- Any proposal to run `reset --hard`, `clean -fd`, or any destructive recovery
+  against the live vault.
+- A live HEAD or status that changed between build and promotion.
 - Discovery that enforcing the floor requires application logic changes beyond
   the validation sites.
 - Any dependency, schema, convention, or security-boundary change.
@@ -523,24 +744,22 @@ Work halts and returns to the product owner on any of these:
   deployment.
 - Any need for private material inside a public task, or any instruction to
   place an instance-specific value in this repository.
-- A vault that is not clean at apply time, or a HEAD that moved between plan
-  and apply.
 
 ## Explicitly out of scope
 
 - Rewriting Grey Matter history.
 - The `project` axis, module numbers, block values, and `sub:` values.
+- Any `books.db` schema change: `UPDATE` only, no DDL.
 - Any change to S7 review tokens, receipts, quarantine, or the managed-
   directory boundary.
 - Changes to Items 2, 3, or 4 beyond resuming them in order.
 - New dependencies, schemas, registry values, conventions, or product surfaces.
-- Collapsing the five grammar copies into one shared expression, beyond
-  single-sourcing the length rule.
+- Collapsing the five grammar copies beyond single-sourcing the length rule.
 
 ## Completion
 
 The cutover is complete when Stage A is merged, the private cutover exists as
-one reverted-testable commit with its private gates recorded, Stage B is
-merged, and a fresh `origin/main` baseline passes. Counts without their
-commands, and mutations without their exact failing tests, are not completion
-evidence.
+one revert-testable commit with its private gates recorded and both audit modes
+clean, Stage B is merged, and a fresh `origin/main` baseline passes. Counts
+without their commands, and mutations without their exact failing tests, are
+not completion evidence.
