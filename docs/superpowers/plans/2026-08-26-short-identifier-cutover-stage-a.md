@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, stdlib `re`/`pathlib`/`sqlite3`/`hashlib`/`subprocess`/`tempfile`, PyYAML, pytest, Git CLI.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 7, commit `ddbd992`.
+**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 8, commit `6b81e76`.
 
 **Supersedes:** the rejected plans at `5f3e82b` and `a96fc18`. Neither is to be consulted during implementation; their code blocks contained the defects listed below and are not a starting point.
 
@@ -50,6 +50,9 @@ The `a96fc18` review added these binding corrections:
    alone with `--tb=line`, so the recorded assertion cannot come from surrounding
    source or another test. Compound mutations and "wrong reason or passes"
    evidence are forbidden.
+9. The validator fixture and parser use the public `BUILD.md` contract's exact
+   `0 error(s), 0 warning(s)` summary. The parser requires that complete line and
+   has a false-zero regression, so `10 error(s)` cannot be accepted as zero.
 
 Seven further requirements from the same review are covered: database paths validated as relative, confined, and non-symlinked (Task 7); each target applied only to its declared axis (Task 7); every approved mapping validated against the deterministic rule (Tasks 1 and 11); dispositions checked before paths move with a separate scoped gate afterward (Task 11); failed promotion distinguished from committed-but-unconfirmed (Task 12); every design acceptance test mapped to an exact node (Task 17); and every mutation an exact reproducible edit (Task 17).
 
@@ -3046,7 +3049,12 @@ import yaml
 
 import app.cutover_build as cutover_build
 
-from app.cutover_build import BuildResult, build_cutover, git
+from app.cutover_build import (
+    BuildResult,
+    build_cutover,
+    git,
+    run_vault_validators,
+)
 from app.cutover_manifest import (
     ApprovalManifest,
     ApprovalRecord,
@@ -3073,7 +3081,7 @@ def cutover_vault(root: Path) -> Path:
                 'actors:\n  h:\n    allow:\n      - {action: read, paths: ["ab/**"], '
                 'except: ["ab/.sensitive/**"]}\n',
             "_system/scripts/check_v2.py":
-                'print("0 errors, 0 warnings")\n',
+                'print("0 error(s), 0 warning(s)")\n',
             "_system/scripts/test_cutover_validator.py":
                 "import unittest\n\n"
                 "class ValidatorSmokeTest(unittest.TestCase):\n"
@@ -3361,6 +3369,22 @@ def test_validator_failure_discards_the_build_and_preserves_the_live_vault(
     assert (git_head(vault), git_status_bytes(vault), (vault / "ab/books.db").read_bytes()) == before
 
 
+def test_default_validator_accepts_the_documented_check_v2_summary(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+
+    run_vault_validators(vault)
+
+
+def test_default_validator_does_not_read_ten_errors_as_zero(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    (vault / "_system" / "scripts" / "check_v2.py").write_text(
+        'print("10 error(s), 0 warning(s)")\n', encoding="utf-8"
+    )
+
+    with pytest.raises(CutoverError, match="0 error"):
+        run_vault_validators(vault)
+
+
 def _opaque_vault_tree(vault: Path) -> dict[str, tuple[str, bytes]]:
     captured = {}
     for path in sorted(vault.rglob("*")):
@@ -3439,6 +3463,7 @@ Append to `app/cutover_build.py`:
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+import re
 import subprocess
 import sys
 
@@ -3473,6 +3498,7 @@ from .identifiers import validate_mapping_pair
 #: Entity first: its directory move relocates everything beneath it. Then the
 #: value axes, then workspaces. Within an axis, sorted by old identifier.
 _AXIS_ORDER = ("entity", "product", "member", "workspace")
+_CHECK_V2_ZERO = re.compile(r"(?m)^0 error\(s\), 0 warning\(s\)\s*$")
 
 
 @dataclass(frozen=True)
@@ -3723,12 +3749,8 @@ def run_vault_validators(root: Path) -> None:
         text=True,
     )
     combined = structural.stdout + structural.stderr
-    if (
-        structural.returncode != 0
-        or "0 errors" not in combined
-        or "0 warnings" not in combined
-    ):
-        raise CutoverError("check_v2 did not report 0 errors and 0 warnings")
+    if structural.returncode != 0 or not _CHECK_V2_ZERO.search(combined):
+        raise CutoverError("check_v2 did not report 0 error(s), 0 warning(s)")
     private_suite = subprocess.run(
         [sys.executable, "-m", "unittest", "discover"],
         cwd=scripts,
@@ -3801,7 +3823,7 @@ def build_cutover(
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_build.py`
-Expected: PASS, 29 tests (the seven Task 10 tests, fifteen ordinary Task 11
+Expected: PASS, 31 tests (the seven Task 10 tests, seventeen ordinary Task 11
 tests, and seven parameter cases in the precommit-stage matrix).
 
 If a fixture's disposition line number does not match, print
@@ -4896,7 +4918,7 @@ plan before proceeding rather than inventing a test during the campaign.
 | Ordering — dry run equals apply | `tests/test_cutover_cli.py::test_dry_run_and_apply_build_identical_trees_for_one_source_head` |
 | Exact artifact — promoted SQLite blob and tree are the verified build | `tests/test_cutover_build.py::test_the_promoted_database_blob_is_the_exact_verified_build_artifact` |
 | Advisory complement and regeneration | `tests/test_cutover_locations.py::test_typed_registry_front_matter_workspace_policy_and_proposal_lines_are_not_advisory`, `tests/test_cutover_build.py::test_build_regenerates_the_advisory_report_after_rewriting`, `tests/test_cutover_build.py::test_build_refuses_an_extra_or_stale_disposition` |
-| Validators run after migration and before commit | `tests/test_cutover_build.py::test_validators_run_after_migration_and_before_commit`, `tests/test_cutover_build.py::test_validator_failure_discards_the_build_and_preserves_the_live_vault` |
+| Validators run after migration and before commit; documented `check_v2` summary parsed exactly | `tests/test_cutover_build.py::test_validators_run_after_migration_and_before_commit`, `tests/test_cutover_build.py::test_validator_failure_discards_the_build_and_preserves_the_live_vault`, `tests/test_cutover_build.py::test_default_validator_accepts_the_documented_check_v2_summary`, `tests/test_cutover_build.py::test_default_validator_does_not_read_ten_errors_as_zero` |
 | Receipts survive | `tests/test_cutover_build.py::test_a_spent_proposal_id_is_still_refused_after_an_entity_cutover` |
 | Proposals rewritten without reserializing unrelated bytes; pre-cutover token refused | `tests/test_cutover_locations.py::test_yaml_path_head_field_preserves_every_unrelated_byte`, `tests/test_cutover_build.py::test_proposal_prefixes_are_rewritten_and_a_pre_cutover_token_is_refused` |
 | `former_slugs` — no resolver, scoped placement, existing provenance preserved | `tests/test_cutover_build.py::test_former_slugs_is_written_only_on_entity_and_product_keys`, `tests/test_cutover_build.py::test_existing_former_slugs_are_preserved_and_no_duplicate_key_is_created`, `tests/test_cutover_locations.py::test_former_slugs_is_exempt_only_in_the_entity_and_product_registries`, `tests/test_cutover_locations.py::test_former_slugs_is_not_exempt_in_the_member_registry` |
@@ -4986,6 +5008,7 @@ For each row: copy the target file to `/private/tmp/cutover-preimage-<n>.py`, ap
 | 32 | `app/cutover_inventory.py` | `if completed.stdout:` → `if False:` in `require_clean_status` | `tests/test_cutover_cli.py::test_inventory_refuses_a_dirty_live_vault` | dirty inventory returned success |
 | 33 | `app/cutover_build.py` | `if existing:` → `if False:` in `_record_former_slug` | `tests/test_cutover_build.py::test_existing_former_slugs_are_preserved_and_no_duplicate_key_is_created` | duplicate provenance key created |
 | 34 | `app/cutover_build.py` | In `_rewrite_proposal`, replace the exact `path.write_text(rewritten, encoding="utf-8")` call with `path.write_text(yaml.safe_dump(yaml.safe_load(rewritten), sort_keys=False), encoding="utf-8")` | `tests/test_cutover_build.py::test_proposal_prefixes_are_rewritten_and_a_pre_cutover_token_is_refused` | proposal rewrite altered bytes outside the approved fields |
+| 35 | `app/cutover_build.py` | `_CHECK_V2_ZERO.search(combined)` → `"0 error(s), 0 warning(s)" in combined` | `tests/test_cutover_build.py::test_default_validator_does_not_read_ten_errors_as_zero` | ten errors were accepted as zero |
 
 Before applying a row, assert its OLD anchor appears exactly once in the target
 file. Rows 11, 16, 17, 18, 21, 22, and 28 are explicitly multi-line exact
