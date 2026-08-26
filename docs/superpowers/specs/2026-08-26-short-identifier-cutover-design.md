@@ -1,6 +1,6 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — public design task only, revision 11. The Stage A
+**Status:** APPROVED DESIGN — public design task only, revision 12. The Stage A
 implementation plan exists; no application code or test has been modified, and
 no migration has been executed.
 
@@ -12,13 +12,9 @@ no migration has been executed.
 "S7 inherits these from S6", and
 `docs/superpowers/specs/2026-08-26-inherited-safety-items-2-4-design.md`.
 
-**Prerequisite state:** inherited Item 2 is implemented and parked, unpushed,
-on branch `codex/inherited-item-2-prose-leakage` at
-`cfed17fffd9f00e0036e7877ab6aa8b5342f93bc`. Its public gates passed. Its
-trusted-local run reported publication-audit findings caused by private
-registry identifiers shorter than the audit's long-term threshold. This cutover
-removes that class of identifier at the source rather than weakening the audit
-that found it.
+**Prerequisite state:** inherited Item 2 is implemented and available as the
+parked prerequisite. Its operational branch, checkpoint, and trusted-local gate
+record belong in the private handoff/runbook, not this public design.
 
 **Revision history.** Revision 2 applied four owner corrections: no vault-wide
 word replacement, a corrected history-audit expectation, an isolated mutable
@@ -57,6 +53,11 @@ only the exact token span owned by a typed location, never every matching token
 on that line, and the source ordinal remains part of post-build identity. The
 approved writers preserve advisory-token order; an insertion, removal, or
 reordering therefore refuses rather than rebinding a disposition.
+**Revision 12 closes the approval-executor boundary:** canonical manifest bytes
+are defined completely, duplicate keys and non-canonical paths refuse, and the
+separate approval record binds the exact clean Stage A executor commit. It also
+defines the exact `CLEAN\n` success contract for both public-audit modes and
+moves prerequisite branch/checkpoint details out of the public design.
 
 ## Objective
 
@@ -610,8 +611,11 @@ happen. It binds:
   axis)` targets**, each naming all four parts; and
 - the **disposition of every advisory-report occurrence**.
 
-**The approval record** is a separate artifact holding the manifest's SHA-256
-together with the owner's approval.
+**The approval record** is a separate artifact holding the manifest's SHA-256,
+the exact Stage A executor commit, and the owner's approval. The executor
+commit is the freshly merged public OneOS commit whose clean checkout runs the
+cutover. Dry-run and apply both refuse if the executing repository is dirty or
+its `HEAD` differs from that approved commit.
 
 The manifest must **not** contain its own digest. A document cannot carry the
 hash of itself: inserting the digest changes the bytes being hashed, so the
@@ -626,8 +630,25 @@ The tool refuses to apply if the manifest bytes do not hash to the digest in
 the approval record, or if live HEAD does not equal the manifest's source HEAD.
 It never recomputes the mapping from a possibly-changed vault at apply time.
 
-The manifest is serialised canonically — fixed key order, fixed encoding — so
-its digest is reproducible.
+The manifest's canonical serialization is UTF-8 JSON, not implementation-
+default YAML: fixed object-key order, arrays sorted by their typed records,
+compact separators `,` and `:`, JSON string escaping with non-ASCII code points
+encoded directly as UTF-8, base-10 integers, and exactly one trailing LF. No
+other whitespace or newline form is accepted. Boolean, null, floating-point,
+and unknown values are invalid; duplicate object keys refuse while parsing.
+Recorded paths are source-relative POSIX paths exactly as produced by
+`relative_to(source_root).as_posix()`: absolute paths, backslashes, empty,
+`.`/`..` components, NUL, and non-NFC Unicode refuse. No case folding or other
+path normalization is performed. The verifier parses with duplicate-key
+rejection, rebuilds these canonical bytes, and requires byte equality before it
+trusts the digest.
+
+The approval record's executor commit closes the other half of reproducibility:
+the same manifest interpreted by different code is not the same approved
+action. Verification requires a clean executor worktree and exact `HEAD`
+equality before inventory-derived artifacts are built or promoted. The commit
+binds the code, dependency lock, and existing helpers together; a caller cannot
+substitute an uncommitted executor while retaining the approval.
 
 ## One reversible commit: build in isolation, then promote
 
@@ -915,9 +936,12 @@ Required coverage:
   appeared ignored content under an affected entity refuses promotion and
   leaves the vault untouched.
 - **Approval binding.** The manifest must not contain its own digest; a test
-  asserts the digest lives only in the approval record. A manifest whose bytes,
-  source HEAD, mappings, database targets, or dispositions differ from the
-  approved ones is refused before any build.
+  asserts the digest lives only in the approval record. Canonical bytes pin the
+  encoding, final LF, scalar forms, duplicate-key refusal, and relative-POSIX
+  path form. A manifest whose bytes, source HEAD, mappings, database targets,
+  or dispositions differ from the approved ones is refused before any build.
+  A dirty executor or an executor `HEAD` different from the commit in the
+  approval record is refused before dry-run or apply.
 - **Database allowlist.** Approved targets are updated; a non-allowlisted
   column with a matching name is **not** updated; the same table and column in
   a *different* database is not updated unless separately approved; an
@@ -1011,8 +1035,9 @@ cloud task.
    relative, confined, non-symlinked regular file. Confirm no affected entity
    carries ignored or untracked content. Confirm nothing private depends on a
    product workspace's `id` equalling its product slug.
-3. **Owner approval.** Present the mapping, dispositions, and allowlist. The
-   owner approves the canonical manifest; record its SHA-256 in a separate
+3. **Owner approval.** Present the mapping, dispositions, allowlist, and clean
+   Stage A executor commit. The owner approves the canonical manifest and that
+   executor; record its commit and the manifest SHA-256 in the separate
    approval record.
 4. **Pre-cutover proof.** Reconfirm the required clean HEAD and capture opaque
    `git status --porcelain=v2 --untracked-files=all`, worktree and cached
@@ -1031,8 +1056,11 @@ cloud task.
    emitting one complete line exactly matching `0 error(s), 0 warning(s)`;
    and the combined repo+vault audit in **both** current-tree and history modes.
    The anchored parser specified in Stage A Task 11 rejects missing, malformed,
-   pluralized, or otherwise unexpected summaries, even on exit zero. Both
-   audits must be clean. A finding is a real finding.
+   pluralized, or otherwise unexpected summaries, even on exit zero. Each audit
+   must exit zero and emit exactly the five bytes `CLEAN\n` on stdout; findings,
+   missing or additional output, malformed output, or non-zero exit all fail.
+   The audit parser is separate from the `check_v2` parser. A finding is a real
+   finding.
 10. **Preservation comparison while writers remain stopped.** Compare the
     opaque snapshots. The required
     clean vault stays clean apart from the single cutover commit. Restoring any
@@ -1084,8 +1112,9 @@ Work halts and returns to the product owner on any of these:
 - Any field claimed by two axes.
 - Any collision of class 1 or class 2.
 - An in-scope identifier that already carries an axis suffix.
-- An approval manifest that contains its own digest, or a missing or
-  non-matching approval record.
+- An approval manifest that contains its own digest; non-canonical encoding,
+  newline, scalar, duplicate-key, or path form; a missing or non-matching
+  approval record; or a dirty/different executor from the approved commit.
 - Any proposal to write `former_slugs` — or any other new field — into a member
   or workspace registry entry, or to widen the residual gate's `former_slugs`
   exemption beyond the entity and product registries.
