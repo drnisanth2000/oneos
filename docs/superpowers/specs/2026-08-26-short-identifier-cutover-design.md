@@ -35,8 +35,11 @@ support it. **Revision 5 applied two wording corrections:** the no-schema rule
 is attributed to this design's scope and `AGENTS.md` rather than to decision 2,
 and "signed" is replaced throughout by "digest-bound", since the mechanism is a
 SHA-256 comparison and no cryptographic signature is defined. **Revision 6
-applies one correction found in plan review:** every database allowlist entry
-gains an `axis`, so a target is a four-tuple rather than a triple.
+applied one correction found in plan review:** every database allowlist entry
+gains an `axis`, so a target is a four-tuple rather than a triple. **Revision 7
+applies one consistency correction:** the schema-similarity exception that
+still allowed a target to omit its path is removed, so all four parts are
+unconditionally mandatory.
 
 ## Objective
 
@@ -421,9 +424,10 @@ The rules are binding:
 
 1. Migrate only explicitly approved `(source-relative database path, table,
    column, axis)` targets proven to store OneOS registry identifiers of that
-   axis. Path, table, and column alone are insufficient unless identical
-   schemas across every affected database are independently proven and that
-   proof is recorded.
+   axis. All four parts are mandatory. Schema similarity between databases —
+   however carefully proven — never permits omitting the path, and no proof
+   permits omitting the axis. One database's proof is never evidence about
+   another's contents, and a target names the exact column it will write.
 2. `axis` is exactly one of `product` or `member`. A target is applied **only**
    to mappings on its declared axis; a mapping on any other axis never touches
    it. `entity` and `workspace` are not valid database axes: neither is stored
@@ -551,7 +555,7 @@ happen. It binds:
 - the **source HEAD** the mapping was derived from;
 - the exact **old → new mappings**, per axis;
 - the exact approved **`books.db` `(source-relative path, table, column,
-  axis)` targets**, with any identical-schema proof recorded; and
+  axis)` targets**, each naming all four parts; and
 - the **disposition of every advisory-report occurrence**.
 
 **The approval record** is a separate artifact holding the manifest's SHA-256
@@ -974,9 +978,9 @@ Work halts and returns to the product owner on any of these:
 - A structural advisory occurrence that cannot be brought into the typed
   rewrite list, or any proposal to resolve one by a separate hand-made commit.
 - A database target proposed without proof that the exact database, table, and
-  column store registry identifiers of its declared axis, or an allowlist keyed
-  by table and column alone without an independently proven identical-schema
-  claim.
+  column store registry identifiers of its declared axis.
+- A database target missing its path or its axis, or any proposal to omit
+  either on the grounds that two databases share a schema.
 - A database target declaring an axis other than `product` or `member`, or a
   target applied to a mapping outside its declared axis.
 - A database path that is absolute, escapes the vault root, or traverses a
