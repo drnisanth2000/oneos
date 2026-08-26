@@ -1,8 +1,8 @@
 # Short-Identifier Cutover
 
-**Status:** DESIGN — public design task only, revision 3. No implementation
-plan exists yet, no application code or test has been modified, and no
-migration has been executed.
+**Status:** APPROVED DESIGN — public design task only, revision 9. The Stage A
+implementation plan exists; no application code or test has been modified, and
+no migration has been executed.
 
 **Base:** freshly fetched merged `origin/main` at
 `e4478fc1beef985fecc16e485b0974568b4fc004`. Fresh public baseline:
@@ -42,7 +42,11 @@ still allowed a target to omit its path is removed, so all four parts are
 unconditionally mandatory. **Revision 8 records one review clarification:**
 the clean-status migration precondition is deliberately stricter than the
 general private-gate preservation rule because the approval and isolated build
-bind only committed `HEAD` bytes.
+bind only committed `HEAD` bytes. **Revision 9 applies the full-PR review
+corrections:** inventory is derived from one immutable source-HEAD snapshot;
+advisory dispositions carry stable token identities rather than line numbers
+alone; identifier examples use non-matching placeholders; and plain `git
+revert` is limited to the pre-writer-restart rollback window.
 
 ## Objective
 
@@ -137,7 +141,7 @@ a second pass and never produces a value that still violates the rule.
 No in-scope identifier can already carry an axis suffix, and arithmetic
 guarantees it: every suffix is at least seven characters, so any identifier
 ending in one is at least eight characters, above the floor and therefore never
-in scope. An identifier such as `ab-entity` is left alone.
+in scope. An identifier such as `<old>-entity` is left alone.
 
 The implementation must still assert this rather than rely on the arithmetic
 surviving a future edit. If an in-scope identifier ends in `-entity`,
@@ -152,11 +156,11 @@ enumerated rewrite locations below must partition, and a public test asserts no
 `(file kind, field)` pair appears under two axes.
 
 Revision 2 violated this for one field. A product-kind workspace's `id:` was
-listed under both the product axis and the workspace axis, so a workspace
-literally named `ab` would have been offered both `ab-product` and
-`ab-workspace`. Decision 14 resolves it: the `id` is a workspace identifier and
-takes `-workspace`; the entry's `product:` field is a product reference and
-takes `-product`.
+listed under both the product axis and the workspace axis, so one in-scope
+identifier would have been offered both `<old>-product` and
+`<old>-workspace`. Decision 14 resolves it: the `id` is a workspace identifier
+and takes `-workspace`; the entry's `product:` field is a product reference
+and takes `-product`.
 
 **This diverges deliberately from `app/rename.py`.**
 [app/rename.py:339](app/rename.py:339) rewrites a product-kind workspace's
@@ -166,8 +170,9 @@ cutover's product pass never touches any `id:`.
 
 The consequence must be stated plainly: the convention that a product
 workspace's `id` equals its product slug **is broken by this cutover**. The
-workspace becomes `ab-workspace` while its product becomes `ab-product`. No
-public reader depends on the coupling — `registry.py::_count_workspaces`
+workspace becomes `<old>-workspace` while its product becomes
+`<old>-product`. No public reader depends on the coupling —
+`registry.py::_count_workspaces`
 matches the `product:` field, and `add_workspace` uses `id` only to compose a
 commit message — but a private consumer might. Proving that nothing depends on
 it is a trusted-local precondition, and a dependency found is a stop condition.
@@ -252,8 +257,12 @@ the sweep it replaces.
 
 The inventory and dry-run therefore produce an **advisory report**: every
 occurrence of an in-scope identifier, matched as a whole token with the
-existing boundary pattern, that lies **outside** the enumerated locations,
-grouped by file and line.
+existing boundary pattern, that lies **outside** the enumerated locations.
+Occurrences remain grouped by file and line for display, but a display line is
+not their authority. Each occurrence is identified by source-relative path,
+axis, old value, token ordinal within the line, and a SHA-256 context digest of
+that exact source line. The manifest's source HEAD makes that identity refer to
+one immutable snapshot even if later insertions shift display line numbers.
 
 The report is never acted on automatically. The owner dispositions each
 occurrence as exactly one of:
@@ -271,9 +280,10 @@ sits uncommitted in the working tree at promotion time, where the promotion
 precheck refuses it. A structural reference that cannot be typed stops the
 cutover.
 
-Every occurrence must carry a disposition before apply. Dispositions are part
-of the approval manifest and are bound by its digest, so the tree that is
-migrated is the tree whose incidental words the owner actually reviewed.
+Every occurrence must carry a disposition with that complete stable identity
+before apply. Dispositions are part of the approval manifest and are bound by
+its digest, so the tree that is migrated is the tree whose incidental words
+the owner actually reviewed. A path-and-line-only disposition is invalid.
 
 ## Collisions
 
@@ -283,10 +293,10 @@ suffix, counter, or alternate spelling.
 
 **1. A new value collides with an existing identifier on the same axis.** The
 mapping is injective on distinct inputs, so this arises only when the new value
-equals another object's current identifier — for example, entity `ab` maps to
-`ab-entity` while an entity named `ab-entity` already exists. Applying it would
-reuse an existing identifier for a different object, violating decision 7.
-Refuse.
+equals another object's current identifier — for example, one entity maps to
+`<old>-entity` while another entity already uses `<old>-entity`. Applying it
+would reuse an existing identifier for a different object, violating decision
+7. Refuse.
 
 **2. A new value collides with another new value.** Impossible for distinct
 inputs on one axis, since appending a constant suffix preserves distinctness.
@@ -297,8 +307,8 @@ duplicate inputs, and a silent duplicate is worse than a noisy refusal.
 hard refusal, because the whole-vault entity sweep would have rewritten a
 same-named product's occurrences and silently given it the entity's suffix.
 Scoped replacement removes that hazard: each axis touches only its own
-structurally-typed locations, so an entity `ab` and a product `ab` migrate
-independently and correctly.
+structurally-typed locations, so an entity and product sharing one old token
+migrate independently and correctly.
 
 It is therefore not a refusal. It remains reportable, so the owner sees that
 one literal carries two meanings, and the residual gate attributes findings per
@@ -537,13 +547,15 @@ failure.
 
 ### The four stages
 
-1. **Inventory** — read-only against the live vault. Enumerate in-scope
-   identifiers per axis, run the three collision checks, run the
-   ignored/untracked check on every affected entity, produce the advisory
-   report, and produce the per-database schema inventory and reference counts.
-   Emits the proposed mapping and the proposed
-   `(path, table, column, axis)` allowlist. Writes nothing, commits nothing,
-   and takes no lock.
+1. **Inventory** — capture live HEAD, require a clean status, and create a
+   temporary isolated worktree at that exact commit. Enumerate identifiers,
+   collision inputs, advisory occurrences, database schemas, and reference
+   counts from that immutable snapshot only. The live tree is consulted only
+   for the ignored/untracked check that a Git worktree cannot reproduce. Before
+   returning, re-read live HEAD and status and repeat the ignored/untracked
+   check; any change discards the inventory. Emits the proposed mapping and the
+   proposed `(path, table, column, axis)` allowlist. Writes nothing, commits
+   nothing, and takes no lock.
 2. **Owner approval** — the owner reviews and explicitly approves a canonical
    manifest, digest-bound by a separate approval record. See below.
 3. **Dry run** — default. In a temporary isolated worktree at the manifest's
@@ -714,8 +726,9 @@ dispositioned in the approved manifest aborts the build.
 
 The boundary pattern used for the advisory scan is the existing
 `(?<![\w-])<old>(?![\w-])`. Its behaviour must be pinned: a migrated
-`ab-entity` does not match a scan for `ab`, because the lookahead fails on the
-hyphen, while a bare `ab` still does. A naive escaped search would report every
+`<old>-entity` does not match a scan for `<old>`, because the lookahead fails
+on the hyphen, while a bare `<old>` still does. A naive escaped search would
+report every
 successful rewrite as a residual.
 
 **2. The in-database residual query.** For every approved target, query for any
@@ -803,11 +816,21 @@ an interrupted promotion keeps the writers stopped, inspects `git status` and
 `reset --hard` or `clean -fd`; that is the same destructive action this design
 removed, and it is no safer performed by hand.
 
-**After promotion.** `git revert` of the single cutover commit restores every
-identifier, including each `books.db` blob, because the databases are tracked
-and the commit is one atomic unit. This is the revert test `AGENTS.md` names as
-one of the two tests that matter more than coverage. Writers are restarted only
-after the promoted state is verified.
+**After promotion, before writers restart.** `git revert` of the single
+cutover commit restores every identifier, including each `books.db` blob,
+because the databases are tracked and no later write exists. This is the revert
+test `AGENTS.md` names as one of the two tests that matter more than coverage.
+The operator must finish verification and either accept the cutover or perform
+this rollback while writers remain quiesced.
+
+**After writers restart.** Plain `git revert` is no longer a safe rollback:
+later SQLite writes could be overwritten or conflict with the old database
+blob. Stop the writers again, back up the current databases byte-for-byte, and
+inventory every post-cutover write. Recovery then requires a separately
+reviewed typed reverse migration or replay of those later writes onto the
+pre-cutover schema; Stage A provides neither and must never present an ordinary
+revert as sufficient. Keep the backup until the recovered state and its audit
+trail are verified.
 
 **A committed-but-unconfirmed promotion** — the ref moved but reading back the
 commit id or releasing the lock failed — is a distinct outcome from a failed
@@ -849,7 +872,8 @@ Required coverage:
 - **Floor enforcement.** Every validation site rejects a sub-floor identifier,
   and a structural test asserts the length rule is single-sourced.
 - **One commit.** A multi-mapping cutover produces exactly one new commit, and
-  `git revert` restores the tree including every database.
+  an immediate revert before writers restart restores the tree including every
+  database.
 - **Isolation.** A failure injected at every stage before promotion leaves the
   live vault byte-identical, with untracked files intact. A test asserts the
   cutover never invokes `reset --hard` or `clean -fd` against the live vault.
@@ -903,9 +927,13 @@ rewrite; removing the ignored/untracked check so an entity with ignored content
 proceeds; restoring the product pass's workspace `id:` rewrite so two mappings
 contend for one field; adding `former_slugs` to a member entry so a
 list-shaped registry gains a new field; widening the residual gate's
-`former_slugs` exemption to every registry so a genuine residual is masked; and removing the promotion precheck so a moved HEAD is
-accepted. Each names the exact test that must go red, and each target file is
-restored byte-for-byte before the suite is re-run green.
+`former_slugs` exemption to every registry so a genuine residual is masked;
+and removing the promotion precheck so a moved HEAD is accepted. Each names the
+exact test that must go red, and each target file is
+restored byte-for-byte before the suite is re-run green. Task 17 of the Stage A
+implementation plan is the single authoritative mapping from every mutation to
+its full `path::test_name` node, including parameter case ids. This design does
+not duplicate that executable table and create a second count that can drift.
 
 ## Public release sequencing
 
@@ -1053,7 +1081,7 @@ Work halts and returns to the product owner on any of these:
 ## Completion
 
 The cutover is complete when Stage A is merged, the private cutover exists as
-one revert-testable commit with its private gates recorded and both audit modes
-clean, Stage B is merged, and a fresh `origin/main` baseline passes. Counts
+one pre-writer-restart revert-tested commit with its private gates recorded and
+both audit modes clean, Stage B is merged, and a fresh `origin/main` baseline passes. Counts
 without their commands, and mutations without their exact failing tests, are
 not completion evidence.
