@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, stdlib `re`/`pathlib`/`sqlite3`/`hashlib`/`subprocess`/`tempfile`, PyYAML, pytest, Git CLI.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 9, commit `9ad53a0`.
+**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 10, commit `6e792b9`.
 
 **Supersedes:** the rejected plans at `5f3e82b` and `a96fc18`. Neither is to be consulted during implementation; their code blocks contained the defects listed below and are not a starting point.
 
@@ -57,9 +57,15 @@ The `a96fc18` review added these binding corrections:
     and database evidence from a detached worktree at that immutable commit.
     Live HEAD, status, and affected ignored content are rechecked before return.
 11. Advisory dispositions bind path, axis, old value, file-level token ordinal,
-    and exact-line context digest. Line number remains display data only.
+    and canonical-context digest. Line number remains display data only.
 12. Plain `git revert` is documented as safe only before writers restart.
     Rollback after later SQLite writes is a separate quiesced recovery migration.
+13. Advisory context canonicalizes approved old/new mapping tokens, while
+    retaining every ordinary surrounding byte. Post-build comparison carries
+    the source context multiset through path translation and never reassigns a
+    disposition by a newly computed ordinal.
+14. The trusted-local sequence starts clean, runs all private gates while
+    writers remain stopped, and accepts or reverts before restart.
 
 Seven further requirements from the same review are covered: database paths validated as relative, confined, and non-symlinked (Task 7); each target applied only to its declared axis (Task 7); every approved mapping validated against the deterministic rule (Tasks 1 and 11); dispositions checked before paths move with a separate scoped gate afterward (Task 11); failed promotion distinguished from committed-but-unconfirmed (Task 12); every design acceptance test mapped to an exact node (Task 17); and every mutation an exact reproducible edit (Task 17).
 
@@ -71,12 +77,18 @@ Seven further requirements from the same review are covered: database paths vali
 
 - Base the branch on freshly fetched `origin/main`; record the SHA before branching.
 - Public repository and synthetic fixtures only. Never read, request, infer, or display a live vault, registry value, database, path, or history.
-- Add no dependency, no schema, no registry value, no exemption, no second scanner.
+- Add no unapproved dependency or schema, no compatibility alias or exemption,
+  and no second scanner. The approved five-character identifier convention,
+  deterministic axis values, and private manifest/record are the only
+  convention or registry-value additions authorized here.
 - Do **not** enforce the length floor at any read-time validation site in Stage A.
 - Do not modify the parked Item 2 branch or its worktree.
 - Do not push, open a pull request, merge, delete a branch, or remove a worktree.
 - Never run `git reset --hard` or `git clean -fd` against the live vault, in code or by hand.
-- Stop on any dependency, schema, convention, security-boundary, destructive-action, deployment, private-material, or unresolved-product decision.
+- Stop on any unapproved dependency, schema, convention, registry-value,
+  security-boundary, destructive-action, deployment, private-material, or
+  unresolved-product decision beyond the identifier convention, deterministic
+  values, and private manifest/record this approved design explicitly defines.
 
 ## Execution preconditions
 
@@ -1238,7 +1250,6 @@ Two fail-open holes from the rejected plan are closed here. The `former_slugs` e
 Append to `tests/test_cutover_locations.py`:
 
 ```python
-import hashlib
 from pathlib import Path
 
 import pytest
@@ -1247,6 +1258,7 @@ from app.cutover_locations import (
     AdvisoryOccurrence,
     UnreadableFile,
     advisory_occurrences,
+    stable_advisory_context,
 )
 from app.cutover_manifest import Mapping
 
@@ -1272,7 +1284,7 @@ def occurrence(
         axis=axis,
         old=old,
         ordinal=ordinal,
-        context_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        context_sha256=stable_advisory_context(text, ADVISORY_MAPPINGS),
         line=line,
     )
 
@@ -1299,6 +1311,15 @@ def test_advisory_does_not_report_a_migrated_token(tmp_path: Path):
     (tmp_path / "note.md").write_text("entity: ab-entity\n", encoding="utf-8")
 
     assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == []
+
+
+def test_stable_context_ignores_an_approved_typed_value_rewrite():
+    before = "entity: ab # q7 remains incidental"
+    after = "entity: ab-entity # q7 remains incidental"
+
+    assert stable_advisory_context(before, ADVISORY_MAPPINGS) == (
+        stable_advisory_context(after, ADVISORY_MAPPINGS)
+    )
 
 
 def test_advisory_does_not_report_a_longer_token(tmp_path: Path):
@@ -1569,6 +1590,24 @@ def _typed_line_keys(
     return typed
 
 
+def stable_advisory_context(line: str, mappings: tuple[Mapping, ...]) -> str:
+    """Hash context after neutralizing only approved old/new mapping tokens.
+
+    The neutral form is stable when a typed value on the same line is rewritten.
+    Every non-mapping byte remains authoritative, and occurrence counts are
+    checked separately, so rewriting or adding an incidental old token cannot
+    hide behind this normalization.
+    """
+    normalized = line
+    terms = sorted(
+        {value for item in mappings for value in (item.old, item.new)},
+        key=lambda value: (-len(value), value),
+    )
+    for term in terms:
+        normalized = boundaried(term).sub("<mapped>", normalized)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def advisory_occurrences(
     root: Path, mappings: tuple[Mapping, ...]
 ) -> list[AdvisoryOccurrence]:
@@ -1611,7 +1650,7 @@ def advisory_occurrences(
                 r"^\s*former_slugs:\s*\[", line
             ):
                 continue
-            context_sha256 = hashlib.sha256(line.encode("utf-8")).hexdigest()
+            context_sha256 = stable_advisory_context(line, mappings)
             for (axis, old), pattern in patterns.items():
                 if (relative, number, axis, old) in typed:
                     continue
@@ -1634,7 +1673,7 @@ def advisory_occurrences(
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_locations.py`
-Expected: PASS, 32 tests.
+Expected: PASS, 33 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -3165,7 +3204,6 @@ Ordering is fixed and each step exists for a reason:
 Append to `tests/test_cutover_build.py`:
 
 ```python
-import hashlib
 import sqlite3
 
 import yaml
@@ -3178,6 +3216,7 @@ from app.cutover_build import (
     git,
     run_vault_validators,
 )
+from app.cutover_locations import stable_advisory_context
 from app.cutover_manifest import (
     ApprovalManifest,
     ApprovalRecord,
@@ -3189,6 +3228,14 @@ from app.cutover_manifest import (
     manifest_digest,
 )
 from tests.conftest import git_count_commits, git_status_bytes
+
+
+CUTOVER_MAPPINGS = (
+    Mapping(axis="entity", old="ab", new="ab-entity"),
+    Mapping(axis="product", old="q7", new="q7-product"),
+    Mapping(axis="member", old="m7", new="m7-member"),
+    Mapping(axis="workspace", old="w7", new="w7-workspace"),
+)
 
 
 def disposition(
@@ -3207,7 +3254,7 @@ def disposition(
         axis=axis,
         old=old,
         ordinal=ordinal,
-        context_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        context_sha256=stable_advisory_context(text, CUTOVER_MAPPINGS),
         line=line,
         kind=kind,
         typed_location=typed_location,
@@ -3252,12 +3299,7 @@ def cutover_vault(root: Path) -> Path:
 def approved(vault: Path, dispositions=None) -> tuple[bytes, ApprovalRecord]:
     manifest = ApprovalManifest(
         source_head=git_head(vault),
-        mappings=(
-            Mapping(axis="entity", old="ab", new="ab-entity"),
-            Mapping(axis="product", old="q7", new="q7-product"),
-            Mapping(axis="member", old="m7", new="m7-member"),
-            Mapping(axis="workspace", old="w7", new="w7-workspace"),
-        ),
+        mappings=CUTOVER_MAPPINGS,
         databases=(
             DatabaseTarget(
                 path="ab/books.db", table="ledger", column="product", axis="product"
@@ -3544,6 +3586,62 @@ def test_post_advisory_identity_survives_a_display_line_shift(
 
     monkeypatch.setattr(
         cutover_build, "_apply_entity_mapping", shifts_only_the_display_line
+    )
+
+    build_cutover(vault, raw, record)
+
+
+def test_post_advisory_identity_survives_reordering_approved_contexts(
+    tmp_path: Path, monkeypatch
+):
+    vault = cutover_vault(tmp_path / "vault")
+    note = vault / "ab" / "00-inbox" / "note.md"
+    note.write_text(
+        note.read_text(encoding="utf-8").replace(
+            "the ab word\n", "first ab context\nsecond ab context\n"
+        ),
+        encoding="utf-8",
+    )
+    commit_in(vault, "seed two approved contexts")
+    raw, record = approved(
+        vault,
+        dispositions=(
+            disposition(
+                "ab/00-inbox/note.md",
+                7,
+                "entity",
+                "ab",
+                "first ab context",
+                ordinal=1,
+            ),
+            disposition(
+                "ab/00-inbox/note.md",
+                8,
+                "entity",
+                "ab",
+                "second ab context",
+                ordinal=2,
+            ),
+        ),
+    )
+    real = cutover_build._apply_entity_mapping
+
+    def reorders_without_changing_either_occurrence(root, old, new):
+        real(root, old, new)
+        moved = root / new / "00-inbox" / "note.md"
+        text = moved.read_text(encoding="utf-8")
+        moved.write_text(
+            text.replace(
+                "first ab context\nsecond ab context\n",
+                "second ab context\nfirst ab context\n",
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        cutover_build,
+        "_apply_entity_mapping",
+        reorders_without_changing_either_occurrence,
     )
 
     build_cutover(vault, raw, record)
@@ -3911,15 +4009,27 @@ def _apply_mappings_in_order(root: Path, manifest: ApprovalManifest) -> None:
             _apply_value_mapping(root, mapping.axis, mapping.old, mapping.new)
 
 
-def _occurrence_key(item, *, path: str | None = None, include_line: bool = False):
+def _occurrence_key(
+    item,
+    *,
+    path: str | None = None,
+    include_ordinal: bool = True,
+    include_line: bool = False,
+):
     key = (
         item.path if path is None else path,
         item.axis,
         item.old,
-        item.ordinal,
         item.context_sha256,
     )
+    if include_ordinal:
+        key += (item.ordinal,)
     return key + ((item.line,) if include_line else ())
+
+
+def _post_occurrence_key(item, *, path: str | None = None):
+    """Carried source identity after path translation; never rebind ordinal."""
+    return _occurrence_key(item, path=path, include_ordinal=False)
 
 
 def _require_dispositions(root: Path, manifest: ApprovalManifest) -> None:
@@ -3962,20 +4072,20 @@ def _require_post_advisory(root: Path, manifest: ApprovalManifest) -> None:
     """Regenerate the report after migration and compare approved evidence.
 
     Entity moves translate source-relative path heads and provenance insertion
-    can shift display line numbers. The stable identity therefore retains axis,
-    old value, file-level token ordinal, and exact-line context digest while
-    translating only the path. The source display line was already
-    digest-bound and checked by `_require_dispositions` before mutation.
+    can shift display line numbers. The post-build identity therefore retains
+    axis, old value, and canonical-context digest while translating only the
+    path. Source ordinal and display line were already digest-bound and checked
+    by `_require_dispositions`; neither is reassigned as post-build authority.
     """
     expected = Counter(
-        _occurrence_key(
+        _post_occurrence_key(
             item, path=_translated_advisory_path(item.path, manifest)
         )
         for item in manifest.dispositions
         if item.kind == "incidental"
     )
     actual = Counter(
-        _occurrence_key(item)
+        _post_occurrence_key(item)
         for item in advisory_occurrences(root, manifest.mappings)
     )
     if actual != expected:
@@ -4072,7 +4182,7 @@ def build_cutover(
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_build.py`
-Expected: PASS, 34 tests (the seven Task 10 tests, twenty ordinary Task 11
+Expected: PASS, 35 tests (the seven Task 10 tests, twenty-one ordinary Task 11
 tests, and seven parameter cases in the precommit-stage matrix).
 
 If a fixture's disposition line number does not match, print
@@ -5220,7 +5330,7 @@ plan before proceeding rather than inventing a test during the campaign.
 | Scoped replacement — prose untouched | `tests/test_cutover_build.py::test_ordinary_prose_containing_a_short_identifier_is_untouched`, `tests/test_cutover_locations.py::test_ordinary_prose_containing_an_old_identifier_is_not_a_residual` |
 | Scoped replacement — containing value unchanged | `tests/test_cutover_locations.py::test_front_matter_rewrite_ignores_a_value_that_merely_contains_the_term` |
 | Advisory report — reported not rewritten | `tests/test_cutover_locations.py::test_advisory_reports_a_bare_token_outside_the_enumerated_locations` |
-| Advisory report — every token has a stable identity; display-line shifts tolerated; context changes refused | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line`, `tests/test_cutover_build.py::test_post_advisory_identity_survives_a_display_line_shift`, `tests/test_cutover_build.py::test_post_advisory_identity_rejects_same_count_with_changed_context` |
+| Advisory report — every token has stable source identity; approved typed rewrites, display-line shifts, and context reordering tolerated; ordinary context changes refused | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line`, `tests/test_cutover_locations.py::test_stable_context_ignores_an_approved_typed_value_rewrite`, `tests/test_cutover_build.py::test_post_advisory_identity_survives_a_display_line_shift`, `tests/test_cutover_build.py::test_post_advisory_identity_survives_reordering_approved_contexts`, `tests/test_cutover_build.py::test_post_advisory_identity_rejects_same_count_with_changed_context` |
 | Advisory report — undispositioned aborts | `tests/test_cutover_build.py::test_build_refuses_an_undispositioned_advisory_occurrence` |
 | Advisory report — structural without typed location aborts | `tests/test_cutover_build.py::test_build_refuses_a_structural_disposition_naming_no_typed_location` |
 | Clean inventory status | `tests/test_cutover_inventory.py::test_inventory_requires_a_globally_clean_tracked_and_untracked_status`, `tests/test_cutover_cli.py::test_inventory_refuses_a_dirty_live_vault` |
@@ -5344,6 +5454,8 @@ For each row: copy the target file to `/private/tmp/cutover-preimage-<n>.py`, ap
 | 38 | `app/cutover.py` | Delete the final `require_clean_status(vault)` between the live-HEAD comparison and repeated `require_clean_entities` call | `tests/test_cutover_cli.py::test_inventory_discards_results_when_live_status_changes_before_return` | changed live status was accepted after snapshot inventory |
 | 39 | `app/cutover_locations.py` | `for _match in pattern.finditer(line):` → `for _match in list(pattern.finditer(line))[:1]:` | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line` | second token on one line had no disposition identity |
 | 40 | `app/cutover_build.py` | `existing_identifiers(scratch)` → `existing_identifiers(vault)` | `tests/test_cutover_build.py::test_build_collision_check_uses_the_manifest_source_head` | collision authority came from mutable live bytes instead of manifest source HEAD |
+| 41 | `app/cutover_locations.py` | `normalized = boundaried(term).sub("<mapped>", normalized)` → `normalized = normalized` | `tests/test_cutover_locations.py::test_stable_context_ignores_an_approved_typed_value_rewrite` | an approved typed rewrite changed the advisory context identity |
+| 42 | `app/cutover_build.py` | `_occurrence_key(item, path=path, include_ordinal=False)` → `_occurrence_key(item, path=path, include_ordinal=True)` | `tests/test_cutover_build.py::test_post_advisory_identity_survives_reordering_approved_contexts` | regenerated ordinals were incorrectly treated as post-build authority |
 
 Before applying a row, assert its OLD anchor appears exactly once in the target
 file. Rows 11, 16, 17, 18, 21, 22, 28, and 38 are explicitly multi-line exact
@@ -5415,4 +5527,8 @@ The term-collection pin is deliberately **not** deferred; it is Task 15, because
 
 Return the recorded base SHA, branch, worktree, commit list, each task's RED and GREEN output, the design-test mapping table with every node's result, the mutation ledger, the full public suite count with its exact command, the publication audit and Gitleaks results, `git diff --check`, and the final `git status --porcelain`. State explicitly that no live vault was accessed and that no private gate was run.
 
-The trusted local reviewer — not the external agent — runs the vault-seeded audits, the private suite, `check_v2`, and the opaque byte-preservation comparison, and performs the migration itself.
+The trusted local reviewer — not the external agent — runs the vault-seeded
+audits, the private suite, `check_v2`, and the opaque clean-state comparison,
+and performs the migration itself. Pre-existing edits are committed or
+preserved outside the cutover before inventory; restoring them is a later
+verified operation and never part of the approval-bound commit or revert proof.
