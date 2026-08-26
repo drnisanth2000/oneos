@@ -1,6 +1,6 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — public design task only, revision 9. The Stage A
+**Status:** APPROVED DESIGN — public design task only, revision 10. The Stage A
 implementation plan exists; no application code or test has been modified, and
 no migration has been executed.
 
@@ -47,6 +47,11 @@ corrections:** inventory is derived from one immutable source-HEAD snapshot;
 advisory dispositions carry stable token identities rather than line numbers
 alone; identifier examples use non-matching placeholders; and plain `git
 revert` is limited to the pre-writer-restart rollback window.
+**Revision 10 applies the final full-review corrections:** advisory context is
+canonicalized across approved typed rewrites and source ordinals are never
+reassigned as post-build authority; the exact `check_v2` success contract is
+fail-closed; clean-HEAD preservation wording is consistent; and stop conditions
+exclude the identifier convention and values this design explicitly approves.
 
 ## Objective
 
@@ -259,10 +264,22 @@ The inventory and dry-run therefore produce an **advisory report**: every
 occurrence of an in-scope identifier, matched as a whole token with the
 existing boundary pattern, that lies **outside** the enumerated locations.
 Occurrences remain grouped by file and line for display, but a display line is
-not their authority. Each occurrence is identified by source-relative path,
-axis, old value, token ordinal within the file, and a SHA-256 context digest of
-that exact source line. The manifest's source HEAD makes that identity refer to
-one immutable snapshot even if later insertions shift display line numbers.
+not their authority. Each source occurrence is identified by source-relative
+path, axis, old value, token ordinal within the file, and a SHA-256 digest of a
+canonical context line. Canonicalization replaces only whole old/new mapping
+tokens with one neutral sentinel; ordinary surrounding bytes remain exact.
+That makes the context stable when an approved typed value on the same line is
+rewritten without masking a changed ordinary word. The manifest's source HEAD
+makes the source identity refer to one immutable snapshot.
+
+The source ordinal is approval evidence, not something the post-build scan may
+reassign. Regeneration translates each approved source path through the entity
+mapping, then compares a multiset keyed by translated path, axis, old value,
+and canonical-context digest. The count distinguishes repeated identical
+contexts. A typed rewrite therefore cannot detach an approved occurrence by
+changing its line bytes; a line insertion cannot detach it by shifting display
+lines; and a new occurrence cannot inherit an old disposition merely by taking
+its ordinal. Inventory, dry-run, and apply use this same source projection.
 
 The report is never acted on automatically. The owner dispositions each
 occurrence as exactly one of:
@@ -720,9 +737,10 @@ pass is not a safety mechanism.
 Within those locations, matching is by exact whole field value, or by exact
 path component for paths.
 
-The advisory report is regenerated and compared against the manifest's
-dispositions. Any occurrence outside the enumerated locations that was not
-dispositioned in the approved manifest aborts the build.
+The advisory report is regenerated and compared against the carried source
+projection defined above, never against newly assigned post-build ordinals.
+Any occurrence outside the enumerated locations that was not dispositioned in
+the approved manifest aborts the build.
 
 The boundary pattern used for the advisory scan is the existing
 `(?<![\w-])<old>(?![\w-])`. Its behaviour must be pinned: a migrated
@@ -978,23 +996,34 @@ cloud task.
 3. **Owner approval.** Present the mapping, dispositions, and allowlist. The
    owner approves the canonical manifest; record its SHA-256 in a separate
    approval record.
-4. **Pre-cutover proof.** Capture opaque `git status --porcelain=v2
-   --untracked-files=all`, worktree and cached binary diffs, outside both
-   repositories, per `BUILD.md`.
+4. **Pre-cutover proof.** Reconfirm the required clean HEAD and capture opaque
+   `git status --porcelain=v2 --untracked-files=all`, worktree and cached
+   binary diffs outside both repositories, per `BUILD.md`. Any pre-existing
+   edit must already have been committed or preserved outside the cutover; it
+   is never overlaid onto the approval-bound migration.
 5. **Dry run.** Review the full combined diff and the row-change summary.
-6. **Quiesce.** Stop OneOS, Hermes, and every parser and adapter, and verify
+6. **Independent preflight review.** A reviewer independently re-derives the
+   mapping from the immutable inventory, re-runs the public suite and mutation
+   campaign, and checks the approval manifest and dry-run claims.
+7. **Quiesce.** Stop OneOS, Hermes, and every parser and adapter, and verify
    they are stopped.
-7. **Build and promote.** One commit. Record its id.
-8. **Restart writers** only after the promoted state is verified.
-9. **Private gates.** The vault's own suite, `check_v2` at 0 errors and 0
-   warnings, and the combined repo+vault audit in **both** current-tree and
-   history modes. Both must be clean. A finding is a real finding.
-10. **Preservation comparison.** Compare the opaque snapshots. A clean vault
-    stays clean apart from the single cutover commit; a vault with approved
-    pre-existing edits retains exactly those edits.
-11. **Independent review.** A reviewer independently re-derives the mapping
-    from the inventory, re-runs the public suite and the mutation campaign, and
-    checks every factual claim.
+8. **Build and promote.** One commit. Record its id.
+9. **Private gates while writers remain stopped.** Run the vault's own suite;
+   require `check_v2` exiting zero and
+   emitting one complete line exactly matching `0 error(s), 0 warning(s)`;
+   and the combined repo+vault audit in **both** current-tree and history modes.
+   The anchored parser specified in Stage A Task 11 rejects missing, malformed,
+   pluralized, or otherwise unexpected summaries, even on exit zero. Both
+   audits must be clean. A finding is a real finding.
+10. **Preservation comparison while writers remain stopped.** Compare the
+    opaque snapshots. The required
+    clean vault stays clean apart from the single cutover commit. Restoring any
+    separately preserved pre-cutover edit is a later verified operation, never
+    part of this approval-bound commit or its revert proof.
+11. **Accept or revert while writers remain stopped.** The owner accepts the
+    verified cutover or uses the immediate tested revert. A failed private gate
+    never restarts writers on the promoted state.
+12. **Restart writers** only after the owner accepts the verified result.
 
 ## Sequencing with the inherited items
 
@@ -1056,8 +1085,11 @@ Work halts and returns to the product owner on any of these:
 - A live HEAD or status that changed between build and promotion.
 - Discovery that enforcing the floor requires application logic changes beyond
   the validation sites.
-- Any dependency, schema, convention, or security-boundary change.
-- Any destructive action beyond the single reversible commit, or any
+- Any **unapproved** dependency, schema, convention, registry-value, or
+  security-boundary change beyond the five-character identifier convention,
+  deterministic axis-suffixed values, and digest-bound private manifest/record
+  explicitly approved by this design.
+- Any destructive action beyond the single approved cutover commit, or any
   deployment.
 - Any need for private material inside a public task, or any instruction to
   place an instance-specific value in this repository.
@@ -1075,7 +1107,10 @@ Work halts and returns to the product owner on any of these:
 - Any change to S7 review tokens, receipts, quarantine, or the managed-
   directory boundary.
 - Changes to Items 2, 3, or 4 beyond resuming them in order.
-- New dependencies, schemas, registry values, conventions, or product surfaces.
+- New dependencies, schemas, registry values, conventions, or product surfaces
+  other than the five-character identifier convention, deterministic
+  axis-suffixed registry values, and digest-bound private manifest/record this
+  design explicitly approves.
 - Collapsing the five grammar copies beyond single-sourcing the length rule.
 
 ## Completion
