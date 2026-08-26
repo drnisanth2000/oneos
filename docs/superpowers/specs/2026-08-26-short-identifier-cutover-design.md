@@ -31,10 +31,12 @@ every writer; a structural reference must join the typed rewrite list or stop
 the cutover; and database approval binds a source-relative path as well as
 table and column. **Revision 4 applied two document corrections:** that
 miscount, and the scoping of `former_slugs` to the registry shapes that already
-support it. **Revision 5 applies two wording corrections:** the no-schema rule
+support it. **Revision 5 applied two wording corrections:** the no-schema rule
 is attributed to this design's scope and `AGENTS.md` rather than to decision 2,
 and "signed" is replaced throughout by "digest-bound", since the mechanism is a
-SHA-256 comparison and no cryptographic signature is defined.
+SHA-256 comparison and no cryptographic signature is defined. **Revision 6
+applies one correction found in plan review:** every database allowlist entry
+gains an `axis`, so a target is a four-tuple rather than a triple.
 
 ## Objective
 
@@ -207,14 +209,16 @@ appears twice.
 - `_system/products.yaml` — the product key within its entity's mapping.
 - Markdown front matter — the `product:` field value.
 - `_system/workspaces.yaml` — `product:` values only. **Never an `id:`.**
-- Approved `books.db` `(path, table, column)` triples only.
+- Approved `books.db` `(path, table, column, axis)` targets whose `axis` is
+  `product`, and no others.
 
 **Member axis**
 
 - `_system/members.yaml` — the entry `id:` value within its entity's list.
 - Markdown front matter — the `member:` field value.
 - `_system/workspaces.yaml` — `member:` values.
-- Approved `books.db` `(path, table, column)` triples only.
+- Approved `books.db` `(path, table, column, axis)` targets whose `axis` is
+  `member`, and no others.
 
 **Workspace axis**
 
@@ -400,30 +404,53 @@ vault therefore holds several, one per entity root, and their schemas are not
 proven identical. An allowlist keyed only by table and column would silently
 apply one entity's proven schema to another's unproven one.
 
+**A column also has a type.** A target names a column that stores identifiers
+of exactly one axis. Without recording which, an implementation has nothing to
+filter on and applies every product *and* member mapping to every approved
+column. Where one literal is short on both axes — the class 3 condition this
+design explicitly permits — whichever mapping runs first wins, and an approved
+product column silently receives a member identifier. The text residual gate
+cannot see it, because the file is binary.
+
+This is the "one field, one axis" rule of the mapping section, applied to the
+one place it would otherwise be missing. It also keeps the residual query
+honest: an untyped query looks for both axes' old values in every column and
+would report a false residual on a correctly migrated one.
+
 The rules are binding:
 
 1. Migrate only explicitly approved `(source-relative database path, table,
-   column)` triples proven to store OneOS registry identifiers. Table and
-   column alone are insufficient unless identical schemas across every affected
-   database are independently proven and that proof is recorded.
-2. Neither `registry.py::_DB_COLUMNS` nor `rename.py`'s broad column-name
+   column, axis)` targets proven to store OneOS registry identifiers of that
+   axis. Path, table, and column alone are insufficient unless identical
+   schemas across every affected database are independently proven and that
+   proof is recorded.
+2. `axis` is exactly one of `product` or `member`. A target is applied **only**
+   to mappings on its declared axis; a mapping on any other axis never touches
+   it. `entity` and `workspace` are not valid database axes: neither is stored
+   in a database column by this design, and naming one is a hard stop.
+3. Neither `registry.py::_DB_COLUMNS` nor `rename.py`'s broad column-name
    counter may be reused as the writer allowlist.
-3. `fund_holdings.member_id` is excluded.
-4. `tag` columns are excluded by default. One may be included only if the
+4. `fund_holdings.member_id` is excluded.
+5. `tag` columns are excluded by default. One may be included only if the
    trusted-local schema inventory proves that exact database, table, and column
    stores product registry identifiers and the owner approves it.
-5. A column name is never evidence. The allowlist identifies exact triples.
-6. Every approved database must be Git-tracked. Ignored, untracked, unreadable,
+6. A column name is never evidence, and neither is a column's apparent type.
+   The allowlist identifies exact `(path, table, column, axis)` targets.
+7. Every approved database must be Git-tracked. Ignored, untracked, unreadable,
    or concurrently changed databases are hard stops.
-7. After updating, every approved triple is re-queried and must return zero
-   remaining old registry values.
-8. Reference counting may stay deliberately broad. Over-counting only causes a
-   refusal, which is safe; writing must stay narrowly allowlisted.
+8. After updating, every approved target is re-queried **for its own axis's old
+   values** and must return zero remaining.
+9. Reference counting may stay deliberately broad. Over-counting only causes a
+   refusal, which is safe; writing must stay narrowly allowlisted and typed.
 
 The recorded path is **source-relative** — relative to the vault root as it
-exists before the cutover — so an approved triple means exactly what the owner
-read. Rule 6 is partly self-enforcing: an untracked database never appears in
-the isolated worktree, making its absence immediately detectable.
+exists before the cutover — so an approved target means exactly what the owner
+read. It must resolve to a regular file confined beneath the vault root: an
+absolute path, a path escaping the root, or any symlinked component is a hard
+stop, never a followed redirection.
+
+Rule 7 is partly self-enforcing: an untracked database never appears in the
+isolated worktree, making its absence immediately detectable.
 
 Values are updated with parameter-bound `UPDATE` statements matching the exact
 old value. Table and column identifiers are quoted with the existing
@@ -498,8 +525,9 @@ failure.
    identifiers per axis, run the three collision checks, run the
    ignored/untracked check on every affected entity, produce the advisory
    report, and produce the per-database schema inventory and reference counts.
-   Emits the proposed mapping and the proposed `(path, table, column)`
-   allowlist. Writes nothing, commits nothing, takes no lock.
+   Emits the proposed mapping and the proposed
+   `(path, table, column, axis)` allowlist. Writes nothing, commits nothing,
+   and takes no lock.
 2. **Owner approval** — the owner reviews and explicitly approves a canonical
    manifest, digest-bound by a separate approval record. See below.
 3. **Dry run** — default. In a temporary isolated worktree at the manifest's
@@ -522,8 +550,8 @@ happen. It binds:
 
 - the **source HEAD** the mapping was derived from;
 - the exact **old → new mappings**, per axis;
-- the exact approved **`books.db` `(source-relative path, table, column)`
-  triples**, with any identical-schema proof recorded; and
+- the exact approved **`books.db` `(source-relative path, table, column,
+  axis)` targets**, with any identical-schema proof recorded; and
 - the **disposition of every advisory-report occurrence**.
 
 **The approval record** is a separate artifact holding the manifest's SHA-256
@@ -674,8 +702,11 @@ The boundary pattern used for the advisory scan is the existing
 hyphen, while a bare `ab` still does. A naive escaped search would report every
 successful rewrite as a residual.
 
-**2. The in-database residual query.** For every approved triple, query for any
-remaining old registry value and require zero rows. The text gate skips
+**2. The in-database residual query.** For every approved target, query for any
+remaining old value **of that target's own axis** and require zero rows. A
+query that ignores the axis would look for the other axis's retired values in a
+column that never held them, and report a false residual on a correctly
+migrated column. The text gate skips
 binaries and can never see inside a database, so without this query the
 database half of the migration would have no fail-closed check at all.
 
@@ -811,13 +842,21 @@ Required coverage:
   leaves the vault untouched.
 - **Approval binding.** The manifest must not contain its own digest; a test
   asserts the digest lives only in the approval record. A manifest whose bytes,
-  source HEAD, mappings, database triples, or dispositions differ from the
+  source HEAD, mappings, database targets, or dispositions differ from the
   approved ones is refused before any build.
-- **Database allowlist.** Approved triples are updated; a non-allowlisted
+- **Database allowlist.** Approved targets are updated; a non-allowlisted
   column with a matching name is **not** updated; the same table and column in
   a *different* database is not updated unless separately approved; an
   untracked or unreadable database is a hard stop; the promoted artifact is
   byte-identical to the verified one.
+- **Database axis typing.** With a product and a member both mapped from the
+  same short literal, a target declared `product` receives the product's new
+  value and never the member's, and a target declared `member` receives the
+  member's. A target naming `entity` or `workspace` is refused. The residual
+  query for a `product` target ignores member old values, so a correctly
+  migrated column reports no residual.
+- **Database path confinement.** An absolute path, a path escaping the vault
+  root, or a symlinked component is refused before any connection is opened.
 - **Residual gates.** A deliberately missed enumerated location aborts; a
   correctly migrated occurrence does not trip the gate; a bare old token inside
   a longer token is not a residual; an in-database old value aborts.
@@ -883,13 +922,15 @@ cloud task.
 
 1. **Inventory (private, read-only).** Run the Stage A tool against the live
    vault. Produce the mapping, the advisory report, the per-database schema
-   inventory with reference counts, the proposed `(path, table, column)`
-   allowlist, and the ignored/untracked result for every affected entity.
+   inventory with reference counts, the proposed
+   `(path, table, column, axis)` allowlist, and the ignored/untracked result
+   for every affected entity.
 2. **Preconditions.** Confirm every approved database is Git-tracked and
-   readable; prove for each proposed triple that it stores OneOS registry
-   identifiers. Confirm no affected entity carries ignored or untracked
-   content. Confirm nothing private depends on a product workspace's `id`
-   equalling its product slug.
+   readable; prove for each proposed target that it stores OneOS registry
+   identifiers **of its declared axis**, and that each recorded path is a
+   relative, confined, non-symlinked regular file. Confirm no affected entity
+   carries ignored or untracked content. Confirm nothing private depends on a
+   product workspace's `id` equalling its product slug.
 3. **Owner approval.** Present the mapping, dispositions, and allowlist. The
    owner approves the canonical manifest; record its SHA-256 in a separate
    approval record.
@@ -932,9 +973,14 @@ Work halts and returns to the product owner on any of these:
 - Any affected entity containing ignored or untracked content.
 - A structural advisory occurrence that cannot be brought into the typed
   rewrite list, or any proposal to resolve one by a separate hand-made commit.
-- A database triple proposed without proof that the exact database, table, and
-  column store registry identifiers, or an allowlist keyed by table and column
-  alone without an independently proven identical-schema claim.
+- A database target proposed without proof that the exact database, table, and
+  column store registry identifiers of its declared axis, or an allowlist keyed
+  by table and column alone without an independently proven identical-schema
+  claim.
+- A database target declaring an axis other than `product` or `member`, or a
+  target applied to a mapping outside its declared axis.
+- A database path that is absolute, escapes the vault root, or traverses a
+  symlink.
 - Any attempt to derive the writer allowlist from `registry.py::_DB_COLUMNS`,
   from `rename.py`'s column-name counter, or from column names alone.
 - A proposal to include `fund_holdings.member_id`, or a `tag` column without
