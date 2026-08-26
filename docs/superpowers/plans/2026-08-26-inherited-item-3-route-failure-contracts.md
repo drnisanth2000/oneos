@@ -337,11 +337,17 @@ git commit -m "test: enforce complete route failure contracts"
 - Verify: all Item 3 files.
 
 **Interfaces:**
-- Produces: seven independently reproducible mutation results and public-complete status.
+- Produces: 35 independently reproducible RED→GREEN cases—six single-case
+  mutations plus the 29 route/service entries in the approved inventory—and
+  public-complete status.
 
-- [ ] **Step 1: Run the seven approved mutations independently**
+- [ ] **Step 1: Run six single-case mutations and the 29-case route/service matrix**
 
-For each, save a pre-image outside the repo, modify one target, run one exact node with a unique diagnostic, restore, verify `cmp`, and rerun GREEN:
+For every case, save a pre-image outside the repo, modify one target, run one
+exact node with a unique diagnostic, restore, verify `cmp`, and rerun GREEN.
+Record the case id, exact route/service pair where applicable, OLD/NEW anchor,
+node id, intended diagnostic, RED result, byte-identical restoration, and GREEN
+result. The required cases are:
 
 1. Remove a known exported class from a route catch; completeness must name the route/service/class.
 2. Remove `@failure_contract` from `entity_scope`; dependency inventory must name it.
@@ -349,11 +355,16 @@ For each, save a pre-image outside the repo, modify one target, run one exact no
 4. Add `PermissionError` to `EntityCatalog.load`'s exported contract without a disposition; completeness must fail.
 5. Keep the Item 4 `EntityManifestError` application handler but remove the narrower body catch; lower-ownership test must fail.
 6. Replace an exact deliberate-unknown entry in a synthetic declaration test with `Exception` or an empty reason; declaration-time validation must fail.
-7. For every route/service entry in the approved inventory, independently
+7. **29-case matrix:** for every route/service entry in the approved inventory, independently
    remove that service from the route's `services` declaration without changing
    the executable body. The route/body binding invariant must fail with the
    exact route and missing service name. The sweep must exercise direct,
    attribute, and bound-call shapes, so no one resolver class passes vacuously.
+
+The 29 matrix cases are the sum of the entries listed in Task 3 Step 1; routes
+whose approved service tuple is empty contribute no removal case. If executable
+characterization changes that inventory, stop under Task 2's approved-inventory
+rule rather than silently changing the evidence count.
 
 - [ ] **Step 2: Retain real-filesystem evidence**
 
