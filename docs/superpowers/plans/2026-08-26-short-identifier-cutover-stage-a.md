@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, stdlib `re`/`pathlib`/`sqlite3`/`hashlib`/`subprocess`/`tempfile`, PyYAML, pytest, Git CLI.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 10, commit `6e792b9`.
+**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 11, commit `be1bbaa`.
 
 **Supersedes:** the rejected plans at `5f3e82b` and `a96fc18`. Neither is to be consulted during implementation; their code blocks contained the defects listed below and are not a starting point.
 
@@ -57,15 +57,19 @@ The `a96fc18` review added these binding corrections:
     and database evidence from a detached worktree at that immutable commit.
     Live HEAD, status, and affected ignored content are rechecked before return.
 11. Advisory dispositions bind path, axis, old value, file-level token ordinal,
-    and canonical-context digest. Line number remains display data only.
+    and canonical-context digest. The source ordinal remains part of the
+    post-build key; line number remains display data only.
 12. Plain `git revert` is documented as safe only before writers restart.
     Rollback after later SQLite writes is a separate quiesced recovery migration.
-13. Advisory context canonicalizes approved old/new mapping tokens, while
+13. Advisory context canonicalizes approved old/new mapping tokens while
     retaining every ordinary surrounding byte. Post-build comparison carries
-    the source context multiset through path translation and never reassigns a
-    disposition by a newly computed ordinal.
+    the source ordinal and context through path translation; an ordinal change
+    refuses rather than rebinding a disposition.
 14. The trusted-local sequence starts clean, runs all private gates while
     writers remain stopped, and accepts or reverts before restart.
+15. The advisory complement excludes only the exact character span owned by a
+    typed location. A same-axis prose token elsewhere on that line remains
+    visible and requires disposition.
 
 Seven further requirements from the same review are covered: database paths validated as relative, confined, and non-symlinked (Task 7); each target applied only to its declared axis (Task 7); every approved mapping validated against the deterministic rule (Tasks 1 and 11); dispositions checked before paths move with a separate scoped gate afterward (Task 11); failed promotion distinguished from committed-but-unconfirmed (Task 12); every design acceptance test mapped to an exact node (Task 17); and every mutation an exact reproducible edit (Task 17).
 
@@ -1425,6 +1429,24 @@ def test_typed_registry_front_matter_workspace_policy_and_proposal_lines_are_not
     ]
 
 
+def test_a_typed_scalar_does_not_hide_same_axis_prose_on_its_line(tmp_path: Path):
+    note = tmp_path / "note.md"
+    note.write_text(
+        "---\nentity: ab # ab remains ordinary prose\n---\n",
+        encoding="utf-8",
+    )
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
+        occurrence(
+            "note.md",
+            2,
+            "entity",
+            "ab",
+            "entity: ab # ab remains ordinary prose",
+        )
+    ]
+
+
 def test_a_symlink_is_scanned_as_link_text_without_following_its_target(tmp_path: Path):
     link = tmp_path / "ab-link"
     link.symlink_to("ab/target")
@@ -1483,34 +1505,54 @@ class AdvisoryOccurrence:
     line: int
 
 
-def _yaml_scalar_occurs(line: str, field: str, old: str) -> bool:
+def _yaml_scalar_span(
+    line: str, field: str, old: str
+) -> tuple[int, int] | None:
     pattern = re.compile(
         rf"(^|[{{,])"
         rf"([ \t]*(?:-[ \t]*)?{re.escape(field)}:[ \t]*)"
-        rf"{re.escape(old)}"
+        rf"(?P<value>{re.escape(old)})"
         rf"(?=[ \t]*(?:[,}}#]|$))"
     )
-    return pattern.search(line) is not None
+    match = pattern.search(line)
+    return None if match is None else match.span("value")
 
 
-def _mapping_key_occurs(line: str, old: str, indent: int) -> bool:
-    return re.match(rf"^\s{{{indent}}}{re.escape(old)}:\s*(?:#.*)?$", line) is not None
+def _mapping_key_span(
+    line: str, old: str, indent: int
+) -> tuple[int, int] | None:
+    match = re.match(
+        rf"^\s{{{indent}}}(?P<value>{re.escape(old)}):\s*(?:#.*)?$",
+        line,
+    )
+    return None if match is None else match.span("value")
 
 
-def _typed_line_keys(
+def _typed_token_spans(
     root: Path, mappings: tuple[Mapping, ...]
-) -> set[tuple[str, int, str, str]]:
-    """Line-level occurrences owned by the closed rewrite-location table.
+) -> set[tuple[str, int, str, str, int, int]]:
+    """Exact token spans owned by the closed rewrite-location table.
 
-    Advisory reporting is the complement of this set. Keeping the exclusion
-    structural and shared with the writer prevents registry keys and front
-    matter from being presented to the owner as unexplained prose.
+    Advisory reporting is the complement of these spans, not of whole lines.
+    A typed scalar and same-axis prose may share a line; only the scalar span
+    is excluded.
     """
     by_axis = {
         axis: {item.old for item in mappings if item.axis == axis}
         for axis in AXES
     }
-    typed: set[tuple[str, int, str, str]] = set()
+    typed: set[tuple[str, int, str, str, int, int]] = set()
+
+    def record(
+        relative: str,
+        number: int,
+        axis: str,
+        old: str,
+        span: tuple[int, int] | None,
+    ) -> None:
+        if span is not None:
+            typed.add((relative, number, axis, old, *span))
+
     for candidate in sorted(root.rglob("*")):
         relative = candidate.relative_to(root).as_posix()
         if any(part in SKIP_DIRS for part in Path(relative).parts):
@@ -1540,25 +1582,50 @@ def _typed_line_keys(
                         ("member", "member"),
                     ):
                         for old in by_axis[axis]:
-                            if _yaml_scalar_occurs(line, field, old):
-                                typed.add((relative, number, axis, old))
+                            record(
+                                relative,
+                                number,
+                                axis,
+                                old,
+                                _yaml_scalar_span(line, field, old),
+                            )
 
             if relative == "_system/entities.yaml":
                 for old in by_axis["entity"]:
-                    if _mapping_key_occurs(line, old, 2):
-                        typed.add((relative, number, "entity", old))
+                    record(
+                        relative,
+                        number,
+                        "entity",
+                        old,
+                        _mapping_key_span(line, old, 2),
+                    )
             elif relative == "_system/products.yaml":
                 for axis, indent in (("entity", 2), ("product", 4)):
                     for old in by_axis[axis]:
-                        if _mapping_key_occurs(line, old, indent):
-                            typed.add((relative, number, axis, old))
+                        record(
+                            relative,
+                            number,
+                            axis,
+                            old,
+                            _mapping_key_span(line, old, indent),
+                        )
             elif relative == "_system/members.yaml":
                 for old in by_axis["entity"]:
-                    if _mapping_key_occurs(line, old, 2):
-                        typed.add((relative, number, "entity", old))
+                    record(
+                        relative,
+                        number,
+                        "entity",
+                        old,
+                        _mapping_key_span(line, old, 2),
+                    )
                 for old in by_axis["member"]:
-                    if _yaml_scalar_occurs(line, "id", old):
-                        typed.add((relative, number, "member", old))
+                    record(
+                        relative,
+                        number,
+                        "member",
+                        old,
+                        _yaml_scalar_span(line, "id", old),
+                    )
             elif relative == "_system/workspaces.yaml":
                 for axis, fields in (
                     ("workspace", ("id",)),
@@ -1568,25 +1635,48 @@ def _typed_line_keys(
                 ):
                     for field in fields:
                         for old in by_axis[axis]:
-                            if _yaml_scalar_occurs(line, field, old):
-                                typed.add((relative, number, axis, old))
+                            record(
+                                relative,
+                                number,
+                                axis,
+                                old,
+                                _yaml_scalar_span(line, field, old),
+                            )
             elif relative == "_system/scripts/action-policy.yaml":
                 for match in _POLICY_LIST.finditer(line):
                     for quoted in _QUOTED.finditer(match.group(4)):
                         head = quoted.group(2).partition("/")[0]
                         if head in by_axis["entity"]:
-                            typed.add((relative, number, "entity", head))
+                            start = match.start(4) + quoted.start(2)
+                            record(
+                                relative,
+                                number,
+                                "entity",
+                                head,
+                                (start, start + len(head)),
+                            )
             elif candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
                 for old in by_axis["entity"]:
-                    if _yaml_scalar_occurs(line, "entity", old):
-                        typed.add((relative, number, "entity", old))
+                    record(
+                        relative,
+                        number,
+                        "entity",
+                        old,
+                        _yaml_scalar_span(line, "entity", old),
+                    )
                     for field in ("src", "dst"):
                         pattern = re.compile(
                             rf"(^|[{{,])([ \t]*{field}:[ \t]*)"
-                            rf"{re.escape(old)}/"
+                            rf"(?P<value>{re.escape(old)})/"
                         )
-                        if pattern.search(line):
-                            typed.add((relative, number, "entity", old))
+                        match = pattern.search(line)
+                        record(
+                            relative,
+                            number,
+                            "entity",
+                            old,
+                            None if match is None else match.span("value"),
+                        )
     return typed
 
 
@@ -1620,7 +1710,7 @@ def advisory_occurrences(
     patterns = {
         (item.axis, item.old): boundaried(item.old) for item in mappings
     }
-    typed = _typed_line_keys(root, mappings)
+    typed = _typed_token_spans(root, mappings)
     found: list[AdvisoryOccurrence] = []
     for candidate in sorted(root.rglob("*")):
         relative = candidate.relative_to(root).as_posix()
@@ -1652,9 +1742,17 @@ def advisory_occurrences(
                 continue
             context_sha256 = stable_advisory_context(line, mappings)
             for (axis, old), pattern in patterns.items():
-                if (relative, number, axis, old) in typed:
-                    continue
-                for _match in pattern.finditer(line):
+                for match in pattern.finditer(line):
+                    token_key = (
+                        relative,
+                        number,
+                        axis,
+                        old,
+                        match.start(),
+                        match.end(),
+                    )
+                    if token_key in typed:
+                        continue
                     key = (axis, old)
                     ordinals[key] = ordinals.get(key, 0) + 1
                     found.append(
@@ -1673,7 +1771,7 @@ def advisory_occurrences(
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_locations.py`
-Expected: PASS, 33 tests.
+Expected: PASS, 34 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -3591,7 +3689,7 @@ def test_post_advisory_identity_survives_a_display_line_shift(
     build_cutover(vault, raw, record)
 
 
-def test_post_advisory_identity_survives_reordering_approved_contexts(
+def test_post_advisory_identity_refuses_reordering_approved_contexts(
     tmp_path: Path, monkeypatch
 ):
     vault = cutover_vault(tmp_path / "vault")
@@ -3644,7 +3742,8 @@ def test_post_advisory_identity_survives_reordering_approved_contexts(
         reorders_without_changing_either_occurrence,
     )
 
-    build_cutover(vault, raw, record)
+    with pytest.raises(CutoverError, match="advisory report changed"):
+        build_cutover(vault, raw, record)
 
 
 def test_post_advisory_identity_rejects_same_count_with_changed_context(
@@ -4028,8 +4127,8 @@ def _occurrence_key(
 
 
 def _post_occurrence_key(item, *, path: str | None = None):
-    """Carried source identity after path translation; never rebind ordinal."""
-    return _occurrence_key(item, path=path, include_ordinal=False)
+    """Carried source identity after path translation, including ordinal."""
+    return _occurrence_key(item, path=path, include_ordinal=True)
 
 
 def _require_dispositions(root: Path, manifest: ApprovalManifest) -> None:
@@ -4072,10 +4171,10 @@ def _require_post_advisory(root: Path, manifest: ApprovalManifest) -> None:
     """Regenerate the report after migration and compare approved evidence.
 
     Entity moves translate source-relative path heads and provenance insertion
-    can shift display line numbers. The post-build identity therefore retains
-    axis, old value, and canonical-context digest while translating only the
-    path. Source ordinal and display line were already digest-bound and checked
-    by `_require_dispositions`; neither is reassigned as post-build authority.
+    can shift display line numbers. The post-build identity retains axis, old
+    value, source ordinal, and canonical-context digest while translating only
+    the path. The span-confined writers do not add, remove, or reorder advisory
+    tokens, so a changed ordinal is a refusal rather than a reason to rebind.
     """
     expected = Counter(
         _post_occurrence_key(
@@ -5330,7 +5429,7 @@ plan before proceeding rather than inventing a test during the campaign.
 | Scoped replacement — prose untouched | `tests/test_cutover_build.py::test_ordinary_prose_containing_a_short_identifier_is_untouched`, `tests/test_cutover_locations.py::test_ordinary_prose_containing_an_old_identifier_is_not_a_residual` |
 | Scoped replacement — containing value unchanged | `tests/test_cutover_locations.py::test_front_matter_rewrite_ignores_a_value_that_merely_contains_the_term` |
 | Advisory report — reported not rewritten | `tests/test_cutover_locations.py::test_advisory_reports_a_bare_token_outside_the_enumerated_locations` |
-| Advisory report — every token has stable source identity; approved typed rewrites, display-line shifts, and context reordering tolerated; ordinary context changes refused | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line`, `tests/test_cutover_locations.py::test_stable_context_ignores_an_approved_typed_value_rewrite`, `tests/test_cutover_build.py::test_post_advisory_identity_survives_a_display_line_shift`, `tests/test_cutover_build.py::test_post_advisory_identity_survives_reordering_approved_contexts`, `tests/test_cutover_build.py::test_post_advisory_identity_rejects_same_count_with_changed_context` |
+| Advisory report — every token has stable source identity; typed spans do not hide same-line prose; approved typed rewrites and display-line shifts survive; ordinary context changes and token reordering refuse | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line`, `tests/test_cutover_locations.py::test_a_typed_scalar_does_not_hide_same_axis_prose_on_its_line`, `tests/test_cutover_locations.py::test_stable_context_ignores_an_approved_typed_value_rewrite`, `tests/test_cutover_build.py::test_post_advisory_identity_survives_a_display_line_shift`, `tests/test_cutover_build.py::test_post_advisory_identity_refuses_reordering_approved_contexts`, `tests/test_cutover_build.py::test_post_advisory_identity_rejects_same_count_with_changed_context` |
 | Advisory report — undispositioned aborts | `tests/test_cutover_build.py::test_build_refuses_an_undispositioned_advisory_occurrence` |
 | Advisory report — structural without typed location aborts | `tests/test_cutover_build.py::test_build_refuses_a_structural_disposition_naming_no_typed_location` |
 | Clean inventory status | `tests/test_cutover_inventory.py::test_inventory_requires_a_globally_clean_tracked_and_untracked_status`, `tests/test_cutover_cli.py::test_inventory_refuses_a_dirty_live_vault` |
@@ -5439,7 +5538,7 @@ For each row: copy the target file to `/private/tmp/cutover-preimage-<n>.py`, ap
 | 23 | `app/cutover.py` | `_run_dry_run`: `result = build_cutover(...)` → `raise CutoverError("dry run skipped build")` | `tests/test_cutover_cli.py::test_dry_run_builds_and_shows_the_diff_without_touching_the_vault` | dry run produced no diff |
 | 24 | `tools/public_repo_audit.py` | Add `terms.update(spec.get("former_slugs") or [])` inside the entity loop | `tests/test_public_repo_audit.py::test_term_collection_reads_only_registry_keys_and_ids` | retired provenance became an audit term |
 | 25 | `app/cutover_locations.py` | Remove `(?=[ \t]*(?:[,}#]|$))` from `rewrite_yaml_value_field` | `tests/test_cutover_locations.py::test_yaml_value_field_rewrite_does_not_match_a_scalar_prefix` | scalar prefix was rewritten |
-| 26 | `app/cutover_locations.py` | `typed = _typed_line_keys(root, mappings)` → `typed = set()` | `tests/test_cutover_locations.py::test_typed_registry_front_matter_workspace_policy_and_proposal_lines_are_not_advisory` | typed lines were reported |
+| 26 | `app/cutover_locations.py` | `typed = _typed_token_spans(root, mappings)` → `typed = set()` | `tests/test_cutover_locations.py::test_typed_registry_front_matter_workspace_policy_and_proposal_lines_are_not_advisory` | typed tokens were reported |
 | 27 | `app/cutover_locations.py` | Symlink branch `text = os.readlink(candidate)` → `continue` | `tests/test_cutover_locations.py::test_a_symlink_is_scanned_as_link_text_without_following_its_target` | symlink occurrence disappeared |
 | 28 | `app/cutover_db.py` | Inventory symlink `raise DatabaseCutoverError(` → `continue  # MUTANT` (replace that complete branch) | `tests/test_cutover_db.py::test_schema_inventory_refuses_a_books_db_symlink_without_following_it` | symlink database silently omitted |
 | 29 | `app/cutover_build.py` | `_require_post_advisory(scratch, manifest)` → `None` | `tests/test_cutover_build.py::test_build_regenerates_the_advisory_report_after_rewriting` | changed advisory report accepted |
@@ -5455,7 +5554,8 @@ For each row: copy the target file to `/private/tmp/cutover-preimage-<n>.py`, ap
 | 39 | `app/cutover_locations.py` | `for _match in pattern.finditer(line):` → `for _match in list(pattern.finditer(line))[:1]:` | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line` | second token on one line had no disposition identity |
 | 40 | `app/cutover_build.py` | `existing_identifiers(scratch)` → `existing_identifiers(vault)` | `tests/test_cutover_build.py::test_build_collision_check_uses_the_manifest_source_head` | collision authority came from mutable live bytes instead of manifest source HEAD |
 | 41 | `app/cutover_locations.py` | `normalized = boundaried(term).sub("<mapped>", normalized)` → `normalized = normalized` | `tests/test_cutover_locations.py::test_stable_context_ignores_an_approved_typed_value_rewrite` | an approved typed rewrite changed the advisory context identity |
-| 42 | `app/cutover_build.py` | `_occurrence_key(item, path=path, include_ordinal=False)` → `_occurrence_key(item, path=path, include_ordinal=True)` | `tests/test_cutover_build.py::test_post_advisory_identity_survives_reordering_approved_contexts` | regenerated ordinals were incorrectly treated as post-build authority |
+| 42 | `app/cutover_build.py` | `_occurrence_key(item, path=path, include_ordinal=True)` → `_occurrence_key(item, path=path, include_ordinal=False)` | `tests/test_cutover_build.py::test_post_advisory_identity_refuses_reordering_approved_contexts` | `DID NOT RAISE` because reordered occurrences were rebound without their source ordinals |
+| 43 | `app/cutover_locations.py` | `if token_key in typed:` → `if any(item[:4] == token_key[:4] for item in typed):` | `tests/test_cutover_locations.py::test_a_typed_scalar_does_not_hide_same_axis_prose_on_its_line` | same-axis prose was hidden by a whole-line typed exclusion |
 
 Before applying a row, assert its OLD anchor appears exactly once in the target
 file. Rows 11, 16, 17, 18, 21, 22, 28, and 38 are explicitly multi-line exact
