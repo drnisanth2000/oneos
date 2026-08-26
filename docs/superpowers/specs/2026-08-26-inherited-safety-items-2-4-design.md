@@ -1,7 +1,8 @@
 # Inherited Safety Items 2–4
 
-**Status:** DRAFT — conversational design approved; written artifact pending
-product-owner review.
+**Status:** APPROVED — conversational design and written artifact approved by
+the product owner on 2026-08-26. Implementation remains unstarted and belongs
+to the separately handed-off external-agent tasks below.
 
 **Base:** freshly fetched merged `origin/main` at
 `ee591549249ca798de2dae5b9156a96895917f5e`. Fresh public baseline:
