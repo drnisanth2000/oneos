@@ -195,7 +195,13 @@ Add `config.VaultRootUnavailable: "E-TAMPER"` to the transcribed class map in `t
 
 - [ ] **Step 2: Add RED dependency-route matrix**
 
-Derive the affected endpoints from FastAPI's registered routes and the actual `EntityScope`/`entity_scope` dependency; do not maintain a second list of names. Reuse the request callables in `_route_totality_plan(main)` for those endpoints. Start from a valid synthetic vault, import the app, rename the whole root to a sibling path, then request each affected endpoint with `raise_server_exceptions=False`.
+Derive the affected endpoints from FastAPI's registered routes and the actual
+`EntityScope`/`entity_scope` dependency; do not maintain a second list of
+names. Reuse the request callables in `_route_totality_plan(main)` for those
+endpoints. For every endpoint accepting form or query input, add a unique
+synthetic sentinel to that request. Start from a valid synthetic vault, import
+the app, rename the whole root to a sibling path, then request each affected
+endpoint with `raise_server_exceptions=False`.
 
 For every response assert:
 
@@ -206,6 +212,8 @@ assert str(vault) not in response.text
 assert "configured vault root is unavailable" not in response.text
 assert "hx-post" not in response.text
 assert "review_sha256" not in response.text
+if submitted_sentinel is not None:
+    assert submitted_sentinel not in response.text
 assert reached_global_fallback == []
 ```
 
@@ -239,7 +247,14 @@ Do not reuse the global handler and do not render `str(exc)`.
 
 - [ ] **Step 5: Add the post-startup manifest-permission route matrix**
 
-Use the same derived endpoint set. After app import, remove read permission from `_system/entities.yaml`; if the executing account can still read it, mark only the real-permission variant skipped with an explicit privilege reason. Always run the deterministic `Path.read_text` denial variant. Assert `E-CONFIG`, status 500, no global fallback, no raw marker/path, no `hx-post`, and unchanged `_fs_snapshot`. Restore the original mode in `finally`.
+Use the same derived endpoint set and the same per-input-endpoint unique form or
+query sentinels. After app import, remove read permission from
+`_system/entities.yaml`; if the executing account can still read it, mark only
+the real-permission variant skipped with an explicit privilege reason. Always
+run the deterministic `Path.read_text` denial variant. Assert `E-CONFIG`, status
+500, no global fallback, no raw marker/path, no submitted sentinel, no
+`hx-post`, and unchanged `_fs_snapshot`. Restore the original mode in
+`finally`.
 
 - [ ] **Step 6: Run focused GREEN and commit**
 
@@ -260,16 +275,18 @@ git commit -m "fix: render dependency filesystem failures safely"
 - Verify: all Item 4 product and test files.
 
 **Interfaces:**
-- Produces: four named mutation results and public completion wording that reserves private gates.
+- Produces: five named mutation results and public completion wording that reserves private gates.
 
-- [ ] **Step 1: Run four independent mutations**
+- [ ] **Step 1: Run five independent mutations**
 
 For each mutation, save a pre-image outside the repo, alter one protection, run the named node, restore, `cmp` the file, and rerun GREEN:
 
 1. `VaultRootUnavailable` → `RuntimeError` at the missing-root raise; root matrix must fail on E-TAMPER/global-fallback assertions.
 2. Delete the `VaultRootUnavailable` handler; root matrix must fail because the global fallback spy fires.
-3. Remove the `except OSError` conversion in `EntityCatalog.load`; deterministic manifest test must fail with bare `PermissionError`.
-4. Remove `SystemRegistryPathError` from one lower body catch such as `_OUTBOX_CATCHES`; existing `test_route_tuples_still_answer_the_leaf_redirect_without_the_dependency_handler` must fail.
+3. Delete the existing `EntityManifestError` application handler; the manifest
+   route matrix must fail because the global fallback spy fires.
+4. Remove the `except OSError` conversion in `EntityCatalog.load`; deterministic manifest test must fail with bare `PermissionError`.
+5. Remove `SystemRegistryPathError` from one lower body catch such as `_OUTBOX_CATCHES`; existing `test_route_tuples_still_answer_the_leaf_redirect_without_the_dependency_handler` must fail.
 
 - [ ] **Step 2: Update status without claiming local gates**
 

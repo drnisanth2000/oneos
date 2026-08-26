@@ -73,6 +73,7 @@ def test_short_markdown_term_is_found_after_removal_from_head(tmp_path: Path):
 def test_short_markdown_finding_never_echoes_term_or_line(tmp_path: Path):
     vault = synthetic_vault(tmp_path / "vault", entity="q7x")
     repo = git_repo(tmp_path / "repo", {"docs/note.md": "before q7x after\n"})
+    source_registry = vault / "_system" / "entities.yaml"
 
     findings = audit_repository(repo, vault=vault, include_history=False)
 
@@ -82,7 +83,13 @@ def test_short_markdown_finding_never_echoes_term_or_line(tmp_path: Path):
     assert "q7x" not in repr(findings)
     assert "before" not in repr(findings)
     assert "after" not in repr(findings)
+    assert str(source_registry) not in repr(findings)
+    assert str(vault) not in repr(findings)
 ```
+
+The two path assertions are mandatory: findings may name the safe repository
+location being audited, but must never disclose either the registry path that
+supplied a private term or the configured vault path.
 
 - [ ] **Step 4: Run the focused tests and confirm RED**
 

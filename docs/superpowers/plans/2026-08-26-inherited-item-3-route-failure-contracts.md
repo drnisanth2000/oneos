@@ -219,9 +219,15 @@ If executable characterization proves one listed family cannot cross that bounda
 
 Decorate `app.main.entity_scope` in this task with `calls=(build_scope,)`. Keep the genuine `build_scope -> vault_root` and `propose_classification -> resolve_classification_destination` edges too.
 
-In `tests/test_console_invariants.py`, strip docstrings and inspect each inventoried boundary's AST. Resolve direct `ast.Name` calls through the function's module globals. Assert both directions:
+In `tests/test_console_invariants.py`, strip docstrings and inspect each
+inventoried boundary's AST. Resolve calls through the relevant executable
+context rather than accepting only `ast.Name`: direct module-global calls,
+attribute calls such as `EntityCatalog.load`, and bound calls such as
+`vault.bundles()` where the receiver's type can be established from the
+function body or its enclosing module. This is a closed-inventory resolver,
+not a claim to infer arbitrary dynamic Python dispatch. Assert both directions:
 
-1. every contracted direct call is named in `FailureContract.calls`; and
+1. every contracted executable call is named in `FailureContract.calls`; and
 2. every named call edge appears in executable code.
 
 Reject a planted cycle in a synthetic contract graph. Comments or docstrings mentioning a function must not satisfy the executable-call check.
@@ -278,7 +284,12 @@ registry_delete_execute: execute_delete, get_delete_receipt_or_review,
 registry_delete_review_fragment: get_delete_receipt_or_review
 ```
 
-The test enumerates registered routes first and fails on a missing or extra endpoint; it never trusts only the map.
+The test enumerates registered routes first and fails on a missing or extra
+endpoint; it never trusts only the map. Apply the same executable-call resolver
+used for contract edges to each route body. Every service call resolved from
+the executable body must appear in that route's `services` tuple, and every
+declared service must be called by that body. Comments, docstrings, logging, or
+a reference outside the acting call cannot satisfy the check.
 
 - [ ] **Step 2: Add RED dependency introspection**
 
@@ -326,9 +337,9 @@ git commit -m "test: enforce complete route failure contracts"
 - Verify: all Item 3 files.
 
 **Interfaces:**
-- Produces: six independently reproducible mutation results and public-complete status.
+- Produces: seven independently reproducible mutation results and public-complete status.
 
-- [ ] **Step 1: Run the six approved mutations independently**
+- [ ] **Step 1: Run the seven approved mutations independently**
 
 For each, save a pre-image outside the repo, modify one target, run one exact node with a unique diagnostic, restore, verify `cmp`, and rerun GREEN:
 
@@ -338,6 +349,11 @@ For each, save a pre-image outside the repo, modify one target, run one exact no
 4. Add `PermissionError` to `EntityCatalog.load`'s exported contract without a disposition; completeness must fail.
 5. Keep the Item 4 `EntityManifestError` application handler but remove the narrower body catch; lower-ownership test must fail.
 6. Replace an exact deliberate-unknown entry in a synthetic declaration test with `Exception` or an empty reason; declaration-time validation must fail.
+7. For every route/service entry in the approved inventory, independently
+   remove that service from the route's `services` declaration without changing
+   the executable body. The route/body binding invariant must fail with the
+   exact route and missing service name. The sweep must exercise direct,
+   attribute, and bound-call shapes, so no one resolver class passes vacuously.
 
 - [ ] **Step 2: Retain real-filesystem evidence**
 
