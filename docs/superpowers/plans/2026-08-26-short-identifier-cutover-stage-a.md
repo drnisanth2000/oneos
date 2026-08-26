@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the public tooling that inventories sub-floor registry identifiers, binds an owner-approved typed mapping by digest, and produces one reversible cutover commit — built in an isolated detached worktree, gated by two independent residual checks, and promoted under the shared action lock — without enforcing the length floor at read time.
+**Goal:** Build the public tooling that inventories sub-floor registry identifiers, binds an owner-approved typed mapping by digest, and produces one cutover commit with a verified pre-writer-restart revert window — built in an isolated detached worktree, gated by two independent residual checks, and promoted under the shared action lock — without enforcing the length floor at read time.
 
 **Architecture:** Seven focused modules. `app/identifiers.py` single-sources the five-character floor, the deterministic suffix mapping, and mapping validation. `app/cutover_manifest.py` holds the canonical manifest and its separate approval record, with every database target typed by axis. `app/cutover_locations.py` owns the closed rewrite-location table, syntax-confined rewriters, the advisory scan over locations outside that table, and the scoped residual gate. `app/cutover_db.py` owns path-confined, axis-filtered database updates, reference-count inventory, and the axis-typed in-database residual query. `app/cutover_inventory.py` enumerates identifiers, collisions, clean-state preconditions, and unmigratable content. `app/cutover_build.py` orchestrates the isolated build, validator gate, and regenerated-advisory comparison. `app/cutover.py` owns promotion under the action lock and the CLI. Dry-run and apply consume the same `BuildResult`; the database row summary is never reconstructed by running a second migration.
 
 **Tech Stack:** Python 3.12, stdlib `re`/`pathlib`/`sqlite3`/`hashlib`/`subprocess`/`tempfile`, PyYAML, pytest, Git CLI.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 8, commit `6b81e76`.
+**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 9, commit `9ad53a0`.
 
 **Supersedes:** the rejected plans at `5f3e82b` and `a96fc18`. Neither is to be consulted during implementation; their code blocks contained the defects listed below and are not a starting point.
 
@@ -53,6 +53,13 @@ The `a96fc18` review added these binding corrections:
 9. The validator fixture and parser use the public `BUILD.md` contract's exact
    `0 error(s), 0 warning(s)` summary. The parser requires that complete line and
    has a false-zero regression, so `10 error(s)` cannot be accepted as zero.
+10. Inventory captures one source HEAD and reads all tracked registry, advisory,
+    and database evidence from a detached worktree at that immutable commit.
+    Live HEAD, status, and affected ignored content are rechecked before return.
+11. Advisory dispositions bind path, axis, old value, file-level token ordinal,
+    and exact-line context digest. Line number remains display data only.
+12. Plain `git revert` is documented as safe only before writers restart.
+    Rollback after later SQLite writes is a separate quiesced recovery migration.
 
 Seven further requirements from the same review are covered: database paths validated as relative, confined, and non-symlinked (Task 7); each target applied only to its declared axis (Task 7); every approved mapping validated against the deterministic rule (Tasks 1 and 11); dispositions checked before paths move with a separate scoped gate afterward (Task 11); failed promotion distinguished from committed-but-unconfirmed (Task 12); every design acceptance test mapped to an exact node (Task 17); and every mutation an exact reproducible edit (Task 17).
 
@@ -350,7 +357,15 @@ def sample_manifest() -> ApprovalManifest:
             ),
         ),
         dispositions=(
-            Disposition(path="notes/one.md", line=3, old="ab", kind="incidental"),
+            Disposition(
+                path="notes/one.md",
+                axis="entity",
+                old="ab",
+                ordinal=1,
+                context_sha256="0" * 64,
+                line=3,
+                kind="incidental",
+            ),
         ),
     )
 
@@ -457,16 +472,48 @@ def test_database_target_axis_must_be_product_or_member():
 
 def test_disposition_kind_is_closed():
     with pytest.raises(ManifestError):
-        Disposition(path="a.md", line=1, old="ab", kind="handfix")
+        Disposition(
+            path="a.md", axis="entity", old="ab", ordinal=1,
+            context_sha256="0" * 64, line=1, kind="handfix"
+        )
+
+
+def test_disposition_requires_the_complete_stable_identity():
+    valid = {
+        "path": "a.md",
+        "axis": "entity",
+        "old": "ab",
+        "ordinal": 1,
+        "context_sha256": "0" * 64,
+        "line": 1,
+        "kind": "incidental",
+    }
+    for field, bad in (
+        ("path", ""),
+        ("axis", "unknown"),
+        ("old", ""),
+        ("ordinal", 0),
+        ("context_sha256", "not-a-digest"),
+        ("line", 0),
+    ):
+        fields = valid | {field: bad}
+        with pytest.raises(ManifestError, match="disposition"):
+            Disposition(**fields)
 
 
 def test_structural_disposition_requires_a_typed_location():
     with pytest.raises(ManifestError):
-        Disposition(path="a.md", line=1, old="ab", kind="structural")
+        Disposition(
+            path="a.md", axis="entity", old="ab", ordinal=1,
+            context_sha256="0" * 64, line=1, kind="structural"
+        )
     allowed = Disposition(
         path="a.md",
-        line=1,
+        axis="entity",
         old="ab",
+        ordinal=1,
+        context_sha256="0" * 64,
+        line=1,
         kind="structural",
         typed_location="entity:front-matter:entity",
     )
@@ -499,12 +546,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import re
 
 import yaml
 
 from .identifiers import AXES, DATABASE_AXES
 
 _DISPOSITION_KINDS = frozenset({"incidental", "structural"})
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class ManifestError(Exception):
@@ -552,12 +601,24 @@ class DatabaseTarget:
 @dataclass(frozen=True, order=True)
 class Disposition:
     path: str
-    line: int
+    axis: str
     old: str
+    ordinal: int
+    context_sha256: str
+    line: int
     kind: str
     typed_location: str = ""
 
     def __post_init__(self) -> None:
+        if (
+            not self.path
+            or self.axis not in AXES
+            or not self.old
+            or self.ordinal < 1
+            or _SHA256.fullmatch(self.context_sha256) is None
+            or self.line < 1
+        ):
+            raise ManifestError("disposition requires a complete stable identity")
         if self.kind not in _DISPOSITION_KINDS:
             raise ManifestError(f"unknown disposition kind {self.kind!r}")
         if self.kind == "structural" and not self.typed_location:
@@ -601,8 +662,11 @@ def canonical_bytes(manifest: ApprovalManifest) -> bytes:
         "dispositions": [
             {
                 "path": item.path,
-                "line": item.line,
+                "axis": item.axis,
                 "old": item.old,
+                "ordinal": item.ordinal,
+                "context_sha256": item.context_sha256,
+                "line": item.line,
                 "kind": item.kind,
                 "typed_location": item.typed_location,
             }
@@ -652,7 +716,7 @@ def verify_manifest(raw: bytes, record: ApprovalRecord) -> None:
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_manifest.py`
-Expected: PASS, 12 tests.
+Expected: PASS, 13 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1174,6 +1238,7 @@ Two fail-open holes from the rejected plan are closed here. The `former_slugs` e
 Append to `tests/test_cutover_locations.py`:
 
 ```python
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -1194,12 +1259,39 @@ ADVISORY_MAPPINGS = (
 )
 
 
+def occurrence(
+    path: str,
+    line: int,
+    axis: str,
+    old: str,
+    text: str,
+    ordinal: int = 1,
+) -> AdvisoryOccurrence:
+    return AdvisoryOccurrence(
+        path=path,
+        axis=axis,
+        old=old,
+        ordinal=ordinal,
+        context_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        line=line,
+    )
+
+
 def test_advisory_reports_a_bare_token_outside_the_enumerated_locations(tmp_path: Path):
     (tmp_path / "notes").mkdir()
     (tmp_path / "notes" / "one.md").write_text("the ab pattern\n", encoding="utf-8")
 
     assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
-        AdvisoryOccurrence(path="notes/one.md", line=1, old="ab")
+        occurrence("notes/one.md", 1, "entity", "ab", "the ab pattern")
+    ]
+
+
+def test_advisory_identity_distinguishes_two_tokens_on_one_line(tmp_path: Path):
+    (tmp_path / "note.md").write_text("ab and ab\n", encoding="utf-8")
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
+        occurrence("note.md", 1, "entity", "ab", "ab and ab", ordinal=1),
+        occurrence("note.md", 1, "entity", "ab", "ab and ab", ordinal=2),
     ]
 
 
@@ -1239,7 +1331,9 @@ def test_former_slugs_is_exempt_only_in_the_entity_and_product_registries(
 
     found = advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:2])
 
-    assert found == [AdvisoryOccurrence(path="note.md", line=1, old="ab")]
+    assert found == [
+        occurrence("note.md", 1, "entity", "ab", "former_slugs: [ab]")
+    ]
 
 
 def test_former_slugs_is_not_exempt_in_the_member_registry(tmp_path: Path):
@@ -1251,7 +1345,13 @@ def test_former_slugs_is_not_exempt_in_the_member_registry(tmp_path: Path):
     )
 
     assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[2:3]) == [
-        AdvisoryOccurrence(path="_system/members.yaml", line=3, old="m7")
+        occurrence(
+            "_system/members.yaml",
+            3,
+            "member",
+            "m7",
+            "    - {id: m7-member, former_slugs: [m7]}",
+        )
     ]
 
 
@@ -1298,7 +1398,9 @@ def test_typed_registry_front_matter_workspace_policy_and_proposal_lines_are_not
     )
 
     assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS) == [
-        AdvisoryOccurrence(path="ab/00-inbox/note.md", line=7, old="ab")
+        occurrence(
+            "ab/00-inbox/note.md", 7, "entity", "ab", "ordinary ab prose"
+        )
     ]
 
 
@@ -1307,7 +1409,7 @@ def test_a_symlink_is_scanned_as_link_text_without_following_its_target(tmp_path
     link.symlink_to("ab/target")
 
     assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
-        AdvisoryOccurrence(path="ab-link", line=1, old="ab")
+        occurrence("ab-link", 1, "entity", "ab", "ab/target")
     ]
 ```
 
@@ -1322,6 +1424,7 @@ Append to `app/cutover_locations.py`:
 
 ```python
 from pathlib import Path
+import hashlib
 import os
 
 from .cutover_manifest import Mapping
@@ -1352,8 +1455,11 @@ class UnreadableFile(Exception):
 @dataclass(frozen=True, order=True)
 class AdvisoryOccurrence:
     path: str
-    line: int
+    axis: str
     old: str
+    ordinal: int
+    context_sha256: str
+    line: int
 
 
 def _yaml_scalar_occurs(line: str, field: str, old: str) -> bool:
@@ -1372,7 +1478,7 @@ def _mapping_key_occurs(line: str, old: str, indent: int) -> bool:
 
 def _typed_line_keys(
     root: Path, mappings: tuple[Mapping, ...]
-) -> set[tuple[str, int, str]]:
+) -> set[tuple[str, int, str, str]]:
     """Line-level occurrences owned by the closed rewrite-location table.
 
     Advisory reporting is the complement of this set. Keeping the exclusion
@@ -1383,7 +1489,7 @@ def _typed_line_keys(
         axis: {item.old for item in mappings if item.axis == axis}
         for axis in AXES
     }
-    typed: set[tuple[str, int, str]] = set()
+    typed: set[tuple[str, int, str, str]] = set()
     for candidate in sorted(root.rglob("*")):
         relative = candidate.relative_to(root).as_posix()
         if any(part in SKIP_DIRS for part in Path(relative).parts):
@@ -1414,24 +1520,24 @@ def _typed_line_keys(
                     ):
                         for old in by_axis[axis]:
                             if _yaml_scalar_occurs(line, field, old):
-                                typed.add((relative, number, old))
+                                typed.add((relative, number, axis, old))
 
             if relative == "_system/entities.yaml":
                 for old in by_axis["entity"]:
                     if _mapping_key_occurs(line, old, 2):
-                        typed.add((relative, number, old))
+                        typed.add((relative, number, "entity", old))
             elif relative == "_system/products.yaml":
                 for axis, indent in (("entity", 2), ("product", 4)):
                     for old in by_axis[axis]:
                         if _mapping_key_occurs(line, old, indent):
-                            typed.add((relative, number, old))
+                            typed.add((relative, number, axis, old))
             elif relative == "_system/members.yaml":
                 for old in by_axis["entity"]:
                     if _mapping_key_occurs(line, old, 2):
-                        typed.add((relative, number, old))
+                        typed.add((relative, number, "entity", old))
                 for old in by_axis["member"]:
                     if _yaml_scalar_occurs(line, "id", old):
-                        typed.add((relative, number, old))
+                        typed.add((relative, number, "member", old))
             elif relative == "_system/workspaces.yaml":
                 for axis, fields in (
                     ("workspace", ("id",)),
@@ -1442,24 +1548,24 @@ def _typed_line_keys(
                     for field in fields:
                         for old in by_axis[axis]:
                             if _yaml_scalar_occurs(line, field, old):
-                                typed.add((relative, number, old))
+                                typed.add((relative, number, axis, old))
             elif relative == "_system/scripts/action-policy.yaml":
                 for match in _POLICY_LIST.finditer(line):
                     for quoted in _QUOTED.finditer(match.group(4)):
                         head = quoted.group(2).partition("/")[0]
                         if head in by_axis["entity"]:
-                            typed.add((relative, number, head))
+                            typed.add((relative, number, "entity", head))
             elif candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
                 for old in by_axis["entity"]:
                     if _yaml_scalar_occurs(line, "entity", old):
-                        typed.add((relative, number, old))
+                        typed.add((relative, number, "entity", old))
                     for field in ("src", "dst"):
                         pattern = re.compile(
                             rf"(^|[{{,])([ \t]*{field}:[ \t]*)"
                             rf"{re.escape(old)}/"
                         )
                         if pattern.search(line):
-                            typed.add((relative, number, old))
+                            typed.add((relative, number, "entity", old))
     return typed
 
 
@@ -1472,8 +1578,9 @@ def advisory_occurrences(
     the owner decides which occurrences are structural references and which are
     incidental prose.
     """
-    olds = {item.old for item in mappings}
-    patterns = {old: boundaried(old) for old in olds}
+    patterns = {
+        (item.axis, item.old): boundaried(item.old) for item in mappings
+    }
     typed = _typed_line_keys(root, mappings)
     found: list[AdvisoryOccurrence] = []
     for candidate in sorted(root.rglob("*")):
@@ -1498,21 +1605,36 @@ def advisory_occurrences(
         else:
             continue
         exempt_former_slugs = relative in FORMER_SLUGS_FILES
+        ordinals: dict[tuple[str, str], int] = {}
         for number, line in enumerate(text.splitlines(), start=1):
             if exempt_former_slugs and re.match(
                 r"^\s*former_slugs:\s*\[", line
             ):
                 continue
-            for old, pattern in patterns.items():
-                if pattern.search(line) and (relative, number, old) not in typed:
-                    found.append(AdvisoryOccurrence(relative, number, old))
+            context_sha256 = hashlib.sha256(line.encode("utf-8")).hexdigest()
+            for (axis, old), pattern in patterns.items():
+                if (relative, number, axis, old) in typed:
+                    continue
+                for _match in pattern.finditer(line):
+                    key = (axis, old)
+                    ordinals[key] = ordinals.get(key, 0) + 1
+                    found.append(
+                        AdvisoryOccurrence(
+                            path=relative,
+                            axis=axis,
+                            old=old,
+                            ordinal=ordinals[key],
+                            context_sha256=context_sha256,
+                            line=number,
+                        )
+                    )
     return sorted(found)
 ```
 
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_locations.py`
-Expected: PASS, 31 tests.
+Expected: PASS, 32 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -3043,6 +3165,7 @@ Ordering is fixed and each step exists for a reason:
 Append to `tests/test_cutover_build.py`:
 
 ```python
+import hashlib
 import sqlite3
 
 import yaml
@@ -3066,6 +3189,29 @@ from app.cutover_manifest import (
     manifest_digest,
 )
 from tests.conftest import git_count_commits, git_status_bytes
+
+
+def disposition(
+    path: str,
+    line: int,
+    axis: str,
+    old: str,
+    text: str,
+    *,
+    ordinal: int = 1,
+    kind: str = "incidental",
+    typed_location: str = "",
+) -> Disposition:
+    return Disposition(
+        path=path,
+        axis=axis,
+        old=old,
+        ordinal=ordinal,
+        context_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        line=line,
+        kind=kind,
+        typed_location=typed_location,
+    )
 
 
 def cutover_vault(root: Path) -> Path:
@@ -3123,8 +3269,12 @@ def approved(vault: Path, dispositions=None) -> tuple[bytes, ApprovalRecord]:
         dispositions=dispositions
         if dispositions is not None
         else (
-            Disposition(
-                path="ab/00-inbox/note.md", line=7, old="ab", kind="incidental"
+            disposition(
+                "ab/00-inbox/note.md",
+                7,
+                "entity",
+                "ab",
+                "the ab word",
             ),
         ),
     )
@@ -3190,10 +3340,12 @@ def test_build_refuses_a_structural_disposition_naming_no_typed_location(
     raw, record = approved(
         vault,
         dispositions=(
-            Disposition(
-                path="ab/00-inbox/note.md",
-                line=7,
-                old="ab",
+            disposition(
+                "ab/00-inbox/note.md",
+                7,
+                "entity",
+                "ab",
+                "the ab word",
                 kind="structural",
                 typed_location="entity:nowhere:nothing",
             ),
@@ -3220,6 +3372,38 @@ def test_build_refuses_a_colliding_mapping(tmp_path: Path):
 
     with pytest.raises(Exception, match="collides"):
         build_cutover(vault, raw, record, validator=lambda _root: None)
+
+
+def test_build_collision_check_uses_the_manifest_source_head(
+    tmp_path: Path, monkeypatch
+):
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+    registry = vault / "_system" / "entities.yaml"
+    original = registry.read_bytes()
+    real = cutover_build.require_clean_status
+    fired = False
+
+    def live_changes_after_the_initial_status_check(root):
+        nonlocal fired
+        real(root)
+        registry.write_text(
+            "entities:\n  ab:\n    label: A\n  ab-entity:\n    label: Later\n",
+            encoding="utf-8",
+        )
+        fired = True
+
+    monkeypatch.setattr(
+        cutover_build,
+        "require_clean_status",
+        live_changes_after_the_initial_status_check,
+    )
+    try:
+        build_cutover(vault, raw, record)
+    finally:
+        registry.write_bytes(original)
+
+    assert fired, "the live-race probe never ran"
 
 
 def test_build_refuses_an_entity_with_ignored_content(tmp_path: Path):
@@ -3313,8 +3497,10 @@ def test_build_refuses_an_extra_or_stale_disposition(tmp_path: Path):
     raw, record = approved(
         vault,
         dispositions=(
-            Disposition(path="ab/00-inbox/note.md", line=7, old="ab", kind="incidental"),
-            Disposition(path="missing.md", line=1, old="ab", kind="incidental"),
+            disposition(
+                "ab/00-inbox/note.md", 7, "entity", "ab", "the ab word"
+            ),
+            disposition("missing.md", 1, "entity", "ab", "missing ab"),
         ),
     )
 
@@ -3335,6 +3521,54 @@ def test_build_regenerates_the_advisory_report_after_rewriting(
         note.write_text(note.read_text(encoding="utf-8") + "new ab occurrence\n", encoding="utf-8")
 
     monkeypatch.setattr(cutover_build, "_apply_entity_mapping", introduces_unapproved_occurrence)
+
+    with pytest.raises(Exception, match="advisory report changed"):
+        build_cutover(vault, raw, record)
+
+
+def test_post_advisory_identity_survives_a_display_line_shift(
+    tmp_path: Path, monkeypatch
+):
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+    real = cutover_build._apply_entity_mapping
+
+    def shifts_only_the_display_line(root, old, new):
+        real(root, old, new)
+        note = root / new / "00-inbox" / "note.md"
+        text = note.read_text(encoding="utf-8")
+        note.write_text(
+            text.replace("\nthe ab word\n", "\nunrelated line\nthe ab word\n"),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        cutover_build, "_apply_entity_mapping", shifts_only_the_display_line
+    )
+
+    build_cutover(vault, raw, record)
+
+
+def test_post_advisory_identity_rejects_same_count_with_changed_context(
+    tmp_path: Path, monkeypatch
+):
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+    real = cutover_build._apply_entity_mapping
+
+    def changes_context_without_changing_the_count(root, old, new):
+        real(root, old, new)
+        note = root / new / "00-inbox" / "note.md"
+        text = note.read_text(encoding="utf-8")
+        note.write_text(
+            text.replace("the ab word", "changed ab word"), encoding="utf-8"
+        )
+
+    monkeypatch.setattr(
+        cutover_build,
+        "_apply_entity_mapping",
+        changes_context_without_changing_the_count,
+    )
 
     with pytest.raises(Exception, match="advisory report changed"):
         build_cutover(vault, raw, record)
@@ -3677,6 +3911,17 @@ def _apply_mappings_in_order(root: Path, manifest: ApprovalManifest) -> None:
             _apply_value_mapping(root, mapping.axis, mapping.old, mapping.new)
 
 
+def _occurrence_key(item, *, path: str | None = None, include_line: bool = False):
+    key = (
+        item.path if path is None else path,
+        item.axis,
+        item.old,
+        item.ordinal,
+        item.context_sha256,
+    )
+    return key + ((item.line,) if include_line else ())
+
+
 def _require_dispositions(root: Path, manifest: ApprovalManifest) -> None:
     """Bind the source advisory report exactly before any path moves."""
     valid = location_keys()
@@ -3691,10 +3936,11 @@ def _require_dispositions(root: Path, manifest: ApprovalManifest) -> None:
                 "change, fresh inventory, and fresh approval"
             )
     expected = {
-        (item.path, item.line, item.old) for item in manifest.dispositions
+        _occurrence_key(item, include_line=True)
+        for item in manifest.dispositions
     }
     actual = {
-        (item.path, item.line, item.old)
+        _occurrence_key(item, include_line=True)
         for item in advisory_occurrences(root, manifest.mappings)
     }
     if actual != expected:
@@ -3716,17 +3962,20 @@ def _require_post_advisory(root: Path, manifest: ApprovalManifest) -> None:
     """Regenerate the report after migration and compare approved evidence.
 
     Entity moves translate source-relative path heads and provenance insertion
-    can shift line numbers, so the post-build comparison is a multiset of
-    `(translated path, old identifier)`. The exact source line was already
+    can shift display line numbers. The stable identity therefore retains axis,
+    old value, file-level token ordinal, and exact-line context digest while
+    translating only the path. The source display line was already
     digest-bound and checked by `_require_dispositions` before mutation.
     """
     expected = Counter(
-        (_translated_advisory_path(item.path, manifest), item.old)
+        _occurrence_key(
+            item, path=_translated_advisory_path(item.path, manifest)
+        )
         for item in manifest.dispositions
         if item.kind == "incidental"
     )
     actual = Counter(
-        (item.path, item.old)
+        _occurrence_key(item)
         for item in advisory_occurrences(root, manifest.mappings)
     )
     if actual != expected:
@@ -3776,11 +4025,11 @@ def build_cutover(
     require_clean_status(vault)
     for mapping in manifest.mappings:
         validate_mapping_pair(mapping.axis, mapping.old, mapping.new)
-    check_collisions(manifest.mappings, existing_identifiers(vault))
     affected = [item.old for item in manifest.mappings if item.axis == "entity"]
     require_clean_entities(vault, affected)
 
     with isolated_worktree(vault, manifest.source_head) as scratch:
+        check_collisions(manifest.mappings, existing_identifiers(scratch))
         _require_dispositions(scratch, manifest)
 
         database_changes = apply_database_mappings(
@@ -3823,7 +4072,7 @@ def build_cutover(
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_build.py`
-Expected: PASS, 31 tests (the seven Task 10 tests, seventeen ordinary Task 11
+Expected: PASS, 34 tests (the seven Task 10 tests, twenty ordinary Task 11
 tests, and seven parameter cases in the precommit-stage matrix).
 
 If a fixture's disposition line number does not match, print
@@ -3849,6 +4098,13 @@ git commit -m "feat: build the single cutover commit under both gates"
 - Produces: `promote(vault, built_commit, source_head, expected_status, affected_entities)`.
 
 Three defects from the rejected plan are fixed: the shared action lock is actually acquired, the ignored/untracked check is repeated immediately before the fast-forward, and a failed promotion is distinguished from a promotion that committed but could not be confirmed.
+
+Promotion does not authorize writers to restart. The operator first verifies
+the promoted state while every writer remains quiesced. Plain `git revert` is
+safe only in that window. Once writers restart, later SQLite writes make an
+ordinary revert unsafe; recovery then requires writers to be stopped again,
+current databases backed up, later writes inventoried, and a separately
+reviewed typed reverse migration or replay.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4161,7 +4417,7 @@ git commit -m "feat: promote the cutover under the shared action lock"
 
 ---
 
-### Task 13: End-to-end preservation — prose, receipts, proposals, revert
+### Task 13: End-to-end preservation — prose, receipts, proposals, pre-restart revert
 
 **Files:**
 - Modify: `tests/test_cutover_build.py`
@@ -4197,6 +4453,8 @@ def test_one_commit_is_produced_and_revert_restores_everything(tmp_path: Path):
     assert git_count_commits(vault) == before + 1
     assert (vault / "ab-entity" / "00-inbox" / "note.md").is_file()
 
+    # This is the approved rollback window: promotion has completed but every
+    # writer is still quiesced, so no later SQLite write can be overwritten.
     subprocess.run(
         ["git", "-c", "user.email=t@e", "-c", "user.name=t",
          "revert", "--no-edit", result.commit],
@@ -4529,6 +4787,7 @@ git commit -m "test: pin publication audit term collection"
 Create `tests/test_cutover_cli.py`:
 
 ```python
+from contextlib import contextmanager
 from pathlib import Path
 
 import yaml
@@ -4578,6 +4837,55 @@ def test_inventory_writes_nothing(tmp_path: Path):
 
     assert git_head(vault) == head
     assert git_is_clean(vault)
+
+
+def test_inventory_reads_tracked_evidence_from_the_captured_head(
+    tmp_path: Path, monkeypatch, capsys
+):
+    vault = cutover_vault(tmp_path / "vault")
+    registry = vault / "_system" / "entities.yaml"
+    original = registry.read_bytes()
+    real = cutover.isolated_worktree
+
+    @contextmanager
+    def live_differs_while_snapshot_is_read(root, source_head):
+        with real(root, source_head) as snapshot:
+            registry.write_text(
+                "entities:\n  zz:\n    label: Later\n", encoding="utf-8"
+            )
+            try:
+                yield snapshot
+            finally:
+                registry.write_bytes(original)
+
+    monkeypatch.setattr(
+        cutover, "isolated_worktree", live_differs_while_snapshot_is_read
+    )
+
+    assert main(["inventory", "--vault-root", str(vault)]) == 0
+    out = capsys.readouterr().out
+    assert "entity: ab -> ab-entity" in out
+    assert "entity: zz" not in out
+
+
+def test_inventory_discards_results_when_live_status_changes_before_return(
+    tmp_path: Path, monkeypatch, capsys
+):
+    vault = cutover_vault(tmp_path / "vault")
+    real = cutover.isolated_worktree
+
+    @contextmanager
+    def live_changes_before_return(root, source_head):
+        with real(root, source_head) as snapshot:
+            yield snapshot
+        (vault / "changed-after-snapshot.txt").write_text(
+            "late\n", encoding="utf-8"
+        )
+
+    monkeypatch.setattr(cutover, "isolated_worktree", live_changes_before_return)
+
+    assert main(["inventory", "--vault-root", str(vault)]) == 1
+    assert "clean status" in capsys.readouterr().out
 
 
 def test_inventory_refuses_a_dirty_live_vault(tmp_path: Path, capsys):
@@ -4684,7 +4992,9 @@ def test_apply_promotes_when_acknowledged(tmp_path: Path, capsys):
     )
 
     assert code == 0
-    assert "DONE" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "DONE" in out
+    assert "before writers restart" in out
     assert git_head(vault) != head
     assert (vault / "ab-entity").is_dir()
 ```
@@ -4703,7 +5013,7 @@ import argparse
 
 import yaml
 
-from .cutover_build import mappings_in_order
+from .cutover_build import isolated_worktree, mappings_in_order
 from .cutover_db import (
     database_reference_inventory,
     database_schema_inventory,
@@ -4734,22 +5044,34 @@ def _load_approval(path: Path) -> ApprovalRecord:
 
 def _run_inventory(vault: Path) -> int:
     require_clean_status(vault)
-    mappings = proposed_mappings(vault)
-    check_collisions(mappings, existing_identifiers(vault))
-    affected = sorted({m.old for m in mappings if m.axis == "entity"})
+    source_head = git(vault, "rev-parse", "HEAD").strip()
+    with isolated_worktree(vault, source_head) as snapshot:
+        mappings = proposed_mappings(snapshot)
+        check_collisions(mappings, existing_identifiers(snapshot))
+        affected = sorted({m.old for m in mappings if m.axis == "entity"})
+        occurrences = advisory_occurrences(snapshot, mappings)
+        schemas = database_schema_inventory(snapshot)
+        references = database_reference_inventory(snapshot, mappings)
+
     require_clean_entities(vault, affected)
-    print(f"source HEAD: {git(vault, 'rev-parse', 'HEAD').strip()}")
+    if git(vault, "rev-parse", "HEAD").strip() != source_head:
+        raise CutoverError("live HEAD changed during inventory; discard the result")
+    require_clean_status(vault)
+    require_clean_entities(vault, affected)
+
+    print(f"source HEAD: {source_head}")
     for mapping in mappings:
         print(f"{mapping.axis}: {mapping.old} -> {mapping.new}")
-    for occurrence in advisory_occurrences(vault, mappings):
+    for occurrence in occurrences:
         print(
             f"advisory: {occurrence.path}:{occurrence.line} "
-            f"({occurrence.old}) — disposition required"
+            f"({occurrence.axis}:{occurrence.old} #{occurrence.ordinal} "
+            f"context={occurrence.context_sha256}) — disposition required"
         )
-    for path, tables in database_schema_inventory(vault).items():
+    for path, tables in schemas.items():
         for table, columns in tables.items():
             print(f"database {path} {table}: {', '.join(columns)}")
-    for reference in database_reference_inventory(vault, mappings):
+    for reference in references:
         print(
             "database candidate (UNPROVEN — owner approval required): "
             f"path={reference.path} table={reference.table} "
@@ -4839,6 +5161,11 @@ def main(argv: list[str] | None = None) -> int:
             vault, result.commit, source_head, expected_status, affected
         )
         print(f"[DONE] cutover promoted as {promoted_id}")
+        print(
+            "[ROLLBACK WINDOW] keep writers stopped while verifying. Plain git "
+            "revert is safe only before writers restart; later rollback needs a "
+            "separately reviewed database recovery migration."
+        )
         return 0
     except CutoverCommittedError as exc:
         print(f"[COMMITTED] {exc}")
@@ -4855,7 +5182,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_cli.py`
-Expected: PASS, 8 tests.
+Expected: PASS, 10 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -4889,18 +5216,21 @@ plan before proceeding rather than inventing a test during the campaign.
 | Collisions — class 1 refuses | `tests/test_cutover_inventory.py::test_a_new_value_colliding_with_an_existing_identifier_is_refused` |
 | Collisions — class 2 refuses | `tests/test_cutover_inventory.py::test_duplicate_inputs_on_one_axis_are_refused` |
 | Collisions — class 3 permitted | `tests/test_cutover_inventory.py::test_one_literal_on_two_axes_is_permitted` |
+| Build collision authority — manifest source HEAD, never mutable live tracked bytes | `tests/test_cutover_build.py::test_build_collision_check_uses_the_manifest_source_head` |
 | Scoped replacement — prose untouched | `tests/test_cutover_build.py::test_ordinary_prose_containing_a_short_identifier_is_untouched`, `tests/test_cutover_locations.py::test_ordinary_prose_containing_an_old_identifier_is_not_a_residual` |
 | Scoped replacement — containing value unchanged | `tests/test_cutover_locations.py::test_front_matter_rewrite_ignores_a_value_that_merely_contains_the_term` |
 | Advisory report — reported not rewritten | `tests/test_cutover_locations.py::test_advisory_reports_a_bare_token_outside_the_enumerated_locations` |
+| Advisory report — every token has a stable identity; display-line shifts tolerated; context changes refused | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line`, `tests/test_cutover_build.py::test_post_advisory_identity_survives_a_display_line_shift`, `tests/test_cutover_build.py::test_post_advisory_identity_rejects_same_count_with_changed_context` |
 | Advisory report — undispositioned aborts | `tests/test_cutover_build.py::test_build_refuses_an_undispositioned_advisory_occurrence` |
 | Advisory report — structural without typed location aborts | `tests/test_cutover_build.py::test_build_refuses_a_structural_disposition_naming_no_typed_location` |
 | Clean inventory status | `tests/test_cutover_inventory.py::test_inventory_requires_a_globally_clean_tracked_and_untracked_status`, `tests/test_cutover_cli.py::test_inventory_refuses_a_dirty_live_vault` |
+| Inventory — tracked evidence comes from one immutable HEAD snapshot and live state is rechecked | `tests/test_cutover_cli.py::test_inventory_reads_tracked_evidence_from_the_captured_head`, `tests/test_cutover_cli.py::test_inventory_discards_results_when_live_status_changes_before_return` |
 | Ignored and untracked — stops at inventory and build | `tests/test_cutover_inventory.py::test_require_clean_entities_raises_for_an_affected_entity`, `tests/test_cutover_build.py::test_build_refuses_an_entity_with_ignored_content` |
 | Ignored and untracked — stops at the promotion precheck | `tests/test_cutover_promotion.py::test_promotion_repeats_the_ignored_content_check` |
 | Ignored and untracked — unaffected entity ignored | `tests/test_cutover_inventory.py::test_require_clean_entities_ignores_an_unaffected_entity` |
 | Already-suffixed refuses | `tests/test_cutover_identifiers.py::test_mapping_refuses_an_already_suffixed_identifier` |
 | Floor enforcement at every validation site | **Stage B** — deferred with the private migration; see "Deferred to Stage B" |
-| One commit and revert | `tests/test_cutover_build.py::test_one_commit_is_produced_and_revert_restores_everything` |
+| One commit and pre-writer-restart revert | `tests/test_cutover_build.py::test_one_commit_is_produced_and_revert_restores_everything` |
 | Isolation — vault byte-identical at every precommit stage, ignored/untracked intact | `tests/test_cutover_build.py::test_every_precommit_stage_failure_preserves_the_complete_live_vault`, `tests/test_cutover_build.py::test_isolated_worktree_writes_do_not_reach_the_live_vault`, `tests/test_cutover_build.py::test_isolated_worktree_is_removed_on_success_and_failure`, `tests/test_cutover_promotion.py::test_promotion_leaves_an_obstructing_untracked_file_intact` |
 | Isolation — no `reset --hard` or `clean -fd` | `tests/test_cutover_build.py::test_no_destructive_git_command_appears_in_the_cutover_modules` (Step 2) |
 | Promotion refusal — moved HEAD, changed status, new ignored content | `tests/test_cutover_promotion.py::test_promotion_refuses_a_moved_head`, `tests/test_cutover_promotion.py::test_promotion_refuses_a_changed_status`, `tests/test_cutover_promotion.py::test_promotion_repeats_the_ignored_content_check` |
@@ -4982,7 +5312,7 @@ For each row: copy the target file to `/private/tmp/cutover-preimage-<n>.py`, ap
 | 6 | `app/cutover_db.py` | `if current.is_symlink():` → `if False:` | `tests/test_cutover_db.py::test_a_symlinked_component_is_refused` | unsafe database path was accepted |
 | 7 | `app/cutover_build.py` | `if residual:` → `if False:` for the immediate post-update database residual | `tests/test_cutover_build.py::test_build_gate_refuses_a_database_writer_that_leaves_the_old_value` | `DID NOT RAISE` database residual |
 | 8 | `app/cutover_build.py` | `if remaining:` → `if False:` for `scoped_residuals` | `tests/test_cutover_build.py::test_build_gate_refuses_a_writer_that_misses_the_policy_except_half` | `DID NOT RAISE` `entity:action-policy:except` |
-| 9 | `app/cutover_build.py` | `check_collisions(manifest.mappings, existing_identifiers(vault))` → `None` | `tests/test_cutover_build.py::test_build_refuses_a_colliding_mapping` | `DID NOT RAISE` collision |
+| 9 | `app/cutover_build.py` | `check_collisions(manifest.mappings, existing_identifiers(scratch))` → `None` | `tests/test_cutover_build.py::test_build_refuses_a_colliding_mapping` | `DID NOT RAISE` collision |
 | 10 | `app/cutover_build.py` | `require_clean_entities(vault, affected)` → `None` | `tests/test_cutover_build.py::test_build_refuses_an_entity_with_ignored_content` | `DID NOT RAISE` ignored content |
 | 11 | `app/cutover_build.py` | Move the exact `_require_dispositions(scratch, manifest)` line from immediately after worktree creation to immediately after `_apply_mappings_in_order` | `tests/test_cutover_build.py::test_dispositions_are_checked_before_any_path_move` | `dispositions were not checked on the source tree` |
 | 12 | `app/cutover_locations.py` | `_POLICY_LIST` group `paths|except` → `paths` | `tests/test_cutover_build.py::test_sensitive_reads_are_denied_before_and_after_the_cutover` | sensitive read became allowed |
@@ -5009,9 +5339,14 @@ For each row: copy the target file to `/private/tmp/cutover-preimage-<n>.py`, ap
 | 33 | `app/cutover_build.py` | `if existing:` → `if False:` in `_record_former_slug` | `tests/test_cutover_build.py::test_existing_former_slugs_are_preserved_and_no_duplicate_key_is_created` | duplicate provenance key created |
 | 34 | `app/cutover_build.py` | In `_rewrite_proposal`, replace the exact `path.write_text(rewritten, encoding="utf-8")` call with `path.write_text(yaml.safe_dump(yaml.safe_load(rewritten), sort_keys=False), encoding="utf-8")` | `tests/test_cutover_build.py::test_proposal_prefixes_are_rewritten_and_a_pre_cutover_token_is_refused` | proposal rewrite altered bytes outside the approved fields |
 | 35 | `app/cutover_build.py` | `_CHECK_V2_ZERO.search(combined)` → `"0 error(s), 0 warning(s)" in combined` | `tests/test_cutover_build.py::test_default_validator_does_not_read_ten_errors_as_zero` | ten errors were accepted as zero |
+| 36 | `app/cutover_build.py` | Delete the unique `item.context_sha256,` field from `_occurrence_key` | `tests/test_cutover_build.py::test_post_advisory_identity_rejects_same_count_with_changed_context` | changed context was accepted because only count and location remained |
+| 37 | `app/cutover.py` | `mappings = proposed_mappings(snapshot)` → `mappings = proposed_mappings(vault)` | `tests/test_cutover_cli.py::test_inventory_reads_tracked_evidence_from_the_captured_head` | inventory read the mutable live registry instead of captured HEAD |
+| 38 | `app/cutover.py` | Delete the final `require_clean_status(vault)` between the live-HEAD comparison and repeated `require_clean_entities` call | `tests/test_cutover_cli.py::test_inventory_discards_results_when_live_status_changes_before_return` | changed live status was accepted after snapshot inventory |
+| 39 | `app/cutover_locations.py` | `for _match in pattern.finditer(line):` → `for _match in list(pattern.finditer(line))[:1]:` | `tests/test_cutover_locations.py::test_advisory_identity_distinguishes_two_tokens_on_one_line` | second token on one line had no disposition identity |
+| 40 | `app/cutover_build.py` | `existing_identifiers(scratch)` → `existing_identifiers(vault)` | `tests/test_cutover_build.py::test_build_collision_check_uses_the_manifest_source_head` | collision authority came from mutable live bytes instead of manifest source HEAD |
 
 Before applying a row, assert its OLD anchor appears exactly once in the target
-file. Rows 11, 16, 17, 18, 21, 22, and 28 are explicitly multi-line exact
+file. Rows 11, 16, 17, 18, 21, 22, 28, and 38 are explicitly multi-line exact
 substitutions: record their complete OLD and NEW blocks in the ledger before
 running them. They are still one mutation each; no row may depend on another
 row being active. Run every full node id alone with `--tb=line`, require exit 1
