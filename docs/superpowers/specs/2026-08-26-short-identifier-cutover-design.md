@@ -1,6 +1,6 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — public design task only, revision 10. The Stage A
+**Status:** APPROVED DESIGN — public design task only, revision 11. The Stage A
 implementation plan exists; no application code or test has been modified, and
 no migration has been executed.
 
@@ -52,6 +52,11 @@ canonicalized across approved typed rewrites and source ordinals are never
 reassigned as post-build authority; the exact `check_v2` success contract is
 fail-closed; clean-HEAD preservation wording is consistent; and stop conditions
 exclude the identifier convention and values this design explicitly approves.
+**Revision 11 closes the remaining advisory-identity gap:** the scanner excludes
+only the exact token span owned by a typed location, never every matching token
+on that line, and the source ordinal remains part of post-build identity. The
+approved writers preserve advisory-token order; an insertion, removal, or
+reordering therefore refuses rather than rebinding a disposition.
 
 ## Objective
 
@@ -263,6 +268,10 @@ the sweep it replaces.
 The inventory and dry-run therefore produce an **advisory report**: every
 occurrence of an in-scope identifier, matched as a whole token with the
 existing boundary pattern, that lies **outside** the enumerated locations.
+The complement is span-specific: recognizing one typed scalar or key excludes
+only that token's exact character span. Another same-axis token in a comment or
+ordinary value on the same line remains advisory. A whole-line exclusion would
+silently hide prose merely because a typed field happened to precede it.
 Occurrences remain grouped by file and line for display, but a display line is
 not their authority. Each source occurrence is identified by source-relative
 path, axis, old value, token ordinal within the file, and a SHA-256 digest of a
@@ -272,14 +281,16 @@ That makes the context stable when an approved typed value on the same line is
 rewritten without masking a changed ordinary word. The manifest's source HEAD
 makes the source identity refer to one immutable snapshot.
 
-The source ordinal is approval evidence, not something the post-build scan may
-reassign. Regeneration translates each approved source path through the entity
-mapping, then compares a multiset keyed by translated path, axis, old value,
-and canonical-context digest. The count distinguishes repeated identical
-contexts. A typed rewrite therefore cannot detach an approved occurrence by
-changing its line bytes; a line insertion cannot detach it by shifting display
-lines; and a new occurrence cannot inherit an old disposition merely by taking
-its ordinal. Inventory, dry-run, and apply use this same source projection.
+The source ordinal remains part of the post-build key. This is safe because the
+closed writers replace only typed token spans, translate an entity path head,
+and add provenance on lines the scanner explicitly exempts; none inserts,
+removes, or reorders an advisory token. Regeneration translates each approved
+source path through the entity mapping, then compares a multiset keyed by
+translated path, axis, old value, source ordinal, and canonical-context digest.
+A typed rewrite therefore cannot detach an approved occurrence by changing its
+line bytes, while an unexpected insertion, removal, or reordering changes an
+ordinal or context and refuses. Display line numbers remain non-authoritative.
+Inventory, dry-run, and apply use this same source projection.
 
 The report is never acted on automatically. The owner dispositions each
 occurrence as exactly one of:
@@ -738,9 +749,11 @@ Within those locations, matching is by exact whole field value, or by exact
 path component for paths.
 
 The advisory report is regenerated and compared against the carried source
-projection defined above, never against newly assigned post-build ordinals.
-Any occurrence outside the enumerated locations that was not dispositioned in
-the approved manifest aborts the build.
+projection defined above, including each source ordinal. The post-build scan
+must reproduce that ordinal under the approved span-confined writers; it may not
+sort or remap a changed set merely to make the counts agree. Any occurrence
+outside the enumerated locations that was not dispositioned in the approved
+manifest aborts the build.
 
 The boundary pattern used for the advisory scan is the existing
 `(?<![\w-])<old>(?![\w-])`. Its behaviour must be pinned: a migrated
@@ -879,7 +892,10 @@ Required coverage:
 - **Advisory report.** An occurrence outside the enumerated locations is
   reported, not rewritten; an undispositioned occurrence aborts the build; a
   structural disposition without a corresponding typed location aborts rather
-  than deferring to a hand-fix.
+  than deferring to a hand-fix. A typed scalar does not hide a same-axis prose
+  token elsewhere on its line. Approved typed rewrites and display-line shifts
+  preserve source identity, while insertion or reordering of advisory tokens
+  refuses rather than rebinding their source ordinals.
 - **Ignored and untracked content.** An affected entity containing an ignored
   path stops the cutover at inventory, at build start, and at the promotion
   precheck. An unaffected entity's ignored content does not stop it. A test
@@ -946,8 +962,10 @@ proceeds; restoring the product pass's workspace `id:` rewrite so two mappings
 contend for one field; adding `former_slugs` to a member entry so a
 list-shaped registry gains a new field; widening the residual gate's
 `former_slugs` exemption to every registry so a genuine residual is masked;
-and removing the promotion precheck so a moved HEAD is accepted. Each names the
-exact test that must go red, and each target file is
+collapsing typed-token exclusion to a whole-line exclusion so same-axis prose is
+hidden; dropping source ordinal from the post-build identity so reordered
+occurrences are accepted; and removing the promotion precheck so a moved HEAD
+is accepted. Each names the exact test that must go red, and each target file is
 restored byte-for-byte before the suite is re-run green. Task 17 of the Stage A
 implementation plan is the single authoritative mapping from every mutation to
 its full `path::test_name` node, including parameter case ids. This design does
