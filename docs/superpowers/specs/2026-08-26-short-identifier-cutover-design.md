@@ -22,13 +22,16 @@ that found it.
 
 **Revision history.** Revision 2 applied four owner corrections: no vault-wide
 word replacement, a corrected history-audit expectation, an isolated mutable
-copy for dry-run, and removal of live-vault destructive rollback. **Revision 3
-applies five more:** the approval digest moves out of the manifest it signs; a
+copy for dry-run, and removal of live-vault destructive rollback, and it
+incorporated the approved `books.db` decision. **Revision 3 applied six
+more:** the approval digest moves out of the manifest it signs; a
 product-kind workspace `id` is typed to one axis only; ignored and untracked
 content under an affected entity is a hard stop; promotion requires quiescing
 every writer; a structural reference must join the typed rewrite list or stop
 the cutover; and database approval binds a source-relative path as well as
-table and column.
+table and column. **Revision 4 applies two document corrections:** that
+miscount, and the scoping of `former_slugs` to the registry shapes that already
+support it.
 
 ## Objective
 
@@ -58,7 +61,9 @@ Decided by the product owner. These are inputs, not open questions.
 10. Independent review and mutation-tested verification remain mandatory.
 11. Only identifiers shorter than five characters are rewritten; identifiers
     already at or above the floor keep their current value.
-12. `former_slugs` is retained as unread provenance only, never as an alias.
+12. `former_slugs` is retained as unread provenance only, never as an alias,
+    and only in the entity and product registries that already carry it.
+    Member and workspace provenance lives in the signed cutover manifest.
 13. Matching product and member values inside `books.db` are migrated in the
     same reversible cutover commit, under the narrow allowlist rules below.
 14. A product-kind workspace's `id` is a workspace identifier and takes
@@ -674,20 +679,59 @@ Either gate failing aborts the build and discards the temporary worktree.
 
 ### `former_slugs` is provenance, not an alias
 
-The cutover records `former_slugs: [old]` on the migrated registry key and
-exempts that line from the residual gate.
-
 This is not a compatibility fallback and must never become one. No code path
 resolves `former_slugs` today: it is written and gate-exempted, never read. It
-is inert provenance that makes the mapping legible in the vault and supports
+is inert provenance that makes a mapping legible in the vault and supports
 reconciliation after a revert.
 
-Two testable constraints follow:
+#### Where it may be written, and where it may not
+
+`former_slugs` is written **only on entity and product registry keys**, which
+are the two shapes that already carry it. It is **never** added to a member or
+workspace entry.
+
+The reason is mechanical, and it is why the restriction is a rule rather than a
+preference. [app/rename.py:156](app/rename.py:156) anchors the insertion on a
+bare mapping-key line, `^(\s*)<key>:\s*$`, and hangs the new field beneath it.
+Its only two call sites are [app/rename.py:257](app/rename.py:257) for the
+`entities.yaml` entity key and [app/rename.py:316](app/rename.py:316) for the
+`products.yaml` product key — the branch taken only when a nested mapping key
+exists.
+
+Members and workspaces are shaped differently: each is a **list entry carrying
+an `id:` value**, not a mapping key. `app/rename.py` takes its `else` branch for
+members and rewrites the `id:` value alone, and its workspace planner inserts no
+provenance at all. There is no `<slug>:` line to anchor to, so writing
+`former_slugs` there would mean inventing a placement convention and adding a
+new field to a list-entry shape. That is a registry schema change, which
+decision 2 forbids and `AGENTS.md` makes a hard stop.
+
+The resulting asymmetry — entity and product carry vault-side provenance,
+member and workspace do not — is **inherited from the existing registries, not
+introduced by this cutover.** Preserving it is the whole point.
+
+#### Where member and workspace provenance lives instead
+
+In the signed approval manifest, which already binds the exact old → new
+mappings for all four axes. No new artifact is required.
+
+Two consequences follow. First, the manifest and its approval record must be
+**retained privately as the provenance record for those two axes**, since the
+vault will not carry it; they are private records and never enter this
+repository. Second, provenance is not needed for recovery in any case: `git
+revert` of the single cutover commit restores every identifier on every axis,
+whether or not a `former_slugs` line exists.
+
+#### Constraints
 
 - No reader may ever resolve an identifier through `former_slugs`, so decision
   2 cannot be eroded later by a well-meaning fallback.
 - Retained values must not enter the publication audit's term set, as the
   history-audit section requires.
+- The residual gate's `former_slugs` exemption applies only to the entity and
+  product registries where the field legitimately appears. It must not become a
+  blanket exemption, which would mask a genuine residual elsewhere.
+- Member and workspace registry entries must gain no new field.
 
 ## Interruption behaviour
 
@@ -777,7 +821,11 @@ Required coverage:
 - **Proposals.** Stored `src`/`dst` prefixes are rewritten and a pre-cutover
   review token is refused afterwards.
 - **`former_slugs`.** No resolver consults it, and term collection reads only
-  entity keys, product keys, member ids, and workspace ids.
+  entity keys, product keys, member ids, and workspace ids. It is written on
+  entity and product registry keys only; a migrated member entry and a migrated
+  workspace entry gain **no** new field, and their entry shape is otherwise
+  byte-identical apart from the rewritten `id:` value. The residual gate's
+  exemption does not extend beyond the entity and product registries.
 - **Fail-open guard.** A policy rule's `paths:` and its `except:` for
   `.sensitive/` are rewritten in the same pass, and a `.sensitive/` read is
   still denied afterwards.
@@ -791,7 +839,9 @@ advisory scan; removing a collision check; replacing sequential application
 with up-front plan composition so two mappings touching one file lose the first
 rewrite; removing the ignored/untracked check so an entity with ignored content
 proceeds; restoring the product pass's workspace `id:` rewrite so two mappings
-contend for one field; and removing the promotion precheck so a moved HEAD is
+contend for one field; adding `former_slugs` to a member entry so a
+list-shaped registry gains a new field; widening the residual gate's
+`former_slugs` exemption to every registry so a genuine residual is masked; and removing the promotion precheck so a moved HEAD is
 accepted. Each names the exact test that must go red, and each target file is
 restored byte-for-byte before the suite is re-run green.
 
@@ -892,6 +942,9 @@ Work halts and returns to the product owner on any of these:
 - An in-scope identifier that already carries an axis suffix.
 - An approval manifest that contains its own digest, or a missing or
   non-matching approval record.
+- Any proposal to write `former_slugs` — or any other new field — into a member
+  or workspace registry entry, or to widen the residual gate's `former_slugs`
+  exemption beyond the entity and product registries.
 - Inability to stop or to verify the stop of OneOS, Hermes, a parser, or an
   adapter before promotion.
 - A request to add an alias, a fallback resolver, a `former_slugs` lookup, or
@@ -919,6 +972,8 @@ Work halts and returns to the product owner on any of these:
 - Any database schema change: `UPDATE` only, no DDL.
 - Relocating, retiring, or migrating ignored or untracked content; the cutover
   refuses instead.
+- Adding `former_slugs` to the list-shaped member and workspace registries;
+  their provenance lives in the signed manifest.
 - Any change to S7 review tokens, receipts, quarantine, or the managed-
   directory boundary.
 - Changes to Items 2, 3, or 4 beyond resuming them in order.
