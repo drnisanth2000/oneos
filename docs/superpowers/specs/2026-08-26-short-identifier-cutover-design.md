@@ -39,7 +39,10 @@ applied one correction found in plan review:** every database allowlist entry
 gains an `axis`, so a target is a four-tuple rather than a triple. **Revision 7
 applies one consistency correction:** the schema-similarity exception that
 still allowed a target to omit its path is removed, so all four parts are
-unconditionally mandatory.
+unconditionally mandatory. **Revision 8 records one review clarification:**
+the clean-status migration precondition is deliberately stricter than the
+general private-gate preservation rule because the approval and isolated build
+bind only committed `HEAD` bytes.
 
 ## Objective
 
@@ -519,6 +522,15 @@ it.
 The live vault is not written, not locked, and not read for mutation during
 planning. It is read at the start to record HEAD, confirm a clean status, and
 run the ignored/untracked check.
+
+That clean-status requirement is deliberate and is stricter than `BUILD.md`'s
+general preservation rule. `BUILD.md` requires any approved pre-existing edit
+to survive a read-only private gate byte-for-byte; it does not authorize this
+migration to begin from an uncommitted overlay. The approval manifest binds
+`HEAD`, and the isolated worktree contains `HEAD` only. A tracked edit outside
+that tree was therefore never reviewed, could be stranded by an entity move,
+and cannot be part of the one-commit/revert proof. Preserve it separately or
+commit it, then begin again from a newly recorded clean `HEAD`.
 
 The temporary worktree is removed when the operation ends, in success or
 failure.
