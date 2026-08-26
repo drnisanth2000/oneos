@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12, stdlib `re`/`pathlib`/`sqlite3`/`hashlib`/`subprocess`/`tempfile`, PyYAML, pytest, Git CLI.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 11, commit `be1bbaa`.
+**Spec:** `docs/superpowers/specs/2026-08-26-short-identifier-cutover-design.md` at revision 12, commit `14e60f3`.
 
 **Supersedes:** the rejected plans at `5f3e82b` and `a96fc18`. Neither is to be consulted during implementation; their code blocks contained the defects listed below and are not a starting point.
 
@@ -70,6 +70,12 @@ The `a96fc18` review added these binding corrections:
 15. The advisory complement excludes only the exact character span owned by a
     typed location. A same-axis prose token elsewhere on that line remains
     visible and requires disposition.
+16. Canonical manifest bytes use one fully specified UTF-8 JSON form with
+    duplicate-key rejection and strict source-relative POSIX paths.
+17. The approval record binds the exact Stage A executor commit. Dry-run and
+    apply refuse a dirty or different executor before building.
+18. Both trusted-local publication audits require exit zero and stdout exactly
+    `CLEAN\n`; their parser contract is separate from `check_v2`.
 
 Seven further requirements from the same review are covered: database paths validated as relative, confined, and non-symlinked (Task 7); each target applied only to its declared axis (Task 7); every approved mapping validated against the deterministic rule (Tasks 1 and 11); dispositions checked before paths move with a separate scoped gate afterward (Task 11); failed promotion distinguished from committed-but-unconfirmed (Task 12); every design acceptance test mapped to an exact node (Task 17); and every mutation an exact reproducible edit (Task 17).
 
@@ -114,7 +120,7 @@ The baseline must report **1,476 or more passing tests** and zero failures. If i
 | File | Responsibility |
 |---|---|
 | Create `app/identifiers.py` | Floor constant, `meets_floor`, `suffix_for_axis`, `map_identifier`, `validate_mapping_pair`. Pure. Stage B's validators consume this. |
-| Create `app/cutover_manifest.py` | `Mapping`, `DatabaseTarget` (axis-typed), `Disposition`, `ApprovalManifest`, `ApprovalRecord`, canonical bytes, digest verification. |
+| Create `app/cutover_manifest.py` | `Mapping`, `DatabaseTarget` (axis-typed), `Disposition`, `ApprovalManifest`, `ApprovalRecord`, canonical UTF-8 JSON bytes, digest and executor binding. |
 | Create `app/cutover_locations.py` | Closed location table, scoped rewriters, strict advisory scan, scoped residual gate. |
 | Create `app/cutover_db.py` | Path-confined axis-filtered updates, axis-typed residual query, schema and reference-count inventory. |
 | Create `app/cutover_inventory.py` | Collision checks, clean-status precondition, ignored/untracked hard stop. |
@@ -330,7 +336,7 @@ git commit -m "feat: single-source the registry identifier floor and mapping"
 **Interfaces:**
 - Produces: `Mapping`, `DatabaseTarget`, `Disposition`, `ApprovalManifest`, `ApprovalRecord`, `canonical_bytes`, `manifest_digest`, `load_manifest`, `verify_manifest`, `ManifestError`.
 
-The manifest never contains its own digest: a self-referential hash makes verification depend on an agreement about which bytes were hashed, and that agreement is what an accident gets to break.
+The manifest never contains its own digest: a self-referential hash makes verification depend on an agreement about which bytes were hashed, and that agreement is what an accident gets to break. Its separate approval record also names the exact clean executor commit, because identical data interpreted by different code is not the same approved action.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -338,9 +344,9 @@ Create `tests/test_cutover_manifest.py`:
 
 ```python
 import hashlib
+import json
 
 import pytest
-import yaml
 
 from app.cutover_manifest import (
     ApprovalManifest,
@@ -354,6 +360,8 @@ from app.cutover_manifest import (
     manifest_digest,
     verify_manifest,
 )
+
+EXECUTOR_COMMIT = "e" * 40
 
 
 def sample_manifest() -> ApprovalManifest:
@@ -386,6 +394,14 @@ def sample_manifest() -> ApprovalManifest:
     )
 
 
+def record_for(manifest: ApprovalManifest) -> ApprovalRecord:
+    return ApprovalRecord(
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=EXECUTOR_COMMIT,
+        approved_by="owner",
+    )
+
+
 def test_canonical_bytes_are_stable_across_construction_order():
     first = sample_manifest()
     second = ApprovalManifest(
@@ -405,7 +421,7 @@ def test_manifest_never_contains_its_own_digest():
     manifest = sample_manifest()
     raw = canonical_bytes(manifest)
     assert manifest_digest(manifest) not in raw.decode("utf-8")
-    loaded = yaml.safe_load(raw)
+    loaded = json.loads(raw)
     assert "digest" not in loaded
     assert "sha256" not in loaded
 
@@ -419,10 +435,7 @@ def test_digest_is_the_sha256_of_the_canonical_bytes():
 
 def test_verify_accepts_a_matching_record():
     manifest = sample_manifest()
-    verify_manifest(
-        canonical_bytes(manifest),
-        ApprovalRecord(manifest_sha256=manifest_digest(manifest), approved_by="owner"),
-    )
+    verify_manifest(canonical_bytes(manifest), record_for(manifest))
 
 
 def test_verify_refuses_a_mismatched_record():
@@ -430,15 +443,17 @@ def test_verify_refuses_a_mismatched_record():
     with pytest.raises(ManifestError):
         verify_manifest(
             canonical_bytes(manifest),
-            ApprovalRecord(manifest_sha256="b" * 64, approved_by="owner"),
+            ApprovalRecord(
+                manifest_sha256="b" * 64,
+                executor_commit=EXECUTOR_COMMIT,
+                approved_by="owner",
+            ),
         )
 
 
 def test_verify_refuses_a_single_changed_byte():
     manifest = sample_manifest()
-    record = ApprovalRecord(
-        manifest_sha256=manifest_digest(manifest), approved_by="owner"
-    )
+    record = record_for(manifest)
     tampered = canonical_bytes(manifest).replace(b"ab-entity", b"ab-produce")
     with pytest.raises(ManifestError):
         verify_manifest(tampered, record)
@@ -447,12 +462,13 @@ def test_verify_refuses_a_single_changed_byte():
 def test_verify_refuses_digest_matching_but_noncanonical_bytes():
     manifest = sample_manifest()
     canonical = canonical_bytes(manifest)
-    noncanonical = yaml.safe_dump(
-        yaml.safe_load(canonical), sort_keys=True, allow_unicode=True
+    noncanonical = (
+        json.dumps(json.loads(canonical), indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")
     assert noncanonical != canonical
     record = ApprovalRecord(
         manifest_sha256=hashlib.sha256(noncanonical).hexdigest(),
+        executor_commit=EXECUTOR_COMMIT,
         approved_by="owner",
     )
 
@@ -463,6 +479,61 @@ def test_verify_refuses_digest_matching_but_noncanonical_bytes():
 def test_round_trip_through_canonical_bytes():
     manifest = sample_manifest()
     assert load_manifest(canonical_bytes(manifest)) == manifest
+
+
+def test_canonical_bytes_have_exact_utf8_json_framing():
+    manifest = sample_manifest()
+    raw = canonical_bytes(manifest)
+
+    assert raw.endswith(b"\n") and not raw.endswith(b"\n\n")
+    assert b"\r" not in raw
+    assert raw == (
+        json.dumps(
+            json.loads(raw),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def test_duplicate_object_keys_are_refused_even_with_a_matching_digest():
+    manifest = sample_manifest()
+    raw = canonical_bytes(manifest)
+    duplicate = raw.replace(
+        b'{"source_head":',
+        b'{"source_head":"' + b"b" * 40 + b'","source_head":',
+        1,
+    )
+    record = ApprovalRecord(
+        manifest_sha256=hashlib.sha256(duplicate).hexdigest(),
+        executor_commit=EXECUTOR_COMMIT,
+        approved_by="owner",
+    )
+
+    with pytest.raises(ManifestError, match="duplicate"):
+        verify_manifest(duplicate, record)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ("/absolute/books.db", "../escape/books.db", "a\\books.db", "a//books.db", "a/./books.db", "a/../books.db"),
+    ids=("absolute", "parent", "backslash", "empty-segment", "dot", "parent-segment"),
+)
+def test_manifest_paths_must_be_canonical_relative_posix(path: str):
+    with pytest.raises(ManifestError, match="path"):
+        DatabaseTarget(path=path, table="t", column="c", axis="product")
+
+
+def test_approval_record_requires_an_executor_commit():
+    with pytest.raises(ManifestError, match="executor"):
+        ApprovalRecord(
+            manifest_sha256="a" * 64,
+            executor_commit="not-a-commit",
+            approved_by="owner",
+        )
 
 
 def test_database_target_requires_every_part():
@@ -562,18 +633,57 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
+from pathlib import PurePosixPath
 import re
-
-import yaml
+import unicodedata
 
 from .identifiers import AXES, DATABASE_AXES
 
 _DISPOSITION_KINDS = frozenset({"incidental", "structural"})
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 
 class ManifestError(Exception):
     pass
+
+
+def _require_text(value, label: str) -> str:
+    if type(value) is not str or not value:  # bool/subclasses are not text
+        raise ManifestError(f"{label} must be a non-empty string")
+    return value
+
+
+def _require_relative_posix_path(value, label: str) -> str:
+    value = _require_text(value, label)
+    if (
+        "\\" in value
+        or "\x00" in value
+        or unicodedata.normalize("NFC", value) != value
+    ):
+        raise ManifestError(f"{label} is not a canonical relative POSIX path")
+    parts = value.split("/")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in parts):
+        raise ManifestError(f"{label} is not a canonical relative POSIX path")
+    if path.as_posix() != value:
+        raise ManifestError(f"{label} is not a canonical relative POSIX path")
+    return value
+
+
+def _without_duplicate_keys(pairs):
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ManifestError(f"duplicate manifest key {key!r}")
+        document[key] = value
+    return document
+
+
+def _require_keys(document: dict, expected: set[str], label: str) -> None:
+    if set(document) != expected:
+        raise ManifestError(f"{label} must contain exactly {sorted(expected)!r}")
 
 
 @dataclass(frozen=True, order=True)
@@ -583,10 +693,11 @@ class Mapping:
     new: str
 
     def __post_init__(self) -> None:
+        _require_text(self.axis, "mapping axis")
+        _require_text(self.old, "mapping old")
+        _require_text(self.new, "mapping new")
         if self.axis not in AXES:
             raise ManifestError(f"unknown axis {self.axis!r}")
-        if not self.old or not self.new:
-            raise ManifestError("mapping requires both old and new values")
 
 
 @dataclass(frozen=True, order=True)
@@ -606,8 +717,8 @@ class DatabaseTarget:
 
     def __post_init__(self) -> None:
         for field_name in ("path", "table", "column", "axis"):
-            if not getattr(self, field_name):
-                raise ManifestError(f"database target requires {field_name!r}")
+            _require_text(getattr(self, field_name), f"database target {field_name}")
+        _require_relative_posix_path(self.path, "database target path")
         if self.axis not in DATABASE_AXES:
             raise ManifestError(
                 f"database target axis must be product or member, not {self.axis!r}"
@@ -626,15 +737,22 @@ class Disposition:
     typed_location: str = ""
 
     def __post_init__(self) -> None:
+        _require_relative_posix_path(self.path, "disposition path")
         if (
-            not self.path
+            type(self.axis) is not str
             or self.axis not in AXES
+            or type(self.old) is not str
             or not self.old
+            or type(self.ordinal) is not int
             or self.ordinal < 1
+            or type(self.context_sha256) is not str
             or _SHA256.fullmatch(self.context_sha256) is None
+            or type(self.line) is not int
             or self.line < 1
         ):
             raise ManifestError("disposition requires a complete stable identity")
+        if type(self.kind) is not str or type(self.typed_location) is not str:
+            raise ManifestError("disposition fields must use their canonical types")
         if self.kind not in _DISPOSITION_KINDS:
             raise ManifestError(f"unknown disposition kind {self.kind!r}")
         if self.kind == "structural" and not self.typed_location:
@@ -651,15 +769,29 @@ class ApprovalManifest:
     databases: tuple[DatabaseTarget, ...]
     dispositions: tuple[Disposition, ...]
 
+    def __post_init__(self) -> None:
+        if type(self.source_head) is not str or _GIT_COMMIT.fullmatch(self.source_head) is None:
+            raise ManifestError("source_head must be a full lowercase Git commit")
+        if not all(type(items) is tuple for items in (self.mappings, self.databases, self.dispositions)):
+            raise ManifestError("manifest collections must be tuples")
+
 
 @dataclass(frozen=True)
 class ApprovalRecord:
     manifest_sha256: str
+    executor_commit: str
     approved_by: str
+
+    def __post_init__(self) -> None:
+        if type(self.manifest_sha256) is not str or _SHA256.fullmatch(self.manifest_sha256) is None:
+            raise ManifestError("approval record requires a SHA-256 digest")
+        if type(self.executor_commit) is not str or _GIT_COMMIT.fullmatch(self.executor_commit) is None:
+            raise ManifestError("approval record requires an executor commit")
+        _require_text(self.approved_by, "approved_by")
 
 
 def canonical_bytes(manifest: ApprovalManifest) -> bytes:
-    """Deterministic serialisation: sorted members, fixed key order, UTF-8."""
+    """One compact UTF-8 JSON document followed by exactly one LF."""
     document = {
         "source_head": manifest.source_head,
         "mappings": [
@@ -689,8 +821,15 @@ def canonical_bytes(manifest: ApprovalManifest) -> bytes:
             for item in sorted(manifest.dispositions)
         ],
     }
-    return yaml.safe_dump(
-        document, sort_keys=False, allow_unicode=True, default_flow_style=False
+    return (
+        json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=False,
+            separators=(",", ":"),
+        )
+        + "\n"
     ).encode("utf-8")
 
 
@@ -700,12 +839,29 @@ def manifest_digest(manifest: ApprovalManifest) -> str:
 
 def load_manifest(raw: bytes) -> ApprovalManifest:
     try:
-        document = yaml.safe_load(raw.decode("utf-8")) or {}
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        document = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_without_duplicate_keys
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ManifestError("approval manifest is unreadable") from exc
     if not isinstance(document, dict):
         raise ManifestError("approval manifest must be a mapping")
     try:
+        _require_keys(
+            document,
+            {"source_head", "mappings", "databases", "dispositions"},
+            "approval manifest",
+        )
+        for item in document["mappings"]:
+            _require_keys(item, {"axis", "old", "new"}, "mapping")
+        for item in document["databases"]:
+            _require_keys(item, {"path", "table", "column", "axis"}, "database target")
+        for item in document["dispositions"]:
+            _require_keys(
+                item,
+                {"path", "axis", "old", "ordinal", "context_sha256", "line", "kind", "typed_location"},
+                "disposition",
+            )
         return ApprovalManifest(
             source_head=document["source_head"],
             mappings=tuple(Mapping(**item) for item in document.get("mappings", [])),
@@ -732,7 +888,7 @@ def verify_manifest(raw: bytes, record: ApprovalRecord) -> None:
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_manifest.py`
-Expected: PASS, 13 tests.
+Expected: PASS, 22 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -3312,6 +3468,7 @@ from app.cutover_build import (
     BuildResult,
     build_cutover,
     git,
+    require_executor_revision,
     run_vault_validators,
 )
 from app.cutover_locations import stable_advisory_context
@@ -3334,6 +3491,7 @@ CUTOVER_MAPPINGS = (
     Mapping(axis="member", old="m7", new="m7-member"),
     Mapping(axis="workspace", old="w7", new="w7-workspace"),
 )
+EXECUTOR_COMMIT = "e" * 40
 
 
 def disposition(
@@ -3420,8 +3578,41 @@ def approved(vault: Path, dispositions=None) -> tuple[bytes, ApprovalRecord]:
     )
     raw = canonical_bytes(manifest)
     return raw, ApprovalRecord(
-        manifest_sha256=manifest_digest(manifest), approved_by="owner"
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=EXECUTOR_COMMIT,
+        approved_by="owner",
     )
+
+
+def executor_record(repo: Path, *, commit: str | None = None) -> ApprovalRecord:
+    return ApprovalRecord(
+        manifest_sha256="a" * 64,
+        executor_commit=commit or git(repo, "rev-parse", "HEAD").strip(),
+        approved_by="owner",
+    )
+
+
+def test_executor_revision_accepts_the_clean_approved_commit(tmp_path: Path):
+    repo = cutover_vault(tmp_path / "executor")
+
+    assert require_executor_revision(executor_record(repo), repo) == git(
+        repo, "rev-parse", "HEAD"
+    ).strip()
+
+
+def test_executor_revision_refuses_a_different_commit(tmp_path: Path):
+    repo = cutover_vault(tmp_path / "executor")
+
+    with pytest.raises(cutover_build.CutoverError, match="executor commit"):
+        require_executor_revision(executor_record(repo, commit="f" * 40), repo)
+
+
+def test_executor_revision_refuses_a_dirty_worktree(tmp_path: Path):
+    repo = cutover_vault(tmp_path / "executor")
+    (repo / "dirty.py").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(cutover_build.CutoverError, match="executor worktree"):
+        require_executor_revision(executor_record(repo), repo)
 
 
 def test_build_leaves_the_live_vault_untouched(tmp_path: Path):
@@ -3443,7 +3634,13 @@ def test_build_refuses_a_manifest_that_does_not_match_its_record(tmp_path: Path)
 
     with pytest.raises(Exception):
         build_cutover(
-            vault, raw, ApprovalRecord(manifest_sha256="c" * 64, approved_by="owner")
+            vault,
+            raw,
+            ApprovalRecord(
+                manifest_sha256="c" * 64,
+                executor_commit=EXECUTOR_COMMIT,
+                approved_by="owner",
+            ),
         )
     assert git_is_clean(vault)
 
@@ -3458,7 +3655,9 @@ def test_build_refuses_a_mapping_that_is_not_the_deterministic_result(tmp_path: 
     )
     raw = canonical_bytes(manifest)
     record = ApprovalRecord(
-        manifest_sha256=manifest_digest(manifest), approved_by="owner"
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=EXECUTOR_COMMIT,
+        approved_by="owner",
     )
 
     with pytest.raises(Exception, match="deterministic"):
@@ -3508,7 +3707,11 @@ def test_build_refuses_a_colliding_mapping(tmp_path: Path):
         dispositions=(),
     )
     raw = canonical_bytes(manifest)
-    record = ApprovalRecord(manifest_sha256=manifest_digest(manifest), approved_by="owner")
+    record = ApprovalRecord(
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=EXECUTOR_COMMIT,
+        approved_by="owner",
+    )
 
     with pytest.raises(Exception, match="collides"):
         build_cutover(vault, raw, record, validator=lambda _root: None)
@@ -3564,7 +3767,11 @@ def test_build_refuses_an_entity_with_ignored_content(tmp_path: Path):
         dispositions=(),
     )
     raw = canonical_bytes(manifest)
-    record = ApprovalRecord(manifest_sha256=manifest_digest(manifest), approved_by="owner")
+    record = ApprovalRecord(
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=EXECUTOR_COMMIT,
+        approved_by="owner",
+    )
 
     with pytest.raises(Exception, match="ignored or untracked"):
         build_cutover(vault, raw, record, validator=lambda _root: None)
@@ -4193,6 +4400,20 @@ def _require_post_advisory(root: Path, manifest: ApprovalManifest) -> None:
         )
 
 
+def require_executor_revision(
+    record: ApprovalRecord, repo_root: Path | None = None
+) -> str:
+    """Require the exact clean public executor the owner approved."""
+    repo = repo_root or Path(__file__).resolve().parents[1]
+    status = git(repo, "status", "--porcelain=v2", "--untracked-files=all")
+    if status:
+        raise CutoverError("executor worktree is dirty; approval binds clean bytes")
+    head = git(repo, "rev-parse", "HEAD").strip()
+    if head != record.executor_commit:
+        raise CutoverError("executor commit does not match the approval record")
+    return head
+
+
 def run_vault_validators(root: Path) -> None:
     """Run both existing read-only vault validators on the migrated tree."""
     scripts = root / "_system" / "scripts"
@@ -4281,7 +4502,7 @@ def build_cutover(
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_build.py`
-Expected: PASS, 35 tests (the seven Task 10 tests, twenty-one ordinary Task 11
+Expected: PASS, 38 tests (the seven Task 10 tests, twenty-four ordinary Task 11
 tests, and seven parameter cases in the precommit-stage matrix).
 
 If a fixture's disposition line number does not match, print
@@ -4999,6 +5220,7 @@ Create `tests/test_cutover_cli.py`:
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 import yaml
 
 import app.cutover as cutover
@@ -5007,13 +5229,22 @@ from tests.conftest import git_head, git_is_clean, git_vault
 from tests.test_cutover_build import approved, commit_in, cutover_vault
 
 
+@pytest.fixture(autouse=True)
+def approved_synthetic_executor(monkeypatch):
+    monkeypatch.setattr(cutover, "require_executor_revision", lambda _record: None)
+
+
 def write_artifacts(tmp_path: Path, raw: bytes, record) -> tuple[Path, Path]:
-    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path = tmp_path / "manifest.json"
     record_path = tmp_path / "record.yaml"
     manifest_path.write_bytes(raw)
     record_path.write_text(
         yaml.safe_dump(
-            {"manifest_sha256": record.manifest_sha256, "approved_by": "owner"}
+            {
+                "manifest_sha256": record.manifest_sha256,
+                "executor_commit": record.executor_commit,
+                "approved_by": "owner",
+            }
         ),
         encoding="utf-8",
     )
@@ -5189,6 +5420,33 @@ def test_apply_requires_the_quiesce_acknowledgement(tmp_path: Path, capsys):
     assert git_head(vault) == head
 
 
+@pytest.mark.parametrize("command", ("dry-run", "apply"))
+def test_action_commands_refuse_a_different_executor(
+    tmp_path: Path, monkeypatch, capsys, command: str
+):
+    vault = cutover_vault(tmp_path / "vault")
+    manifest_path, record_path = write_artifacts(tmp_path, *approved(vault))
+
+    def refuses(_record):
+        raise cutover.CutoverError("executor commit does not match")
+
+    monkeypatch.setattr(cutover, "require_executor_revision", refuses)
+    argv = [
+        command,
+        "--vault-root",
+        str(vault),
+        "--manifest",
+        str(manifest_path),
+        "--approval",
+        str(record_path),
+    ]
+    if command == "apply":
+        argv.append("--i-have-quiesced-all-writers")
+
+    assert main(argv) == 1
+    assert "executor commit" in capsys.readouterr().out
+
+
 def test_apply_promotes_when_acknowledged(tmp_path: Path, capsys):
     vault = cutover_vault(tmp_path / "vault")
     head = git_head(vault)
@@ -5222,7 +5480,11 @@ import argparse
 
 import yaml
 
-from .cutover_build import isolated_worktree, mappings_in_order
+from .cutover_build import (
+    isolated_worktree,
+    mappings_in_order,
+    require_executor_revision,
+)
 from .cutover_db import (
     database_reference_inventory,
     database_schema_inventory,
@@ -5245,6 +5507,7 @@ def _load_approval(path: Path) -> ApprovalRecord:
     try:
         return ApprovalRecord(
             manifest_sha256=document["manifest_sha256"],
+            executor_commit=document["executor_commit"],
             approved_by=document["approved_by"],
         )
     except KeyError as exc:
@@ -5349,6 +5612,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         manifest_bytes = Path(args.manifest).read_bytes()
         record = _load_approval(Path(args.approval))
+        require_executor_revision(record)
 
         if args.command == "dry-run":
             return _run_dry_run(vault, manifest_bytes, record)
@@ -5391,7 +5655,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the test and confirm it passes**
 
 Run: `uv run python -m pytest -q tests/test_cutover_cli.py`
-Expected: PASS, 10 tests.
+Expected: PASS, 12 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -5443,8 +5707,9 @@ plan before proceeding rather than inventing a test during the campaign.
 | Isolation — vault byte-identical at every precommit stage, ignored/untracked intact | `tests/test_cutover_build.py::test_every_precommit_stage_failure_preserves_the_complete_live_vault`, `tests/test_cutover_build.py::test_isolated_worktree_writes_do_not_reach_the_live_vault`, `tests/test_cutover_build.py::test_isolated_worktree_is_removed_on_success_and_failure`, `tests/test_cutover_promotion.py::test_promotion_leaves_an_obstructing_untracked_file_intact` |
 | Isolation — no `reset --hard` or `clean -fd` | `tests/test_cutover_build.py::test_no_destructive_git_command_appears_in_the_cutover_modules` (Step 2) |
 | Promotion refusal — moved HEAD, changed status, new ignored content | `tests/test_cutover_promotion.py::test_promotion_refuses_a_moved_head`, `tests/test_cutover_promotion.py::test_promotion_refuses_a_changed_status`, `tests/test_cutover_promotion.py::test_promotion_repeats_the_ignored_content_check` |
-| Approval binding — digest not in manifest; bytes canonical | `tests/test_cutover_manifest.py::test_manifest_never_contains_its_own_digest`, `tests/test_cutover_manifest.py::test_verify_refuses_digest_matching_but_noncanonical_bytes` |
+| Approval binding — digest not in manifest; UTF-8 JSON framing, duplicate keys, and paths canonical | `tests/test_cutover_manifest.py::test_manifest_never_contains_its_own_digest`, `tests/test_cutover_manifest.py::test_verify_refuses_digest_matching_but_noncanonical_bytes`, `tests/test_cutover_manifest.py::test_canonical_bytes_have_exact_utf8_json_framing`, `tests/test_cutover_manifest.py::test_duplicate_object_keys_are_refused_even_with_a_matching_digest`, `tests/test_cutover_manifest.py::test_manifest_paths_must_be_canonical_relative_posix[absolute]`, `tests/test_cutover_manifest.py::test_manifest_paths_must_be_canonical_relative_posix[parent]`, `tests/test_cutover_manifest.py::test_manifest_paths_must_be_canonical_relative_posix[backslash]`, `tests/test_cutover_manifest.py::test_manifest_paths_must_be_canonical_relative_posix[empty-segment]`, `tests/test_cutover_manifest.py::test_manifest_paths_must_be_canonical_relative_posix[dot]`, `tests/test_cutover_manifest.py::test_manifest_paths_must_be_canonical_relative_posix[parent-segment]` |
 | Approval binding — any difference refused | `tests/test_cutover_manifest.py::test_verify_refuses_a_single_changed_byte`, `tests/test_cutover_build.py::test_build_refuses_a_manifest_that_does_not_match_its_record`, `tests/test_cutover_build.py::test_build_refuses_a_mapping_that_is_not_the_deterministic_result` |
+| Approval binding — exact clean executor commit | `tests/test_cutover_manifest.py::test_approval_record_requires_an_executor_commit`, `tests/test_cutover_build.py::test_executor_revision_accepts_the_clean_approved_commit`, `tests/test_cutover_build.py::test_executor_revision_refuses_a_different_commit`, `tests/test_cutover_build.py::test_executor_revision_refuses_a_dirty_worktree`, `tests/test_cutover_cli.py::test_action_commands_refuse_a_different_executor[dry-run]`, `tests/test_cutover_cli.py::test_action_commands_refuse_a_different_executor[apply]` |
 | Database allowlist — narrowness | `tests/test_cutover_db.py::test_only_the_allowlisted_column_is_updated`, `tests/test_cutover_db.py::test_a_matching_column_name_in_another_database_is_untouched`, `tests/test_cutover_db.py::test_an_unknown_table_or_column_is_a_hard_stop`, `tests/test_cutover_db.py::test_a_missing_database_is_a_hard_stop` |
 | Database axis typing | `tests/test_cutover_db.py::test_a_product_target_receives_only_the_product_mapping`, `tests/test_cutover_db.py::test_a_member_target_receives_only_the_member_mapping`, `tests/test_cutover_db.py::test_the_residual_query_ignores_another_axis_old_value`, `tests/test_cutover_manifest.py::test_database_target_axis_must_be_product_or_member` |
 | Database path confinement | `tests/test_cutover_db.py::test_an_absolute_path_is_refused`, `tests/test_cutover_db.py::test_a_path_escaping_the_root_is_refused`, `tests/test_cutover_db.py::test_a_symlinked_component_is_refused` |
@@ -5556,6 +5821,12 @@ For each row: copy the target file to `/private/tmp/cutover-preimage-<n>.py`, ap
 | 41 | `app/cutover_locations.py` | `normalized = boundaried(term).sub("<mapped>", normalized)` → `normalized = normalized` | `tests/test_cutover_locations.py::test_stable_context_ignores_an_approved_typed_value_rewrite` | an approved typed rewrite changed the advisory context identity |
 | 42 | `app/cutover_build.py` | `_occurrence_key(item, path=path, include_ordinal=True)` → `_occurrence_key(item, path=path, include_ordinal=False)` | `tests/test_cutover_build.py::test_post_advisory_identity_refuses_reordering_approved_contexts` | `DID NOT RAISE` because reordered occurrences were rebound without their source ordinals |
 | 43 | `app/cutover_locations.py` | `if token_key in typed:` → `if any(item[:4] == token_key[:4] for item in typed):` | `tests/test_cutover_locations.py::test_a_typed_scalar_does_not_hide_same_axis_prose_on_its_line` | same-axis prose was hidden by a whole-line typed exclusion |
+| 44 | `app/cutover_manifest.py` | The canonical serializer's `+ "\n"` → `+ ""` | `tests/test_cutover_manifest.py::test_canonical_bytes_have_exact_utf8_json_framing` | canonical manifest lost its one required final LF |
+| 45 | `app/cutover_manifest.py` | `object_pairs_hook=_without_duplicate_keys` → `object_pairs_hook=dict` | `tests/test_cutover_manifest.py::test_duplicate_object_keys_are_refused_even_with_a_matching_digest` | duplicate manifest keys were accepted |
+| 46 | `app/cutover_manifest.py` | `_require_relative_posix_path(self.path, "database target path")` → `None` | `tests/test_cutover_manifest.py::test_manifest_paths_must_be_canonical_relative_posix[absolute]` | an absolute manifest path was accepted |
+| 47 | `app/cutover_build.py` | `if status:` inside `require_executor_revision` → `if False:` | `tests/test_cutover_build.py::test_executor_revision_refuses_a_dirty_worktree` | a dirty executor was accepted as the approved bytes |
+| 48 | `app/cutover_build.py` | `if head != record.executor_commit:` → `if False:` | `tests/test_cutover_build.py::test_executor_revision_refuses_a_different_commit` | a different executor commit was accepted |
+| 49 | `app/cutover.py` | `require_executor_revision(record)` → `None` | `tests/test_cutover_cli.py::test_action_commands_refuse_a_different_executor[dry-run]` | dry-run skipped the executor binding shared with apply |
 
 Before applying a row, assert its OLD anchor appears exactly once in the target
 file. Rows 11, 16, 17, 18, 21, 22, 28, and 38 are explicitly multi-line exact
@@ -5601,15 +5872,16 @@ git commit -m "docs: record the cutover mutation ledger"
 - [ ] **Step 9: Run publication gates against the committed checkpoint**
 
 ```bash
+uv run python -m tools.public_repo_audit --repo .
 uv run python -m tools.public_repo_audit --repo . --history
 tools/run_gitleaks.sh .
 git diff --check
 git status --porcelain --untracked-files=all
 ```
 
-Expected: audit `CLEAN`; Gitleaks no leaks; diff check and status produce no
-output. Do not amend the evidence commit after this check; any correction gets
-a new, separately verified commit.
+Expected: each audit exits zero and writes exactly one `CLEAN` line; Gitleaks no
+leaks; diff check and status produce no output. Do not amend the evidence commit
+after this check; any correction gets a new, separately verified commit.
 
 ---
 
@@ -5632,3 +5904,7 @@ audits, the private suite, `check_v2`, and the opaque clean-state comparison,
 and performs the migration itself. Pre-existing edits are committed or
 preserved outside the cutover before inventory; restoring them is a later
 verified operation and never part of the approval-bound commit or revert proof.
+For both current-tree and history publication audits, success means exit zero
+and stdout byte-for-byte equal to `CLEAN\n`; findings, missing/additional output,
+or non-zero exit fail closed. This check is separate from the exact
+`0 error(s), 0 warning(s)` parser used for `check_v2`.
