@@ -24,14 +24,17 @@ that found it.
 word replacement, a corrected history-audit expectation, an isolated mutable
 copy for dry-run, and removal of live-vault destructive rollback, and it
 incorporated the approved `books.db` decision. **Revision 3 applied six
-more:** the approval digest moves out of the manifest it signs; a
+more:** the approval digest moves out of the manifest it covers; a
 product-kind workspace `id` is typed to one axis only; ignored and untracked
 content under an affected entity is a hard stop; promotion requires quiescing
 every writer; a structural reference must join the typed rewrite list or stop
 the cutover; and database approval binds a source-relative path as well as
-table and column. **Revision 4 applies two document corrections:** that
+table and column. **Revision 4 applied two document corrections:** that
 miscount, and the scoping of `former_slugs` to the registry shapes that already
-support it.
+support it. **Revision 5 applies two wording corrections:** the no-schema rule
+is attributed to this design's scope and `AGENTS.md` rather than to decision 2,
+and "signed" is replaced throughout by "digest-bound", since the mechanism is a
+SHA-256 comparison and no cryptographic signature is defined.
 
 ## Objective
 
@@ -63,7 +66,8 @@ Decided by the product owner. These are inputs, not open questions.
     already at or above the floor keep their current value.
 12. `former_slugs` is retained as unread provenance only, never as an alias,
     and only in the entity and product registries that already carry it.
-    Member and workspace provenance lives in the signed cutover manifest.
+    Member and workspace provenance lives in the digest-bound approval
+    manifest and its separate approval record.
 13. Matching product and member values inside `books.db` are migrated in the
     same reversible cutover commit, under the narrow allowlist rules below.
 14. A product-kind workspace's `id` is a workspace identifier and takes
@@ -497,7 +501,7 @@ failure.
    Emits the proposed mapping and the proposed `(path, table, column)`
    allowlist. Writes nothing, commits nothing, takes no lock.
 2. **Owner approval** — the owner reviews and explicitly approves a canonical
-   manifest, signed by a separate approval record. See below.
+   manifest, digest-bound by a separate approval record. See below.
 3. **Dry run** — default. In a temporary isolated worktree at the manifest's
    source HEAD, apply every mapping in the fixed order and render the complete
    combined diff, move list, and database row-change summary. Discard the
@@ -703,8 +707,11 @@ an `id:` value**, not a mapping key. `app/rename.py` takes its `else` branch for
 members and rewrites the `id:` value alone, and its workspace planner inserts no
 provenance at all. There is no `<slug>:` line to anchor to, so writing
 `former_slugs` there would mean inventing a placement convention and adding a
-new field to a list-entry shape. That is a registry schema change, which
-decision 2 forbids and `AGENTS.md` makes a hard stop.
+new field to a list-entry shape. That is a registry schema change, which this
+design's scope excludes — see the Objective and "Explicitly out of scope" — and
+which `AGENTS.md` makes a binding stop. Decision 2 is not the authority here:
+it forbids aliases and compatibility fallbacks, which is a different rule that
+`former_slugs` also has to satisfy.
 
 The resulting asymmetry — entity and product carry vault-side provenance,
 member and workspace do not — is **inherited from the existing registries, not
@@ -712,7 +719,7 @@ introduced by this cutover.** Preserving it is the whole point.
 
 #### Where member and workspace provenance lives instead
 
-In the signed approval manifest, which already binds the exact old → new
+In the digest-bound approval manifest, which already binds the exact old → new
 mappings for all four axes. No new artifact is required.
 
 Two consequences follow. First, the manifest and its approval record must be
@@ -973,7 +980,8 @@ Work halts and returns to the product owner on any of these:
 - Relocating, retiring, or migrating ignored or untracked content; the cutover
   refuses instead.
 - Adding `former_slugs` to the list-shaped member and workspace registries;
-  their provenance lives in the signed manifest.
+  their provenance lives in the digest-bound approval manifest and its
+  separate approval record.
 - Any change to S7 review tokens, receipts, quarantine, or the managed-
   directory boundary.
 - Changes to Items 2, 3, or 4 beyond resuming them in order.
