@@ -260,7 +260,7 @@ occurrence of an in-scope identifier, matched as a whole token with the
 existing boundary pattern, that lies **outside** the enumerated locations.
 Occurrences remain grouped by file and line for display, but a display line is
 not their authority. Each occurrence is identified by source-relative path,
-axis, old value, token ordinal within the line, and a SHA-256 context digest of
+axis, old value, token ordinal within the file, and a SHA-256 context digest of
 that exact source line. The manifest's source HEAD makes that identity refer to
 one immutable snapshot even if later insertions shift display line numbers.
 
