@@ -179,6 +179,7 @@ def registry_entry_scalar_spans(
     Returns `(line, start_col, end_col, value)`; the caller edits the decoded
     text at those offsets and never reserialises.
     """
+    _refuse_record_anchors(text, f"{container}.yaml")
     try:
         root = yaml.compose(text)
     except yaml.YAMLError as exc:
@@ -245,6 +246,7 @@ def root_scalar_spans(
     Returns `(field, line, start_col, end_col, value)`; the caller edits the
     decoded text at those offsets and never reserialises.
     """
+    _refuse_record_anchors(text, "record")
     try:
         root = yaml.compose(text)
     except yaml.YAMLError as exc:
@@ -334,6 +336,32 @@ def _policy_events(text: str):
 def _policy_nodes(text: str):
     """The policy's composed node graph, carrying the marks the writer edits."""
     return yaml.compose(text)
+
+
+@structured_reader(category="admin-record")
+def _record_events(text: str):
+    """A record's YAML event stream — the layer node offsets derive from."""
+    return list(yaml.parse(text))
+
+
+def _refuse_record_anchors(text: str, label: str) -> None:
+    """Refuse a record that uses YAML anchors or aliases.
+
+    An alias resolves to the anchor's node, so the marks a rewriter works from
+    point at wherever the anchor was declared — possibly an unrelated field.
+    Editing there silently changes a value outside the closed location table,
+    and because typed-span detection reads the same marks, the occurrence is
+    suppressed from the advisory report as well.
+    """
+    try:
+        for event in _record_events(text):
+            if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None):
+                raise UnreadableFile(
+                    f"{label} uses a YAML anchor or alias; the cutover neither "
+                    f"rewrites nor verifies indirected values"
+                )
+    except yaml.YAMLError as exc:
+        raise UnreadableFile(f"{label} could not be scanned for anchors") from exc
 
 
 def _refuse_yaml_anchors(text: str) -> None:

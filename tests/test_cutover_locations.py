@@ -53,6 +53,9 @@ def test_location_keys_are_stable_identifiers_for_dispositions():
 import textwrap
 
 from app.cutover_locations import (
+    rewrite_root_scalar,
+    registry_entry_scalar_spans,
+    root_scalar_spans,
     rewrite_registry_entry_scalar,
     rewrite_front_matter_field,
     rewrite_mapping_key,
@@ -1077,3 +1080,54 @@ def test_root_proposal_fields_stay_typed(tmp_path: Path):
     assert advisory_occurrences(
         tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),)
     ) == []
+
+
+ALIASED_PROPOSAL = "meta: &shared ab\nentity: *shared\nsrc: ab/a.md\n"
+ALIASED_MEMBERS = "members:\n  ab:\n    - {meta: &s m7, id: *s}\n"
+ALIASED_WORKSPACES = "workspaces:\n  - {meta: &s w7, id: *s}\n"
+
+
+def test_root_scalar_spans_refuse_yaml_aliases():
+    """An alias resolves to the anchor's node, whose marks point elsewhere.
+
+    Rewriting at those offsets edits the *anchor* — here an unrelated `meta:`
+    — while the aliased field keeps its value. Typed-span detection then hides
+    the occurrence, so the edit is silent and outside the closed table.
+    """
+    with pytest.raises(UnreadableFile, match="anchor or alias"):
+        root_scalar_spans(ALIASED_PROPOSAL, ("entity", "src", "dst"))
+
+
+@pytest.mark.parametrize(
+    ("text", "container"),
+    [(ALIASED_MEMBERS, "members"), (ALIASED_WORKSPACES, "workspaces")],
+    ids=["members", "workspaces"],
+)
+def test_registry_entry_spans_refuse_yaml_aliases(text: str, container: str):
+    with pytest.raises(UnreadableFile, match="anchor or alias"):
+        registry_entry_scalar_spans(text, container, ("id",))
+
+
+def test_an_aliased_proposal_is_never_rewritten():
+    with pytest.raises(UnreadableFile):
+        rewrite_root_scalar(ALIASED_PROPOSAL, "entity", "ab", "ab-entity")
+
+
+def test_an_aliased_registry_entry_is_never_rewritten():
+    with pytest.raises(UnreadableFile):
+        rewrite_registry_entry_scalar(
+            ALIASED_MEMBERS, "members", "id", "m7", "m7-member"
+        )
+
+
+def test_ordinary_records_still_work_without_anchors():
+    """The refusal is specific to anchors, not a blanket rejection."""
+    proposal = "entity: ab\nsrc: ab/a.md\ndst: ab/b.md\n"
+    assert rewrite_root_scalar(proposal, "entity", "ab", "ab-entity") == (
+        "entity: ab-entity\nsrc: ab/a.md\ndst: ab/b.md\n"
+    )
+
+    members = "members:\n  ab:\n    - {id: m7}\n"
+    assert rewrite_registry_entry_scalar(
+        members, "members", "id", "m7", "m7-member"
+    ) == "members:\n  ab:\n    - {id: m7-member}\n"

@@ -366,3 +366,25 @@ def test_database_inventory_only_reports_entity_books_db(tmp_path: Path):
     make_db(tmp_path / "_system" / "books.db")
 
     assert list(database_schema_inventory(tmp_path)) == ["ab/books.db"]
+
+
+def test_inventory_refuses_a_registered_entity_root_that_is_a_symlink(tmp_path: Path):
+    """A registered entity root that redirects must stop the inventory.
+
+    The existing CLI coverage exercised only an *unregistered* symlink, which
+    is merely out of scope. A registered one names a database the owner would
+    be asked to approve, resolved through a redirection.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    make_db(outside / "books.db")
+    (tmp_path / "ab").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(DatabaseCutoverError, match="symlink"):
+        database_schema_inventory(tmp_path, {"ab"})
+
+
+def test_inventory_accepts_a_real_registered_entity_root(tmp_path: Path):
+    make_db(tmp_path / "ab" / "books.db")
+
+    assert list(database_schema_inventory(tmp_path, {"ab"})) == ["ab/books.db"]
