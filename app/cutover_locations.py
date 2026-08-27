@@ -202,3 +202,305 @@ def rewrite_policy_path_heads(text: str, old: str, new: str) -> str:
         return f"{boundary}{spacing}{key}: [{rewritten}]"
 
     return _POLICY_LIST.sub(rewrite_body, text)
+
+
+from pathlib import Path
+import hashlib
+import os
+
+from .cutover_manifest import Mapping
+
+SKIP_DIRS = frozenset({".git", ".obsidian", ".trash"})
+BINARY_SUFFIXES = frozenset({
+    ".pdf", ".docx", ".xlsx", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+    ".db", ".sqlite", ".sqlite3", ".zip", ".gz", ".tar", ".woff", ".woff2",
+})
+
+#: The only two files where a `former_slugs:` line is legitimate. The rejected
+#: plan exempted every line containing the substring, in any file — a blanket
+#: exemption that would mask a genuine residual anywhere in the vault.
+FORMER_SLUGS_FILES = frozenset({
+    "_system/entities.yaml",
+    "_system/products.yaml",
+})
+
+
+class UnreadableFile(Exception):
+    """A text file the advisory scan could not read.
+
+    Never skipped: an unreadable file could hold a residual, and skipping it
+    would let the gate pass on evidence it never saw.
+    """
+
+
+@dataclass(frozen=True, order=True)
+class AdvisoryOccurrence:
+    path: str
+    axis: str
+    old: str
+    ordinal: int
+    context_sha256: str
+    line: int
+
+
+def _yaml_scalar_span(
+    line: str, field: str, old: str
+) -> tuple[int, int] | None:
+    pattern = re.compile(
+        rf"(^|[{{,])"
+        rf"([ \t]*(?:-[ \t]*)?{re.escape(field)}:[ \t]*)"
+        rf"(?P<value>{re.escape(old)})"
+        rf"(?=[ \t]*(?:[,}}#]|$))"
+    )
+    match = pattern.search(line)
+    return None if match is None else match.span("value")
+
+
+def _mapping_key_span(
+    line: str, old: str, indent: int
+) -> tuple[int, int] | None:
+    match = re.match(
+        rf"^\s{{{indent}}}(?P<value>{re.escape(old)}):\s*(?:#.*)?$",
+        line,
+    )
+    return None if match is None else match.span("value")
+
+
+def _typed_token_spans(
+    root: Path, mappings: tuple[Mapping, ...]
+) -> set[tuple[str, int, str, str, int, int]]:
+    """Exact token spans owned by the closed rewrite-location table.
+
+    Advisory reporting is the complement of these spans, not of whole lines.
+    A typed scalar and same-axis prose may share a line; only the scalar span
+    is excluded.
+    """
+    by_axis = {
+        axis: {item.old for item in mappings if item.axis == axis}
+        for axis in AXES
+    }
+    typed: set[tuple[str, int, str, str, int, int]] = set()
+
+    def record(
+        relative: str,
+        number: int,
+        axis: str,
+        old: str,
+        span: tuple[int, int] | None,
+    ) -> None:
+        if span is not None:
+            typed.add((relative, number, axis, old, *span))
+
+    for candidate in sorted(root.rglob("*")):
+        relative = candidate.relative_to(root).as_posix()
+        if any(part in SKIP_DIRS for part in Path(relative).parts):
+            continue
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        if candidate.suffix.lower() in BINARY_SUFFIXES:
+            continue
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError) as exc:
+            raise UnreadableFile(f"{relative} could not be read") from exc
+
+        in_front_matter = False
+        for number, line in enumerate(lines, start=1):
+            if candidate.suffix.lower() == ".md":
+                if number == 1 and line.strip() == "---":
+                    in_front_matter = True
+                    continue
+                if in_front_matter and line.strip() == "---":
+                    in_front_matter = False
+                    continue
+                if in_front_matter:
+                    for axis, field in (
+                        ("entity", "entity"),
+                        ("product", "product"),
+                        ("member", "member"),
+                    ):
+                        for old in by_axis[axis]:
+                            record(
+                                relative,
+                                number,
+                                axis,
+                                old,
+                                _yaml_scalar_span(line, field, old),
+                            )
+
+            if relative == "_system/entities.yaml":
+                for old in by_axis["entity"]:
+                    record(
+                        relative,
+                        number,
+                        "entity",
+                        old,
+                        _mapping_key_span(line, old, 2),
+                    )
+            elif relative == "_system/products.yaml":
+                for axis, indent in (("entity", 2), ("product", 4)):
+                    for old in by_axis[axis]:
+                        record(
+                            relative,
+                            number,
+                            axis,
+                            old,
+                            _mapping_key_span(line, old, indent),
+                        )
+            elif relative == "_system/members.yaml":
+                for old in by_axis["entity"]:
+                    record(
+                        relative,
+                        number,
+                        "entity",
+                        old,
+                        _mapping_key_span(line, old, 2),
+                    )
+                for old in by_axis["member"]:
+                    record(
+                        relative,
+                        number,
+                        "member",
+                        old,
+                        _yaml_scalar_span(line, "id", old),
+                    )
+            elif relative == "_system/workspaces.yaml":
+                for axis, fields in (
+                    ("workspace", ("id",)),
+                    ("entity", ("entity", "primary_entity")),
+                    ("product", ("product",)),
+                    ("member", ("member",)),
+                ):
+                    for field in fields:
+                        for old in by_axis[axis]:
+                            record(
+                                relative,
+                                number,
+                                axis,
+                                old,
+                                _yaml_scalar_span(line, field, old),
+                            )
+            elif relative == "_system/scripts/action-policy.yaml":
+                for match in _POLICY_LIST.finditer(line):
+                    for quoted in _QUOTED.finditer(match.group(4)):
+                        head = quoted.group(2).partition("/")[0]
+                        if head in by_axis["entity"]:
+                            start = match.start(4) + quoted.start(2)
+                            record(
+                                relative,
+                                number,
+                                "entity",
+                                head,
+                                (start, start + len(head)),
+                            )
+            elif candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
+                for old in by_axis["entity"]:
+                    record(
+                        relative,
+                        number,
+                        "entity",
+                        old,
+                        _yaml_scalar_span(line, "entity", old),
+                    )
+                    for field in ("src", "dst"):
+                        pattern = re.compile(
+                            rf"(^|[{{,])([ \t]*{field}:[ \t]*)"
+                            rf"(?P<value>{re.escape(old)})/"
+                        )
+                        match = pattern.search(line)
+                        record(
+                            relative,
+                            number,
+                            "entity",
+                            old,
+                            None if match is None else match.span("value"),
+                        )
+    return typed
+
+
+def stable_advisory_context(line: str, mappings: tuple[Mapping, ...]) -> str:
+    """Hash context after neutralizing only approved old/new mapping tokens.
+
+    The neutral form is stable when a typed value on the same line is rewritten.
+    Every non-mapping byte remains authoritative, and occurrence counts are
+    checked separately, so rewriting or adding an incidental old token cannot
+    hide behind this normalization.
+    """
+    normalized = line
+    terms = sorted(
+        {value for item in mappings for value in (item.old, item.new)},
+        key=lambda value: (-len(value), value),
+    )
+    for term in terms:
+        normalized = boundaried(term).sub("<mapped>", normalized)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def advisory_occurrences(
+    root: Path, mappings: tuple[Mapping, ...]
+) -> list[AdvisoryOccurrence]:
+    """Whole-token occurrences of an old identifier, for owner disposition.
+
+    Reported, never rewritten. A short identifier may be an ordinary word, so
+    the owner decides which occurrences are structural references and which are
+    incidental prose.
+    """
+    patterns = {
+        (item.axis, item.old): boundaried(item.old) for item in mappings
+    }
+    typed = _typed_token_spans(root, mappings)
+    found: list[AdvisoryOccurrence] = []
+    for candidate in sorted(root.rglob("*")):
+        relative = candidate.relative_to(root).as_posix()
+        if any(part in SKIP_DIRS for part in Path(relative).parts):
+            continue
+        if candidate.is_symlink():
+            try:
+                text = os.readlink(candidate)
+            except OSError as exc:
+                raise UnreadableFile(f"{relative} link text could not be read") from exc
+        elif candidate.is_file():
+            if candidate.suffix.lower() in BINARY_SUFFIXES:
+                continue
+            try:
+                text = candidate.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as exc:
+                raise UnreadableFile(
+                    f"{relative} could not be read; the advisory scan cannot pass "
+                    f"on a file it never saw"
+                ) from exc
+        else:
+            continue
+        exempt_former_slugs = relative in FORMER_SLUGS_FILES
+        ordinals: dict[tuple[str, str], int] = {}
+        for number, line in enumerate(text.splitlines(), start=1):
+            if exempt_former_slugs and re.match(
+                r"^\s*former_slugs:\s*\[", line
+            ):
+                continue
+            context_sha256 = stable_advisory_context(line, mappings)
+            for (axis, old), pattern in patterns.items():
+                for match in pattern.finditer(line):
+                    token_key = (
+                        relative,
+                        number,
+                        axis,
+                        old,
+                        match.start(),
+                        match.end(),
+                    )
+                    if token_key in typed:
+                        continue
+                    key = (axis, old)
+                    ordinals[key] = ordinals.get(key, 0) + 1
+                    found.append(
+                        AdvisoryOccurrence(
+                            path=relative,
+                            axis=axis,
+                            old=old,
+                            ordinal=ordinals[key],
+                            context_sha256=context_sha256,
+                            line=number,
+                        )
+                    )
+    return sorted(found)

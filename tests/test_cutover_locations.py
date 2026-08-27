@@ -198,3 +198,205 @@ def test_policy_rewrite_leaves_a_non_matching_path_head_alone():
     result = rewrite_policy_path_heads(POLICY, "ab", "ab-entity")
 
     assert '".sensitive/**"' in result
+
+
+from pathlib import Path
+
+import pytest
+
+from app.cutover_locations import (
+    AdvisoryOccurrence,
+    UnreadableFile,
+    advisory_occurrences,
+    stable_advisory_context,
+)
+from app.cutover_manifest import Mapping
+
+
+ADVISORY_MAPPINGS = (
+    Mapping(axis="entity", old="ab", new="ab-entity"),
+    Mapping(axis="product", old="q7", new="q7-product"),
+    Mapping(axis="member", old="m7", new="m7-member"),
+    Mapping(axis="workspace", old="w7", new="w7-workspace"),
+)
+
+
+def occurrence(
+    path: str,
+    line: int,
+    axis: str,
+    old: str,
+    text: str,
+    ordinal: int = 1,
+) -> AdvisoryOccurrence:
+    return AdvisoryOccurrence(
+        path=path,
+        axis=axis,
+        old=old,
+        ordinal=ordinal,
+        context_sha256=stable_advisory_context(text, ADVISORY_MAPPINGS),
+        line=line,
+    )
+
+
+def test_advisory_reports_a_bare_token_outside_the_enumerated_locations(tmp_path: Path):
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "one.md").write_text("the ab pattern\n", encoding="utf-8")
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
+        occurrence("notes/one.md", 1, "entity", "ab", "the ab pattern")
+    ]
+
+
+def test_advisory_identity_distinguishes_two_tokens_on_one_line(tmp_path: Path):
+    (tmp_path / "note.md").write_text("ab and ab\n", encoding="utf-8")
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
+        occurrence("note.md", 1, "entity", "ab", "ab and ab", ordinal=1),
+        occurrence("note.md", 1, "entity", "ab", "ab and ab", ordinal=2),
+    ]
+
+
+def test_advisory_does_not_report_a_migrated_token(tmp_path: Path):
+    (tmp_path / "note.md").write_text("entity: ab-entity\n", encoding="utf-8")
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == []
+
+
+def test_stable_context_ignores_an_approved_typed_value_rewrite():
+    before = "entity: ab # q7 remains incidental"
+    after = "entity: ab-entity # q7 remains incidental"
+
+    assert stable_advisory_context(before, ADVISORY_MAPPINGS) == (
+        stable_advisory_context(after, ADVISORY_MAPPINGS)
+    )
+
+
+def test_advisory_does_not_report_a_longer_token(tmp_path: Path):
+    (tmp_path / "note.md").write_text("xabx and cab and abx\n", encoding="utf-8")
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == []
+
+
+def test_advisory_skips_git_and_binaries(tmp_path: Path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "note.md").write_text("ab\n", encoding="utf-8")
+    (tmp_path / "books.db").write_bytes(b"\x00ab\x00")
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == []
+
+
+def test_former_slugs_is_exempt_only_in_the_entity_and_product_registries(
+    tmp_path: Path,
+):
+    system = tmp_path / "_system"
+    system.mkdir()
+    (system / "entities.yaml").write_text(
+        "entities:\n  ab-entity:\n    former_slugs: [ab]\n", encoding="utf-8"
+    )
+    (system / "products.yaml").write_text(
+        "products:\n  ab-entity:\n    q7-product:\n      former_slugs: [q7]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "note.md").write_text("former_slugs: [ab]\n", encoding="utf-8")
+
+    found = advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:2])
+
+    assert found == [
+        occurrence("note.md", 1, "entity", "ab", "former_slugs: [ab]")
+    ]
+
+
+def test_former_slugs_is_not_exempt_in_the_member_registry(tmp_path: Path):
+    system = tmp_path / "_system"
+    system.mkdir()
+    (system / "members.yaml").write_text(
+        "members:\n  ab-entity:\n    - {id: m7-member, former_slugs: [m7]}\n",
+        encoding="utf-8",
+    )
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[2:3]) == [
+        occurrence(
+            "_system/members.yaml",
+            3,
+            "member",
+            "m7",
+            "    - {id: m7-member, former_slugs: [m7]}",
+        )
+    ]
+
+
+def test_an_unreadable_text_file_is_a_hard_failure(tmp_path: Path):
+    (tmp_path / "note.md").write_bytes(b"\xff\xfe not utf-8 \xff")
+
+    with pytest.raises(UnreadableFile):
+        advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1])
+
+
+def test_typed_registry_front_matter_workspace_policy_and_proposal_lines_are_not_advisory(
+    tmp_path: Path,
+):
+    system = tmp_path / "_system"
+    (system / "scripts").mkdir(parents=True)
+    (system / "entities.yaml").write_text(
+        "entities:\n  ab:\n    label: A\n", encoding="utf-8"
+    )
+    (system / "products.yaml").write_text(
+        "products:\n  ab:\n    q7:\n      label: Q\n", encoding="utf-8"
+    )
+    (system / "members.yaml").write_text(
+        "members:\n  ab:\n    - {id: m7}\n", encoding="utf-8"
+    )
+    (system / "workspaces.yaml").write_text(
+        "workspaces:\n  - {id: w7, entity: ab, product: q7, member: m7}\n",
+        encoding="utf-8",
+    )
+    (system / "scripts" / "action-policy.yaml").write_text(
+        'allow:\n  - {paths: ["ab/**"], except: ["ab/.sensitive/**"]}\n',
+        encoding="utf-8",
+    )
+    inbox = tmp_path / "ab" / "00-inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "note.md").write_text(
+        "---\nentity: ab\nproduct: q7\nmember: m7\n---\n\nordinary ab prose\n",
+        encoding="utf-8",
+    )
+    outbox = tmp_path / "ab" / "outbox"
+    outbox.mkdir()
+    (outbox / "p.yaml").write_text(
+        "entity: ab\nsrc: ab/00-inbox/a.md\ndst: ab/09-marketing/a.md\n",
+        encoding="utf-8",
+    )
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS) == [
+        occurrence(
+            "ab/00-inbox/note.md", 7, "entity", "ab", "ordinary ab prose"
+        )
+    ]
+
+
+def test_a_typed_scalar_does_not_hide_same_axis_prose_on_its_line(tmp_path: Path):
+    note = tmp_path / "note.md"
+    note.write_text(
+        "---\nentity: ab # ab remains ordinary prose\n---\n",
+        encoding="utf-8",
+    )
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
+        occurrence(
+            "note.md",
+            2,
+            "entity",
+            "ab",
+            "entity: ab # ab remains ordinary prose",
+        )
+    ]
+
+
+def test_a_symlink_is_scanned_as_link_text_without_following_its_target(tmp_path: Path):
+    link = tmp_path / "ab-link"
+    link.symlink_to("ab/target")
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
+        occurrence("ab-link", 1, "entity", "ab", "ab/target")
+    ]
