@@ -108,3 +108,179 @@ def promote(
         raise CutoverError(
             "shared action lock is unavailable; the cutover was not started"
         ) from exc
+
+
+import argparse
+
+import yaml
+
+from .cutover_build import (
+    isolated_worktree,
+    mappings_in_order,
+    require_executor_revision,
+)
+from .cutover_db import (
+    database_reference_inventory,
+    database_schema_inventory,
+)
+from .cutover_inventory import (
+    check_collisions,
+    existing_identifiers,
+    proposed_mappings,
+    require_clean_entities,
+    require_clean_status,
+)
+from .cutover_locations import advisory_occurrences
+from .cutover_manifest import ApprovalRecord, load_manifest, verify_manifest
+
+
+def _load_approval(path: Path) -> ApprovalRecord:
+    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(document, dict):
+        raise CutoverError("approval record must be a mapping")
+    try:
+        return ApprovalRecord(
+            manifest_sha256=document["manifest_sha256"],
+            executor_commit=document["executor_commit"],
+            approved_by=document["approved_by"],
+        )
+    except KeyError as exc:
+        raise CutoverError("approval record is missing a required field") from exc
+
+
+def _run_inventory(vault: Path) -> int:
+    require_clean_status(vault)
+    source_head = git(vault, "rev-parse", "HEAD").strip()
+    with isolated_worktree(vault, source_head) as snapshot:
+        mappings = proposed_mappings(snapshot)
+        check_collisions(mappings, existing_identifiers(snapshot))
+        affected = sorted({m.old for m in mappings if m.axis == "entity"})
+        occurrences = advisory_occurrences(snapshot, mappings)
+        schemas = database_schema_inventory(snapshot)
+        references = database_reference_inventory(snapshot, mappings)
+
+    require_clean_entities(vault, affected)
+    if git(vault, "rev-parse", "HEAD").strip() != source_head:
+        raise CutoverError("live HEAD changed during inventory; discard the result")
+    require_clean_status(vault)
+    require_clean_entities(vault, affected)
+
+    print(f"source HEAD: {source_head}")
+    for mapping in mappings:
+        print(f"{mapping.axis}: {mapping.old} -> {mapping.new}")
+    for occurrence in occurrences:
+        print(
+            f"advisory: {occurrence.path}:{occurrence.line} "
+            f"({occurrence.axis}:{occurrence.old} #{occurrence.ordinal} "
+            f"context={occurrence.context_sha256}) — disposition required"
+        )
+    for path, tables in schemas.items():
+        for table, columns in tables.items():
+            print(f"database {path} {table}: {', '.join(columns)}")
+    for reference in references:
+        print(
+            "database candidate (UNPROVEN — owner approval required): "
+            f"path={reference.path} table={reference.table} "
+            f"column={reference.column} axis={reference.axis} "
+            f"old={reference.old} count={reference.count}"
+        )
+    print("[INVENTORY] read-only; nothing was written")
+    return 0
+
+
+def _run_dry_run(vault: Path, manifest_bytes: bytes, record: ApprovalRecord) -> int:
+    """Build the real result in isolation and render it, then discard.
+
+    A dry run that only printed the mapping table would not be a preview: the
+    planners read from disk, so the only faithful preview is the tree the apply
+    would actually produce.
+    """
+    verify_manifest(manifest_bytes, record)
+    manifest = load_manifest(manifest_bytes)
+    result = build_cutover(vault, manifest_bytes, record)
+    print(git(vault, "diff", f"{manifest.source_head}..{result.commit}"))
+    for change in result.database_changes:
+        print(
+            "database rows changed: "
+            f"path={change.path} table={change.table} column={change.column} "
+            f"axis={change.axis} old={change.old} new={change.new} "
+            f"count={change.count}"
+        )
+    print(
+        "database rows changed (total): "
+        f"{sum(item.count for item in result.database_changes)}"
+    )
+    for mapping in mappings_in_order(manifest):
+        print(f"{mapping.axis}: {mapping.old} -> {mapping.new}")
+    print("\n[DRY RUN] re-run with apply to execute")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="oneos cutover",
+        description="Raise registry identifiers to the five-character floor.",
+    )
+    parser.add_argument("command", choices=("inventory", "dry-run", "apply"))
+    parser.add_argument("--vault-root", default=".")
+    parser.add_argument("--manifest")
+    parser.add_argument("--approval")
+    parser.add_argument(
+        "--i-have-quiesced-all-writers",
+        action="store_true",
+        help=(
+            "confirm OneOS, Hermes, and every parser and adapter are stopped; "
+            "the working-tree update is not atomic and the action lock does "
+            "not govern them"
+        ),
+    )
+    args = parser.parse_args(argv)
+    vault = Path(args.vault_root).expanduser().resolve()
+
+    try:
+        if args.command == "inventory":
+            return _run_inventory(vault)
+
+        if not args.manifest or not args.approval:
+            print("[ABORTED] --manifest and --approval are required")
+            return 1
+        manifest_bytes = Path(args.manifest).read_bytes()
+        record = _load_approval(Path(args.approval))
+        require_executor_revision(record)
+
+        if args.command == "dry-run":
+            return _run_dry_run(vault, manifest_bytes, record)
+
+        if not args.i_have_quiesced_all_writers:
+            print(
+                "[ABORTED] refusing to promote without "
+                "--i-have-quiesced-all-writers: stop OneOS, Hermes, and every "
+                "parser and adapter first"
+            )
+            return 1
+
+        manifest = load_manifest(manifest_bytes)
+        source_head = git(vault, "rev-parse", "HEAD").strip()
+        expected_status = _status_bytes(vault)
+        affected = [m.old for m in manifest.mappings if m.axis == "entity"]
+        result = build_cutover(vault, manifest_bytes, record)
+        promoted_id = promote(
+            vault, result.commit, source_head, expected_status, affected
+        )
+        print(f"[DONE] cutover promoted as {promoted_id}")
+        print(
+            "[ROLLBACK WINDOW] keep writers stopped while verifying. Plain git "
+            "revert is safe only before writers restart; later rollback needs a "
+            "separately reviewed database recovery migration."
+        )
+        return 0
+    except CutoverCommittedError as exc:
+        print(f"[COMMITTED] {exc}")
+        return 2
+    except Exception as exc:  # noqa: BLE001 — CLI boundary
+        print(f"[ABORTED] {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
