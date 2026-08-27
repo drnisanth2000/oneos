@@ -141,4 +141,11 @@ def test_proposed_mappings_cover_only_sub_floor_identifiers(tmp_path: Path):
 def test_proposed_mappings_are_deterministically_ordered(tmp_path: Path):
     vault = registry_vault(tmp_path)
 
-    assert proposed_mappings(vault) == proposed_mappings(vault)
+    # `f() == f()` is satisfied by any implementation, including a random
+    # one that happens to be stable within a process. Assert the order.
+    assert proposed_mappings(vault) == (
+        Mapping(axis="entity", old="ab", new="ab-entity"),
+        Mapping(axis="product", old="q7", new="q7-product"),
+        Mapping(axis="member", old="m7", new="m7-member"),
+        Mapping(axis="workspace", old="w7", new="w7-workspace"),
+    )

@@ -190,6 +190,15 @@ def disposition(
     )
 
 
+def make_entity_db(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE ledger (product TEXT)")
+    conn.execute("INSERT INTO ledger VALUES ('q7')")
+    conn.commit()
+    conn.close()
+
+
 def cutover_vault(root: Path) -> Path:
     vault = git_vault(
         root,
@@ -225,11 +234,11 @@ def cutover_vault(root: Path) -> Path:
     return vault
 
 
-def approved(vault: Path, dispositions=None) -> tuple[bytes, ApprovalRecord]:
+def approved(vault: Path, dispositions=None, databases=None) -> tuple[bytes, ApprovalRecord]:
     manifest = ApprovalManifest(
         source_head=git_head(vault),
         mappings=CUTOVER_MAPPINGS,
-        databases=(
+        databases=databases if databases is not None else (
             DatabaseTarget(
                 path="ab/books.db", table="ledger", column="product", axis="product"
             ),
@@ -1653,3 +1662,121 @@ def test_former_slugs_values_survive_yaml_round_trip():
         )
         loaded = yaml.safe_load(result)["entities"]["x-entity"]["former_slugs"]
         assert loaded == [old], f"{old!r} round-tripped as {loaded!r}"
+
+
+def test_proposal_rewrite_is_confined_to_root_fields(tmp_path: Path):
+    """A proposal's `entity`/`src`/`dst` are root fields of the record.
+
+    A same-named key inside nested metadata is unrelated data; rewriting it
+    edits content the proposal schema never described.
+    """
+    from app.cutover_build import _rewrite_proposal
+
+    record = tmp_path / "p.yaml"
+    record.write_text(
+        "entity: ab\nsrc: ab/a.md\ndst: ab/b.md\n"
+        "meta:\n  entity: ab\n  src: ab/x.md\n  dst: ab/y.md\n",
+        encoding="utf-8",
+    )
+
+    _rewrite_proposal(record, "ab", "ab-entity")
+
+    document = yaml.safe_load(record.read_text(encoding="utf-8"))
+    assert document["entity"] == "ab-entity"
+    assert document["src"] == "ab-entity/a.md"
+    assert document["dst"] == "ab-entity/b.md"
+    assert document["meta"] == {
+        "entity": "ab",
+        "src": "ab/x.md",
+        "dst": "ab/y.md",
+    }, "nested metadata was rewritten"
+
+
+def test_former_slugs_matches_the_key_only_at_its_own_depth():
+    """A same-named key deeper in the tree is not the registry key.
+
+    Matching at any depth inserted provenance under the wrong parent and
+    produced a document that no longer parses.
+    """
+    from app.cutover_build import _record_former_slug
+
+    text = (
+        "products:\n"
+        "  ab:\n"
+        "    q7-product:\n"
+        "      nested:\n"
+        "        q7-product:\n"
+        "          x: 1\n"
+    )
+
+    result = _record_former_slug(text, "q7-product", "q7", 6)
+
+    loaded = yaml.safe_load(result)
+    assert loaded["products"]["ab"]["q7-product"]["former_slugs"] == ["q7"]
+    assert "former_slugs" not in loaded["products"]["ab"]["q7-product"]["nested"]["q7-product"]
+
+
+def test_build_refuses_a_database_under_an_unregistered_entity(tmp_path: Path):
+    """`<slug>/books.db` syntax is not membership.
+
+    A syntactically valid slug that no manifest registers names a database in
+    a location no registry describes, so the build must refuse rather than
+    write to it.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    make_entity_db(vault / "zz" / "books.db")
+    commit_in(vault, "add an unregistered entity database")
+
+    raw, record = approved(
+        vault,
+        databases=(
+            DatabaseTarget(
+                path="zz/books.db", table="ledger", column="product", axis="product"
+            ),
+        ),
+    )
+
+    with pytest.raises(CutoverError, match="registered entit"):
+        build_cutover(vault, raw, record)
+
+
+def test_build_refuses_a_symlinked_entity_root(tmp_path: Path):
+    """A registered entity whose root is a symlink redirects the migration.
+
+    Every path the cutover resolves beneath it would land outside the vault,
+    including the database the owner approved.
+    """
+    outside = tmp_path / "outside"
+    (outside / "00-inbox").mkdir(parents=True)
+    (outside / "00-inbox" / "note.md").write_text(
+        "---\nentity: ab\n---\n", encoding="utf-8"
+    )
+    make_entity_db(outside / "books.db")
+
+    vault = git_vault(
+        tmp_path / "vault",
+        {"_system/entities.yaml": "entities:\n  ab:\n    label: A\n"},
+    )
+    (vault / "ab").symlink_to(outside, target_is_directory=True)
+    subprocess.run(["git", "add", "-A"], cwd=vault, check=True, capture_output=True)
+    commit_in(vault, "registered entity root is a symlink")
+
+    manifest = ApprovalManifest(
+        source_head=git_head(vault),
+        mappings=(Mapping(axis="entity", old="ab", new="ab-entity"),),
+        databases=(
+            DatabaseTarget(
+                path="ab/books.db", table="ledger", column="product", axis="product"
+            ),
+        ),
+        dispositions=(),
+    )
+    raw = canonical_bytes(manifest)
+    record = ApprovalRecord(
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=approved(vault)[1].executor_commit,
+        approved_by="owner",
+    )
+
+    with pytest.raises(CutoverError, match="symlink"):
+        build_cutover(vault, raw, record)

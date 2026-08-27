@@ -232,6 +232,63 @@ def rewrite_registry_entry_scalar(
     return "".join(lines)
 
 
+@structured_reader(category="admin-record")
+def root_scalar_spans(
+    text: str, fields: tuple[str, ...]
+) -> list[tuple[str, int, int, int, str]]:
+    """Spans of root-level scalars in a mapping document.
+
+    A proposal's `entity`, `src` and `dst` are fields of the record itself.
+    A same-named key inside nested metadata is unrelated data, and a regex
+    boundary of `{`/`,`/line-start cannot tell the two apart.
+
+    Returns `(field, line, start_col, end_col, value)`; the caller edits the
+    decoded text at those offsets and never reserialises.
+    """
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise UnreadableFile("record could not be parsed") from exc
+    if not isinstance(root, yaml.MappingNode):
+        return []
+    found: list[tuple[str, int, int, int, str]] = []
+    for key_node, value_node in root.value:
+        field = getattr(key_node, "value", None)
+        if field in fields and isinstance(value_node, yaml.ScalarNode) and (
+            value_node.start_mark.line == value_node.end_mark.line
+        ):
+            found.append((
+                field,
+                value_node.start_mark.line,
+                value_node.start_mark.column,
+                value_node.end_mark.column,
+                value_node.value,
+            ))
+    return found
+
+
+def rewrite_root_scalar(
+    text: str, field: str, old: str, new: str, *, path_head: bool = False
+) -> str:
+    """Rewrite one root-level scalar in place, never nested data."""
+    lines = text.splitlines(keepends=True)
+    for name, line_no, col_start, col_end, value in sorted(
+        root_scalar_spans(text, (field,)), reverse=True
+    ):
+        replacement = (
+            rewrite_path_head(value, old, new) if path_head
+            else (new if value == old else value)
+        )
+        if replacement == value:
+            continue
+        raw = lines[line_no]
+        start = raw.find(value, col_start, col_end + len(value))
+        if start == -1:
+            continue
+        lines[line_no] = raw[:start] + replacement + raw[start + len(value):]
+    return "".join(lines)
+
+
 def rewrite_yaml_path_head_field(
     text: str, field: str, old: str, new: str
 ) -> str:
@@ -601,39 +658,6 @@ def _typed_token_spans(
                             old,
                             _mapping_key_span(line, old, indent),
                         )
-            elif relative == "_system/members.yaml":
-                for old in by_axis["entity"]:
-                    record(
-                        relative,
-                        number,
-                        "entity",
-                        old,
-                        _mapping_key_span(line, old, 2),
-                    )
-                for old in by_axis["member"]:
-                    record(
-                        relative,
-                        number,
-                        "member",
-                        old,
-                        _yaml_scalar_span(line, "id", old),
-                    )
-            elif relative == "_system/workspaces.yaml":
-                for axis, fields in (
-                    ("workspace", ("id",)),
-                    ("entity", ("entity", "primary_entity")),
-                    ("product", ("product",)),
-                    ("member", ("member",)),
-                ):
-                    for field in fields:
-                        for old in by_axis[axis]:
-                            record(
-                                relative,
-                                number,
-                                axis,
-                                old,
-                                _yaml_scalar_span(line, field, old),
-                            )
             elif relative == "_system/scripts/action-policy.yaml":
                 # Typed spans come from the same structural parse the writer
                 # uses, so a block sequence is typed exactly as a flow one is.

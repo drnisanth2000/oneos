@@ -63,7 +63,10 @@ def _module_aliases(tree: ast.AST) -> tuple[dict, set]:
                     alias.name.split(".")[0]
                 )
         elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
+            # `from ruamel.yaml import safe_load` is a yaml source too, so
+            # membership is tested over every dotted component.
+            components = (node.module or "").split(".")
+            root = "yaml" if "yaml" in components else components[0]
             for alias in node.names:
                 local = alias.asname or alias.name
                 if root == "yaml" and alias.name in _YAML_LOADERS:
@@ -110,7 +113,9 @@ def _is_trigger_call(node: ast.Call, modules=None, bare=None,
         ):
             return True
     if isinstance(func, ast.Name):
-        if func.id in _YAML_LOADERS | {"split_front_matter"} or func.id in bare:
+        # A bare `parse`/`compose`/`load` is a YAML reader only when it was
+        # imported from yaml. A local function that shares the name is not.
+        if func.id == "split_front_matter" or func.id in bare:
             return True
     return False
 
@@ -239,6 +244,8 @@ def test_guard_catches_a_synthetic_undeclared_reader():
         "def f(p):\n    return yaml.compose(p)",
         "from yaml import compose as c\ndef f(p):\n    return c(p)",
         "def f(t):\n    return split_front_matter(t)",
+        "from yaml import parse\ndef f(p):\n    return parse(p)",
+        "from yaml import compose as c\ndef f(p):\n    return c(p)",
     ]
     for src in shapes:
         tree = ast.parse(textwrap.dedent(src))
@@ -834,3 +841,19 @@ def test_boundary_readers_carry_no_blanket_try_of_their_own():
         "(`return read()`) — widening it defeats the per-access narrowness "
         "this helper exists to enforce"
     )
+
+
+def test_a_local_function_named_like_a_yaml_reader_is_not_flagged():
+    """Bare names count only when imported from yaml.
+
+    Treating any local `parse`, `compose` or `load` as a structured read makes
+    the guard fire on unrelated code, and a guard that cries wolf gets
+    silenced.
+    """
+    for src in (
+        "def parse(p):\n    return p\ndef f(p):\n    return parse(p)",
+        "def compose(a, b):\n    return a\ndef f(x):\n    return compose(x, x)",
+        "def load(self):\n    return 1\ndef f(o):\n    return load(o)",
+    ):
+        tree = ast.parse(textwrap.dedent(src))
+        assert _collect_offenders(tree, pathlib.Path("synthetic.py")) == [], src

@@ -1023,3 +1023,20 @@ def test_nested_same_named_metadata_is_not_typed(tmp_path: Path):
     assert [(item.path, item.old) for item in found] == [
         ("_system/members.yaml", "m7")
     ], "nested metadata was suppressed as typed"
+
+
+def test_workspace_entity_rewrite_is_confined_to_the_entry():
+    """`entity`/`primary_entity` are entry fields, not nested metadata."""
+    text = (
+        "workspaces:\n"
+        "  - {id: w7, entity: ab, primary_entity: ab, extra: {entity: ab}}\n"
+    )
+
+    result = rewrite_registry_entry_scalar(text, "workspaces", "entity", "ab", "ab-entity")
+    result = rewrite_registry_entry_scalar(
+        result, "workspaces", "primary_entity", "ab", "ab-entity"
+    )
+
+    assert "entity: ab-entity," in result
+    assert "primary_entity: ab-entity," in result
+    assert "extra: {entity: ab}" in result, "nested metadata was rewritten"

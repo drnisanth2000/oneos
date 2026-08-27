@@ -214,7 +214,9 @@ def database_residuals(
     return found
 
 
-def database_schema_inventory(root: Path) -> dict[str, dict[str, list[str]]]:
+def database_schema_inventory(
+    root: Path, registered: set[str] | None = None
+) -> dict[str, dict[str, list[str]]]:
     """Every database under `root`, with its tables and columns. Read-only and
     deliberately broad: over-reporting only informs the owner's proof."""
     inventory: dict[str, dict[str, list[str]]] = {}
@@ -223,6 +225,15 @@ def database_schema_inventory(root: Path) -> dict[str, dict[str, list[str]]]:
         # database is not one the registries describe.
         if _ENTITY_SLUG.fullmatch(path.parent.name) is None:
             continue
+        # Syntax is not membership: a well-formed slug that no manifest
+        # registers names a location no registry describes.
+        if registered is not None and path.parent.name not in registered:
+            continue
+        if path.parent.is_symlink():
+            raise DatabaseCutoverError(
+                "an entity root is a symlink; the inventory never follows a "
+                "redirected database location"
+            )
         if path.is_symlink():
             raise DatabaseCutoverError(
                 f"{path.relative_to(root).as_posix()} is a symlink; inventory "

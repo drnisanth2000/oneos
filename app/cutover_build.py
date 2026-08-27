@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import hashlib
 import os
 import shutil
@@ -125,7 +125,6 @@ import sys
 import yaml
 
 from .console_routing import structured_reader
-from .console_routing import structured_reader
 from .cutover_db import DatabaseChange, apply_database_mappings, database_residuals
 from .cutover_inventory import (
     check_collisions,
@@ -141,6 +140,7 @@ from .cutover_locations import (
     rewrite_front_matter_field,
     rewrite_mapping_key,
     rewrite_registry_entry_scalar,
+    rewrite_root_scalar,
     rewrite_path_head,
     rewrite_policy_path_heads,
     rewrite_yaml_path_head_field,
@@ -177,7 +177,6 @@ def mappings_in_order(manifest: ApprovalManifest) -> list:
 
 
 @structured_reader(category="admin-record")
-@structured_reader(category="admin-record")
 def _existing_former_slugs(line: str) -> list:
     """Read provenance already recorded on a registry key."""
     return (yaml.safe_load(line) or {})["former_slugs"]
@@ -209,7 +208,14 @@ def _record_former_slug(text: str, key: str, old: str, indent: int) -> str:
     import re
 
     lines = text.splitlines(keepends=True)
-    key_re = re.compile(rf"^(\s*){re.escape(key)}:\s*(?:#.*)?$")
+    # The registry key sits at a known depth: `former_slugs` is written at
+    # `indent`, so its parent is at `indent - 2`. Matching at any depth found
+    # a same-named key deeper in the tree and inserted provenance under the
+    # wrong parent, producing a document that no longer parses.
+    parent_indent_required = max(indent - 2, 0)
+    key_re = re.compile(
+        rf"^( {{{parent_indent_required}}})(?! ){re.escape(key)}:\s*(?:#.*)?$"
+    )
     parents = [
         index for index, line in enumerate(lines)
         if key_re.match(line.rstrip("\n"))
@@ -227,7 +233,9 @@ def _record_former_slug(text: str, key: str, old: str, indent: int) -> str:
                 current_indent = len(lines[index]) - len(lines[index].lstrip(" "))
                 if current_indent <= parent_indent:
                     break
-            if re.match(r"^\s*former_slugs:\s*", lines[index]):
+            if re.match(
+                rf"^ {{{indent}}}(?! )former_slugs:\s*", lines[index]
+            ):
                 existing.append(index)
         if len(existing) > 1:
             raise CutoverError(f"registry key {key!r} has duplicate former_slugs")
@@ -259,9 +267,9 @@ def _rewrite_proposal(path: Path, old: str, new: str) -> None:
     unsupported representation that these exact textual writers left behind.
     """
     text = path.read_text(encoding="utf-8")
-    rewritten = rewrite_yaml_value_field(text, "entity", old, new)
+    rewritten = rewrite_root_scalar(text, "entity", old, new)
     for field in ("src", "dst"):
-        rewritten = rewrite_yaml_path_head_field(rewritten, field, old, new)
+        rewritten = rewrite_root_scalar(rewritten, field, old, new, path_head=True)
     if rewritten != text:
         path.write_text(rewritten, encoding="utf-8")
 
@@ -297,7 +305,9 @@ def _apply_entity_mapping(root: Path, old: str, new: str) -> None:
     if workspaces.is_file():
         text = workspaces.read_text(encoding="utf-8")
         for field in ("entity", "primary_entity"):
-            text = rewrite_yaml_value_field(text, field, old, new)
+            text = rewrite_registry_entry_scalar(
+                text, "workspaces", field, old, new
+            )
         workspaces.write_text(text, encoding="utf-8")
     policy = system / "scripts" / "action-policy.yaml"
     if policy.is_file():
@@ -647,6 +657,20 @@ def build_cutover(
                 "the approved mapping does not cover every sub-floor identifier "
                 "at the source HEAD; re-run from inventory"
             )
+        registered = existing_identifiers(scratch)["entity"]
+        for entity in sorted(registered):
+            if (scratch / entity).is_symlink():
+                raise CutoverError(
+                    "a registered entity root is a symlink; the cutover will "
+                    "not migrate through a redirected location"
+                )
+        for target in manifest.databases:
+            owner = PurePosixPath(target.path).parts[0]
+            if owner not in registered:
+                raise CutoverError(
+                    "an approved database is not under a registered entity; "
+                    "re-run from inventory"
+                )
         check_collisions(manifest.mappings, existing_identifiers(scratch))
         _require_dispositions(scratch, manifest)
 
