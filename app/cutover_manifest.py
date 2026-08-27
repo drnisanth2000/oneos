@@ -21,6 +21,8 @@ import unicodedata
 
 from .identifiers import AXES, DATABASE_AXES
 
+_ENTITY_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
 _DISPOSITION_KINDS = frozenset({"incidental", "structural"})
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -100,6 +102,17 @@ class DatabaseTarget:
         for field_name in ("path", "table", "column", "axis"):
             _require_text(getattr(self, field_name), f"database target {field_name}")
         _require_relative_posix_path(self.path, "database target path")
+        # `books.db` sits at an entity root and serves all that entity's
+        # modules. Any other shape names a database no registry describes.
+        parts = PurePosixPath(self.path).parts
+        if (
+            len(parts) != 2
+            or parts[1] != "books.db"
+            or _ENTITY_SLUG.fullmatch(parts[0]) is None
+        ):
+            raise ManifestError(
+                "database target path must be <entity>/books.db"
+            )
         if self.axis not in DATABASE_AXES:
             raise ManifestError(
                 f"database target axis must be product or member, not {self.axis!r}"

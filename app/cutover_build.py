@@ -125,6 +125,7 @@ import sys
 import yaml
 
 from .console_routing import structured_reader
+from .console_routing import structured_reader
 from .cutover_db import DatabaseChange, apply_database_mappings, database_residuals
 from .cutover_inventory import (
     check_collisions,
@@ -139,6 +140,7 @@ from .cutover_locations import (
     location_keys,
     rewrite_front_matter_field,
     rewrite_mapping_key,
+    rewrite_registry_entry_scalar,
     rewrite_path_head,
     rewrite_policy_path_heads,
     rewrite_yaml_path_head_field,
@@ -175,53 +177,76 @@ def mappings_in_order(manifest: ApprovalManifest) -> list:
 
 
 @structured_reader(category="admin-record")
+@structured_reader(category="admin-record")
+def _existing_former_slugs(line: str) -> list:
+    """Read provenance already recorded on a registry key."""
+    return (yaml.safe_load(line) or {})["former_slugs"]
+
+
+def _render_former_slugs(values: list[str], indent: int) -> str:
+    """Serialise provenance so every value stays a string.
+
+    Interpolating raw text writes `former_slugs: [no]`, which parses back as
+    the boolean `False` rather than the identifier it records.
+    """
+    rendered = yaml.safe_dump(
+        values, default_flow_style=True, width=10**6
+    ).strip()
+    return " " * indent + f"former_slugs: {rendered}\n"
+
+
 def _record_former_slug(text: str, key: str, old: str, indent: int) -> str:
-    """Append inert provenance beneath one entity/product mapping key.
+    """Append inert provenance beneath every matching registry key.
 
     A key may already carry provenance from a previous sanctioned rename. A
     second `former_slugs` key would be duplicate YAML and could change meaning
-    by parser, so this function updates the existing list or inserts exactly
-    one new child. Member and workspace entries never call it.
+    by parser, so this updates an existing list or inserts exactly one child.
+
+    `products.yaml` nests product keys per entity, so one slug can occur under
+    several entities and each occurrence needs its own provenance. Member and
+    workspace entries never call this.
     """
     import re
 
     lines = text.splitlines(keepends=True)
     key_re = re.compile(rf"^(\s*){re.escape(key)}:\s*(?:#.*)?$")
-    parent_index = next(
-        (index for index, line in enumerate(lines) if key_re.match(line.rstrip("\n"))),
-        None,
-    )
-    if parent_index is None:
+    parents = [
+        index for index, line in enumerate(lines)
+        if key_re.match(line.rstrip("\n"))
+    ]
+    if not parents:
         raise CutoverError(f"renamed registry key {key!r} is absent")
-    parent_indent = len(key_re.match(lines[parent_index].rstrip("\n")).group(1))
-    existing: list[int] = []
-    end = len(lines)
-    for index in range(parent_index + 1, len(lines)):
-        stripped = lines[index].strip()
-        if stripped:
-            current_indent = len(lines[index]) - len(lines[index].lstrip(" "))
-            if current_indent <= parent_indent:
-                end = index
-                break
-        if re.match(r"^\s*former_slugs:\s*", lines[index]):
-            existing.append(index)
-    if len(existing) > 1:
-        raise CutoverError(f"registry key {key!r} has duplicate former_slugs")
-    if existing:
-        index = existing[0]
-        try:
-            document = yaml.safe_load(lines[index].strip()) or {}
-            values = document["former_slugs"]
-        except (KeyError, TypeError, yaml.YAMLError) as exc:
-            raise CutoverError(f"former_slugs for {key!r} is malformed") from exc
-        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-            raise CutoverError(f"former_slugs for {key!r} must be a string list")
-        if old not in values:
-            values.append(old)
-        prefix = lines[index][: len(lines[index]) - len(lines[index].lstrip(" "))]
-        lines[index] = prefix + f"former_slugs: [{', '.join(values)}]\n"
-        return "".join(lines)
-    lines.insert(parent_index + 1, " " * indent + f"former_slugs: [{old}]\n")
+
+    # Right-to-left, so an insertion never shifts an earlier parent's index.
+    for parent_index in sorted(parents, reverse=True):
+        parent_indent = len(key_re.match(lines[parent_index].rstrip("\n")).group(1))
+        existing: list[int] = []
+        for index in range(parent_index + 1, len(lines)):
+            stripped = lines[index].strip()
+            if stripped:
+                current_indent = len(lines[index]) - len(lines[index].lstrip(" "))
+                if current_indent <= parent_indent:
+                    break
+            if re.match(r"^\s*former_slugs:\s*", lines[index]):
+                existing.append(index)
+        if len(existing) > 1:
+            raise CutoverError(f"registry key {key!r} has duplicate former_slugs")
+        if existing:
+            index = existing[0]
+            try:
+                values = _existing_former_slugs(lines[index].strip())
+            except (KeyError, TypeError, yaml.YAMLError) as exc:
+                raise CutoverError(f"former_slugs for {key!r} is malformed") from exc
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values
+            ):
+                raise CutoverError(f"former_slugs for {key!r} must be a string list")
+            if old not in values:
+                values.append(old)
+            prefix_length = len(lines[index]) - len(lines[index].lstrip(" "))
+            lines[index] = _render_former_slugs(values, prefix_length)
+        else:
+            lines.insert(parent_index + 1, _render_former_slugs([old], indent))
     return "".join(lines)
 
 
@@ -302,8 +327,8 @@ def _apply_value_mapping(root: Path, axis: str, old: str, new: str) -> None:
         registry = system / "members.yaml"
         if registry.is_file():
             registry.write_text(
-                rewrite_yaml_value_field(
-                    registry.read_text(encoding="utf-8"), "id", old, new
+                rewrite_registry_entry_scalar(
+                    registry.read_text(encoding="utf-8"), "members", "id", old, new
                 ),
                 encoding="utf-8",
             )
@@ -315,8 +340,8 @@ def _apply_value_mapping(root: Path, axis: str, old: str, new: str) -> None:
     workspaces = system / "workspaces.yaml"
     if workspaces.is_file():
         workspaces.write_text(
-            rewrite_yaml_value_field(
-                workspaces.read_text(encoding="utf-8"), axis, old, new
+            rewrite_registry_entry_scalar(
+                workspaces.read_text(encoding="utf-8"), "workspaces", axis, old, new
             ),
             encoding="utf-8",
         )
@@ -326,8 +351,8 @@ def _apply_workspace_mapping(root: Path, old: str, new: str) -> None:
     workspaces = root / "_system" / "workspaces.yaml"
     if workspaces.is_file():
         workspaces.write_text(
-            rewrite_yaml_value_field(
-                workspaces.read_text(encoding="utf-8"), "id", old, new
+            rewrite_registry_entry_scalar(
+                workspaces.read_text(encoding="utf-8"), "workspaces", "id", old, new
             ),
             encoding="utf-8",
         )

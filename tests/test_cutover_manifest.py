@@ -303,3 +303,30 @@ def test_the_same_column_in_a_different_database_is_permitted():
         dispositions=(),
     )
     assert len(manifest.databases) == 2
+
+
+def test_a_database_target_must_be_an_entity_books_db():
+    """The only database the cutover migrates is `<entity>/books.db`.
+
+    `books.db` sits at an entity root and serves all its modules. Accepting an
+    arbitrary path lets an approved target name a database the design never
+    contemplated, in a location no registry describes.
+    """
+    for refused in (
+        "ab/nested/other.db",
+        "ab/nested/books.db",
+        "books.db",
+        "ab/ledger.db",
+        "_system/books.db",
+    ):
+        with pytest.raises(ManifestError, match="entity"):
+            DatabaseTarget(
+                path=refused, table="ledger", column="product", axis="product"
+            )
+
+
+def test_an_entity_books_db_is_accepted():
+    target = DatabaseTarget(
+        path="ab/books.db", table="ledger", column="product", axis="product"
+    )
+    assert target.path == "ab/books.db"

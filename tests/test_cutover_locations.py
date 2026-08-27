@@ -53,6 +53,7 @@ def test_location_keys_are_stable_identifiers_for_dispositions():
 import textwrap
 
 from app.cutover_locations import (
+    rewrite_registry_entry_scalar,
     rewrite_front_matter_field,
     rewrite_mapping_key,
     rewrite_path_head,
@@ -928,3 +929,97 @@ def test_a_hash_after_whitespace_is_still_a_comment():
     result = rewrite_front_matter_field(text, "entity", "ab", "ab-entity")
 
     assert "entity: ab-entity #suffix\n" in result
+
+
+MULTILINE_POLICY = """\
+actors:
+  h:
+    allow:
+      - action: read
+        paths:
+          - "ab/**
+             continued"
+        except: ["ab/.sensitive/**"]
+"""
+
+
+def test_policy_writer_refuses_a_multiline_scalar():
+    """A scalar spanning lines cannot be edited by one line/column span.
+
+    The node marks report a single start line, so an in-place edit at those
+    offsets would corrupt the continuation rather than rewrite the value.
+    """
+    with pytest.raises(UnreadableFile, match="multiline"):
+        rewrite_policy_path_heads(MULTILINE_POLICY, "ab", "ab-entity")
+
+
+def test_residual_gate_refuses_a_multiline_scalar(tmp_path: Path):
+    system = tmp_path / "_system" / "scripts"
+    system.mkdir(parents=True)
+    (system / "action-policy.yaml").write_text(MULTILINE_POLICY, encoding="utf-8")
+
+    with pytest.raises(UnreadableFile, match="multiline"):
+        scoped_residuals(
+            tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),)
+        )
+
+
+def test_block_style_policy_paths_are_typed_not_advisory(tmp_path: Path):
+    """A supported, rewritable location must not appear in the advisory report.
+
+    Typedness is decided by the same structural parse the writer uses, so a
+    block sequence is typed exactly as a flow sequence is.
+    """
+    system = tmp_path / "_system" / "scripts"
+    system.mkdir(parents=True)
+    (system / "action-policy.yaml").write_text(
+        "actors:\n  h:\n    allow:\n      - action: read\n"
+        "        paths:\n          - \"ab/**\"\n"
+        "        except:\n          - \"ab/.sensitive/**\"\n",
+        encoding="utf-8",
+    )
+
+    found = advisory_occurrences(
+        tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),)
+    )
+
+    assert found == [], "a rewritable policy path was reported as advisory"
+
+
+def test_member_rewrite_is_confined_to_the_registry_entry_id():
+    """`id:` inside nested metadata is not the member registry's `id:`.
+
+    A same-named key one level deeper is unrelated data; rewriting it edits
+    content the registry schema never described.
+    """
+    text = "members:\n  ab:\n    - {id: m7, meta: {id: m7}}\n"
+
+    result = rewrite_registry_entry_scalar(text, "members", "id", "m7", "m7-member")
+
+    assert "meta: {id: m7}" in result, "nested metadata was rewritten"
+    assert "{id: m7-member," in result
+
+
+def test_workspace_rewrite_is_confined_to_the_entry_id():
+    text = "workspaces:\n  - {id: w7, extra: {id: w7}}\n"
+
+    result = rewrite_registry_entry_scalar(text, "workspaces", "id", "w7", "w7-workspace")
+
+    assert "extra: {id: w7}" in result, "nested metadata was rewritten"
+    assert "{id: w7-workspace," in result
+
+
+def test_nested_same_named_metadata_is_not_typed(tmp_path: Path):
+    """What the writer does not own must remain visible to the owner."""
+    system = tmp_path / "_system"
+    system.mkdir()
+    (system / "members.yaml").write_text(
+        "members:\n  ab-entity:\n    - {id: m7-member, meta: {id: m7}}\n",
+        encoding="utf-8",
+    )
+
+    found = advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[2:3])
+
+    assert [(item.path, item.old) for item in found] == [
+        ("_system/members.yaml", "m7")
+    ], "nested metadata was suppressed as typed"

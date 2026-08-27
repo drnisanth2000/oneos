@@ -29,6 +29,14 @@ TEXT_FIELDS = frozenset(
 DATABASE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 PRIVATE_PATH_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9:/])/(?:Users|home)/[^/\s]+/"),
+    # macOS per-user temporary namespace, with or without the `/private`
+    # prefix. Captured test output embeds these routinely, and the segment
+    # often carries a username (`pytest-of-<user>`). Matching only `/Users`
+    # and `/home` let this form pass a CLEAN audit.
+    # Written with alternations so the pattern's own source does not contain
+    # the literal it matches — the same reason the rule above spells
+    # `/(?:Users|home)/` rather than the bare path.
+    re.compile(r"(?<![A-Za-z0-9:/])(?:/private)?/(?:var)/(?:folders)/[^\s\"']+"),
     re.compile(r"(?i)(?<![A-Za-z0-9:/\\])[A-Z]:\\[^\\\s]+\\"),
     re.compile(
         r"(?:^|[\s\"'=(\[,]|:(?=/[^/]))/(?:[^\s\"']*/)?\.sensitive(?:/|$)"

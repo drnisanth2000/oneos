@@ -322,3 +322,30 @@ def test_committed_outcome_survives_broken_output(tmp_path: Path, monkeypatch):
 
     monkeypatch.undo()
     assert code == 2, "a committed outcome was lost when its report failed"
+
+
+def test_an_unreadable_approval_record_is_a_cutover_error(tmp_path: Path):
+    """Every approval failure must reach the CLI as a typed refusal.
+
+    A raw `UnicodeDecodeError` escapes the taxonomy and reaches the operator
+    as an untyped traceback rather than an administrative refusal.
+    """
+    from app.cutover import _load_approval
+    from app.cutover_build import CutoverError
+
+    record = tmp_path / "record.yaml"
+    record.write_bytes(b"\xff\xfe not utf-8")
+
+    with pytest.raises(CutoverError, match="approval record"):
+        _load_approval(record)
+
+
+def test_a_malformed_approval_record_is_a_cutover_error(tmp_path: Path):
+    from app.cutover import _load_approval
+    from app.cutover_build import CutoverError
+
+    record = tmp_path / "record.yaml"
+    record.write_text("manifest_sha256: [unclosed\n", encoding="utf-8")
+
+    with pytest.raises(CutoverError, match="approval record"):
+        _load_approval(record)

@@ -154,6 +154,84 @@ def rewrite_yaml_value_field(text: str, field: str, old: str, new: str) -> str:
     return pattern.sub(rf"\g<1>\g<2>{new}", text)
 
 
+def _mapping_get(node, key: str):
+    """The value node for `key` in a composed mapping, or None."""
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    for key_node, value_node in node.value:
+        if getattr(key_node, "value", None) == key:
+            return value_node
+    return None
+
+
+@structured_reader(category="admin-record")
+def registry_entry_scalar_spans(
+    text: str, container: str, fields: tuple[str, ...]
+) -> list[tuple[int, int, int, str]]:
+    """Spans of entry-level scalars inside a registry list.
+
+    Structural on purpose. A regex boundary of `{` or `,` also matches a
+    same-named key inside nested metadata — `meta: {id: m7}` is not the
+    registry entry's `id`, and rewriting it edits data the schema never
+    described. Walking the composed graph reaches exactly the entry mapping's
+    own fields and nothing deeper.
+
+    Returns `(line, start_col, end_col, value)`; the caller edits the decoded
+    text at those offsets and never reserialises.
+    """
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise UnreadableFile(f"{container}.yaml could not be parsed") from exc
+    if root is None:
+        return []
+    holder = _mapping_get(root, container)
+    if holder is None:
+        return []
+
+    groups = []
+    if isinstance(holder, yaml.SequenceNode):
+        groups = [holder]
+    elif isinstance(holder, yaml.MappingNode):
+        groups = [value for _key, value in holder.value]
+
+    found: list[tuple[int, int, int, str]] = []
+    for group in groups:
+        if not isinstance(group, yaml.SequenceNode):
+            continue
+        for entry in group.value:
+            for field in fields:
+                value_node = _mapping_get(entry, field)
+                if isinstance(value_node, yaml.ScalarNode) and (
+                    value_node.start_mark.line == value_node.end_mark.line
+                ):
+                    found.append((
+                        value_node.start_mark.line,
+                        value_node.start_mark.column,
+                        value_node.end_mark.column,
+                        value_node.value,
+                    ))
+    return found
+
+
+def rewrite_registry_entry_scalar(
+    text: str, container: str, field: str, old: str, new: str
+) -> str:
+    """Rewrite one entry-level registry scalar, in place, never nested data."""
+    lines = text.splitlines(keepends=True)
+    spans = [
+        span for span in registry_entry_scalar_spans(text, container, (field,))
+        if span[3] == old
+    ]
+    for line_no, col_start, col_end, value in sorted(spans, reverse=True):
+        raw = lines[line_no]
+        start = raw.find(value, col_start, col_end + len(value))
+        if start == -1:
+            continue
+        lines[line_no] = raw[:start] + new + raw[start + len(value):]
+    return "".join(lines)
+
+
 def rewrite_yaml_path_head_field(
     text: str, field: str, old: str, new: str
 ) -> str:
@@ -264,6 +342,14 @@ def policy_path_scalars(text: str) -> list[tuple[str, int, int, int, str]]:
                             raise UnreadableFile(
                                 f"action-policy.yaml has an unsupported shape "
                                 f"inside {key_node.value!r}: expected a scalar"
+                            )
+                        if item.start_mark.line != item.end_mark.line:
+                            # One line/column span cannot describe a scalar
+                            # that continues onto the next line; editing at
+                            # those offsets would corrupt the continuation.
+                            raise UnreadableFile(
+                                f"action-policy.yaml has a multiline scalar "
+                                f"inside {key_node.value!r}"
                             )
                         found.append((
                             key_node.value,
@@ -420,9 +506,45 @@ def _typed_token_spans(
         if candidate.suffix.lower() in BINARY_SUFFIXES:
             continue
         try:
-            lines = candidate.read_text(encoding="utf-8").splitlines()
+            text = candidate.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError) as exc:
             raise UnreadableFile(f"{relative} could not be read") from exc
+        lines = text.splitlines()
+
+        if relative in ("_system/members.yaml", "_system/workspaces.yaml"):
+            # Structural: the entry's own fields, never a same-named key in
+            # nested metadata that no writer owns.
+            container = relative.rsplit("/", 1)[1].removesuffix(".yaml")
+            wanted = ("id",) if container == "members" else (
+                "id", "entity", "primary_entity", "product", "member"
+            )
+            for line_no, col_start, col_end, value in registry_entry_scalar_spans(
+                text, container, wanted
+            ):
+                for axis, olds in by_axis.items():
+                    if value in olds:
+                        record(
+                            relative, line_no + 1, axis, value,
+                            (col_start, col_end),
+                        )
+
+        if relative == "_system/scripts/action-policy.yaml":
+            # Structural, once per file: the writer locates these scalars the
+            # same way, so every shape it can rewrite is typed here. The old
+            # per-line regex saw only flow sequences, leaving block-style
+            # paths advisory despite being fully rewritable.
+            for _key, line_no, col_start, col_end, value in policy_path_scalars(text):
+                head = value.partition("/")[0]
+                if head not in by_axis["entity"]:
+                    continue
+                # A quoted scalar's start mark includes its opening quote, so
+                # the head is located within the scalar's own extent rather
+                # than assumed to sit at its first column.
+                raw = lines[line_no]
+                start = raw.find(head, col_start, col_end)
+                if start == -1:
+                    continue
+                record(relative, line_no + 1, "entity", head, (start, start + len(head)))
 
         in_front_matter = False
         for number, line in enumerate(lines, start=1):
@@ -448,7 +570,19 @@ def _typed_token_spans(
                                 _front_matter_scalar_span(line, field, old),
                             )
 
-            if relative == "_system/entities.yaml":
+            if relative == "_system/members.yaml":
+                # The entity grouping key is a mapping key, still matched per
+                # line; the entry's own fields are typed structurally below,
+                # so a same-named key in nested metadata is never suppressed.
+                for old in by_axis["entity"]:
+                    record(
+                        relative, number, "entity", old,
+                        _mapping_key_span(line, old, 2),
+                    )
+            elif relative == "_system/workspaces.yaml":
+                # Entirely structural: this file has no grouping key.
+                pass
+            elif relative == "_system/entities.yaml":
                 for old in by_axis["entity"]:
                     record(
                         relative,
@@ -501,18 +635,11 @@ def _typed_token_spans(
                                 _yaml_scalar_span(line, field, old),
                             )
             elif relative == "_system/scripts/action-policy.yaml":
-                for match in _POLICY_LIST.finditer(line):
-                    for quoted in _QUOTED.finditer(match.group(4)):
-                        head = quoted.group(2).partition("/")[0]
-                        if head in by_axis["entity"]:
-                            start = match.start(4) + quoted.start(2)
-                            record(
-                                relative,
-                                number,
-                                "entity",
-                                head,
-                                (start, start + len(head)),
-                            )
+                # Typed spans come from the same structural parse the writer
+                # uses, so a block sequence is typed exactly as a flow one is.
+                # The old per-line regex saw only flow sequences, leaving every
+                # block-style path advisory despite being fully rewritable.
+                pass
             elif candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
                 for old in by_axis["entity"]:
                     record(
@@ -679,6 +806,54 @@ def _load_yaml_file(path: Path) -> object:
 
 
 @structured_reader(category="admin-record")
+def _compose_policy(text: str):
+    """The gate's own node graph.
+
+    Composed independently of the writer's: a gate that reuses the writer's
+    parse cannot see a shape the writer failed to see.
+    """
+    return yaml.compose(text)
+
+
+def _refuse_multiline_policy_scalars(text: str) -> None:
+    """Refuse a `paths`/`except` scalar that continues onto another line.
+
+    A double-quoted scalar folds its newline into a space, so the loaded value
+    looks ordinary; only the node marks reveal that no single line/column span
+    describes it.
+    """
+    try:
+        root = _compose_policy(text)
+    except yaml.YAMLError as exc:
+        raise UnreadableFile(
+            "action-policy.yaml could not be parsed for the residual gate"
+        ) from exc
+
+    def walk(node) -> None:
+        if isinstance(node, yaml.MappingNode):
+            for key_node, value_node in node.value:
+                if getattr(key_node, "value", None) in ("paths", "except") and (
+                    isinstance(value_node, yaml.SequenceNode)
+                ):
+                    for item in value_node.value:
+                        if (
+                            isinstance(item, yaml.ScalarNode)
+                            and item.start_mark.line != item.end_mark.line
+                        ):
+                            raise UnreadableFile(
+                                f"action-policy.yaml has a multiline scalar "
+                                f"inside {key_node.value!r}"
+                            )
+                walk(value_node)
+        elif isinstance(node, yaml.SequenceNode):
+            for item in node.value:
+                walk(item)
+
+    if root is not None:
+        walk(root)
+
+
+@structured_reader(category="admin-record")
 def _load_policy_document(text: str):
     """Parse the policy for the residual gate, independently of the writer.
 
@@ -687,6 +862,7 @@ def _load_policy_document(text: str):
     gate.
     """
     _refuse_yaml_anchors(text)
+    _refuse_multiline_policy_scalars(text)
     try:
         return yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -717,6 +893,11 @@ def _policy_path_values(document) -> list[tuple[str, str]]:
                             raise UnreadableFile(
                                 f"action-policy.yaml has an unsupported shape "
                                 f"inside {key!r}: expected a scalar"
+                            )
+                        if "\n" in item:
+                            raise UnreadableFile(
+                                f"action-policy.yaml has a multiline scalar "
+                                f"inside {key!r}"
                             )
                         found.append((key, item))
                 walk(value)

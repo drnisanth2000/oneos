@@ -19,10 +19,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+import re
 import sqlite3
+from urllib.request import pathname2url
 
 from .console_routing import structured_reader
 from .cutover_manifest import DatabaseTarget, Mapping
+
+
+_ENTITY_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 class DatabaseCutoverError(Exception):
@@ -89,7 +94,11 @@ def resolve_database_path(root: Path, target: DatabaseTarget) -> Path:
 def _connect(path: Path, *, read_only: bool) -> sqlite3.Connection:
     try:
         if read_only:
-            return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            # `#` and `?` in a path are URI syntax. Unescaped, SQLite parses
+            # them and opens something other than the approved database.
+            return sqlite3.connect(
+                f"file:{pathname2url(str(path))}?mode=ro", uri=True
+            )
         return sqlite3.connect(path)
     except sqlite3.Error as exc:
         raise DatabaseCutoverError("approved database could not be opened") from exc
@@ -115,6 +124,27 @@ def _require_column(conn: sqlite3.Connection, target: DatabaseTarget) -> None:
         raise DatabaseCutoverError("approved column is absent from its table")
 
 
+def _require_no_update_trigger(conn: sqlite3.Connection, target: DatabaseTarget) -> None:
+    """Refuse an approved table carrying an UPDATE trigger.
+
+    The owner approved a column rewrite, not whatever a trigger writes when it
+    fires. Those writes are unreviewed and would land in the same single
+    cutover commit, so the cutover refuses rather than firing them.
+    """
+    try:
+        triggers = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+            (target.table,),
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        raise DatabaseCutoverError("approved database could not be read") from exc
+    if triggers:
+        raise DatabaseCutoverError(
+            "an approved table carries a trigger; the cutover will not fire "
+            "unreviewed side effects"
+        )
+
+
 def _mappings_for(target: DatabaseTarget, mappings: tuple[Mapping, ...]) -> list[Mapping]:
     """Only this target's declared axis. Never another's."""
     return [item for item in mappings if item.axis == target.axis]
@@ -129,6 +159,7 @@ def apply_database_mappings(
         conn = _connect(path, read_only=False)
         try:
             _require_column(conn, target)
+            _require_no_update_trigger(conn, target)
             statement = (
                 f"UPDATE {_quote_identifier(target.table)} "
                 f"SET {_quote_identifier(target.column)} = ? "
@@ -187,7 +218,11 @@ def database_schema_inventory(root: Path) -> dict[str, dict[str, list[str]]]:
     """Every database under `root`, with its tables and columns. Read-only and
     deliberately broad: over-reporting only informs the owner's proof."""
     inventory: dict[str, dict[str, list[str]]] = {}
-    for path in sorted(root.rglob("books.db")):
+    for path in sorted(root.glob("*/books.db")):
+        # Only an entity-root `books.db` is in scope; a nested or `_system`
+        # database is not one the registries describe.
+        if _ENTITY_SLUG.fullmatch(path.parent.name) is None:
+            continue
         if path.is_symlink():
             raise DatabaseCutoverError(
                 f"{path.relative_to(root).as_posix()} is a symlink; inventory "

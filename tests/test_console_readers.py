@@ -57,6 +57,9 @@ def _module_aliases(tree: ast.AST) -> tuple[dict, set]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 modules[alias.asname or alias.name.split(".")[0]] = (
+                    alias.name
+                    if alias.asname
+                    else
                     alias.name.split(".")[0]
                 )
         elif isinstance(node, ast.ImportFrom):
@@ -75,7 +78,15 @@ def _module_aliases(tree: ast.AST) -> tuple[dict, set]:
 
 
 def _resolved_chain(node, modules: dict) -> list[str]:
-    return [modules.get(name, name) for name in _receiver_chain(node)]
+    """Receiver names with aliases resolved, split on dots.
+
+    `import a.b.yaml as y` binds `y` to the whole dotted module, so the alias
+    must expand to its components or a `yaml` receiver hides behind it.
+    """
+    resolved: list[str] = []
+    for name in _receiver_chain(node):
+        resolved.extend(str(modules.get(name, name)).split("."))
+    return resolved
 
 
 def _is_trigger_call(node: ast.Call, modules=None, bare=None,
@@ -215,6 +226,9 @@ def test_guard_catches_a_synthetic_undeclared_reader():
         "import yaml as y\ndef f(p):\n    return y.load(p)",
         "import sqlite3 as sq\ndef f(s):\n    return sq.connect(s)",
         "from yaml import safe_load as sl\ndef f(p):\n    return sl(p)",
+        "import a.b.yaml as y\ndef f(p):\n    return y.compose(p)",
+        "import ruamel.yaml\ndef f(p):\n    return ruamel.yaml.safe_load(p)",
+        "from ruamel.yaml import safe_load\ndef f(p):\n    return safe_load(p)",
         "def f(s):\n    return json.loads(s.system_path('x.json').read_text())",
         "def f(v):\n    p = v.system_path('members.yaml')\n    return p.read_bytes()",
         "def f(v):\n    p = v.system_path('x.json')\n    return json.loads(p.read_text())",

@@ -412,3 +412,46 @@ def test_term_collection_reads_only_registry_keys_and_ids(tmp_path: Path):
     # audit would look for retired identifiers again and go red.
     assert "ab" not in short_terms and "ab" not in long_terms
     assert "q7" not in short_terms and "q7" not in long_terms
+
+
+def test_macos_temporary_paths_are_detected(tmp_path: Path):
+    """The macOS temporary namespace carries a machine-local path.
+
+    Captured test output routinely embeds these, and they can include a
+    username (`pytest-of-<user>`). The audit matched only `/Users` and
+    `/home`, so this form passed a CLEAN run.
+    """
+    sample = "/" + "var/folders/9h/abc/T/pytest-of-someone/run0/vault"
+    private_sample = "/private" + sample
+    repo = git_repo(
+        tmp_path / "repo",
+        {
+            "notes/a.md": f"see {sample}\n",
+            "notes/b.md": f"see {private_sample}\n",
+        },
+    )
+
+    assert categories(repo, vault=None) == [
+        "absolute-private-path",
+        "absolute-private-path",
+    ]
+
+
+def test_an_ordinary_var_path_is_not_flagged(tmp_path: Path):
+    """The rule is the temporary namespace, not every path under /var."""
+    repo = git_repo(tmp_path / "repo", {"notes/a.md": "see /var/log/system.log\n"})
+
+    assert categories(repo, vault=None) == []
+
+
+def test_a_private_path_finding_never_echoes_the_path(tmp_path: Path):
+    repo = git_repo(
+        tmp_path / "repo",
+        {"a.md": "see " + "/" + "var/folders/9h/abc/T/pytest-of-someone/x/v\n"},
+    )
+
+    findings = audit_repository(repo, vault=None, include_history=False)
+
+    assert findings
+    assert "pytest-of-someone" not in repr(findings)
+    assert "var/folders" not in repr(findings)

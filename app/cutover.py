@@ -41,6 +41,7 @@ def promote(
     source_head: str,
     expected_status: bytes,
     affected_entities: list[str],
+    destination_entities: list[str],
 ) -> str:
     """Fast-forward the live vault to the commit built in isolation.
 
@@ -59,12 +60,17 @@ def promote(
                 raise CutoverError(
                     "live status changed since the build; re-run from inventory"
                 )
-            # Repeated here because ignored content can appear at any moment,
-            # and a linked worktree could never have carried it.
-            require_clean_entities(vault, affected_entities)
+            # Both ends of every move. The source is where ignored content
+            # would be stranded; the destination is where promotion would
+            # overwrite it, and only the destination check can see that.
+            require_clean_entities(
+                vault, [*affected_entities, *destination_entities]
+            )
 
             completed = subprocess.run(
-                ["git", "merge", "--ff-only", built_commit],
+                # `--no-overwrite-ignore` makes git refuse rather than write
+                # over an ignored file; without it the default is to clobber.
+                ["git", "merge", "--ff-only", "--no-overwrite-ignore", built_commit],
                 cwd=vault, check=False, capture_output=True, text=True,
             )
             if completed.returncode != 0:
@@ -137,7 +143,16 @@ from .cutover_manifest import ApprovalRecord, load_manifest, verify_manifest
 
 @structured_reader(category="admin-record")
 def _load_approval(path: Path) -> ApprovalRecord:
-    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    # Reading and parsing both fail in ways the taxonomy must own: an
+    # untyped traceback reaches the operator instead of a refusal.
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CutoverError("approval record could not be read") from exc
+    try:
+        document = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        raise CutoverError("approval record could not be parsed") from exc
     if not isinstance(document, dict):
         raise CutoverError("approval record must be a mapping")
     try:
@@ -285,8 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         # Everything before promotion may still be refused. Once `promote`
         # returns, the ref has moved and no later failure — reporting
         # included — may reclassify the outcome as a refusal.
+        destinations = [m.new for m in manifest.mappings if m.axis == "entity"]
         promoted_id = promote(
-            vault, result.commit, source_head, expected_status, affected
+            vault, result.commit, source_head, expected_status,
+            affected, destinations,
         )
     except CutoverCommittedError as exc:
         return _report_committed(f"[COMMITTED] {exc}")

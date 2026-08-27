@@ -275,3 +275,94 @@ def test_reference_inventory_is_path_column_and_axis_typed(tmp_path: Path):
     # approved writer allowlist. In particular, the broad counter does not
     # make `tag` or `fund_holdings.member_id` safe to write.
     assert all(item.count > 0 for item in found)
+
+
+def test_read_only_uri_escapes_special_characters(tmp_path: Path):
+    """A `#` or `?` in a path is URI syntax, not a filename character.
+
+    Unescaped, SQLite parses the fragment/query and opens something other than
+    the approved database — silently, since the open succeeds.
+    """
+    odd = tmp_path / "we#ird?dir"
+    odd.mkdir()
+    make_db(odd / "books.db")
+    conn = sqlite3.connect(odd / "books.db")
+    conn.execute("INSERT INTO ledger VALUES ('marker', 'x')")
+    conn.commit()
+    conn.close()
+
+    from app.cutover_db import _connect
+
+    handle = _connect(odd / "books.db", read_only=True)
+    try:
+        assert handle.execute(
+            "SELECT product FROM ledger WHERE product = 'marker'"
+        ).fetchall() == [("marker",)]
+    finally:
+        handle.close()
+
+
+def make_db_with_update_trigger(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE ledger (product TEXT, tag TEXT)")
+    conn.execute("CREATE TABLE audit (seen TEXT)")
+    conn.execute(
+        "CREATE TRIGGER ledger_audit AFTER UPDATE ON ledger "
+        "BEGIN INSERT INTO audit VALUES (new.product); END"
+    )
+    conn.execute("INSERT INTO ledger VALUES ('ab', 'ab')")
+    conn.commit()
+    conn.close()
+
+
+def test_an_update_trigger_on_an_approved_table_is_refused(tmp_path: Path):
+    """A trigger turns one reviewed UPDATE into unreviewed side effects.
+
+    The owner approved a column rewrite, not whatever a trigger writes when it
+    fires — and those writes land in the same single cutover commit.
+    """
+    make_db_with_update_trigger(tmp_path / "ab" / "books.db")
+    target = DatabaseTarget(
+        path="ab/books.db", table="ledger", column="product", axis="product"
+    )
+
+    with pytest.raises(DatabaseCutoverError, match="trigger"):
+        apply_database_mappings(tmp_path, (target,), (PRODUCT_MAPPING,))
+
+    conn = sqlite3.connect(tmp_path / "ab" / "books.db")
+    try:
+        assert conn.execute("SELECT * FROM audit").fetchall() == []
+        assert conn.execute("SELECT product FROM ledger").fetchall() == [("ab",)]
+    finally:
+        conn.close()
+
+
+def test_a_trigger_on_another_table_does_not_block_the_cutover(tmp_path: Path):
+    """The refusal is specific to the approved table."""
+    make_db(tmp_path / "ab" / "books.db")
+    conn = sqlite3.connect(tmp_path / "ab" / "books.db")
+    conn.execute("CREATE TABLE other (v TEXT)")
+    conn.execute(
+        "CREATE TRIGGER other_audit AFTER UPDATE ON other "
+        "BEGIN SELECT 1; END"
+    )
+    conn.commit()
+    conn.close()
+    target = DatabaseTarget(
+        path="ab/books.db", table="ledger", column="product", axis="product"
+    )
+
+    apply_database_mappings(tmp_path, (target,), (PRODUCT_MAPPING,))
+
+    assert read(tmp_path / "ab" / "books.db", "SELECT product FROM ledger") == [
+        ("ab-product",)
+    ]
+
+
+def test_database_inventory_only_reports_entity_books_db(tmp_path: Path):
+    make_db(tmp_path / "ab" / "books.db")
+    make_db(tmp_path / "ab" / "nested" / "books.db")
+    make_db(tmp_path / "_system" / "books.db")
+
+    assert list(database_schema_inventory(tmp_path)) == ["ab/books.db"]

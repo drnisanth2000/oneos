@@ -145,6 +145,7 @@ from app.cutover_build import (
 )
 from app.cutover_locations import stable_advisory_context
 from app.cutover_manifest import (
+    ManifestError,
     ApprovalManifest,
     ApprovalRecord,
     DatabaseTarget,
@@ -304,7 +305,9 @@ def test_build_refuses_a_manifest_that_does_not_match_its_record(tmp_path: Path)
     vault = cutover_vault(tmp_path / "vault")
     raw, _ = approved(vault)
 
-    with pytest.raises(Exception):
+    # Narrow: `Exception` would be satisfied by any failure, including one
+    # raised before the digest is ever compared.
+    with pytest.raises(ManifestError, match="approval record"):
         build_cutover(
             vault,
             raw,
@@ -811,7 +814,7 @@ def promoted(vault: Path) -> BuildResult:
     head = git_head(vault)
     raw, record = approved(vault)
     result = build_cutover(vault, raw, record)
-    promote(vault, result.commit, head, git_status_bytes(vault), ["ab"])
+    promote(vault, result.commit, head, git_status_bytes(vault), ["ab"], [])
     return result
 
 
@@ -853,8 +856,34 @@ def test_ordinary_prose_containing_a_short_identifier_is_untouched(tmp_path: Pat
 
 
 def test_the_database_is_updated_before_the_entity_directory_moves(tmp_path: Path):
+    """Ordering asserted directly, not inferred from the finished tree.
+
+    A correct end state is also reachable by translating the path after the
+    move, which is exactly what the approved path is meant to avoid; observing
+    the order proves the approved path was used verbatim.
+    """
+    import app.cutover_build as cutover_build
+
     vault = cutover_vault(tmp_path / "vault")
-    promoted(vault)
+    events: list[str] = []
+    real_db = cutover_build.apply_database_mappings
+    real_map = cutover_build._apply_mappings_in_order
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        cutover_build, "apply_database_mappings",
+        lambda *a, **k: (events.append("database"), real_db(*a, **k))[1],
+    )
+    monkeypatch.setattr(
+        cutover_build, "_apply_mappings_in_order",
+        lambda *a, **k: (events.append("mappings"), real_map(*a, **k))[1],
+    )
+    try:
+        promoted(vault)
+    finally:
+        monkeypatch.undo()
+
+    assert events == ["database", "mappings"], f"unexpected order: {events}"
 
     moved = vault / "ab-entity" / "books.db"
     assert moved.is_file()
@@ -1080,7 +1109,7 @@ def test_a_product_kind_workspace_id_takes_the_workspace_suffix(tmp_path: Path):
     )
 
     built = build_cutover(vault, raw, record)
-    promote(vault, built.commit, manifest.source_head, git_status_bytes(vault), ["ab"])
+    promote(vault, built.commit, manifest.source_head, git_status_bytes(vault), ["ab"], [])
 
     workspaces = workspaces_path.read_text(encoding="utf-8")
     assert "id: q7-workspace" in workspaces, "product claimed workspace id"
@@ -1126,15 +1155,11 @@ import ast
 
 
 def test_no_destructive_git_command_appears_in_the_cutover_modules():
-    modules = [
-        "app/cutover.py",
-        "app/cutover_build.py",
-        "app/cutover_db.py",
-        "app/cutover_inventory.py",
-        "app/cutover_locations.py",
-        "app/identifiers.py",
-        "app/cutover_manifest.py",
-    ]
+    # Discovered, not listed: a hardcoded list silently stops covering a
+    # module the moment one is added.
+    root = Path(__file__).resolve().parents[1]
+    modules = sorted(root.glob("app/cutover*.py")) + [root / "app" / "identifiers.py"]
+    assert len(modules) >= 7, f"module discovery found only {modules}"
     for name in modules:
         source = Path(name).read_text(encoding="utf-8")
         tree = ast.parse(source, filename=name)
@@ -1590,3 +1615,41 @@ def test_tree_state_never_queries_path_state_after_lstat():
     ]
 
     assert offenders == [], f"_tree_state re-queries path state: {offenders}"
+
+
+def test_former_slugs_is_recorded_for_every_matching_product_key():
+    """One product slug can occur under more than one entity.
+
+    `products.yaml` nests product keys per entity, so the same slug appears
+    once per owning entity. Recording provenance on only the first leaves the
+    others migrated but unattributed.
+    """
+    from app.cutover_build import _record_former_slug
+
+    text = (
+        "products:\n"
+        "  ab:\n"
+        "    q7-product:\n"
+        "      label: A\n"
+        "  zz:\n"
+        "    q7-product:\n"
+        "      label: B\n"
+    )
+
+    result = _record_former_slug(text, "q7-product", "q7", 6)
+
+    assert result.count("former_slugs:") == 2, (
+        "provenance was recorded for only the first matching key"
+    )
+
+
+def test_former_slugs_values_survive_yaml_round_trip():
+    """`no`, `y`, `on` and friends are booleans unless quoted."""
+    from app.cutover_build import _record_former_slug
+
+    for old in ("no", "y", "on", "null"):
+        result = _record_former_slug(
+            "entities:\n  x-entity:\n    label: A\n", "x-entity", old, 4
+        )
+        loaded = yaml.safe_load(result)["entities"]["x-entity"]["former_slugs"]
+        assert loaded == [old], f"{old!r} round-tripped as {loaded!r}"
