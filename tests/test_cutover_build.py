@@ -4,6 +4,7 @@ import subprocess
 
 import pytest
 
+from app.cutover_locations import advisory_occurrences
 from app.cutover_build import CutoverError, isolated_worktree
 from tests.conftest import git_head, git_is_clean, git_vault
 
@@ -126,6 +127,7 @@ import yaml
 
 import app.cutover_build as cutover_build
 
+from app.cutover_locations import advisory_occurrences
 from app.cutover_build import (
     BuildResult,
     build_cutover,
@@ -1019,13 +1021,63 @@ def test_existing_former_slugs_are_preserved_and_no_duplicate_key_is_created(
 
 
 def test_a_product_kind_workspace_id_takes_the_workspace_suffix(tmp_path: Path):
-    vault = cutover_vault(tmp_path / "vault")
-    promoted(vault)
+    """One literal on two axes: each field takes its own suffix.
 
-    workspaces = (vault / "_system" / "workspaces.yaml").read_text(encoding="utf-8")
-    assert "id: w7-workspace" in workspaces
+    The dangerous shape is a product workspace whose `id` equals the product
+    slug. A fixture where the two differ cannot detect a product pass that also
+    rewrites `id:`, because a product-axis rewrite of `q7` never matches
+    `id: w7`.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    workspaces_path = vault / "_system" / "workspaces.yaml"
+    workspaces_path.write_text(
+        "workspaces:\n"
+        "  - {id: q7, entity: ab, product: q7, member: m7, kind: product}\n",
+        encoding="utf-8",
+    )
+    commit_in(vault, "workspace id equals the product slug")
+
+    mappings = (
+        Mapping(axis="entity", old="ab", new="ab-entity"),
+        Mapping(axis="product", old="q7", new="q7-product"),
+        Mapping(axis="member", old="m7", new="m7-member"),
+        Mapping(axis="workspace", old="q7", new="q7-workspace"),
+    )
+    # Dispositions come from the actual pre-scan objects, carrying their own
+    # context digests, so the approved set is exactly what the scanner saw.
+    dispositions = tuple(
+        Disposition(
+            path=item.path,
+            axis=item.axis,
+            old=item.old,
+            ordinal=item.ordinal,
+            context_sha256=item.context_sha256,
+            line=item.line,
+            kind="incidental",
+            typed_location="",
+        )
+        for item in advisory_occurrences(vault, mappings)
+    )
+    manifest = ApprovalManifest(
+        source_head=git_head(vault),
+        mappings=mappings,
+        databases=load_manifest(approved(vault)[0]).databases,
+        dispositions=dispositions,
+    )
+    raw = canonical_bytes(manifest)
+    record = ApprovalRecord(
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=approved(vault)[1].executor_commit,
+        approved_by="owner",
+    )
+
+    built = build_cutover(vault, raw, record)
+    promote(vault, built.commit, manifest.source_head, git_status_bytes(vault), ["ab"])
+
+    workspaces = workspaces_path.read_text(encoding="utf-8")
+    assert "id: q7-workspace" in workspaces, "product claimed workspace id"
     assert "product: q7-product" in workspaces
-    assert "id: q7-product" not in workspaces
+    assert "id: q7-product" not in workspaces, "product claimed workspace id"
 
 
 def test_run_vault_validators_leaves_no_bytecode(tmp_path: Path):
@@ -1060,3 +1112,33 @@ def test_a_validator_that_writes_an_ignored_file_refuses_the_build(tmp_path: Pat
         build_cutover(vault, raw, record, validator=writes_ignored_file)
 
     assert git_is_clean(vault)
+
+
+import ast
+
+
+def test_no_destructive_git_command_appears_in_the_cutover_modules():
+    modules = [
+        "app/cutover.py",
+        "app/cutover_build.py",
+        "app/cutover_db.py",
+        "app/cutover_inventory.py",
+        "app/cutover_locations.py",
+        "app/identifiers.py",
+        "app/cutover_manifest.py",
+    ]
+    for name in modules:
+        source = Path(name).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=name)
+        for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+            literals = {
+                item.value
+                for item in ast.walk(call)
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            }
+            assert not {"reset", "--hard"} <= literals, (
+                f"{name} can invoke git reset --hard"
+            )
+            assert not {"clean", "-fd"} <= literals, (
+                f"{name} can invoke git clean -fd"
+            )

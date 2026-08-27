@@ -7,6 +7,7 @@ import app.cutover as cutover
 from app.cutover import promote
 from app.cutover_build import CutoverCommittedError, CutoverError, isolated_worktree
 from app.cutover_inventory import UnmigratableContentError
+from app.git_transaction import GitTransactionFailure
 from tests.conftest import git_head, git_status_bytes, git_vault
 
 
@@ -64,7 +65,13 @@ def test_promotion_refuses_a_moved_head(tmp_path: Path):
     (vault / "b.md").write_text("y\n", encoding="utf-8")
     moved = commit_in(vault, "concurrent")
 
-    with pytest.raises(CutoverError):
+    # Match the precheck's own message. Without it, disabling the precheck
+    # still raises CutoverError from `git merge --ff-only`, and the test would
+    # prove the fallback primitive rather than the precheck.
+    with pytest.raises(
+        CutoverError,
+        match="live HEAD moved since the build",
+    ):
         promote(vault, built, head, git_status_bytes(vault), [])
     assert git_head(vault) == moved
 
@@ -111,15 +118,35 @@ def test_promotion_leaves_an_obstructing_untracked_file_intact(tmp_path: Path):
     assert git_head(vault) == head
 
 
-def test_a_failed_promotion_is_not_reported_as_committed(tmp_path: Path):
+def test_a_failed_promotion_is_not_reported_as_committed(
+    tmp_path: Path, monkeypatch
+):
+    """A failure before the body runs is an ordinary refusal, never "committed".
+
+    The lock layer fails before promotion can reach `git merge`, so nothing was
+    written. Reporting that as `CutoverCommittedError` would tell an operator
+    not to retry a cutover that never started.
+    """
+    import contextlib
+
     vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
     head = git_head(vault)
     built = build_a_commit(vault, head)
-    (vault / "stray.md").write_text("s\n", encoding="utf-8")
+    captured = git_status_bytes(vault)
+
+    @contextlib.contextmanager
+    def refuses_to_lock(_vault):
+        raise GitTransactionFailure("lock layer unavailable")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(cutover, "action_lock", refuses_to_lock)
 
     with pytest.raises(CutoverError) as caught:
-        promote(vault, built, head, git_status_bytes(vault), [])
-    assert not isinstance(caught.value, CutoverCommittedError)
+        promote(vault, built, head, captured, [])
+    assert not isinstance(caught.value, CutoverCommittedError), (
+        "uncommitted failure reported committed"
+    )
+    assert git_head(vault) == head
 
 
 def test_a_commit_that_cannot_be_confirmed_is_reported_as_committed(
