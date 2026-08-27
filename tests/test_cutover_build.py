@@ -789,3 +789,138 @@ def test_final_database_gate_reads_the_moved_artifact(tmp_path: Path, monkeypatc
     assert seen["moved_exists"] is True
     assert seen["source_gone"] is True
     assert git_is_clean(vault)
+
+
+import hashlib
+
+from app.action_receipts import make_action_receipt, render_action_receipt, resolve_head_receipt
+from app.cutover import promote
+
+
+def promoted(vault: Path) -> BuildResult:
+    head = git_head(vault)
+    raw, record = approved(vault)
+    result = build_cutover(vault, raw, record)
+    promote(vault, result.commit, head, git_status_bytes(vault), ["ab"])
+    return result
+
+
+def test_one_commit_is_produced_and_revert_restores_everything(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    before = git_count_commits(vault)
+
+    result = promoted(vault)
+
+    assert git_count_commits(vault) == before + 1
+    assert (vault / "ab-entity" / "00-inbox" / "note.md").is_file()
+
+    # This is the approved rollback window: promotion has completed but every
+    # writer is still quiesced, so no later SQLite write can be overwritten.
+    subprocess.run(
+        ["git", "-c", "user.email=t@e", "-c", "user.name=t",
+         "revert", "--no-edit", result.commit],
+        cwd=vault, check=True, capture_output=True,
+    )
+
+    assert (vault / "ab" / "00-inbox" / "note.md").is_file()
+    conn = sqlite3.connect(vault / "ab" / "books.db")
+    try:
+        assert conn.execute("SELECT product FROM ledger").fetchall() == [("q7",)]
+        assert conn.execute("SELECT member FROM roster").fetchall() == [("m7",)]
+    finally:
+        conn.close()
+
+
+def test_ordinary_prose_containing_a_short_identifier_is_untouched(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    promoted(vault)
+
+    note = (vault / "ab-entity" / "00-inbox" / "note.md").read_text(encoding="utf-8")
+    assert "entity: ab-entity" in note
+    assert "product: q7-product" in note
+    assert "member: m7-member" in note
+    assert "the ab word" in note
+
+
+def test_the_database_is_updated_before_the_entity_directory_moves(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    promoted(vault)
+
+    moved = vault / "ab-entity" / "books.db"
+    assert moved.is_file()
+    conn = sqlite3.connect(moved)
+    try:
+        assert conn.execute("SELECT product FROM ledger").fetchall() == [
+            ("q7-product",)
+        ]
+        assert conn.execute("SELECT member FROM roster").fetchall() == [
+            ("m7-member",)
+        ]
+    finally:
+        conn.close()
+
+
+def test_the_promoted_database_blob_is_the_exact_verified_build_artifact(
+    tmp_path: Path,
+):
+    vault = cutover_vault(tmp_path / "vault")
+
+    result = promoted(vault)
+
+    built_blob = git(
+        vault, "rev-parse", f"{result.commit}:ab-entity/books.db"
+    ).strip()
+    promoted_blob = git(vault, "rev-parse", "HEAD:ab-entity/books.db").strip()
+    assert promoted_blob == built_blob
+    assert git(vault, "rev-parse", "HEAD^{tree}").strip() == result.tree
+
+
+def test_a_spent_proposal_id_is_still_refused_after_an_entity_cutover(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    proposal_id = "20260826T120000-" + "ab" * 16
+    receipt = make_action_receipt(proposal_id, "a" * 64, "approval")
+    store = vault / "ab" / "outbox" / ".receipts"
+    store.mkdir(parents=True)
+    (store / f"{proposal_id}.yaml").write_bytes(render_action_receipt(receipt))
+    commit_in(vault, "add receipt")
+
+    promoted(vault)
+
+    resolution = resolve_head_receipt(vault, "ab-entity", proposal_id)
+    assert resolution.error is None
+    assert resolution.receipt == receipt
+
+
+def test_proposal_prefixes_are_rewritten_and_a_pre_cutover_token_is_refused(
+    tmp_path: Path,
+):
+    vault = cutover_vault(tmp_path / "vault")
+    outbox = vault / "ab" / "outbox"
+    outbox.mkdir(parents=True)
+    proposal_id = "20260826T120000-" + "cd" * 16
+    record_path = outbox / f"{proposal_id}.yaml"
+    record_path.write_text(
+        f"id: {proposal_id}\n"
+        "action: classify\n"
+        "entity: ab\n"
+        "src: ab/00-inbox/active/x.md\n"
+        "dst: ab/09-marketing/active/x.md\n"
+        'opaque: "keep: [x]"  # exact\n',
+        encoding="utf-8",
+    )
+    before_token = hashlib.sha256(record_path.read_bytes()).hexdigest()
+    commit_in(vault, "add proposal")
+
+    promoted(vault)
+
+    moved = vault / "ab-entity" / "outbox" / record_path.name
+    text = moved.read_text(encoding="utf-8")
+    assert "entity: ab-entity" in text
+    assert "src: ab-entity/00-inbox/active/x.md" in text
+    assert "dst: ab-entity/09-marketing/active/x.md" in text
+    assert 'opaque: "keep: [x]"  # exact' in text, (
+        "proposal rewrite altered bytes outside the approved fields"
+    )
+    # S7 binds an approval to exact proposal bytes, so a token issued before the
+    # cutover no longer matches. Failing closed is correct.
+    assert hashlib.sha256(moved.read_bytes()).hexdigest() != before_token
