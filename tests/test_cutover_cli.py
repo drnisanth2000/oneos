@@ -245,3 +245,80 @@ def test_apply_promotes_when_acknowledged(tmp_path: Path, capsys):
     assert "before writers restart" in out
     assert git_head(vault) != head
     assert (vault / "ab-entity").is_dir()
+
+
+def test_output_failure_after_promotion_keeps_the_committed_classification(
+    tmp_path: Path, monkeypatch
+):
+    """Once `promote()` returns, the ref has moved.
+
+    Reporting must never downgrade that to a refusal: an operator who sees the
+    aborted code retries a cutover that already committed, which is exactly the
+    confusion the distinct committed outcome exists to prevent.
+    """
+    import builtins
+
+    import app.cutover as cutover
+
+    vault = cutover_vault(tmp_path / "vault")
+    head = git_head(vault)
+    manifest_path, record_path = write_artifacts(tmp_path, *approved(vault))
+
+    real_print = builtins.print
+
+    def print_or_break(*args, **kwargs):
+        if args and str(args[0]).startswith("[DONE]"):
+            raise BrokenPipeError("stdout closed")
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", print_or_break)
+
+    code = main(
+        ["apply", "--vault-root", str(vault),
+         "--manifest", str(manifest_path), "--approval", str(record_path),
+         "--i-have-quiesced-all-writers"]
+    )
+
+    monkeypatch.undo()
+    assert git_head(vault) != head, "the cutover did commit"
+    assert (vault / "ab-entity").is_dir()
+    assert code != 1, "a committed cutover was reported with the aborted code"
+    assert code == 2
+
+
+def test_committed_outcome_survives_broken_output(tmp_path: Path, monkeypatch):
+    """`CutoverCommittedError` must still return the committed code.
+
+    Its own handler prints. If that print fails, an unguarded handler raises
+    out of `main()` and the operator gets a traceback instead of "committed,
+    do not retry" — losing the classification at the one moment it matters.
+    """
+    import builtins
+
+    import app.cutover as cutover
+
+    vault = cutover_vault(tmp_path / "vault")
+    manifest_path, record_path = write_artifacts(tmp_path, *approved(vault))
+
+    def committed(*args, **kwargs):
+        raise cutover.CutoverCommittedError("committed but unconfirmed")
+
+    monkeypatch.setattr(cutover, "promote", committed)
+
+    real_print = builtins.print
+
+    def print_or_break(*args, **kwargs):
+        if args and str(args[0]).startswith("[COMMITTED]"):
+            raise BrokenPipeError("stdout closed")
+        return real_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", print_or_break)
+
+    code = main(
+        ["apply", "--vault-root", str(vault),
+         "--manifest", str(manifest_path), "--approval", str(record_path),
+         "--i-have-quiesced-all-writers"]
+    )
+
+    monkeypatch.undo()
+    assert code == 2, "a committed outcome was lost when its report failed"

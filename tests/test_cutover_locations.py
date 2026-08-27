@@ -577,3 +577,354 @@ def test_untyped_same_literal_prose_remains_advisory_per_axis(tmp_path: Path):
         ("product", "q7"),
         ("workspace", "q7"),
     }
+
+
+def test_mapping_key_rewrite_respects_exact_indent_across_blank_lines(tmp_path: Path):
+    """`\\s{n}` matches newlines; only exact spaces separate nesting depths.
+
+    `indent` is the sole mechanism keeping an entity-group key and a product
+    key apart inside `products.yaml` — the one file where two axes share a key
+    space — so a depth-4 pass reaching a depth-2 key is a cross-axis rewrite.
+    """
+    text = "products:\n\n\n  ab:\n    label: A\n"
+
+    result = rewrite_mapping_key(text, "ab", "ab-product", indent=4)
+
+    assert "  ab:" in result, "a depth-4 pass rewrote a depth-2 key"
+    assert "ab-product" not in result
+
+
+def test_mapping_key_span_respects_exact_indent(tmp_path: Path):
+    from app.cutover_locations import _mapping_key_span
+
+    assert _mapping_key_span("  ab:", "ab", 4) is None
+    assert _mapping_key_span("    ab:", "ab", 4) is not None
+
+
+def test_malformed_front_matter_is_a_hard_failure(tmp_path: Path):
+    """Every sibling reader in this gate raises; this one must not return {}."""
+    from app.cutover_locations import _front_matter_values
+
+    with pytest.raises(UnreadableFile):
+        _front_matter_values("---\nentity: [unclosed\n---\n\nbody\n")
+
+
+def test_former_slugs_exemption_is_span_specific_not_whole_line(tmp_path: Path):
+    """A whole-line skip hides every other token on the line, including a
+    comment the owner must still disposition."""
+    system = tmp_path / "_system"
+    system.mkdir()
+    (system / "entities.yaml").write_text(
+        "entities:\n  ab-entity:\n    former_slugs: [ab]  # ab is our ledger code\n",
+        encoding="utf-8",
+    )
+
+    found = advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1])
+
+    assert [(item.path, item.old) for item in found] == [
+        ("_system/entities.yaml", "ab")
+    ], "the comment token was hidden by a whole-line exemption"
+
+
+BLOCK_POLICY = """\
+version: 1.0
+default: deny
+description: "ab is mentioned here and must not change"
+actors:
+  h:
+    allow:
+      - action: read
+        paths: ["ab/**"]
+        except:
+          - "ab/.sensitive/**"
+      - action: write
+        paths:
+          - "ab/00-inbox/**"
+    deny:
+      - paths: [".sensitive/**"]
+"""
+
+
+def test_policy_rewrite_handles_block_sequences(tmp_path: Path):
+    """A block `except:` is legal YAML and must move with its `paths:`.
+
+    Rewriting one half and not the other converts a deny into an allow — the
+    BUILD §4 fail-open.
+    """
+    result = rewrite_policy_path_heads(BLOCK_POLICY, "ab", "ab-entity")
+
+    assert '"ab-entity/**"' in result
+    assert '"ab-entity/.sensitive/**"' in result, "block except was left behind"
+    assert '"ab-entity/00-inbox/**"' in result, "block paths was left behind"
+    assert '"ab/' not in result
+
+
+def test_policy_rewrite_leaves_unrelated_quoted_text_and_formatting_alone(
+    tmp_path: Path,
+):
+    result = rewrite_policy_path_heads(BLOCK_POLICY, "ab", "ab-entity")
+
+    assert 'description: "ab is mentioned here and must not change"' in result
+    assert '".sensitive/**"' in result
+    # No reserialisation: every original line survives except the rewritten
+    # path heads.
+    assert result.count("\n") == BLOCK_POLICY.count("\n")
+    assert "action: read" in result and "actors:" in result
+
+
+def test_residual_gate_reports_a_block_style_stale_except(tmp_path: Path):
+    """The gate must parse the policy itself, not reuse the writer's matcher.
+
+    A gate built from the writer's own regex is blind wherever the writer is
+    blind, which is how a half-rewritten rule passed both gates.
+    """
+    system = tmp_path / "_system" / "scripts"
+    system.mkdir(parents=True)
+    (system / "action-policy.yaml").write_text(
+        "actors:\n  h:\n    allow:\n      - action: read\n"
+        '        paths: ["ab-entity/**"]\n'
+        "        except:\n"
+        '          - "ab/.sensitive/**"\n',
+        encoding="utf-8",
+    )
+
+    found = scoped_residuals(tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),))
+
+    assert any(item.location == "entity:action-policy:except" for item in found), (
+        "the gate did not see a stale block-style except"
+    )
+
+
+def test_residual_gate_fails_closed_on_malformed_policy(tmp_path: Path):
+    system = tmp_path / "_system" / "scripts"
+    system.mkdir(parents=True)
+    (system / "action-policy.yaml").write_text(
+        "actors:\n  h:\n    allow:\n      - paths: [unclosed\n", encoding="utf-8"
+    )
+
+    with pytest.raises(UnreadableFile):
+        scoped_residuals(tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),))
+
+
+ALIASED_POLICY = """\
+description: &shared "ab/**"
+actors:
+  h:
+    allow:
+      - action: read
+        paths: [*shared]
+        except: ["ab/.sensitive/**"]
+"""
+
+
+def test_policy_writer_refuses_yaml_aliases(tmp_path: Path):
+    """An alias resolves to the anchor's node, whose marks point elsewhere.
+
+    Rewriting at those offsets edits the *anchor* — here an unrelated
+    `description:` — while `paths:` keeps pointing at the same value. The
+    parsed gate then sees a value that looks migrated and reports nothing, so
+    the edit is silent and outside `paths`/`except` entirely.
+    """
+    with pytest.raises(UnreadableFile, match="anchor or alias"):
+        rewrite_policy_path_heads(ALIASED_POLICY, "ab", "ab-entity")
+
+
+def test_policy_writer_never_edits_the_anchored_field(tmp_path: Path):
+    try:
+        result = rewrite_policy_path_heads(ALIASED_POLICY, "ab", "ab-entity")
+    except UnreadableFile:
+        result = ALIASED_POLICY
+    assert 'description: &shared "ab/**"' in result, (
+        "an unrelated anchored field was rewritten"
+    )
+    assert "ab-entity" not in result
+
+
+def test_residual_gate_refuses_yaml_aliases(tmp_path: Path):
+    """The gate must refuse independently, not inherit the writer's check."""
+    system = tmp_path / "_system" / "scripts"
+    system.mkdir(parents=True)
+    (system / "action-policy.yaml").write_text(ALIASED_POLICY, encoding="utf-8")
+
+    with pytest.raises(UnreadableFile, match="anchor or alias"):
+        scoped_residuals(
+            tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),)
+        )
+
+
+def test_policy_without_anchors_is_still_accepted(tmp_path: Path):
+    """The refusal must be specific to anchors, not a blanket rejection."""
+    result = rewrite_policy_path_heads(BLOCK_POLICY, "ab", "ab-entity")
+
+    assert '"ab-entity/.sensitive/**"' in result
+
+
+SCALAR_PATHS_POLICY = """\
+actors:
+  h:
+    allow:
+      - action: read
+        paths: "ab/**"
+        except: ["ab/.sensitive/**"]
+"""
+
+SCALAR_EXCEPT_POLICY = """\
+actors:
+  h:
+    allow:
+      - action: read
+        paths: ["ab/**"]
+        except: "ab/.sensitive/**"
+"""
+
+NON_STRING_ITEM_POLICY = """\
+actors:
+  h:
+    allow:
+      - action: read
+        paths:
+          - {glob: "ab/**"}
+        except: ["ab/.sensitive/**"]
+"""
+
+
+@pytest.mark.parametrize(
+    ("policy", "diagnosis"),
+    [
+        (SCALAR_PATHS_POLICY, "expected a sequence"),
+        (SCALAR_EXCEPT_POLICY, "expected a sequence"),
+        (NON_STRING_ITEM_POLICY, "expected a scalar"),
+    ],
+    ids=["scalar-paths", "scalar-except", "non-string-item"],
+)
+def test_policy_writer_refuses_a_wrongly_shaped_field(policy: str, diagnosis: str):
+    """A shape the writer cannot rewrite must refuse, never be skipped.
+
+    Silently ignoring it leaves the rule stale and, because the gate ignores
+    the same shape, unreported — a rule still naming the retired entity in a
+    committed cutover.
+    """
+    # The diagnosis matters: a disabled sequence check falls through to the
+    # item check, which still raises. Matching only "shape" would accept the
+    # wrong guard doing the work.
+    with pytest.raises(UnreadableFile, match=diagnosis):
+        rewrite_policy_path_heads(policy, "ab", "ab-entity")
+
+
+@pytest.mark.parametrize(
+    ("policy", "diagnosis"),
+    [
+        (SCALAR_PATHS_POLICY, "expected a sequence"),
+        (SCALAR_EXCEPT_POLICY, "expected a sequence"),
+        (NON_STRING_ITEM_POLICY, "expected a scalar"),
+    ],
+    ids=["scalar-paths", "scalar-except", "non-string-item"],
+)
+def test_residual_gate_refuses_a_wrongly_shaped_field(
+    tmp_path: Path, policy: str, diagnosis: str
+):
+    """The gate refuses independently, not by inheriting the writer's check."""
+    system = tmp_path / "_system" / "scripts"
+    system.mkdir(parents=True)
+    (system / "action-policy.yaml").write_text(policy, encoding="utf-8")
+
+    with pytest.raises(UnreadableFile, match=diagnosis):
+        scoped_residuals(
+            tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),)
+        )
+
+
+NESTED_FRONT_MATTER = """\
+---
+entity: ab
+source:
+  member: m7
+related:
+  - member: m7
+---
+
+the ab word
+"""
+
+
+def test_front_matter_writer_owns_top_level_scalars_only():
+    """Nested structures are outside the cutover's front-matter ownership.
+
+    The writer matched any indent and tolerated a `- ` prefix, so a nested
+    provenance block was rewritten — bytes the owner never approved, because
+    the typed-span suppression removed them from the advisory report too.
+    """
+    result = rewrite_front_matter_field(NESTED_FRONT_MATTER, "member", "m7", "m7-member")
+
+    assert "  member: m7\n" in result, "a nested mapping value was rewritten"
+    assert "  - member: m7\n" in result, "a list entry value was rewritten"
+    assert "m7-member" not in result
+
+
+def test_front_matter_writer_still_rewrites_a_top_level_scalar():
+    text = "---\nentity: ab\nmember: m7\n---\n\nbody\n"
+
+    result = rewrite_front_matter_field(text, "member", "m7", "m7-member")
+
+    assert "member: m7-member\n" in result
+
+
+def test_nested_front_matter_values_remain_advisory(tmp_path: Path):
+    """What the writer does not own must stay visible to the owner.
+
+    Suppressing a nested value as "typed" while no writer rewrites it and no
+    gate inspects it is the worst of both: unreviewed and unverifiable.
+    """
+    (tmp_path / "note.md").write_text(NESTED_FRONT_MATTER, encoding="utf-8")
+
+    found = advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[2:3])
+
+    assert [(item.path, item.old, item.line) for item in found] == [
+        ("note.md", "m7", 4),
+        ("note.md", "m7", 6),
+    ], "nested front-matter values were suppressed as typed"
+
+
+def test_top_level_front_matter_value_is_still_typed(tmp_path: Path):
+    """The genuine typed field must not become advisory noise."""
+    (tmp_path / "note.md").write_text(
+        "---\nentity: ab\n---\n\nbody\n", encoding="utf-8"
+    )
+
+    assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == []
+
+
+def test_a_hash_without_whitespace_is_part_of_the_value_not_a_comment():
+    """YAML starts a comment only after whitespace.
+
+    `entity: ab#suffix` is the single scalar `ab#suffix`, so the old
+    identifier is not the whole value and the field must not be rewritten —
+    doing so corrupts an unrelated value into `ab-entity#suffix`.
+    """
+    text = "---\nentity: ab#suffix\n---\n\nbody\n"
+
+    result = rewrite_front_matter_field(text, "entity", "ab", "ab-entity")
+
+    assert result == text, "a `#` inside a scalar was treated as a comment"
+
+
+def test_a_hash_without_whitespace_stays_advisory(tmp_path: Path):
+    """Not owned by the writer, so it must remain visible to the owner."""
+    (tmp_path / "note.md").write_text(
+        "---\nentity: ab#suffix\n---\n\nbody\n", encoding="utf-8"
+    )
+
+    found = advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1])
+
+    assert [(item.path, item.old, item.line) for item in found] == [
+        ("note.md", "ab", 2)
+    ], "a value the writer cannot own was suppressed as typed"
+
+
+def test_a_hash_after_whitespace_is_still_a_comment():
+    """The distinction is whitespace, not the presence of `#`."""
+    text = "---\nentity: ab #suffix\n---\n\nbody\n"
+
+    result = rewrite_front_matter_field(text, "entity", "ab", "ab-entity")
+
+    assert "entity: ab-entity #suffix\n" in result

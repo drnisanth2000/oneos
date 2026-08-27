@@ -14,13 +14,45 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+import hashlib
+import os
 import shutil
+import stat
 import subprocess
 import tempfile
 
 
 class CutoverError(Exception):
     pass
+
+
+class CutoverCleanupError(CutoverError):
+    """Cleanup of the isolated build failed, possibly alongside the build.
+
+    Composed rather than chained: the CLI prints `str(exc)`, so a fact that
+    lives only in `__notes__` or `__cause__` never reaches the operator. A
+    stranded temporary tree is a copy of tracked vault content, so it has to
+    appear in the message the operator actually sees.
+
+    Changing the propagating type is safe here — every isolated-build failure
+    is a pre-promotion administrative refusal, and `CutoverError` is what
+    upstream dispatches on.
+    """
+
+    def __init__(self, detail: str, body_error: BaseException | None = None):
+        self.body_error = body_error
+        self.detail = detail
+        if body_error is None:
+            super().__init__(f"temporary cutover cleanup failed: {detail}")
+        else:
+            # Only the type name is public. `str(body_error)` is arbitrary
+            # text that can carry vault paths — a git error naming a file, an
+            # OSError with a filename — and the CLI prints this message. The
+            # text is preserved on `.body_error` and through the chain.
+            super().__init__(
+                f"build failed ({type(body_error).__name__}); "
+                f"temporary cutover cleanup also failed: {detail}"
+            )
 
 
 class CutoverCommittedError(CutoverError):
@@ -53,11 +85,34 @@ def isolated_worktree(vault: Path, source_head: str) -> Iterator[Path]:
         git(vault, "worktree", "add", "--quiet", "--detach", str(scratch), source_head)
         yield scratch
     finally:
-        subprocess.run(
+        # Cleanup failure is never swallowed. A leaked temporary tree is a full
+        # copy of tracked vault content sitting in temporary storage on a
+        # machine that holds Grey Matter, and a stale worktree registration
+        # leaves the vault's Git metadata pointing at a path that is gone.
+        # The message stays generic: the temporary path is not printed.
+        failures: list[str] = []
+        removal = subprocess.run(
             ["git", "worktree", "remove", "--force", str(scratch)],
-            cwd=vault, check=False, capture_output=True,
+            cwd=vault, check=False, capture_output=True, text=True,
         )
-        shutil.rmtree(parent, ignore_errors=True)
+        if removal.returncode != 0:
+            failures.append(
+                "a stale worktree registration remains in the vault; "
+                "run `git worktree prune`"
+            )
+        try:
+            shutil.rmtree(parent)
+        except OSError:
+            failures.append(
+                "the temporary cutover worktree could not be removed and may "
+                "still hold a copy of vault content; remove it manually"
+            )
+        if failures:
+            # Compose both facts into one message. The operator sees `str(exc)`
+            # and nothing else, so the stranded copy must be stated there.
+            raise CutoverCleanupError(
+                "; ".join(failures), sys.exc_info()[1]
+            ) from sys.exc_info()[1]
 
 
 from collections import Counter
@@ -74,10 +129,12 @@ from .cutover_db import DatabaseChange, apply_database_mappings, database_residu
 from .cutover_inventory import (
     check_collisions,
     existing_identifiers,
+    proposed_mappings,
     require_clean_entities,
     require_clean_status,
 )
 from .cutover_locations import (
+    SKIP_DIRS,
     advisory_occurrences,
     location_keys,
     rewrite_front_matter_field,
@@ -185,8 +242,15 @@ def _rewrite_proposal(path: Path, old: str, new: str) -> None:
 
 
 def _markdown_files(root: Path):
+    """Exactly the scope the advisory scan and the residual gate inspect.
+
+    A writer that reaches further than either gate edits bytes nobody
+    reviewed and nothing can verify. `SKIP_DIRS` content is outside the
+    cutover entirely — not rewritten, and deliberately not advisory either.
+    """
     for candidate in sorted(root.rglob("*.md")):
-        if ".git" in candidate.relative_to(root).parts or candidate.is_symlink():
+        relative = candidate.relative_to(root)
+        if any(part in SKIP_DIRS for part in relative.parts) or candidate.is_symlink():
             continue
         yield candidate
 
@@ -446,19 +510,87 @@ def run_vault_validators(root: Path) -> None:
         raise CutoverError("vault script tests failed on the isolated tree")
 
 
-def _tree_state(root: Path) -> bytes:
-    """Opaque worktree state, including ignored paths.
+def _tree_state(root: Path) -> str:
+    """An opaque digest of the tree's own contents.
 
-    `--ignored` is mandatory: without it a private ignore rule could hide
-    validator detritus, and the comparison would pass while the artifact
-    silently gained a file nobody reviewed.
+    `git status` carries no content hash, so a file the migration already
+    reports as modified yields an identical status line after its bytes change
+    again — a validator could edit migrated content and reach the single
+    reviewed commit ungated.
+
+    Every entry contributes its path, type, mode and content: a file's bytes,
+    a symlink's target text. Symlinks are never followed, so a link planted
+    during validation is recorded as a link rather than read through. Only the
+    repository's own `.git` metadata is excluded, because Git rewrites it as a
+    matter of course; nothing else is trusted to be uninteresting.
+
+    The digest is opaque by construction — no path or content ever reaches a
+    diagnostic, only the fact that something changed.
     """
-    return subprocess.run(
-        ["git", "status", "--porcelain=v2", "--untracked-files=all", "--ignored"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    ).stdout
+    digest = hashlib.sha256()
+    for entry in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = entry.relative_to(root)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        digest.update(relative.as_posix().encode("utf-8", "surrogateescape"))
+        # Classification comes from this one captured `lstat` and nothing
+        # else. `is_dir()` traverses a symlink to answer, and every such call
+        # re-reads the path, so it can describe something that arrived after
+        # the entry was inspected.
+        info = entry.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            digest.update(b"\x00link\x00")
+            digest.update(os.readlink(entry).encode("utf-8", "surrogateescape"))
+            digest.update(f"\x00{info.st_mode:o}\x00".encode("ascii"))
+        elif stat.S_ISDIR(info.st_mode):
+            digest.update(b"\x00dir\x00")
+            digest.update(f"\x00{info.st_mode:o}\x00".encode("ascii"))
+        elif stat.S_ISREG(info.st_mode):
+            digest.update(b"\x00file\x00")
+            digest.update(_regular_file_contents(entry, info))
+            digest.update(f"\x00{info.st_mode:o}\x00".encode("ascii"))
+        else:
+            # A FIFO, socket or device is never read — opening one can block
+            # forever. Its type and mode still change the artifact, so they
+            # are recorded instead.
+            digest.update(f"\x00special:{stat.S_IFMT(info.st_mode):o}\x00".encode("ascii"))
+            digest.update(f"\x00{info.st_mode:o}\x00".encode("ascii"))
+    return digest.hexdigest()
+
+
+def _regular_file_contents(entry: Path, expected: os.stat_result) -> bytes:
+    """Read a regular file through a descriptor that cannot be redirected.
+
+    Between deciding a path is a regular file and reading it, the path can
+    become a symlink. `O_NOFOLLOW` refuses to open one, and re-checking the
+    type and inode *through the descriptor* proves the bytes came from the
+    file that was inspected rather than something swapped in behind it.
+    """
+    try:
+        handle = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise CutoverError(
+            "a tree entry changed while it was being read; the snapshot "
+            "cannot describe a tree that moved beneath it"
+        ) from exc
+    try:
+        actual = os.fstat(handle)
+        if not stat.S_ISREG(actual.st_mode) or (
+            actual.st_ino,
+            actual.st_dev,
+        ) != (expected.st_ino, expected.st_dev):
+            raise CutoverError(
+                "a tree entry changed while it was being read; the snapshot "
+                "cannot describe a tree that moved beneath it"
+            )
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(handle, 1 << 20)
+            if not block:
+                return b"".join(chunks)
+            chunks.append(block)
+    finally:
+        os.close(handle)
 
 
 def build_cutover(
@@ -479,6 +611,17 @@ def build_cutover(
     require_clean_entities(vault, affected)
 
     with isolated_worktree(vault, manifest.source_head) as scratch:
+        # The isolated worktree *is* the manifest's source HEAD, so this is a
+        # closed comparison rather than a recomputation the design forbids.
+        # Without it both residual gates pass by construction on a partial
+        # manifest — they only search for the mappings it carries — and the
+        # omission is discoverable only after the revert window has closed.
+        expected = set(proposed_mappings(scratch))
+        if set(manifest.mappings) != expected:
+            raise CutoverError(
+                "the approved mapping does not cover every sub-floor identifier "
+                "at the source HEAD; re-run from inventory"
+            )
         check_collisions(manifest.mappings, existing_identifiers(scratch))
         _require_dispositions(scratch, manifest)
 

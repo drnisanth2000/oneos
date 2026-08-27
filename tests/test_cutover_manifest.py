@@ -260,3 +260,46 @@ def test_structural_disposition_requires_a_typed_location():
         typed_location="entity:front-matter:entity",
     )
     assert allowed.typed_location == "entity:front-matter:entity"
+
+
+def test_two_targets_may_not_claim_one_column_on_different_axes():
+    """Per-target axis filtering is correct, but nothing forbade two targets
+    naming one column under different axes.
+
+    With a literal short on both axes the canonical sort applies `member`
+    first, the column ends up holding the member value, and the residual query
+    reports nothing — the exact silent corruption the axis rule exists to
+    prevent, in a binary file no text gate can inspect.
+    """
+    with pytest.raises(ManifestError, match="claimed by more than one"):
+        ApprovalManifest(
+            source_head="a" * 40,
+            mappings=(Mapping(axis="entity", old="ab", new="ab-entity"),),
+            databases=(
+                DatabaseTarget(
+                    path="ab/books.db", table="ledger", column="ref", axis="product"
+                ),
+                DatabaseTarget(
+                    path="ab/books.db", table="ledger", column="ref", axis="member"
+                ),
+            ),
+            dispositions=(),
+        )
+
+
+def test_the_same_column_in_a_different_database_is_permitted():
+    """The key is the whole triple: a different database is a different column."""
+    manifest = ApprovalManifest(
+        source_head="a" * 40,
+        mappings=(Mapping(axis="entity", old="ab", new="ab-entity"),),
+        databases=(
+            DatabaseTarget(
+                path="ab/books.db", table="ledger", column="ref", axis="product"
+            ),
+            DatabaseTarget(
+                path="zz/books.db", table="ledger", column="ref", axis="product"
+            ),
+        ),
+        dispositions=(),
+    )
+    assert len(manifest.databases) == 2

@@ -16,6 +16,12 @@ import yaml
 from app.action_receipts import ReceiptError, validate_all_head_receipt_stores
 
 
+#: A term of this length or more is matched in every tracked text file; a
+#: shorter one is only matched as a path component, a structured value, or an
+#: exact Markdown token. The registry identifier floor is deliberately one
+#: character above this, so retuning it must be a visible change.
+LONG_TERM_MINIMUM_LENGTH = 4
+
 ALLOWLIST_PATH = ".oneos-public-binary-allowlist"
 TEXT_FIELDS = frozenset(
     {"entity", "product", "member", "workspace", "owner", "id", "slug"}
@@ -344,8 +350,8 @@ def load_instance_terms(vault: Path) -> tuple[set[str], set[str]]:
 
     normalized = {term for term in terms if term}
     return (
-        {term for term in normalized if len(term) >= 4},
-        {term for term in normalized if len(term) < 4},
+        {term for term in normalized if len(term) >= LONG_TERM_MINIMUM_LENGTH},
+        {term for term in normalized if len(term) < LONG_TERM_MINIMUM_LENGTH},
     )
 
 

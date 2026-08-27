@@ -111,9 +111,14 @@ def rewrite_front_matter_field(text: str, field: str, old: str, new: str) -> str
     if parts is None:
         return text
     head, block, tail = parts
+    # Top-level scalars only. A nested mapping or a list entry is outside the
+    # cutover's front-matter ownership: rewriting one edits bytes the owner
+    # never approved, because the typed-span suppression would also remove it
+    # from the advisory report.
     rewritten = re.sub(
-        rf"(?m)^(\s*{re.escape(field)}:\s*){re.escape(old)}[ \t]*$",
-        rf"\g<1>{new}",
+        rf"(?m)^({re.escape(field)}:[ \t]*){re.escape(old)}"
+        rf"(?P<trailer>[ \t]*|[ \t]+\#.*)$",
+        rf"\g<1>{new}\g<trailer>",
         block,
     )
     return head + rewritten + tail
@@ -168,8 +173,11 @@ def rewrite_yaml_path_head_field(
 
 def rewrite_mapping_key(text: str, old: str, new: str, indent: int) -> str:
     """Rename a mapping key sitting at exactly `indent` spaces."""
+    # `\s` matches newlines, so `\s{n}` spans blank lines and reaches a
+    # shallower key. `indent` is the only thing separating the entity-group
+    # key from the product key inside `products.yaml`, so it must be exact.
     return re.sub(
-        rf"(?m)^(\s{{{indent}}}){re.escape(old)}:",
+        rf"(?m)^( {{{indent}}}(?! )){re.escape(old)}:",
         rf"\g<1>{new}:",
         text,
     )
@@ -181,28 +189,120 @@ _POLICY_LIST = re.compile(
 _QUOTED = re.compile(r"([\"'])([^\"']*)\1")
 
 
-def rewrite_policy_path_heads(text: str, old: str, new: str) -> str:
-    """Rewrite path heads inside `paths:` and `except:` list bodies only.
+@structured_reader(category="admin-record")
+def _policy_events(text: str):
+    """The policy's YAML event stream — the layer node offsets derive from."""
+    return list(yaml.parse(text))
 
-    Rewriting every quoted string in the file would edit descriptions and
-    unrelated values — the blind substitution this design exists to avoid. An
-    allow rule's `paths:` and its `except:` for `.sensitive/` are both matched
-    here, so they move together; rewriting one without the other is the
-    BUILD §4 fail-open.
+
+@structured_reader(category="admin-record")
+def _policy_nodes(text: str):
+    """The policy's composed node graph, carrying the marks the writer edits."""
+    return yaml.compose(text)
+
+
+def _refuse_yaml_anchors(text: str) -> None:
+    """Refuse a policy that uses YAML anchors or aliases.
+
+    An alias resolves to the anchor's node, so the node marks a rewriter works
+    from point at wherever the anchor was declared — possibly an unrelated
+    field. Editing there silently changes content outside `paths`/`except`,
+    and because the alias still resolves to the edited value, a parsed gate
+    sees nothing stale and reports nothing.
+
+    Checked over the event stream rather than the composed graph: the event
+    stream is what the offsets are ultimately derived from, so this sees the
+    construct directly instead of inferring it from resolved nodes.
     """
-    def rewrite_body(match: re.Match[str]) -> str:
-        boundary, spacing, key, body = match.groups()
-        rewritten = _QUOTED.sub(
-            lambda item: (
-                f"{item.group(1)}"
-                f"{rewrite_path_head(item.group(2), old, new)}"
-                f"{item.group(1)}"
-            ),
-            body,
-        )
-        return f"{boundary}{spacing}{key}: [{rewritten}]"
+    try:
+        for event in _policy_events(text):
+            anchor = getattr(event, "anchor", None)
+            if isinstance(event, yaml.AliasEvent) or anchor:
+                raise UnreadableFile(
+                    "action-policy.yaml uses a YAML anchor or alias; the "
+                    "cutover neither rewrites nor verifies indirected rules"
+                )
+    except yaml.YAMLError as exc:
+        raise UnreadableFile(
+            "action-policy.yaml could not be scanned for anchors"
+        ) from exc
 
-    return _POLICY_LIST.sub(rewrite_body, text)
+
+def policy_path_scalars(text: str) -> list[tuple[str, int, int, int, str]]:
+    """Locate every `paths:`/`except:` scalar structurally.
+
+    Returns `(key, line, start_col, end_col, value)` using the YAML parser's
+    own node marks rather than a regex, so block sequences, flow sequences and
+    quoted or plain scalars are all found. The caller edits the decoded text
+    at those offsets — nothing is reserialised, because round-tripping this
+    file would reformat rules the owner reviewed.
+    """
+    _refuse_yaml_anchors(text)
+    try:
+        root = _policy_nodes(text)
+    except yaml.YAMLError as exc:
+        raise UnreadableFile(
+            "action-policy.yaml could not be parsed; the fail-open guard "
+            "cannot pass on a rule it never read"
+        ) from exc
+    found: list[tuple[str, int, int, int, str]] = []
+
+    def walk(node) -> None:
+        if isinstance(node, yaml.MappingNode):
+            for key_node, value_node in node.value:
+                if getattr(key_node, "value", None) in ("paths", "except"):
+                    # A shape the writer cannot rewrite must refuse, not be
+                    # skipped: skipping leaves the rule stale, and the gate
+                    # ignores the same shape, so nothing reports it.
+                    if not isinstance(value_node, yaml.SequenceNode):
+                        raise UnreadableFile(
+                            f"action-policy.yaml has an unsupported shape for "
+                            f"{key_node.value!r}: expected a sequence"
+                        )
+                    for item in value_node.value:
+                        if not isinstance(item, yaml.ScalarNode):
+                            raise UnreadableFile(
+                                f"action-policy.yaml has an unsupported shape "
+                                f"inside {key_node.value!r}: expected a scalar"
+                            )
+                        found.append((
+                            key_node.value,
+                            item.start_mark.line,
+                            item.start_mark.column,
+                            item.end_mark.column,
+                            item.value,
+                        ))
+                walk(value_node)
+        elif isinstance(node, yaml.SequenceNode):
+            for item in node.value:
+                walk(item)
+
+    if root is not None:
+        walk(root)
+    return found
+
+
+def rewrite_policy_path_heads(text: str, old: str, new: str) -> str:
+    """Rewrite path heads inside `paths:` and `except:` scalars only.
+
+    An allow rule's `paths:` and its `except:` for `.sensitive/` move
+    together; rewriting one without the other is the BUILD §4 fail-open. The
+    scalars are located structurally and their decoded text edited in place, so a
+    block sequence is handled as readily as a flow one and no unrelated line
+    is touched.
+    """
+    lines = text.splitlines(keepends=True)
+    # Right-to-left within each line, so earlier column offsets stay valid.
+    for _key, line_no, col_start, col_end, value in sorted(
+        policy_path_scalars(text), key=lambda item: (item[1], item[2]), reverse=True
+    ):
+        moved = rewrite_path_head(value, old, new)
+        if moved == value:
+            continue
+        line = lines[line_no]
+        segment = line[col_start:col_end].replace(value, moved, 1)
+        lines[line_no] = line[:col_start] + segment + line[col_end:]
+    return "".join(lines)
 
 
 from pathlib import Path
@@ -220,6 +320,8 @@ BINARY_SUFFIXES = frozenset({
 #: The only two files where a `former_slugs:` line is legitimate. The rejected
 #: plan exempted every line containing the substring, in any file — a blanket
 #: exemption that would mask a genuine residual anywhere in the vault.
+_FORMER_SLUGS_SPAN = re.compile(r"^\s*former_slugs:\s*\[[^\]]*\]")
+
 FORMER_SLUGS_FILES = frozenset({
     "_system/entities.yaml",
     "_system/products.yaml",
@@ -244,6 +346,23 @@ class AdvisoryOccurrence:
     line: int
 
 
+def _front_matter_scalar_span(
+    line: str, field: str, old: str
+) -> tuple[int, int] | None:
+    """The span the front-matter writer owns — and only that.
+
+    Typedness must match the writer exactly. A span marked typed is removed
+    from the advisory report, so marking one the writer never rewrites hides
+    a value that is neither migrated nor reviewable.
+    """
+    match = re.match(
+        rf"^({re.escape(field)}:[ \t]*)(?P<value>{re.escape(old)})"
+        rf"(?:[ \t]*|[ \t]+\#.*)$",
+        line,
+    )
+    return None if match is None else match.span("value")
+
+
 def _yaml_scalar_span(
     line: str, field: str, old: str
 ) -> tuple[int, int] | None:
@@ -261,7 +380,7 @@ def _mapping_key_span(
     line: str, old: str, indent: int
 ) -> tuple[int, int] | None:
     match = re.match(
-        rf"^\s{{{indent}}}(?P<value>{re.escape(old)}):\s*(?:#.*)?$",
+        rf"^ {{{indent}}}(?! )(?P<value>{re.escape(old)}):[ \t]*(?:#.*)?$",
         line,
     )
     return None if match is None else match.span("value")
@@ -326,7 +445,7 @@ def _typed_token_spans(
                                 number,
                                 axis,
                                 old,
-                                _yaml_scalar_span(line, field, old),
+                                _front_matter_scalar_span(line, field, old),
                             )
 
             if relative == "_system/entities.yaml":
@@ -482,13 +601,20 @@ def advisory_occurrences(
         exempt_former_slugs = relative in FORMER_SLUGS_FILES
         ordinals: dict[tuple[str, str], int] = {}
         for number, line in enumerate(text.splitlines(), start=1):
-            if exempt_former_slugs and re.match(
-                r"^\s*former_slugs:\s*\[", line
-            ):
-                continue
+            # Span-specific, never whole-line: a whole-line skip would hide
+            # every other old-identifier token sharing the line — a trailing
+            # comment above all — from the report the owner dispositions.
+            exempt_span = (
+                _FORMER_SLUGS_SPAN.match(line) if exempt_former_slugs else None
+            )
             context_sha256 = stable_advisory_context(line, mappings)
             for (axis, old), pattern in patterns.items():
                 for match in pattern.finditer(line):
+                    if exempt_span is not None and (
+                        exempt_span.start() <= match.start()
+                        and match.end() <= exempt_span.end()
+                    ):
+                        continue
                     span_key = (
                         relative,
                         number,
@@ -530,8 +656,13 @@ def _front_matter_values(text: str) -> dict[str, str]:
         return {}
     try:
         loaded = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError:
-        return {}
+    except yaml.YAMLError as exc:
+        # Every sibling reader in this gate raises on the same condition.
+        # Returning {} would treat the file as having no front matter, so a
+        # retired identifier in an unrewritable form would pass unseen.
+        raise UnreadableFile(
+            "front matter could not be parsed for the residual gate"
+        ) from exc
     if not isinstance(loaded, dict):
         return {}
     return {k: v for k, v in loaded.items() if isinstance(v, str)}
@@ -545,6 +676,56 @@ def _load_yaml_file(path: Path) -> object:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, OSError, yaml.YAMLError) as exc:
         raise UnreadableFile(f"{path.name} could not be read for the residual gate") from exc
+
+
+@structured_reader(category="admin-record")
+def _load_policy_document(text: str):
+    """Parse the policy for the residual gate, independently of the writer.
+
+    Anchors are refused here too rather than inherited from the writer's
+    check: a gate that trusts the writer's validation is not an independent
+    gate.
+    """
+    _refuse_yaml_anchors(text)
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise UnreadableFile(
+            "action-policy.yaml could not be parsed for the residual gate"
+        ) from exc
+
+
+def _policy_path_values(document) -> list[tuple[str, str]]:
+    """Every `paths:`/`except:` scalar, from the parsed document.
+
+    Deliberately independent of `policy_path_scalars`: the gate must be able
+    to see a rule the writer could not rewrite.
+    """
+    found: list[tuple[str, str]] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("paths", "except"):
+                    if not isinstance(value, list):
+                        raise UnreadableFile(
+                            f"action-policy.yaml has an unsupported shape for "
+                            f"{key!r}: expected a sequence"
+                        )
+                    for item in value:
+                        if not isinstance(item, str):
+                            raise UnreadableFile(
+                                f"action-policy.yaml has an unsupported shape "
+                                f"inside {key!r}: expected a scalar"
+                            )
+                        found.append((key, item))
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(document)
+    return found
 
 
 def scoped_residuals(
@@ -623,16 +804,19 @@ def scoped_residuals(
             text = policy.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError) as exc:
             raise UnreadableFile("action-policy.yaml could not be read") from exc
-        for match in _POLICY_LIST.finditer(text):
-            key, body = match.group(3), match.group(4)
-            for quoted in _QUOTED.finditer(body):
-                head = quoted.group(2).partition("/")[0]
-                if head in entities:
-                    report(
-                        f"entity:action-policy:{key}",
-                        "_system/scripts/action-policy.yaml",
-                        head,
-                    )
+        # Parsed independently of the writer. A gate built from the writer's
+        # own matcher is blind exactly where the writer is blind, which is how
+        # a rule with a rewritten `paths:` and a stale `except:` passed both
+        # gates and left a `.sensitive/` read allowed. Malformed policy raises
+        # rather than quietly reporting nothing.
+        for key, value in _policy_path_values(_load_policy_document(text)):
+            head = value.partition("/")[0]
+            if head in entities:
+                report(
+                    f"entity:action-policy:{key}",
+                    "_system/scripts/action-policy.yaml",
+                    head,
+                )
 
     # front matter and proposals
     for candidate in sorted(root.rglob("*")):

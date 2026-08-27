@@ -1,11 +1,19 @@
 import os
 from pathlib import Path
+import os
+import shutil
+import stat
 import subprocess
+import textwrap
 
 import pytest
 
 from app.cutover_locations import advisory_occurrences
-from app.cutover_build import CutoverError, isolated_worktree
+from app.cutover_build import (
+    CutoverCleanupError,
+    CutoverError,
+    isolated_worktree,
+)
 from tests.conftest import git_head, git_is_clean, git_vault
 
 
@@ -1142,3 +1150,443 @@ def test_no_destructive_git_command_appears_in_the_cutover_modules():
             assert not {"clean", "-fd"} <= literals, (
                 f"{name} can invoke git clean -fd"
             )
+
+
+def test_markdown_under_skip_dirs_is_never_rewritten(tmp_path: Path):
+    """The writer must not reach further than the gates can verify.
+
+    `.obsidian/` and `.trash/` are outside the cutover entirely: no gate
+    inspects them and no advisory report shows them, so a rewrite there would
+    be bytes nobody reviewed and nothing could verify.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    for skipped in (".obsidian", ".trash"):
+        directory = vault / skipped
+        directory.mkdir()
+        (directory / "template.md").write_text(
+            "---\nentity: ab\nproduct: q7\n---\n\nthe ab word\n", encoding="utf-8"
+        )
+    commit_in(vault, "tracked content inside skip dirs")
+    before = {
+        skipped: (vault / skipped / "template.md").read_bytes()
+        for skipped in (".obsidian", ".trash")
+    }
+
+    promoted(vault)
+
+    for skipped, original in before.items():
+        assert (vault / skipped / "template.md").read_bytes() == original, (
+            f"{skipped} content was rewritten outside every gate"
+        )
+
+
+@pytest.fixture
+def stranding_rmtree(monkeypatch):
+    """Patch `shutil.rmtree` to fail, recording what it deliberately strands.
+
+    Teardown always runs — including when an assertion in the test body
+    fails — so a regression about leaked temporary trees can never leak one
+    itself. The closing assertion makes that cleanup provable rather than
+    assumed.
+    """
+    import app.cutover_build as cutover_build
+
+    stranded: list[Path] = []
+
+    def refuse_rmtree(path, *args, **kwargs):
+        stranded.append(Path(path))
+        raise OSError("device busy")
+
+    real_rmtree = cutover_build.shutil.rmtree
+    monkeypatch.setattr(cutover_build.shutil, "rmtree", refuse_rmtree)
+    yield stranded
+    # Use the captured original rather than relying on teardown ordering to
+    # have restored the patch.
+    for leaked in stranded:
+        real_rmtree(leaked, ignore_errors=True)
+    assert not [leaked for leaked in stranded if leaked.exists()], (
+        "the stranding regression leaked a temporary tree"
+    )
+
+
+def test_cleanup_failure_after_a_successful_body_is_surfaced(
+    tmp_path: Path, stranding_rmtree
+):
+    """A swallowed cleanup failure can leave a full tracked-vault copy behind.
+
+    On a machine holding Grey Matter that is a silent copy of vault content in
+    temporary storage, so it must refuse loudly rather than pass quietly.
+    """
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+
+    with pytest.raises(CutoverError, match="temporary cutover worktree"):
+        with isolated_worktree(vault, git_head(vault)):
+            pass
+
+    assert stranding_rmtree, "the cleanup path was never reached"
+
+
+def test_cleanup_failure_preserves_a_failing_body(tmp_path: Path, stranding_rmtree):
+    """Both facts survive: the build's own failure and the cleanup failure."""
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+
+    with pytest.raises(CutoverCleanupError) as caught:
+        with isolated_worktree(vault, git_head(vault)):
+            raise RuntimeError("body failed")
+
+    # Both facts must appear in the message the CLI actually prints.
+    message = str(caught.value)
+    assert "build failed" in message and "RuntimeError" in message
+    assert "body failed" not in message, "body exception text is not public"
+    assert "cleanup also failed" in message
+    assert "copy of vault content" in message
+    assert isinstance(caught.value.body_error, RuntimeError)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_cleanup_failure_never_prints_the_absolute_temporary_path(
+    tmp_path: Path, stranding_rmtree
+):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+
+    with pytest.raises(CutoverError) as caught:
+        with isolated_worktree(vault, git_head(vault)):
+            pass
+
+    message = str(caught.value)
+    assert "/var/" not in message and "/private/" not in message
+    assert "oneos-cutover-" not in message
+
+
+def test_cleanup_message_never_carries_body_exception_text(
+    tmp_path: Path, stranding_rmtree
+):
+    """Only the body exception's *type* may reach public CLI output.
+
+    `str(exc)` on an arbitrary failure can carry vault paths — a git error
+    naming a file, an OSError with a filename. The CLI prints this message, so
+    the text is preserved structurally instead, via `.body_error` and the
+    exception chain.
+    """
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    # A real absolute path, built at runtime. Writing a private-looking literal
+    # here would itself trip the publication audit this test exists to defend.
+    secret = str(tmp_path / "vault" / "entity" / "00-inbox" / "secret.md")
+
+    with pytest.raises(CutoverCleanupError) as caught:
+        with isolated_worktree(vault, git_head(vault)):
+            raise RuntimeError(f"could not read {secret}")
+
+    message = str(caught.value)
+    assert secret not in message, "body exception text reached public output"
+    assert str(tmp_path) not in message
+    assert "RuntimeError" in message, "the body failure type must still be named"
+    # Preserved structurally for diagnosis, not for printing.
+    assert secret in str(caught.value.body_error)
+    assert secret in str(caught.value.__cause__)
+
+
+def test_stale_worktree_registration_is_surfaced(tmp_path: Path, monkeypatch):
+    """The other cleanup failure mode: the temp tree goes but Git's record stays.
+
+    The vault is then left with a worktree registration pointing at a path that
+    no longer exists, and nothing tells the operator to prune it.
+    """
+    import app.cutover_build as cutover_build
+
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    real_run = cutover_build.subprocess.run
+
+    def fail_worktree_remove(args, **kwargs):
+        if args[:3] == ["git", "worktree", "remove"]:
+            return subprocess.CompletedProcess(args, 1, "", "is locked")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(cutover_build.subprocess, "run", fail_worktree_remove)
+
+    with pytest.raises(CutoverError, match="worktree prune"):
+        with isolated_worktree(vault, git_head(vault)):
+            pass
+
+
+def test_build_refuses_a_manifest_that_omits_a_sub_floor_identifier(tmp_path: Path):
+    """A partial cutover defeats the objective and cannot be undone later.
+
+    Both residual gates search only for the mappings the manifest carries, so
+    an omitted identifier passes by construction. Stage B would then refuse to
+    read the vault — after the one-commit revert window has closed.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    manifest = ApprovalManifest(
+        source_head=git_head(vault),
+        mappings=(Mapping(axis="entity", old="ab", new="ab-entity"),),
+        databases=(),
+        dispositions=(),
+    )
+    raw = canonical_bytes(manifest)
+    record = ApprovalRecord(
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=approved(vault)[1].executor_commit,
+        approved_by="owner",
+    )
+
+    with pytest.raises(CutoverError, match="does not cover every sub-floor"):
+        build_cutover(vault, raw, record)
+
+
+def test_a_validator_that_edits_a_migrated_file_refuses_the_build(tmp_path: Path):
+    """`git status` carries no content hash.
+
+    A file the migration already reports as modified produces an identical
+    status line after its bytes change again, so a validator could edit
+    migrated content and reach the single reviewed commit ungated.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+
+    def edits_a_migrated_file(root: Path) -> None:
+        entities = root / "_system" / "entities.yaml"
+        entities.write_text(
+            entities.read_text(encoding="utf-8") + "injected_by_validator: true\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(CutoverError, match="validator changed the isolated tree"):
+        build_cutover(vault, raw, record, validator=edits_a_migrated_file)
+
+    assert git_is_clean(vault)
+
+
+def test_a_validator_that_changes_a_file_mode_refuses_the_build(tmp_path: Path):
+    """Mode is part of what gets committed, so it is part of the snapshot."""
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+
+    def flips_a_mode(root: Path) -> None:
+        target = root / "_system" / "entities.yaml"
+        target.chmod(target.stat().st_mode | stat.S_IXUSR)
+
+    with pytest.raises(CutoverError, match="validator changed the isolated tree"):
+        build_cutover(vault, raw, record, validator=flips_a_mode)
+
+
+def test_a_validator_that_adds_a_symlink_refuses_without_following_it(tmp_path: Path):
+    """The snapshot records link targets and never follows them."""
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+
+    def adds_a_symlink(root: Path) -> None:
+        (root / "pointer.md").symlink_to("/etc/passwd")
+
+    with pytest.raises(CutoverError, match="validator changed the isolated tree"):
+        build_cutover(vault, raw, record, validator=adds_a_symlink)
+
+
+def test_a_read_only_validator_still_passes(tmp_path: Path):
+    """The snapshot must not be so strict that an honest validator trips it."""
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+    seen: list[int] = []
+
+    def reads_only(root: Path) -> None:
+        seen.append(len(list(root.rglob("*.md"))))
+
+    result = build_cutover(vault, raw, record, validator=reads_only)
+
+    assert seen and result.commit
+
+
+def test_a_validator_that_retargets_a_symlink_refuses_the_build(tmp_path: Path):
+    """Same path, different target: only recording the target catches this.
+
+    Adding a link changes the path set, so a digest that ignored link targets
+    would still catch it. Repointing an existing link is the shape that
+    isolates the target itself.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    (vault / "pointer.md").symlink_to("00-inbox/note.md")
+    commit_in(vault, "add a tracked symlink")
+    raw, record = approved(vault)
+
+    def repoints_the_symlink(root: Path) -> None:
+        link = root / "pointer.md"
+        link.unlink()
+        link.symlink_to("/etc/passwd")
+
+    with pytest.raises(CutoverError, match="validator changed the isolated tree"):
+        build_cutover(vault, raw, record, validator=repoints_the_symlink)
+
+
+def test_snapshot_does_not_follow_a_symlink_raced_into_place(tmp_path: Path):
+    """Deterministic stand-in for the TOCTOU window.
+
+    The swap happens after the entry is stat-ed as a regular file and before
+    the read, which is the real window. Reading through the planted link would
+    pull content from outside the tree into the digest — and read a file the
+    cutover has no business touching. `O_NOFOLLOW` plus a post-open identity
+    check closes it.
+    """
+    import app.cutover_build as cutover_build
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    target = tree / "raced.md"
+    target.write_text("original\n", encoding="utf-8")
+
+    real_lstat = cutover_build.Path.lstat
+    swapped: list[bool] = []
+
+    def lstat_then_swap(self):
+        info = real_lstat(self)
+        if self.name == "raced.md" and not swapped:
+            swapped.append(True)
+            self.unlink()
+            self.symlink_to(outside)
+        return info
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(cutover_build.Path, "lstat", lstat_then_swap)
+    try:
+        with pytest.raises(CutoverError, match="changed while it was being read"):
+            cutover_build._tree_state(tree)
+    finally:
+        monkeypatch.undo()
+
+    assert swapped, "the race was never triggered"
+
+
+def test_snapshot_records_a_fifo_without_reading_it(tmp_path: Path):
+    """A FIFO would block a reader forever; its type and mode still count."""
+    import app.cutover_build as cutover_build
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    os.mkfifo(tree / "pipe")
+
+    before = cutover_build._tree_state(tree)
+    (tree / "pipe").chmod(0o600)
+    after = cutover_build._tree_state(tree)
+
+    assert before != after, "a special file's mode was not recorded"
+
+
+def test_snapshot_distinguishes_a_fifo_from_a_regular_file(tmp_path: Path):
+    import app.cutover_build as cutover_build
+
+    as_fifo = tmp_path / "a"
+    as_fifo.mkdir()
+    os.mkfifo(as_fifo / "node")
+
+    as_file = tmp_path / "b"
+    as_file.mkdir()
+    (as_file / "node").write_bytes(b"")
+
+    assert cutover_build._tree_state(as_fifo) != cutover_build._tree_state(as_file)
+
+
+def test_snapshot_refuses_a_regular_file_swapped_for_another_regular_file(
+    tmp_path: Path,
+):
+    """Isolates the post-open identity check.
+
+    `O_NOFOLLOW` cannot see this: the replacement is an ordinary file, so the
+    open succeeds. Only comparing the inode through the descriptor proves the
+    bytes came from the entry that was stat-ed.
+    """
+    import app.cutover_build as cutover_build
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    target = tree / "swapped.md"
+    target.write_text("original\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.md"
+    replacement.write_text("substituted\n", encoding="utf-8")
+
+    real_lstat = cutover_build.Path.lstat
+    swapped: list[bool] = []
+
+    def lstat_then_swap(self):
+        info = real_lstat(self)
+        if self.name == "swapped.md" and not swapped:
+            swapped.append(True)
+            self.unlink()
+            os.link(replacement, self)
+        return info
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(cutover_build.Path, "lstat", lstat_then_swap)
+    try:
+        with pytest.raises(CutoverError, match="changed while it was being read"):
+            cutover_build._tree_state(tree)
+    finally:
+        monkeypatch.undo()
+
+    assert swapped, "the swap was never triggered"
+
+
+def test_snapshot_refuses_a_file_replaced_by_a_symlink_to_a_directory(tmp_path: Path):
+    """Classification must come from the captured lstat, not a fresh query.
+
+    After the entry is stat-ed as a regular file, the path becomes a symlink
+    to an external directory. Re-querying with `is_symlink()`/`is_dir()` would
+    describe whatever is there *now* — and `is_dir()` traverses the link to do
+    it. Dispatching on the captured mode keeps the entry a regular file, so
+    the open runs and `O_NOFOLLOW` refuses without ever touching the target.
+    """
+    import app.cutover_build as cutover_build
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("secret\n", encoding="utf-8")
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    target = tree / "raced.md"
+    target.write_text("original\n", encoding="utf-8")
+
+    real_lstat = cutover_build.Path.lstat
+    raced: list[bool] = []
+
+    def lstat_then_swap(self):
+        info = real_lstat(self)
+        if self.name == "raced.md" and not raced:
+            raced.append(True)
+            self.unlink()
+            self.symlink_to(outside, target_is_directory=True)
+        return info
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(cutover_build.Path, "lstat", lstat_then_swap)
+    try:
+        with pytest.raises(CutoverError, match="changed while it was being read"):
+            cutover_build._tree_state(tree)
+    finally:
+        monkeypatch.undo()
+
+    assert raced, "the race was never triggered"
+
+
+def test_tree_state_never_queries_path_state_after_lstat():
+    """Structural: classification comes from the captured mode alone.
+
+    Any `is_file`, `is_dir`, `is_symlink`, `exists`, `stat` or `resolve` call
+    re-reads the path and can describe something the snapshot never inspected
+    — and several of them traverse a symlink to answer.
+    """
+    import ast
+    import inspect
+
+    import app.cutover_build as cutover_build
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cutover_build._tree_state)))
+    following = {"is_file", "is_dir", "is_symlink", "exists", "stat", "resolve"}
+    offenders = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in following
+    ]
+
+    assert offenders == [], f"_tree_state re-queries path state: {offenders}"

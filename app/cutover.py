@@ -218,6 +218,22 @@ def _run_dry_run(vault: Path, manifest_bytes: bytes, record: ApprovalRecord) -> 
     return 0
 
 
+def _report_committed(*lines: str, success: bool = False) -> int:
+    """Report an outcome whose commit has already happened.
+
+    Past this point the ref has moved, so reporting must never change the
+    answer. A broken pipe, a closed stream, an encoding failure — none of them
+    may turn a committed cutover into a refusal the operator would retry. The
+    committed code is returned whether or not a single byte reached stdout.
+    """
+    try:
+        for line in lines:
+            print(line)
+    except Exception:  # noqa: BLE001 — output failure never reclassifies
+        return 2
+    return 0 if success else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="oneos cutover",
@@ -266,22 +282,25 @@ def main(argv: list[str] | None = None) -> int:
         expected_status = _status_bytes(vault)
         affected = [m.old for m in manifest.mappings if m.axis == "entity"]
         result = build_cutover(vault, manifest_bytes, record)
+        # Everything before promotion may still be refused. Once `promote`
+        # returns, the ref has moved and no later failure — reporting
+        # included — may reclassify the outcome as a refusal.
         promoted_id = promote(
             vault, result.commit, source_head, expected_status, affected
         )
-        print(f"[DONE] cutover promoted as {promoted_id}")
-        print(
-            "[ROLLBACK WINDOW] keep writers stopped while verifying. Plain git "
-            "revert is safe only before writers restart; later rollback needs a "
-            "separately reviewed database recovery migration."
-        )
-        return 0
     except CutoverCommittedError as exc:
-        print(f"[COMMITTED] {exc}")
-        return 2
+        return _report_committed(f"[COMMITTED] {exc}")
     except Exception as exc:  # noqa: BLE001 — CLI boundary
         print(f"[ABORTED] {exc}")
         return 1
+
+    return _report_committed(
+        f"[DONE] cutover promoted as {promoted_id}",
+        "[ROLLBACK WINDOW] keep writers stopped while verifying. Plain git "
+        "revert is safe only before writers restart; later rollback needs a "
+        "separately reviewed database recovery migration.",
+        success=True,
+    )
 
 
 if __name__ == "__main__":

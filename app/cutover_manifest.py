@@ -161,6 +161,18 @@ class ApprovalManifest:
         object.__setattr__(self, "mappings", tuple(sorted(self.mappings)))
         object.__setattr__(self, "databases", tuple(sorted(self.databases)))
         object.__setattr__(self, "dispositions", tuple(sorted(self.dispositions)))
+        # One column belongs to one axis. Two targets naming the same
+        # `(path, table, column)` under different axes would let whichever
+        # sorts first win, so a product column could hold a member value —
+        # invisibly, because the residual query then finds nothing to report.
+        columns: dict[tuple[str, str, str], str] = {}
+        for target in self.databases:
+            key = (target.path, target.table, target.column)
+            if key in columns:
+                raise ManifestError(
+                    "a database column is claimed by more than one target"
+                )
+            columns[key] = target.axis
 
 
 @dataclass(frozen=True)

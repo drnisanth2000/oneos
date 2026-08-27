@@ -13,7 +13,12 @@ from app.identifiers import (
 
 
 def test_floor_is_one_above_the_audit_long_term_threshold():
-    assert IDENTIFIER_MINIMUM_LENGTH == 5
+    # Asserting `== 5` restates a constant and cannot fail on the drift this
+    # test is named for. Bind the relationship instead: retuning the audit
+    # must break this, not silently erase the one-character margin.
+    from tools.public_repo_audit import LONG_TERM_MINIMUM_LENGTH
+
+    assert IDENTIFIER_MINIMUM_LENGTH == LONG_TERM_MINIMUM_LENGTH + 1
 
 
 def test_meets_floor_counts_hyphens():

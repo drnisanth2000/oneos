@@ -21,7 +21,10 @@ _APP_ROOT = pathlib.Path(__file__).resolve().parents[1] / "app"
 # guard matches on the call shape, not on an import alias, because its entire
 # purpose is catching sites nobody remembered to declare.
 _YAML_LOADERS = {"safe_load", "load", "full_load", "unsafe_load",
-                 "safe_load_all", "load_all"}
+                 "safe_load_all", "load_all",
+                 # Event stream and node graph: still structured reads of the
+                 # same file, and the layer a rewriter's offsets derive from.
+                 "parse", "compose", "compose_all"}
 _SQLITE_OPENERS = {"connect", "Connection"}
 _BYTE_READERS = {"read_text", "read_bytes", "open"}
 
@@ -218,6 +221,9 @@ def test_guard_catches_a_synthetic_undeclared_reader():
         "class C:\n    def __init__(self, v):\n        self._p = v.system_path('r.yaml')\n"
         "    def load(self):\n        return self._p.read_text()",
         "def f(p):\n    return yaml.safe_load_all(p)",
+        "def f(p):\n    return yaml.parse(p)",
+        "def f(p):\n    return yaml.compose(p)",
+        "from yaml import compose as c\ndef f(p):\n    return c(p)",
         "def f(t):\n    return split_front_matter(t)",
     ]
     for src in shapes:

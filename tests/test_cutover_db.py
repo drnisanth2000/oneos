@@ -93,32 +93,61 @@ def test_a_matching_column_name_in_another_database_is_untouched(tmp_path: Path)
     assert read(tmp_path / "zz" / "books.db", "SELECT product FROM ledger") == [("ab",)]
 
 
-def test_an_absolute_path_is_refused(tmp_path: Path):
+def unchecked_target(path: str) -> DatabaseTarget:
+    """A real DatabaseTarget carrying a path its constructor would refuse.
+
+    `resolve_database_path` is a second, independent layer: a caller that
+    obtained a target by any other route must still be refused. Constructing
+    through `DatabaseTarget(path=...)` raises `ManifestError` before the
+    function under test is entered, so the guard would go untested.
+    """
+    target = DatabaseTarget(
+        path="ab/books.db", table="ledger", column="product", axis="product"
+    )
+    object.__setattr__(target, "path", path)
+    return target
+
+
+def test_resolve_refuses_an_absolute_path_before_opening_a_connection(tmp_path: Path):
     make_db(tmp_path / "ab" / "books.db")
-    with pytest.raises(ManifestError):
+
+    # The message matters: without this guard a later check may still refuse
+    # on some platforms and not others, so a type-only assertion is not
+    # reliably RED.
+    with pytest.raises(DatabaseCutoverError, match="must be relative"):
         resolve_database_path(
-            tmp_path,
-            DatabaseTarget(
-                path=str(tmp_path / "ab" / "books.db"),
-                table="ledger",
-                column="product",
-                axis="product",
-            ),
+            tmp_path, unchecked_target(str(tmp_path / "ab" / "books.db"))
         )
 
 
-def test_a_path_escaping_the_root_is_refused(tmp_path: Path):
+def test_resolve_refuses_an_upward_traversal_that_escapes_the_root(tmp_path: Path):
     make_db(tmp_path / "inside" / "ab" / "books.db")
-    with pytest.raises(ManifestError):
+    make_db(tmp_path / "outside" / "books.db")
+
+    # Without the `..` guard the confinement check still refuses this shape
+    # with a different diagnosis, so a type-only assertion stays green.
+    with pytest.raises(DatabaseCutoverError, match="must not traverse upward"):
         resolve_database_path(
-            tmp_path / "inside",
-            DatabaseTarget(
-                path="../outside/books.db",
-                table="ledger",
-                column="product",
-                axis="product",
-            ),
+            tmp_path / "inside", unchecked_target("../outside/books.db")
         )
+
+
+def test_resolve_refuses_an_upward_traversal_that_re_enters_the_root(tmp_path: Path):
+    """A `..` landing back inside the root is still not the path the owner
+    read, and no later check refuses it."""
+    make_db(tmp_path / "ab" / "books.db")
+
+    with pytest.raises(DatabaseCutoverError, match="must not traverse upward"):
+        resolve_database_path(tmp_path, unchecked_target("ab/../ab/books.db"))
+
+
+def test_manifest_construction_also_refuses_those_paths(tmp_path: Path):
+    """The first layer stays in place; these tests pin the second."""
+    for bad in (str(tmp_path / "ab" / "books.db"), "../outside/books.db"):
+        with pytest.raises(ManifestError):
+            DatabaseTarget(
+                path=bad, table="ledger", column="product", axis="product"
+            )
 
 
 def test_a_symlinked_component_is_refused(tmp_path: Path):
