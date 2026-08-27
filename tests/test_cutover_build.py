@@ -924,3 +924,105 @@ def test_proposal_prefixes_are_rewritten_and_a_pre_cutover_token_is_refused(
     # S7 binds an approval to exact proposal bytes, so a token issued before the
     # cutover no longer matches. Failing closed is correct.
     assert hashlib.sha256(moved.read_bytes()).hexdigest() != before_token
+
+
+import re as _re
+
+
+def _glob_to_regex(pattern: str) -> _re.Pattern[str]:
+    out, index = [], 0
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            out.append("(?:.*/)?")
+            index += 3
+        elif pattern.startswith("**", index):
+            out.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            out.append("[^/]*")
+            index += 1
+        else:
+            out.append(_re.escape(pattern[index]))
+            index += 1
+    return _re.compile("^" + "".join(out) + "$")
+
+
+def policy_allows_read(policy_text: str, path: str) -> bool:
+    """Minimal allow/except evaluator: default deny; an allow rule grants a
+    path only when it matches `paths:` and no `except:` pattern."""
+    document = yaml.safe_load(policy_text) or {}
+    for actor in (document.get("actors") or {}).values():
+        for rule in (actor or {}).get("allow", []) or []:
+            if rule.get("action") not in (None, "read"):
+                continue
+            if not any(
+                _glob_to_regex(p).match(path) for p in rule.get("paths", []) or []
+            ):
+                continue
+            if any(
+                _glob_to_regex(p).match(path) for p in rule.get("except", []) or []
+            ):
+                continue
+            return True
+    return False
+
+
+def test_sensitive_reads_are_denied_before_and_after_the_cutover(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    policy_path = vault / "_system" / "scripts" / "action-policy.yaml"
+
+    before = policy_path.read_text(encoding="utf-8")
+    assert policy_allows_read(before, "ab/00-inbox/note.md")
+    assert not policy_allows_read(before, "ab/.sensitive/secret.md")
+
+    promoted(vault)
+
+    after = policy_path.read_text(encoding="utf-8")
+    assert policy_allows_read(after, "ab-entity/00-inbox/note.md")
+    assert not policy_allows_read(after, "ab-entity/.sensitive/secret.md")
+
+
+def test_former_slugs_is_written_only_on_entity_and_product_keys(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    promoted(vault)
+
+    system = vault / "_system"
+    entities = (system / "entities.yaml").read_text(encoding="utf-8")
+    products = (system / "products.yaml").read_text(encoding="utf-8")
+    members = (system / "members.yaml").read_text(encoding="utf-8")
+    workspaces = (system / "workspaces.yaml").read_text(encoding="utf-8")
+
+    assert "former_slugs: [ab]" in entities
+    assert "former_slugs: [q7]" in products
+    assert "former_slugs" not in members
+    assert "former_slugs" not in workspaces
+    assert "id: m7-member" in members
+    assert "id: w7-workspace" in workspaces
+
+
+def test_existing_former_slugs_are_preserved_and_no_duplicate_key_is_created(
+    tmp_path: Path,
+):
+    vault = cutover_vault(tmp_path / "vault")
+    entities = vault / "_system" / "entities.yaml"
+    entities.write_text(
+        "entities:\n  ab:\n    former_slugs: [older]\n    label: A\n",
+        encoding="utf-8",
+    )
+    commit_in(vault, "seed provenance")
+
+    promoted(vault)
+
+    text = entities.read_text(encoding="utf-8")
+    assert text.count("former_slugs:") == 1
+    assert "former_slugs: [older, ab]" in text
+
+
+def test_a_product_kind_workspace_id_takes_the_workspace_suffix(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    promoted(vault)
+
+    workspaces = (vault / "_system" / "workspaces.yaml").read_text(encoding="utf-8")
+    assert "id: w7-workspace" in workspaces
+    assert "product: q7-product" in workspaces
+    assert "id: q7-product" not in workspaces
