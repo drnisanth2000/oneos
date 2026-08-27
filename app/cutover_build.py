@@ -69,6 +69,7 @@ import sys
 
 import yaml
 
+from .console_routing import structured_reader
 from .cutover_db import DatabaseChange, apply_database_mappings, database_residuals
 from .cutover_inventory import (
     check_collisions,
@@ -116,6 +117,7 @@ def mappings_in_order(manifest: ApprovalManifest) -> list:
     )
 
 
+@structured_reader(category="admin-record")
 def _record_former_slug(text: str, key: str, old: str, indent: int) -> str:
     """Append inert provenance beneath one entity/product mapping key.
 

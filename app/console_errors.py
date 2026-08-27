@@ -290,6 +290,13 @@ from . import review_tokens as _review_tokens  # noqa: E402
 from . import rename as _rename  # noqa: E402
 from . import scope as _scope  # noqa: E402
 from . import vault as _vault  # noqa: E402
+from . import cutover as _cutover  # noqa: E402
+from . import cutover_build as _cutover_build  # noqa: E402
+from . import cutover_db as _cutover_db  # noqa: E402
+from . import cutover_inventory as _cutover_inventory  # noqa: E402
+from . import cutover_locations as _cutover_locations  # noqa: E402
+from . import cutover_manifest as _cutover_manifest  # noqa: E402
+from . import identifiers as _identifiers  # noqa: E402
 from .ingest import base as _ingest_base  # noqa: E402
 
 #: Rule 2 — `GitTransactionError` is a closed family: within it, MRO
@@ -300,6 +307,7 @@ CLOSED_FAMILY = _git_transaction.GitTransactionError
 #: `exact` — the entry applies to that class only, never through MRO.
 _EXACT: dict[type[BaseException], ConsoleError] = {
     _rename.RenameCommittedError: _CODES["E-COMMITTED"],
+    _cutover_build.CutoverCommittedError: _CODES["E-COMMITTED"],
     _git_transaction.GitTransactionCommittedError: _CODES["E-COMMITTED"],
     _git_transaction.PostCommitConsumptionError: _CODES["E-APPLIED"],
     _git_transaction.GitTransactionRecoveryError: _CODES["E-RECOVER"],
@@ -339,6 +347,18 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
 
 #: `mro` — subclasses without their own entry inherit it.
 _MRO: dict[type[BaseException], ConsoleError] = {
+    # The short-identifier cutover is administrative tooling, so its domain
+    # failures are administrative refusals — the same disposition `rename`
+    # already carries. `CutoverCommittedError` is listed in `_EXACT` above so
+    # it can never inherit E-ADMIN and lose the "do not retry" outcome.
+    _cutover_build.CutoverError: _CODES["E-ADMIN"],
+    _identifiers.AxisError: _CODES["E-ADMIN"],
+    _cutover_locations.LocationError: _CODES["E-ADMIN"],
+    _cutover_locations.UnreadableFile: _CODES["E-ADMIN"],
+    _cutover_manifest.ManifestError: _CODES["E-ADMIN"],
+    _cutover_db.DatabaseCutoverError: _CODES["E-ADMIN"],
+    _cutover_inventory.CollisionError: _CODES["E-ADMIN"],
+    _cutover_inventory.UnmigratableContentError: _CODES["E-ADMIN"],
     _scope.RedirectedPathError: _CODES["E-TAMPER"],
     _scope.OutOfScopeError: _CODES["E-SCOPE"],
     _outbox.OutboxScopeError: _CODES["E-SCOPE"],

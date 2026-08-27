@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import Callable, TypeVar
 
 SURFACES = frozenset({"page", "fragment-only"})
-READER_CATEGORIES = frozenset({"registry", "proposal", "front-matter", "admin-db"})
+#: `admin-record` is an administrative structured record — YAML or JSON —
+#: whose existing domain exception stays an administrative refusal. It is
+#: the record-shaped parallel of `admin-db`.
+READER_CATEGORIES = frozenset(
+    {"registry", "proposal", "front-matter", "admin-db", "admin-record"}
+)
 
 _Decorated = TypeVar("_Decorated", bound=Callable)
 

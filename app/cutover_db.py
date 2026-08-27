@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import sqlite3
 
+from .console_routing import structured_reader
 from .cutover_manifest import DatabaseTarget, Mapping
 
 
@@ -84,6 +85,7 @@ def resolve_database_path(root: Path, target: DatabaseTarget) -> Path:
     return resolved
 
 
+@structured_reader(category="admin-db")
 def _connect(path: Path, *, read_only: bool) -> sqlite3.Connection:
     try:
         if read_only:

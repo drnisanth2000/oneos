@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
+from .console_routing import structured_reader
 from .cutover_manifest import Mapping
 
 
@@ -107,6 +108,7 @@ import yaml
 from .identifiers import AXES, map_identifier, meets_floor
 
 
+@structured_reader(category="admin-record")
 def _load(path: Path) -> object:
     if not path.is_file():
         return None

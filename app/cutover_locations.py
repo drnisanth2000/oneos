@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .console_routing import structured_reader
 from .identifiers import AXES
 
 
@@ -516,6 +517,7 @@ class ScopedResidual:
     old: str
 
 
+@structured_reader(category="front-matter")
 def _front_matter_values(text: str) -> dict[str, str]:
     parts = _split_front_matter(text)
     if parts is None:
@@ -529,6 +531,7 @@ def _front_matter_values(text: str) -> dict[str, str]:
     return {k: v for k, v in loaded.items() if isinstance(v, str)}
 
 
+@structured_reader(category="admin-record")
 def _load_yaml_file(path: Path) -> object:
     if not path.is_file():
         return None

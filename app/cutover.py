@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 
+from .console_routing import structured_reader
 from .cutover_build import (
     CutoverCommittedError,
     CutoverError,
@@ -134,6 +135,7 @@ from .cutover_locations import advisory_occurrences
 from .cutover_manifest import ApprovalRecord, load_manifest, verify_manifest
 
 
+@structured_reader(category="admin-record")
 def _load_approval(path: Path) -> ApprovalRecord:
     document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(document, dict):
