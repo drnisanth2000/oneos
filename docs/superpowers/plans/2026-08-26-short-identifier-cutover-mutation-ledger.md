@@ -1716,3 +1716,836 @@ All 56 mutations restored byte-identically: every `cmp` reported
 no difference and every before/after SHA-256 matched. After the campaign,
 `git diff app/ tools/` was empty apart from the deliberate `a5fe98f`
 defect fix, which is committed rather than restored.
+
+---
+
+## Round two — independent review findings
+
+An independent code review of the Stage A branch found two blockers, five
+should-fix items and seven nits. Thirteen were fixed as one follow-up:
+**B1, B2, S1–S5, N1, N2, N3, N4a, N4c, N5**. Each was RED-first, and each
+guard carries its own mutation below.
+
+**N4b remains held** pending a decided predicate for what counts as a pending
+proposal record; widening the writer's glob without one would let it rewrite
+arbitrary YAML beneath `outbox/`, including S7 receipt records.
+**N6 is deferred**: it is purely diagnostic, and its proposed remedy surfaces
+`exc.stderr`, which carries vault paths into a public tool's output — the
+publication rule inherited item 2 exists to enforce. If revisited it must go
+to a private channel, never the CLI message.
+**N7 is deferred**: cosmetic dead logic with no runtime effect.
+
+### Isolated-cache methodology
+
+A stale `__pycache__` entry once served mutated bytecode against a restored
+source, turning a real failure into an apparent pass. Every mutated and
+restored pytest subprocess in this round therefore ran with a fresh, empty
+`PYTHONPYCACHEPREFIX` outside the repository, removed immediately afterwards,
+and with `-p no:cacheprovider`. The closing suite ran the same way.
+
+Two further method notes earned the hard way this round:
+
+- **Structural edits use AST bounds, never string search.** A
+  `s.index("\ndef ", start)` boundary matched a far-later top-level `def`
+  and silently deleted five definitions in between. Replacing an exact
+  `lineno`/`end_lineno` range succeeded first time.
+- **A test that patches a specific call is only as durable as that call.**
+  Two race regressions hooked `Path.is_symlink`; when the snapshot stopped
+  calling it, their swap never fired and they passed while proving nothing.
+
+### Discarded non-killing attempts
+
+Recorded because a mutation that does not go red is not weaker evidence, it
+is no evidence. None of these is counted in the arithmetic.
+
+| Attempt | Why it did not kill | Correction |
+|---|---|---|
+| N5b, first form | Only `rmtree` was forced to fail, so the `git worktree remove` branch was never exercised | Added `test_stale_worktree_registration_is_surfaced` |
+| B1d, first form | Disabling the sequence check falls through to the item check, which still raises; a `match="shape"` assertion accepted the wrong guard | Assertions tightened to `expected a sequence` / `expected a scalar` |
+| S3c, first form | The test *added* a symlink, so the new path alone moved the digest regardless of target | Added a retarget test: same path, different target |
+| S3d, first form | Masked by `O_NOFOLLOW`, which refuses the swap independently | Isolated with a regular-file-for-regular-file swap `O_NOFOLLOW` cannot see |
+| S3e | Masked by the identity check | Proved with the identity check disabled first, so only `O_NOFOLLOW` could refuse |
+| B2, first form | Narrowed typedness so a top-level `entity: ab # comment` became advisory-but-unrewritable | Widened the writer to own the commented shape instead |
+
+Each of the two `O_NOFOLLOW`/identity guards independently suffices, so
+neither can be proved without disabling the other. Both were proved that way
+rather than left as a single combined row.
+
+### Round-two evidence
+
+#### Mutation N1a — `app/cutover_db.py`
+
+**Edit:**
+
+```diff
+-     if pure.is_absolute() or Path(target.path).is_absolute():
+-         raise DatabaseCutoverError("database path must be relative")
++     if False:
++         raise DatabaseCutoverError("database path must be relative")
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_db.py::test_resolve_refuses_an_absolute_path_before_opening_a_connection
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE DatabaseCutoverError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `679ef99fb9672117…` before and `679ef99fb9672117…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.02s`
+
+#### Mutation N1b — `app/cutover_db.py`
+
+**Edit:**
+
+```diff
+-     if ".." in pure.parts:
+-         raise DatabaseCutoverError("database path must not traverse upward")
++     if False:
++         raise DatabaseCutoverError("database path must not traverse upward")
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_db.py::test_resolve_refuses_an_upward_traversal_that_escapes_the_root
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'must not traverse upward'
+E         Actual message: 'database path leaves the vault root'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `679ef99fb9672117…` before and `679ef99fb9672117…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.02s`
+
+#### Mutation N1c — `app/cutover_db.py`
+
+**Edit:**
+
+```diff
+-     if ".." in pure.parts:
+-         raise DatabaseCutoverError("database path must not traverse upward")
++     if False:
++         raise DatabaseCutoverError("database path must not traverse upward")
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_db.py::test_resolve_refuses_an_upward_traversal_that_re_enters_the_root
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE DatabaseCutoverError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `679ef99fb9672117…` before and `679ef99fb9672117…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.02s`
+
+#### Mutation N2 — `tools/public_repo_audit.py`
+
+**Edit:**
+
+```diff
+- LONG_TERM_MINIMUM_LENGTH = 4
++ LONG_TERM_MINIMUM_LENGTH = 5
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_identifiers.py::test_floor_is_one_above_the_audit_long_term_threshold
+```
+
+**RED** (exit 1):
+
+```
+E       assert 5 == (5 + 1)
+```
+
+**Restoration:** `cmp` identical; SHA-256 `22c0c2725ef20aff…` before and `22c0c2725ef20aff…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.04s`
+
+#### Mutation N3a — `app/cutover.py`
+
+**Edit:**
+
+```diff
+-     except Exception:  # noqa: BLE001 — output failure never reclassifies
+-         return 2
++     except Exception:  # noqa: BLE001
++         raise
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_cli.py::test_committed_outcome_survives_broken_output
+```
+
+**RED** (exit 1):
+
+```
+E       app.cutover_build.CutoverCommittedError: committed but unconfirmed
+E           BrokenPipeError: stdout closed
+```
+
+**Restoration:** `cmp` identical; SHA-256 `8a44d6dcacfab760…` before and `8a44d6dcacfab760…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 3.72s`
+
+#### Mutation N4a — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-         if any(part in SKIP_DIRS for part in relative.parts) or candidate.is_symlink():
++         if ".git" in relative.parts or candidate.is_symlink():
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_markdown_under_skip_dirs_is_never_rewritten
+```
+
+**RED** (exit 1):
+
+```
+E           AssertionError: .obsidian content was rewritten outside every gate
+E           assert b'---\nentity...the ab word\n' == b'---\nentity...the ab word\n'
+E
+E             At index 14 diff: b'-' != b'\n'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.42s`
+
+#### Mutation N5a — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-         try:
+-             shutil.rmtree(parent)
+-         except OSError:
++         try:
++             shutil.rmtree(parent)
++         except OSError if False else ():
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_cleanup_failure_after_a_successful_body_is_surfaced
+```
+
+**RED** (exit 1):
+
+```
+E       OSError: device busy
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.18s`
+
+#### Mutation N5b — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-         if removal.returncode != 0:
++         if False:
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_stale_worktree_registration_is_surfaced
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE CutoverError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.16s`
+
+#### Mutation N5e — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+- f"build failed ({type(body_error).__name__}); "
++ f"build failed ({type(body_error).__name__}: {body_error}); "
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_cleanup_message_never_carries_body_exception_text
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: body exception text reached public output
+E       assert '<absolute-path-redacted>' not in 'build faile... it manually'
+E
+E         '<absolute-path-redacted>' is contained here:
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.17s`
+
+#### Mutation N5f — `tests/test_cutover_build.py`
+
+**Edit:**
+
+```diff
+-     for leaked in stranded:
+-         real_rmtree(leaked, ignore_errors=True)
++ (removed)
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_cleanup_failure_after_a_successful_body_is_surfaced
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: the stranding regression leaked a temporary tree
+E       assert not [PosixPath('<temporary-path-redacted>
+```
+
+**Restoration:** `cmp` identical; SHA-256 `289e9b90734afdea…` before and `289e9b90734afdea…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.17s`
+
+#### Mutation S2 — `app/cutover_manifest.py`
+
+**Edit:**
+
+```diff
+-             if key in columns:
+-                 raise ManifestError(
+-                     "a database column is claimed by more than one target"
+-                 )
++             if False:
++                 raise ManifestError("unreachable")
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_manifest.py::test_two_targets_may_not_claim_one_column_on_different_axes
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE ManifestError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `0275e5b4f1f59278…` before and `0275e5b4f1f59278…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.01s`
+
+#### Mutation S3a — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-             digest.update(b"\x00file\x00")
+-             digest.update(_regular_file_contents(entry, info))
++             digest.update(b"\x00file\x00")
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_a_validator_that_edits_a_migrated_file_refuses_the_build
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE CutoverError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.25s`
+
+#### Mutation S3c — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-             digest.update(b"\x00link\x00")
+-             digest.update(os.readlink(entry).encode("utf-8", "surrogateescape"))
++             digest.update(b"\x00link\x00")
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_a_validator_that_retargets_a_symlink_refuses_the_build
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE CutoverError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.27s`
+
+#### Mutation S3d — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-         actual = os.fstat(handle)
+-         if not stat.S_ISREG(actual.st_mode) or (
+-             actual.st_ino,
+-             actual.st_dev,
+-         ) != (expected.st_ino, expected.st_dev):
++         actual = os.fstat(handle)
++         if False:
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_snapshot_refuses_a_regular_file_swapped_for_another_regular_file
+```
+
+**RED** (exit 1):
+
+```
+E           Failed: DID NOT RAISE CutoverError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.08s`
+
+#### Mutation S3f — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-         if stat.S_ISLNK(info.st_mode):
++         if entry.is_symlink():
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_snapshot_refuses_a_file_replaced_by_a_symlink_to_a_directory
+```
+
+**RED** (exit 1):
+
+```
+E           Failed: DID NOT RAISE CutoverError
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.08s`
+
+#### Mutation S3g — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-         elif stat.S_ISDIR(info.st_mode):
++         elif entry.is_dir():
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_tree_state_never_queries_path_state_after_lstat
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: _tree_state re-queries path state: ['is_dir']
+E       assert ['is_dir'] == []
+E
+E         Left contains one more item: 'is_dir'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.08s`
+
+#### Mutation S4 — `app/cutover_build.py`
+
+**Edit:**
+
+```diff
+-         if set(manifest.mappings) != expected:
++         if False:
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_build_refuses_a_manifest_that_omits_a_sub_floor_identifier
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'does not cover every sub-floor'
+E         Actual message: 'approved dispositions do not exactly match the source advisory report; re-run from inventory'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.23s`
+
+#### Mutation B1a — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-     _refuse_yaml_anchors(text)
+-     try:
+-         root = _policy_nodes(text)
++     try:
++         root = _policy_nodes(text)
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_policy_writer_refuses_yaml_aliases
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE UnreadableFile
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+#### Mutation B1b — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-     _refuse_yaml_anchors(text)
+-     try:
+-         return yaml.safe_load(text)
++     try:
++         return yaml.safe_load(text)
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_residual_gate_refuses_yaml_aliases
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE UnreadableFile
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+#### Mutation B1c — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-             if isinstance(event, yaml.AliasEvent) or anchor:
++             if isinstance(event, yaml.AliasEvent) and False:
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_policy_writer_refuses_yaml_aliases
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE UnreadableFile
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+#### Mutation B1d — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-                     if not isinstance(value_node, yaml.SequenceNode):
+-                         raise UnreadableFile(
++                     if False:
++                         raise UnreadableFile(
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_policy_writer_refuses_a_wrongly_shaped_field[scalar-paths]
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: Regex pattern did not match.
+E         Expected regex: 'expected a sequence'
+E         Actual message: "action-policy.yaml has an unsupported shape inside 'paths': expected a scalar"
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+#### Mutation B1e — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-                         if not isinstance(item, yaml.ScalarNode):
+-                             raise UnreadableFile(
++                         if False:
++                             raise UnreadableFile(
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_policy_writer_refuses_a_wrongly_shaped_field[non-string-item]
+```
+
+**RED** (exit 1):
+
+```
+E       AttributeError: 'list' object has no attribute 'partition'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+#### Mutation B1f — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-                     if not isinstance(value, list):
+-                         raise UnreadableFile(
++                     if False:
++                         raise UnreadableFile(
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_residual_gate_refuses_a_wrongly_shaped_field[scalar-except]
+```
+
+**RED** (exit 1):
+
+```
+E       Failed: DID NOT RAISE UnreadableFile
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+#### Mutation B1g — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-                         if not isinstance(item, str):
+-                             raise UnreadableFile(
++                         if False:
++                             raise UnreadableFile(
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_residual_gate_refuses_a_wrongly_shaped_field[non-string-item]
+```
+
+**RED** (exit 1):
+
+```
+E               AttributeError: 'dict' object has no attribute 'partition'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+#### Mutation B1h — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+- @structured_reader(category="admin-record")
+- def _policy_events(text: str):
++ def _policy_events(text: str):
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_console_readers.py::test_every_structured_read_site_declares_a_category
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: structured read site without a @structured_reader category declaration: ['app/cutover_locations.py:194']
+E       assert ['<absolute-path-redacted>'] == []
+E
+E         Left contains one more item: 'app/cutover_locations.py:194'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.11s`
+
+#### Mutation B1i — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+- @structured_reader(category="admin-record")
+- def _policy_nodes(text: str):
++ def _policy_nodes(text: str):
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_console_readers.py::test_every_structured_read_site_declares_a_category
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: structured read site without a @structured_reader category declaration: ['app/cutover_locations.py:200']
+E       assert ['<absolute-path-redacted>'] == []
+E
+E         Left contains one more item: 'app/cutover_locations.py:200'
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.11s`
+
+#### Mutation B1j — `tests/test_console_readers.py`
+
+**Edit:**
+
+```diff
+-                  "parse", "compose", "compose_all"}
++                  }
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_console_readers.py::test_guard_catches_a_synthetic_undeclared_reader
+```
+
+**RED** (exit 1):
+
+```
+E           AssertionError: guard missed an undeclared reader shape:
+E             def f(p):
+E                 return yaml.parse(p)
+E           assert []
+```
+
+**Restoration:** `cmp` identical; SHA-256 `473a9bd3520ff2bc…` before and `473a9bd3520ff2bc…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.03s`
+
+#### Mutation B2b — `app/cutover_locations.py`
+
+**Edit:**
+
+```diff
+-                                 _front_matter_scalar_span(line, field, old),
++                                 _yaml_scalar_span(line, field, old),
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_nested_front_matter_values_remain_advisory
+```
+
+**RED** (exit 1):
+
+```
+E       AssertionError: nested front-matter values were suppressed as typed
+E       assert [] == [('note.md', ...md', 'm7', 6)]
+E
+E         Right contains 2 more items, first extra item: ('note.md', 'm7', 4)
+```
+
+**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.05s`
+
+### Round-two arithmetic
+
+- **28 round-two mutant edits**, every one proved RED → byte-identical
+  restore → GREEN.
+- Round one contributed 53 Stage A mutant edits plus 3 integration mutations.
+- **81 Stage A mutant edits and 3 integration mutations, 84 total proofs.**
+- Six discarded attempts are excluded from every count above.
