@@ -100,3 +100,65 @@ def require_clean_status(vault: Path) -> None:
             "inventory requires a clean status; preserve or commit current "
             "work and re-run from a newly recorded source HEAD"
         )
+
+
+import yaml
+
+from .identifiers import AXES, map_identifier, meets_floor
+
+
+def _load(path: Path) -> object:
+    if not path.is_file():
+        return None
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, OSError, yaml.YAMLError) as exc:
+        raise UnmigratableContentError(f"{path.name} could not be read") from exc
+
+
+def existing_identifiers(vault: Path) -> dict[str, set[str]]:
+    """Every current identifier, per axis, read from the registries."""
+    system = vault / "_system"
+    found: dict[str, set[str]] = {axis: set() for axis in AXES}
+
+    entities = _load(system / "entities.yaml")
+    if isinstance(entities, dict):
+        found["entity"].update(
+            key for key in (entities.get("entities") or {}) if isinstance(key, str)
+        )
+
+    products = _load(system / "products.yaml")
+    if isinstance(products, dict):
+        for values in (products.get("products") or {}).values():
+            if isinstance(values, dict):
+                found["product"].update(k for k in values if isinstance(k, str))
+
+    members = _load(system / "members.yaml")
+    if isinstance(members, dict):
+        for values in (members.get("members") or {}).values():
+            if isinstance(values, list):
+                found["member"].update(
+                    entry["id"]
+                    for entry in values
+                    if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+                )
+
+    workspaces = _load(system / "workspaces.yaml")
+    if isinstance(workspaces, dict):
+        for entry in workspaces.get("workspaces") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+                found["workspace"].add(entry["id"])
+
+    return found
+
+
+def proposed_mappings(vault: Path) -> tuple[Mapping, ...]:
+    """The deterministic mapping for every sub-floor identifier."""
+    existing = existing_identifiers(vault)
+    mappings: list[Mapping] = []
+    for axis in AXES:
+        for old in sorted(existing[axis]):
+            if meets_floor(old):
+                continue
+            mappings.append(Mapping(axis=axis, old=old, new=map_identifier(axis, old)))
+    return tuple(mappings)

@@ -98,3 +98,47 @@ def test_inventory_requires_a_globally_clean_tracked_and_untracked_status(
 
     with pytest.raises(UnmigratableContentError, match="clean status"):
         require_clean_status(vault)
+
+
+from app.cutover_inventory import existing_identifiers, proposed_mappings
+
+
+def registry_vault(root: Path) -> Path:
+    return git_vault(
+        root,
+        {
+            "_system/entities.yaml": "entities:\n  ab:\n    label: A\n  longenough:\n    label: L\n",
+            "_system/products.yaml": "products:\n  ab:\n    q7:\n      label: Q\n",
+            "_system/members.yaml": "members:\n  ab:\n    - {id: m7}\n",
+            "_system/workspaces.yaml": "workspaces:\n  - {id: w7, entity: ab}\n",
+        },
+    )
+
+
+def test_existing_identifiers_are_read_per_axis(tmp_path: Path):
+    vault = registry_vault(tmp_path)
+
+    existing = existing_identifiers(vault)
+
+    assert existing["entity"] == {"ab", "longenough"}
+    assert existing["product"] == {"q7"}
+    assert existing["member"] == {"m7"}
+    assert existing["workspace"] == {"w7"}
+
+
+def test_proposed_mappings_cover_only_sub_floor_identifiers(tmp_path: Path):
+    vault = registry_vault(tmp_path)
+
+    mappings = proposed_mappings(vault)
+
+    assert Mapping(axis="entity", old="ab", new="ab-entity") in mappings
+    assert Mapping(axis="product", old="q7", new="q7-product") in mappings
+    assert Mapping(axis="member", old="m7", new="m7-member") in mappings
+    assert Mapping(axis="workspace", old="w7", new="w7-workspace") in mappings
+    assert all(item.old != "longenough" for item in mappings)
+
+
+def test_proposed_mappings_are_deterministically_ordered(tmp_path: Path):
+    vault = registry_vault(tmp_path)
+
+    assert proposed_mappings(vault) == proposed_mappings(vault)
