@@ -449,7 +449,14 @@ def advisory_occurrences(
     patterns = {
         (item.axis, item.old): boundaried(item.old) for item in mappings
     }
-    typed = _typed_token_spans(root, mappings)
+    # Typedness belongs to the exact token span, not to the axis currently
+    # scanning it. Keying the exclusion by axis made a product-typed `q7`
+    # advisory for a workspace `q7` on the same span — the class-3 condition
+    # the design explicitly permits. The span itself is typed for every axis.
+    typed_spans = {
+        (path, line, old, start, end)
+        for path, line, _axis, old, start, end in _typed_token_spans(root, mappings)
+    }
     found: list[AdvisoryOccurrence] = []
     for candidate in sorted(root.rglob("*")):
         relative = candidate.relative_to(root).as_posix()
@@ -482,15 +489,14 @@ def advisory_occurrences(
             context_sha256 = stable_advisory_context(line, mappings)
             for (axis, old), pattern in patterns.items():
                 for match in pattern.finditer(line):
-                    token_key = (
+                    span_key = (
                         relative,
                         number,
-                        axis,
                         old,
                         match.start(),
                         match.end(),
                     )
-                    if token_key in typed:
+                    if span_key in typed_spans:
                         continue
                     key = (axis, old)
                     ordinals[key] = ordinals.get(key, 0) + 1

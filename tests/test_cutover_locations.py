@@ -517,3 +517,63 @@ def test_a_missed_workspace_id_is_a_residual(tmp_path: Path):
         item.location == "workspace:workspaces:id"
         for item in scoped_residuals(tmp_path, MAPPINGS)
     )
+
+
+def test_advisory_scan_itself_refuses_an_unreadable_file(tmp_path: Path, monkeypatch):
+    """The advisory scan's own read must fail closed, independently.
+
+    `_typed_token_spans` reads the same file first, so its guard masks this
+    one in the end-to-end test. Neutralising that first reader isolates the
+    advisory scan's own read: a file it cannot decode must stop the scan, never
+    be skipped, because a gate cannot pass on evidence it never saw.
+    """
+    import app.cutover_locations as locations
+
+    monkeypatch.setattr(locations, "_typed_token_spans", lambda *a, **k: set())
+    (tmp_path / "note.md").write_bytes(b"\xff\xfe not utf-8 \xff")
+
+    with pytest.raises(UnreadableFile, match="the advisory scan cannot pass"):
+        advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1])
+
+
+def test_a_typed_span_is_typed_for_every_axis_not_only_its_own(tmp_path: Path):
+    """One literal on two axes: neither typed span is advisory for the other.
+
+    Typedness belongs to the exact token span, not to the axis that happens to
+    be scanning it. Keying the exclusion by axis makes a product-typed `q7`
+    advisory for a workspace `q7` occupying the same span — and since a typed
+    rewrite later removes it, the post-migration identity check would refuse
+    every class-3 cutover the design explicitly permits.
+    """
+    same_literal = (
+        Mapping(axis="product", old="q7", new="q7-product"),
+        Mapping(axis="workspace", old="q7", new="q7-workspace"),
+    )
+    system = tmp_path / "_system"
+    system.mkdir()
+    (system / "products.yaml").write_text(
+        "products:\n  ab:\n    q7:\n      label: Q\n", encoding="utf-8"
+    )
+    (system / "workspaces.yaml").write_text(
+        "workspaces:\n  - {id: q7, product: q7, kind: product}\n", encoding="utf-8"
+    )
+
+    found = advisory_occurrences(tmp_path, same_literal)
+
+    assert found == [], "a typed span was misreported on another axis"
+
+
+def test_untyped_same_literal_prose_remains_advisory_per_axis(tmp_path: Path):
+    """The exclusion must narrow to typed spans, never to whole lines."""
+    same_literal = (
+        Mapping(axis="product", old="q7", new="q7-product"),
+        Mapping(axis="workspace", old="q7", new="q7-workspace"),
+    )
+    (tmp_path / "note.md").write_text("the q7 pattern\n", encoding="utf-8")
+
+    found = advisory_occurrences(tmp_path, same_literal)
+
+    assert {(item.axis, item.old) for item in found} == {
+        ("product", "q7"),
+        ("workspace", "q7"),
+    }
