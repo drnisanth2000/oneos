@@ -400,3 +400,120 @@ def test_a_symlink_is_scanned_as_link_text_without_following_its_target(tmp_path
     assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
         occurrence("ab-link", 1, "entity", "ab", "ab/target")
     ]
+
+
+from app.cutover_locations import ScopedResidual, scoped_residuals
+from app.cutover_manifest import Mapping
+
+
+def migrated_tree(root: Path) -> None:
+    system = root / "_system"
+    (system / "scripts").mkdir(parents=True)
+    (system / "entities.yaml").write_text(
+        "entities:\n  ab-entity:\n    label: A\n", encoding="utf-8"
+    )
+    (system / "products.yaml").write_text(
+        "products:\n  ab-entity:\n    q7-product:\n      label: Q\n", encoding="utf-8"
+    )
+    (system / "members.yaml").write_text(
+        "members:\n  ab-entity:\n    - {id: m7-member}\n", encoding="utf-8"
+    )
+    (system / "workspaces.yaml").write_text(
+        "workspaces:\n  - {id: w7-workspace, entity: ab-entity, product: q7-product}\n",
+        encoding="utf-8",
+    )
+    (system / "scripts" / "action-policy.yaml").write_text(
+        'actors:\n  h:\n    allow:\n      - {paths: ["ab-entity/**"], '
+        'except: ["ab-entity/.sensitive/**"]}\n',
+        encoding="utf-8",
+    )
+    inbox = root / "ab-entity" / "00-inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "n.md").write_text(
+        "---\nentity: ab-entity\nproduct: q7-product\nmember: m7-member\n---\n\n"
+        "the ab word is ordinary prose\n",
+        encoding="utf-8",
+    )
+
+
+MAPPINGS = (
+    Mapping(axis="entity", old="ab", new="ab-entity"),
+    Mapping(axis="product", old="q7", new="q7-product"),
+    Mapping(axis="member", old="m7", new="m7-member"),
+    Mapping(axis="workspace", old="w7", new="w7-workspace"),
+)
+
+
+def test_a_fully_migrated_tree_has_no_scoped_residual(tmp_path: Path):
+    migrated_tree(tmp_path)
+
+    assert scoped_residuals(tmp_path, MAPPINGS) == []
+
+
+def test_ordinary_prose_containing_an_old_identifier_is_not_a_residual(tmp_path: Path):
+    migrated_tree(tmp_path)
+    (tmp_path / "ab-entity" / "00-inbox" / "prose.md").write_text(
+        "ab ab ab everywhere in the body\n", encoding="utf-8"
+    )
+
+    assert scoped_residuals(tmp_path, MAPPINGS) == []
+
+
+def test_a_missed_front_matter_field_is_a_residual(tmp_path: Path):
+    migrated_tree(tmp_path)
+    (tmp_path / "ab-entity" / "00-inbox" / "n.md").write_text(
+        "---\nentity: ab\n---\n", encoding="utf-8"
+    )
+
+    assert ScopedResidual(
+        location="entity:front-matter:entity",
+        path="ab-entity/00-inbox/n.md",
+        old="ab",
+    ) in scoped_residuals(tmp_path, MAPPINGS)
+
+
+def test_a_missed_registry_key_is_a_residual(tmp_path: Path):
+    migrated_tree(tmp_path)
+    (tmp_path / "_system" / "entities.yaml").write_text(
+        "entities:\n  ab:\n    label: A\n", encoding="utf-8"
+    )
+
+    assert any(
+        item.location == "entity:entities:key" for item in scoped_residuals(tmp_path, MAPPINGS)
+    )
+
+
+def test_a_missed_policy_except_half_is_a_residual(tmp_path: Path):
+    migrated_tree(tmp_path)
+    (tmp_path / "_system" / "scripts" / "action-policy.yaml").write_text(
+        'actors:\n  h:\n    allow:\n      - {paths: ["ab-entity/**"], '
+        'except: ["ab/.sensitive/**"]}\n',
+        encoding="utf-8",
+    )
+
+    assert any(
+        item.location == "entity:action-policy:except"
+        for item in scoped_residuals(tmp_path, MAPPINGS)
+    )
+
+
+def test_a_surviving_entity_directory_is_a_residual(tmp_path: Path):
+    migrated_tree(tmp_path)
+    (tmp_path / "ab").mkdir()
+
+    assert any(
+        item.location == "entity:vault-root:dirname"
+        for item in scoped_residuals(tmp_path, MAPPINGS)
+    )
+
+
+def test_a_missed_workspace_id_is_a_residual(tmp_path: Path):
+    migrated_tree(tmp_path)
+    (tmp_path / "_system" / "workspaces.yaml").write_text(
+        "workspaces:\n  - {id: w7, entity: ab-entity}\n", encoding="utf-8"
+    )
+
+    assert any(
+        item.location == "workspace:workspaces:id"
+        for item in scoped_residuals(tmp_path, MAPPINGS)
+    )

@@ -504,3 +504,158 @@ def advisory_occurrences(
                         )
                     )
     return sorted(found)
+
+
+import yaml
+
+
+@dataclass(frozen=True, order=True)
+class ScopedResidual:
+    location: str
+    path: str
+    old: str
+
+
+def _front_matter_values(text: str) -> dict[str, str]:
+    parts = _split_front_matter(text)
+    if parts is None:
+        return {}
+    try:
+        loaded = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return {k: v for k, v in loaded.items() if isinstance(v, str)}
+
+
+def _load_yaml_file(path: Path) -> object:
+    if not path.is_file():
+        return None
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, OSError, yaml.YAMLError) as exc:
+        raise UnreadableFile(f"{path.name} could not be read for the residual gate") from exc
+
+
+def scoped_residuals(
+    root: Path, mappings: tuple[Mapping, ...]
+) -> list[ScopedResidual]:
+    """Any enumerated location still holding an old identifier.
+
+    Scoped to the writer's own locations. Prose is never inspected, because a
+    retired identifier may legitimately survive there as an ordinary word.
+    """
+    by_axis: dict[str, set[str]] = {}
+    for mapping in mappings:
+        by_axis.setdefault(mapping.axis, set()).add(mapping.old)
+    entities = by_axis.get("entity", set())
+    products = by_axis.get("product", set())
+    members = by_axis.get("member", set())
+    workspaces = by_axis.get("workspace", set())
+    found: list[ScopedResidual] = []
+
+    def report(location: str, path: str, old: str) -> None:
+        found.append(ScopedResidual(location, path, old))
+
+    system = root / "_system"
+
+    # entity: bundle directory names
+    for old in entities:
+        if (root / old).is_dir():
+            report("entity:vault-root:dirname", old, old)
+
+    # entity / product: registry mapping keys
+    entities_doc = _load_yaml_file(system / "entities.yaml")
+    if isinstance(entities_doc, dict):
+        for key in (entities_doc.get("entities") or {}):
+            if key in entities:
+                report("entity:entities:key", "_system/entities.yaml", key)
+    products_doc = _load_yaml_file(system / "products.yaml")
+    if isinstance(products_doc, dict):
+        for group, values in (products_doc.get("products") or {}).items():
+            if group in entities:
+                report("entity:products:entity-group", "_system/products.yaml", group)
+            if isinstance(values, dict):
+                for key in values:
+                    if key in products:
+                        report("product:products:key", "_system/products.yaml", key)
+    members_doc = _load_yaml_file(system / "members.yaml")
+    if isinstance(members_doc, dict):
+        for group, values in (members_doc.get("members") or {}).items():
+            if group in entities:
+                report("entity:members:entity-group", "_system/members.yaml", group)
+            if isinstance(values, list):
+                for entry in values:
+                    if isinstance(entry, dict) and entry.get("id") in members:
+                        report("member:members:id", "_system/members.yaml", entry["id"])
+
+    # workspaces: four typed fields, each owned by exactly one axis
+    workspaces_doc = _load_yaml_file(system / "workspaces.yaml")
+    if isinstance(workspaces_doc, dict):
+        for entry in workspaces_doc.get("workspaces") or []:
+            if not isinstance(entry, dict):
+                continue
+            checks = (
+                ("workspace:workspaces:id", "id", workspaces),
+                ("entity:workspaces:entity", "entity", entities),
+                ("entity:workspaces:primary_entity", "primary_entity", entities),
+                ("product:workspaces:product", "product", products),
+                ("member:workspaces:member", "member", members),
+            )
+            for location, field, olds in checks:
+                if entry.get(field) in olds:
+                    report(location, "_system/workspaces.yaml", entry[field])
+
+    # action-policy: both halves of every rule
+    policy = system / "scripts" / "action-policy.yaml"
+    if policy.is_file():
+        try:
+            text = policy.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            raise UnreadableFile("action-policy.yaml could not be read") from exc
+        for match in _POLICY_LIST.finditer(text):
+            key, body = match.group(3), match.group(4)
+            for quoted in _QUOTED.finditer(body):
+                head = quoted.group(2).partition("/")[0]
+                if head in entities:
+                    report(
+                        f"entity:action-policy:{key}",
+                        "_system/scripts/action-policy.yaml",
+                        head,
+                    )
+
+    # front matter and proposals
+    for candidate in sorted(root.rglob("*")):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        relative = candidate.relative_to(root).as_posix()
+        if any(part in SKIP_DIRS for part in Path(relative).parts):
+            continue
+        if candidate.suffix.lower() == ".md":
+            try:
+                text = candidate.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as exc:
+                raise UnreadableFile(f"{relative} could not be read") from exc
+            values = _front_matter_values(text)
+            for location, field, olds in (
+                ("entity:front-matter:entity", "entity", entities),
+                ("product:front-matter:product", "product", products),
+                ("member:front-matter:member", "member", members),
+            ):
+                if values.get(field) in olds:
+                    report(location, relative, values[field])
+        elif candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
+            document = _load_yaml_file(candidate)
+            if not isinstance(document, dict):
+                continue
+            if document.get("entity") in entities:
+                report("entity:proposal:entity", relative, document["entity"])
+            for field in ("src", "dst"):
+                value = document.get(field)
+                if isinstance(value, str) and value.partition("/")[0] in entities:
+                    report(
+                        f"entity:proposal:{field}", relative, value.partition("/")[0]
+                    )
+
+    return sorted(found)
