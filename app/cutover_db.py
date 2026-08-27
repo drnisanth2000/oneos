@@ -264,7 +264,7 @@ def database_schema_inventory(
 
 
 def database_reference_inventory(
-    root: Path, mappings: tuple[Mapping, ...]
+    root: Path, mappings: tuple[Mapping, ...], registered: set[str] | None = None
 ) -> list[DatabaseReference]:
     """Exact-value reference counts for owner classification.
 
@@ -272,7 +272,7 @@ def database_reference_inventory(
     it does not turn a matching column name or value into writer authority.
     Only the owner's digest-bound `DatabaseTarget` list grants that authority.
     """
-    schemas = database_schema_inventory(root)
+    schemas = database_schema_inventory(root, registered)
     found: list[DatabaseReference] = []
     for relative, tables in sorted(schemas.items()):
         path = root / relative

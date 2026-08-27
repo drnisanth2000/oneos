@@ -173,8 +173,11 @@ def _run_inventory(vault: Path) -> int:
         check_collisions(mappings, existing_identifiers(snapshot))
         affected = sorted({m.old for m in mappings if m.axis == "entity"})
         occurrences = advisory_occurrences(snapshot, mappings)
-        schemas = database_schema_inventory(snapshot)
-        references = database_reference_inventory(snapshot, mappings)
+        # Registry-derived: a stray `<slug>/books.db` under a directory no
+        # manifest registers is not part of the vault being migrated.
+        registered = existing_identifiers(snapshot)["entity"]
+        schemas = database_schema_inventory(snapshot, registered)
+        references = database_reference_inventory(snapshot, mappings, registered)
 
     require_clean_entities(vault, affected)
     if git(vault, "rev-parse", "HEAD").strip() != source_head:

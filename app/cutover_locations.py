@@ -568,6 +568,26 @@ def _typed_token_spans(
             raise UnreadableFile(f"{relative} could not be read") from exc
         lines = text.splitlines()
 
+        if candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
+            # The writer owns the record's root `entity`/`src`/`dst` only, so
+            # typedness must stop there too. The old per-line regex matched a
+            # same-named key inside nested metadata, suppressing values the
+            # writer never rewrites — unreviewed and unverifiable at once.
+            for field, line_no, col_start, col_end, value in root_scalar_spans(
+                text, ("entity", "src", "dst")
+            ):
+                head = value if field == "entity" else value.partition("/")[0]
+                if head not in by_axis["entity"]:
+                    continue
+                raw = lines[line_no]
+                start = raw.find(head, col_start, col_end + len(head))
+                if start == -1:
+                    continue
+                record(
+                    relative, line_no + 1, "entity", head,
+                    (start, start + len(head)),
+                )
+
         if relative in ("_system/members.yaml", "_system/workspaces.yaml"):
             # Structural: the entry's own fields, never a same-named key in
             # nested metadata that no writer owns.
@@ -664,28 +684,6 @@ def _typed_token_spans(
                 # The old per-line regex saw only flow sequences, leaving every
                 # block-style path advisory despite being fully rewritable.
                 pass
-            elif candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
-                for old in by_axis["entity"]:
-                    record(
-                        relative,
-                        number,
-                        "entity",
-                        old,
-                        _yaml_scalar_span(line, "entity", old),
-                    )
-                    for field in ("src", "dst"):
-                        pattern = re.compile(
-                            rf"(^|[{{,])([ \t]*{field}:[ \t]*)"
-                            rf"(?P<value>{re.escape(old)})/"
-                        )
-                        match = pattern.search(line)
-                        record(
-                            relative,
-                            number,
-                            "entity",
-                            old,
-                            None if match is None else match.span("value"),
-                        )
     return typed
 
 

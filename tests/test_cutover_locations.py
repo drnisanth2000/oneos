@@ -1040,3 +1040,40 @@ def test_workspace_entity_rewrite_is_confined_to_the_entry():
     assert "entity: ab-entity," in result
     assert "primary_entity: ab-entity," in result
     assert "extra: {entity: ab}" in result, "nested metadata was rewritten"
+
+
+def test_nested_proposal_metadata_remains_advisory(tmp_path: Path):
+    """Typed spans must match the structural writer's ownership.
+
+    The writer confines itself to the record's root `entity`/`src`/`dst`, so
+    nested `meta:` values are neither rewritten nor typed — they must reach
+    the owner as advisory, not vanish from both.
+    """
+    outbox = tmp_path / "ab" / "outbox"
+    outbox.mkdir(parents=True)
+    (outbox / "p.yaml").write_text(
+        "entity: ab\nsrc: ab/a.md\ndst: ab/b.md\n"
+        "meta:\n  entity: ab\n  src: ab/x.md\n  dst: ab/y.md\n",
+        encoding="utf-8",
+    )
+
+    found = advisory_occurrences(
+        tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),)
+    )
+
+    assert [item.line for item in found] == [5, 6, 7], (
+        "nested proposal metadata was suppressed as typed"
+    )
+
+
+def test_root_proposal_fields_stay_typed(tmp_path: Path):
+    """The genuine root fields must not become advisory noise."""
+    outbox = tmp_path / "ab" / "outbox"
+    outbox.mkdir(parents=True)
+    (outbox / "p.yaml").write_text(
+        "entity: ab\nsrc: ab/a.md\ndst: ab/b.md\n", encoding="utf-8"
+    )
+
+    assert advisory_occurrences(
+        tmp_path, (Mapping(axis="entity", old="ab", new="ab-entity"),)
+    ) == []

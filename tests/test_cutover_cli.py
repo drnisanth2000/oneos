@@ -349,3 +349,41 @@ def test_a_malformed_approval_record_is_a_cutover_error(tmp_path: Path):
 
     with pytest.raises(CutoverError, match="approval record"):
         _load_approval(record)
+
+
+def test_inventory_ignores_a_stray_unregistered_database(tmp_path: Path, capsys):
+    """Inventory must report only databases the registry describes.
+
+    A stray `<slug>/books.db` under a directory no manifest registers is not
+    part of the vault the cutover migrates, and listing it invites an owner to
+    approve a target the build would then refuse.
+    """
+    import sqlite3
+
+    vault = cutover_vault(tmp_path / "vault")
+    stray = vault / "zz" / "books.db"
+    stray.parent.mkdir(parents=True)
+    conn = sqlite3.connect(stray)
+    conn.execute("CREATE TABLE ledger (product TEXT)")
+    conn.execute("INSERT INTO ledger VALUES ('q7')")
+    conn.commit()
+    conn.close()
+    commit_in(vault, "stray unregistered database")
+
+    assert main(["inventory", "--vault-root", str(vault)]) == 0
+    out = capsys.readouterr().out
+
+    assert "ab/books.db" in out
+    assert "zz/books.db" not in out, "an unregistered database was inventoried"
+
+
+def test_inventory_refuses_a_symlinked_entity_root(tmp_path: Path, capsys):
+    vault = cutover_vault(tmp_path / "vault")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "linked").symlink_to(outside, target_is_directory=True)
+    commit_in(vault, "symlinked directory at the vault root")
+
+    # Not a registered entity, so it is simply out of scope rather than fatal.
+    assert main(["inventory", "--vault-root", str(vault)]) == 0
+    assert "linked" not in capsys.readouterr().out
