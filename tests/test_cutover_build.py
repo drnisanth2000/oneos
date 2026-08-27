@@ -1026,3 +1026,37 @@ def test_a_product_kind_workspace_id_takes_the_workspace_suffix(tmp_path: Path):
     assert "id: w7-workspace" in workspaces
     assert "product: q7-product" in workspaces
     assert "id: q7-product" not in workspaces
+
+
+def test_run_vault_validators_leaves_no_bytecode(tmp_path: Path):
+    """The validators read the tree; they must not add compiled bytecode.
+
+    `git add -A` stages whatever is present, so a `.pyc` written during
+    validation would enter the single reviewed cutover commit — and would also
+    make two builds of one source HEAD produce different trees.
+    """
+    from app.cutover_build import run_vault_validators
+
+    vault = cutover_vault(tmp_path / "vault")
+
+    run_vault_validators(vault)
+
+    assert list(vault.rglob("*.pyc")) == []
+    assert list(vault.rglob("__pycache__")) == []
+
+
+def test_a_validator_that_writes_an_ignored_file_refuses_the_build(tmp_path: Path):
+    """An ignored file is still detritus. `--ignored` coverage is what makes
+    this detectable; without it a private ignore rule would hide it."""
+    vault = cutover_vault(tmp_path / "vault")
+    (vault / ".gitignore").write_text("scratch.tmp\n", encoding="utf-8")
+    commit_in(vault, "ignore scratch")
+    raw, record = approved(vault)
+
+    def writes_ignored_file(root: Path) -> None:
+        (root / "scratch.tmp").write_text("left behind\n", encoding="utf-8")
+
+    with pytest.raises(CutoverError, match="validator changed the isolated tree"):
+        build_cutover(vault, raw, record, validator=writes_ignored_file)
+
+    assert git_is_clean(vault)

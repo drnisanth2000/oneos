@@ -420,8 +420,11 @@ def run_vault_validators(root: Path) -> None:
     check_v2 = scripts / "check_v2.py"
     if not check_v2.is_file():
         raise CutoverError("check_v2.py is absent from the isolated tree")
+    # `-B` stops bytecode at its source. Relying on a private `.gitignore` to
+    # hide validator detritus would make commit contents depend on a rule this
+    # repository cannot see.
     structural = subprocess.run(
-        [sys.executable, str(check_v2), "."],
+        [sys.executable, "-B", str(check_v2), "."],
         cwd=root,
         check=False,
         capture_output=True,
@@ -431,7 +434,7 @@ def run_vault_validators(root: Path) -> None:
     if structural.returncode != 0 or not _CHECK_V2_ZERO.search(combined):
         raise CutoverError("check_v2 did not report 0 error(s), 0 warning(s)")
     private_suite = subprocess.run(
-        [sys.executable, "-m", "unittest", "discover"],
+        [sys.executable, "-B", "-m", "unittest", "discover"],
         cwd=scripts,
         check=False,
         capture_output=True,
@@ -439,6 +442,21 @@ def run_vault_validators(root: Path) -> None:
     )
     if private_suite.returncode != 0:
         raise CutoverError("vault script tests failed on the isolated tree")
+
+
+def _tree_state(root: Path) -> bytes:
+    """Opaque worktree state, including ignored paths.
+
+    `--ignored` is mandatory: without it a private ignore rule could hide
+    validator detritus, and the comparison would pass while the artifact
+    silently gained a file nobody reviewed.
+    """
+    return subprocess.run(
+        ["git", "status", "--porcelain=v2", "--untracked-files=all", "--ignored"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    ).stdout
 
 
 def build_cutover(
@@ -485,7 +503,17 @@ def build_cutover(
             raise CutoverError("database residual after migration")
 
         _require_post_advisory(scratch, manifest)
+
+        # The validators read the tree; they must not add to it. `git add -A`
+        # stages everything present, so anything a validator leaves behind
+        # would enter the one reviewed cutover commit.
+        before_validation = _tree_state(scratch)
         validator(scratch)
+        if _tree_state(scratch) != before_validation:
+            raise CutoverError(
+                "validator changed the isolated tree; the cutover commit must "
+                "contain only the reviewed migration"
+            )
 
         git(scratch, "add", "-A")
         git(
