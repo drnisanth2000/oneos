@@ -1,0 +1,172 @@
+from pathlib import Path
+import subprocess
+
+import pytest
+
+import app.cutover as cutover
+from app.cutover import promote
+from app.cutover_build import CutoverCommittedError, CutoverError, isolated_worktree
+from app.cutover_inventory import UnmigratableContentError
+from tests.conftest import git_head, git_status_bytes, git_vault
+
+
+def commit_in(root: Path, message: str) -> str:
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@e", "-c", "user.name=t",
+         "commit", "-q", "-m", message],
+        cwd=root, check=True, capture_output=True,
+    )
+    return git_head(root)
+
+
+def build_a_commit(vault: Path, head: str, filename: str = "a.md") -> str:
+    with isolated_worktree(vault, head) as scratch:
+        (scratch / filename).write_text("changed\n", encoding="utf-8")
+        return commit_in(scratch, "cutover")
+
+
+def test_promotion_fast_forwards_the_live_vault(tmp_path: Path):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head)
+
+    assert promote(vault, built, head, git_status_bytes(vault), []) == built
+    assert (vault / "a.md").read_text(encoding="utf-8") == "changed\n"
+
+
+def test_promotion_takes_the_shared_action_lock(tmp_path: Path, monkeypatch):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head)
+    taken: list[Path] = []
+
+    real = cutover.action_lock
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def recording(target):
+        taken.append(target)
+        with real(target):
+            yield
+
+    monkeypatch.setattr(cutover, "action_lock", recording)
+    promote(vault, built, head, git_status_bytes(vault), [])
+
+    assert taken == [vault]
+
+
+def test_promotion_refuses_a_moved_head(tmp_path: Path):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head)
+    (vault / "b.md").write_text("y\n", encoding="utf-8")
+    moved = commit_in(vault, "concurrent")
+
+    with pytest.raises(CutoverError):
+        promote(vault, built, head, git_status_bytes(vault), [])
+    assert git_head(vault) == moved
+
+
+def test_promotion_refuses_a_changed_status(tmp_path: Path):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    captured = git_status_bytes(vault)
+    built = build_a_commit(vault, head)
+    (vault / "stray.md").write_text("s\n", encoding="utf-8")
+
+    with pytest.raises(CutoverError):
+        promote(vault, built, head, captured, [])
+    assert git_head(vault) == head
+
+
+def test_promotion_repeats_the_ignored_content_check(tmp_path: Path):
+    vault = git_vault(
+        tmp_path / "vault", {".gitignore": ".sensitive/\n", "ab/n.md": "x\n"}
+    )
+    head = git_head(vault)
+    built = build_a_commit(vault, head, filename="ab/other.md")
+    captured = git_status_bytes(vault)
+    (vault / "ab" / ".sensitive").mkdir()
+    (vault / "ab" / ".sensitive" / "s.md").write_text("s\n", encoding="utf-8")
+
+    with pytest.raises(
+        UnmigratableContentError,
+        match="ignored or untracked content",
+    ):
+        promote(vault, built, head, captured, ["ab"])
+    assert git_head(vault) == head
+
+
+def test_promotion_leaves_an_obstructing_untracked_file_intact(tmp_path: Path):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head, filename="new.md")
+    (vault / "new.md").write_text("mine\n", encoding="utf-8")
+
+    with pytest.raises(CutoverError):
+        promote(vault, built, head, git_status_bytes(vault), [])
+    assert (vault / "new.md").read_text(encoding="utf-8") == "mine\n"
+    assert git_head(vault) == head
+
+
+def test_a_failed_promotion_is_not_reported_as_committed(tmp_path: Path):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head)
+    (vault / "stray.md").write_text("s\n", encoding="utf-8")
+
+    with pytest.raises(CutoverError) as caught:
+        promote(vault, built, head, git_status_bytes(vault), [])
+    assert not isinstance(caught.value, CutoverCommittedError)
+
+
+def test_a_commit_that_cannot_be_confirmed_is_reported_as_committed(
+    tmp_path: Path, monkeypatch
+):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head)
+    captured = git_status_bytes(vault)
+    state = {"merged": False}
+
+    real_run = subprocess.run
+
+    def flaky(args, **kwargs):
+        if args[:2] == ["git", "merge"]:
+            state["merged"] = True
+            return real_run(args, **kwargs)
+        if state["merged"] and args[:3] == ["git", "rev-parse", "HEAD"]:
+            raise OSError("injected confirmation failure")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(cutover.subprocess, "run", flaky)
+
+    with pytest.raises(CutoverCommittedError):
+        promote(vault, built, head, captured, [])
+
+
+def test_a_commit_confirmed_as_the_wrong_head_is_reported_as_committed_but_unresolved(
+    tmp_path: Path, monkeypatch
+):
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head)
+    captured = git_status_bytes(vault)
+    real_run = subprocess.run
+    merged = {"done": False}
+
+    def wrong_head(args, **kwargs):
+        if args[:2] == ["git", "merge"]:
+            result = real_run(args, **kwargs)
+            merged["done"] = True
+            return result
+        if merged["done"] and args[:3] == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(args, 0, stdout=head + "\n", stderr="")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(cutover.subprocess, "run", wrong_head)
+
+    with pytest.raises(CutoverCommittedError, match="does not equal the built commit"):
+        promote(vault, built, head, captured, [])
