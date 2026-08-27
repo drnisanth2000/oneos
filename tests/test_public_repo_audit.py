@@ -12,7 +12,7 @@ from app.action_receipts import (
     render_action_receipt,
     validate_head_receipt_store,
 )
-from tools.public_repo_audit import audit_repository
+from tools.public_repo_audit import audit_repository, load_instance_terms
 
 
 def run_git(
@@ -390,3 +390,25 @@ def test_cli_prints_redacted_finding_and_exits_one(tmp_path: Path):
     assert "absolute private path detected" in result.stdout
     assert private_path not in result.stdout
     assert "config.py" not in result.stdout
+
+
+def test_term_collection_reads_only_registry_keys_and_ids(tmp_path: Path):
+    vault = synthetic_vault(tmp_path / "vault", entity="alpha")
+    system = vault / "_system"
+    system.joinpath("entities.yaml").write_text(
+        "entities:\n  alpha:\n    label: A\n    former_slugs: [ab]\n",
+        encoding="utf-8",
+    )
+    system.joinpath("products.yaml").write_text(
+        "products:\n  alpha:\n    bravo:\n      former_slugs: [q7]\n",
+        encoding="utf-8",
+    )
+
+    long_terms, short_terms = load_instance_terms(vault)
+
+    assert "alpha" in long_terms
+    assert "bravo" in long_terms
+    # Retained provenance must never be seeded, or the post-cutover history
+    # audit would look for retired identifiers again and go red.
+    assert "ab" not in short_terms and "ab" not in long_terms
+    assert "q7" not in short_terms and "q7" not in long_terms
