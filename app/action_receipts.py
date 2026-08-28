@@ -23,7 +23,20 @@ from .proposal_identity import (
     require_proposal_id,
     require_proposal_identity,
 )
-from .review_tokens import InvalidReviewToken, require_review_sha256
+from .review_tokens import (
+    InvalidReviewToken,
+    ReviewContractViolation,
+    require_review_sha256,
+)
+
+
+# Console failure metadata belongs at this route-facing adapter rather than in
+# review_tokens.py. That exact-byte domain primitive deliberately has no app
+# imports; decorating the shared function object here preserves that boundary
+# while exposing the same immutable contract to the Console composition graph.
+require_review_sha256 = failure_contract(
+    raises=(InvalidReviewToken, ReviewContractViolation)
+)(require_review_sha256)
 
 
 ActionKind = Literal["approval", "registry deletion"]
