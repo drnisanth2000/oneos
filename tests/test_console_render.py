@@ -5,6 +5,7 @@ override must reach every full-page document through one shared head
 (design §4). Synthetic vaults only.
 """
 import importlib
+from dataclasses import FrozenInstanceError
 
 import pytest
 
@@ -95,6 +96,120 @@ def test_console_route_rejects_exception_in_catches():
         console_route(catches=(Exception,), surface="page")
     with pytest.raises(ValueError):
         console_route(catches=(ValueError, BaseException), surface="page")
+
+
+def test_failure_contract_metadata_is_frozen_and_does_not_wrap():
+    from app.console_routing import (
+        DeliberateUnknown,
+        FailureContract,
+        failure_contract,
+    )
+
+    unknown = DeliberateUnknown(KeyError, "legacy parser boundary")
+
+    @failure_contract(
+        raises=(ValueError,),
+        deliberate_unknown=(unknown,),
+    )
+    def service():
+        return "unchanged"
+
+    assert service() == "unchanged"
+    assert service.__failure_contract__ == FailureContract(
+        raises=(ValueError,),
+        calls=(),
+        deliberate_unknown=(unknown,),
+    )
+    with pytest.raises(FrozenInstanceError):
+        service.__failure_contract__.raises = ()
+    with pytest.raises(FrozenInstanceError):
+        unknown.reason = "changed"
+
+
+@pytest.mark.parametrize(
+    "raises",
+    [
+        (Exception,),
+        (BaseException,),
+        ("not-an-exception",),
+        (ValueError, ValueError),
+    ],
+)
+def test_failure_contract_rejects_invalid_raised_classes(raises):
+    from app.console_routing import failure_contract
+
+    with pytest.raises(ValueError):
+        failure_contract(raises=raises)
+
+
+def test_failure_contract_rejects_invalid_deliberate_unknown_entries():
+    from app.console_routing import DeliberateUnknown, failure_contract
+
+    with pytest.raises(ValueError):
+        DeliberateUnknown(Exception, "too broad")
+    with pytest.raises(ValueError):
+        DeliberateUnknown(BaseException, "too broad")
+    with pytest.raises(ValueError):
+        DeliberateUnknown("not-an-exception", "invalid")
+    with pytest.raises(ValueError):
+        DeliberateUnknown(KeyError, "   ")
+
+    duplicate = DeliberateUnknown(KeyError, "one known legacy outcome")
+    with pytest.raises(ValueError):
+        failure_contract(deliberate_unknown=(duplicate, duplicate))
+    with pytest.raises(ValueError):
+        failure_contract(raises=(KeyError,), deliberate_unknown=(duplicate,))
+
+
+def test_failure_contract_rejects_uncontracted_calls_targets():
+    from app.console_routing import failure_contract
+
+    def uncontracted():
+        pass
+
+    with pytest.raises(ValueError):
+        failure_contract(calls=(uncontracted,))
+    with pytest.raises(ValueError):
+        failure_contract(calls=("not-callable",))
+
+
+def test_failure_contract_accepts_a_contracted_call_edge():
+    from app.console_routing import FailureContract, failure_contract
+
+    @failure_contract(raises=(ValueError,))
+    def leaf():
+        pass
+
+    @failure_contract(calls=(leaf,))
+    def caller():
+        pass
+
+    assert caller.__failure_contract__ == FailureContract(
+        raises=(), calls=(leaf,), deliberate_unknown=()
+    )
+
+
+def test_console_route_requires_genuine_contracts_for_callable_services():
+    from app.console_routing import console_route, failure_contract
+
+    @failure_contract(raises=(ValueError,))
+    def contracted():
+        pass
+
+    @console_route(catches=(ValueError,), surface="page", services=(contracted,))
+    def endpoint():
+        pass
+
+    assert endpoint.__console_route__.services == (contracted,)
+
+    def uncontracted():
+        pass
+
+    uncontracted.__failure_contract__ = object()
+    with pytest.raises(ValueError):
+        console_route(catches=(), surface="page", services=(uncontracted,))
+    with pytest.raises(ValueError):
+        console_route(catches=(), surface="page", services=("not-callable",))
 
 
 def _full_page_route_paths(main) -> list[str]:
