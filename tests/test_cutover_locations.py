@@ -56,11 +56,14 @@ from app.cutover_locations import (
     rewrite_root_scalar,
     registry_entry_scalar_spans,
     root_scalar_spans,
+    rewrite_conventions_member_references,
     rewrite_registry_entry_scalar,
     rewrite_front_matter_field,
     rewrite_mapping_key,
+    rewrite_members_comment_references,
     rewrite_path_head,
     rewrite_policy_path_heads,
+    rewrite_system_product_references,
     rewrite_yaml_path_head_field,
     rewrite_yaml_value_field,
 )
@@ -156,6 +159,65 @@ def test_mapping_key_rewrite_matches_at_the_given_indent():
     result = rewrite_mapping_key(text, "ab", "ab-product", indent=4)
     assert "    ab-product:" in result
     assert "  zz:" in result
+
+
+def test_conventions_member_references_rewrite_only_owned_inline_code():
+    text = (
+        "Known members: `m7`, `x8`; a note tagged `member: m7`.\n"
+        "Ordinary m7 prose stays unchanged.\n"
+    )
+
+    result = rewrite_conventions_member_references(text, "m7", "m7-member")
+
+    assert result == (
+        "Known members: `m7-member`, `x8`; "
+        "a note tagged `member: m7-member`.\n"
+        "Ordinary m7 prose stays unchanged.\n"
+    )
+
+
+def test_members_comment_rewrites_only_an_explicit_member_reference():
+    text = (
+        "members:\n"
+        "  ab:\n"
+        "    # Example `member: m7`; the code token `m7` and prose m7 stay.\n"
+        "    - {id: m7}\n"
+    )
+
+    result = rewrite_members_comment_references(text, "m7", "m7-member")
+
+    assert result == (
+        "members:\n"
+        "  ab:\n"
+        "    # Example `member: m7-member`; the code token `m7` and prose m7 stay.\n"
+        "    - {id: m7}\n"
+    )
+
+
+def test_members_comment_does_not_rewrite_a_hash_inside_a_yaml_scalar():
+    text = (
+        "members:\n"
+        "  ab:\n"
+        "    - {id: x8, label: \"# Example `member: m7`\"}\n"
+    )
+
+    assert rewrite_members_comment_references(text, "m7", "m7-member") == text
+
+
+def test_system_product_references_require_a_registered_entity_pair():
+    text = (
+        "Compact `ab`/q7 and spaced `ab` / q7 references migrate.\n"
+        "Unregistered `zz`/q7 and shell cd q7 remain unchanged.\n"
+    )
+
+    result = rewrite_system_product_references(
+        text, frozenset({"ab"}), "q7", "q7-product"
+    )
+
+    assert result == (
+        "Compact `ab`/q7-product and spaced `ab` / q7-product references migrate.\n"
+        "Unregistered `zz`/q7 and shell cd q7 remain unchanged.\n"
+    )
 
 
 POLICY = textwrap.dedent(
@@ -379,6 +441,43 @@ def test_typed_registry_front_matter_workspace_policy_and_proposal_lines_are_not
     ]
 
 
+def test_supported_system_document_references_are_typed_but_prose_is_advisory(
+    tmp_path: Path,
+):
+    system = tmp_path / "_system"
+    docs = system / "docs"
+    docs.mkdir(parents=True)
+    (system / "entities.yaml").write_text(
+        "entities:\n  ab:\n    label: A\n", encoding="utf-8"
+    )
+    (system / "members.yaml").write_text(
+        "members:\n"
+        "  ab:\n"
+        "    # A note tagged `member: m7` is explicit.\n"
+        "    - {id: m7-member}\n",
+        encoding="utf-8",
+    )
+    (system / "conventions-v2.1-additions.md").write_text(
+        "Known member: `m7`.\nOrdinary m7 prose stays advisory.\n",
+        encoding="utf-8",
+    )
+    (docs / "guide.md").write_text(
+        "Product pair: `ab` / q7.\nOrdinary q7 prose stays advisory.\n",
+        encoding="utf-8",
+    )
+    mappings = ADVISORY_MAPPINGS[1:3] + (
+        Mapping(axis="workspace", old="q7", new="q7-workspace"),
+    )
+
+    found = advisory_occurrences(tmp_path, mappings)
+
+    assert {(item.path, item.line, item.axis, item.old) for item in found} == {
+        ("_system/conventions-v2.1-additions.md", 2, "member", "m7"),
+        ("_system/docs/guide.md", 2, "product", "q7"),
+        ("_system/docs/guide.md", 2, "workspace", "q7"),
+    }
+
+
 def test_a_typed_scalar_does_not_hide_same_axis_prose_on_its_line(tmp_path: Path):
     note = tmp_path / "note.md"
     note.write_text(
@@ -461,6 +560,54 @@ def test_ordinary_prose_containing_an_old_identifier_is_not_a_residual(tmp_path:
     )
 
     assert scoped_residuals(tmp_path, MAPPINGS) == []
+
+
+def test_supported_system_document_references_are_scoped_residuals(
+    tmp_path: Path,
+):
+    system = tmp_path / "_system"
+    docs = system / "docs"
+    docs.mkdir(parents=True)
+    (system / "entities.yaml").write_text(
+        "entities:\n  ab:\n    label: A\n", encoding="utf-8"
+    )
+    (system / "members.yaml").write_text(
+        "members:\n"
+        "  ab:\n"
+        "    # Example `member: m7`.\n"
+        "    - {id: m7-member}\n",
+        encoding="utf-8",
+    )
+    (system / "conventions-v2.1-additions.md").write_text(
+        "Known member: `m7`.\n", encoding="utf-8"
+    )
+    (docs / "guide.md").write_text(
+        "Product pair: `ab`/q7.\n", encoding="utf-8"
+    )
+    mappings = (
+        Mapping(axis="product", old="q7", new="q7-product"),
+        Mapping(axis="member", old="m7", new="m7-member"),
+    )
+
+    found = scoped_residuals(tmp_path, mappings)
+
+    assert {(item.location, item.path, item.old) for item in found} == {
+        (
+            "member:system-doc:member-code-reference",
+            "_system/conventions-v2.1-additions.md",
+            "m7",
+        ),
+        (
+            "member:members:comment-member-reference",
+            "_system/members.yaml",
+            "m7",
+        ),
+        (
+            "product:system-doc:entity-product-reference",
+            "_system/docs/guide.md",
+            "q7",
+        ),
+    }
 
 
 def test_a_missed_front_matter_field_is_a_residual(tmp_path: Path):

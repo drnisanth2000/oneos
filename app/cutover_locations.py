@@ -49,10 +49,13 @@ REWRITE_LOCATIONS: tuple[Location, ...] = (
     Location("product", "products", "key", "key"),
     Location("product", "front-matter", "product", "value"),
     Location("product", "workspaces", "product", "value"),
+    Location("product", "system-doc", "entity-product-reference", "value"),
     Location("product", "books-db", "approved-target", "value"),
     # --- member -----------------------------------------------------------
     Location("member", "members", "id", "value"),
+    Location("member", "members", "comment-member-reference", "value"),
     Location("member", "front-matter", "member", "value"),
+    Location("member", "system-doc", "member-code-reference", "value"),
     Location("member", "workspaces", "member", "value"),
     Location("member", "books-db", "approved-target-member", "value"),
     # --- workspace --------------------------------------------------------
@@ -93,6 +96,167 @@ import re
 #: lookahead fails on the hyphen, while a bare `ab` still does.
 def boundaried(term: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![\w-]){re.escape(term)}(?![\w-])")
+
+
+_INLINE_CODE = re.compile(r"(?<!`)`(?P<code>[^`\n]+)`(?!`)")
+
+
+def _rewrite_reference_spans(
+    text: str, spans: list[tuple[int, int, int]], new: str
+) -> str:
+    """Replace exact line-local spans without reflowing surrounding text."""
+    lines = text.splitlines(keepends=True)
+    by_line: dict[int, list[tuple[int, int]]] = {}
+    for line_no, start, end in spans:
+        by_line.setdefault(line_no, []).append((start, end))
+    for line_no, line_spans in by_line.items():
+        line = lines[line_no]
+        for start, end in sorted(line_spans, reverse=True):
+            line = line[:start] + new + line[end:]
+        lines[line_no] = line
+    return "".join(lines)
+
+
+def conventions_member_reference_spans(
+    text: str, old: str
+) -> list[tuple[int, int, int]]:
+    """Member ids owned by inline code in the conventions additions.
+
+    A code span is typed only when it is exactly the id, or exactly an
+    explicit ``member: <id>`` example. Ordinary prose remains advisory.
+    """
+    found: list[tuple[int, int, int]] = []
+    explicit = re.compile(rf"member:[ \t]*(?P<value>{re.escape(old)})$")
+    for line_no, line in enumerate(text.splitlines()):
+        for match in _INLINE_CODE.finditer(line):
+            code = match.group("code")
+            if code == old:
+                found.append((line_no, match.start("code"), match.end("code")))
+                continue
+            reference = explicit.fullmatch(code)
+            if reference is not None:
+                offset = match.start("code")
+                found.append(
+                    (
+                        line_no,
+                        offset + reference.start("value"),
+                        offset + reference.end("value"),
+                    )
+                )
+    return found
+
+
+def rewrite_conventions_member_references(text: str, old: str, new: str) -> str:
+    return _rewrite_reference_spans(
+        text, conventions_member_reference_spans(text, old), new
+    )
+
+
+def members_comment_reference_spans(
+    text: str, old: str
+) -> list[tuple[int, int, int]]:
+    """Explicit ``member: <id>`` examples on comment-only YAML lines."""
+    found: list[tuple[int, int, int]] = []
+    explicit = re.compile(rf"member:[ \t]*(?P<value>{re.escape(old)})$")
+    for line_no, line in enumerate(text.splitlines()):
+        comment_match = re.match(r"^[ \t]*#", line)
+        if comment_match is None:
+            continue
+        comment = comment_match.end() - 1
+        for match in _INLINE_CODE.finditer(line, comment + 1):
+            reference = explicit.fullmatch(match.group("code"))
+            if reference is None:
+                continue
+            offset = match.start("code")
+            found.append(
+                (
+                    line_no,
+                    offset + reference.start("value"),
+                    offset + reference.end("value"),
+                )
+            )
+    return found
+
+
+def rewrite_members_comment_references(text: str, old: str, new: str) -> str:
+    return _rewrite_reference_spans(
+        text, members_comment_reference_spans(text, old), new
+    )
+
+
+def system_product_reference_spans(
+    text: str, registered_entities: frozenset[str], old: str
+) -> list[tuple[int, int, int]]:
+    """Product ids in explicit ``<registered entity> / <product>`` pairs."""
+    pair = re.compile(
+        rf"(?<!`)`(?P<entity>[^`\n]+)`(?!`)[ \t]*/[ \t]*"
+        rf"(?P<product>{re.escape(old)})(?![\w-])"
+    )
+    found: list[tuple[int, int, int]] = []
+    for line_no, line in enumerate(text.splitlines()):
+        for match in pair.finditer(line):
+            if match.group("entity") in registered_entities:
+                found.append(
+                    (line_no, match.start("product"), match.end("product"))
+                )
+    return found
+
+
+def rewrite_system_product_references(
+    text: str,
+    registered_entities: frozenset[str],
+    old: str,
+    new: str,
+) -> str:
+    return _rewrite_reference_spans(
+        text, system_product_reference_spans(text, registered_entities, old), new
+    )
+
+
+def _conventions_member_reference_values(text: str) -> list[str]:
+    """Independently enumerate the member-reference shapes for the gate."""
+    found: list[str] = []
+    explicit = re.compile(r"member:[ \t]*(?P<value>[a-z0-9][a-z0-9-]*)$")
+    for line in text.splitlines():
+        for match in re.finditer(r"`(?P<code>[^`\n]+)`", line):
+            code = match.group("code")
+            reference = explicit.fullmatch(code)
+            found.append(reference.group("value") if reference else code)
+    return found
+
+
+def _members_comment_reference_values(text: str) -> list[str]:
+    """Independently enumerate member examples on comment-only YAML lines."""
+    found: list[str] = []
+    explicit = re.compile(
+        r"`member:[ \t]*(?P<value>[a-z0-9][a-z0-9-]*)`"
+    )
+    for line in text.splitlines():
+        comment_match = re.match(r"^[ \t]*#", line)
+        if comment_match is None:
+            continue
+        comment = comment_match.end() - 1
+        found.extend(
+            match.group("value")
+            for match in explicit.finditer(line, comment + 1)
+        )
+    return found
+
+
+def _system_product_reference_values(
+    text: str, registered_entities: frozenset[str]
+) -> list[str]:
+    """Independently enumerate registered-entity/product pairs for the gate."""
+    pair = re.compile(
+        r"`(?P<entity>[^`\n]+)`[ \t]*/[ \t]*"
+        r"(?P<product>[a-z0-9][a-z0-9-]*)(?![\w-])"
+    )
+    return [
+        match.group("product")
+        for line in text.splitlines()
+        for match in pair.finditer(line)
+        if match.group("entity") in registered_entities
+    ]
 
 
 def _split_front_matter(text: str) -> tuple[str, str, str] | None:
@@ -572,6 +736,13 @@ def _typed_token_spans(
     }
     typed: set[tuple[str, int, str, str, int, int]] = set()
 
+    entities_doc = _load_yaml_file(root / "_system" / "entities.yaml")
+    registered_entities = frozenset(
+        (entities_doc.get("entities") or {}).keys()
+        if isinstance(entities_doc, dict)
+        else ()
+    )
+
     def record(
         relative: str,
         number: int,
@@ -632,6 +803,54 @@ def _typed_token_spans(
                             relative, line_no + 1, axis, value,
                             (col_start, col_end),
                         )
+
+        if relative == "_system/members.yaml":
+            for old in by_axis["member"]:
+                for line_no, col_start, col_end in members_comment_reference_spans(
+                    text, old
+                ):
+                    record(
+                        relative,
+                        line_no + 1,
+                        "member",
+                        old,
+                        (col_start, col_end),
+                    )
+
+        relative_path = Path(relative)
+        if (
+            relative_path.parent == Path("_system")
+            and relative_path.name.startswith("conventions")
+            and relative_path.suffix.lower() == ".md"
+        ):
+            for old in by_axis["member"]:
+                for line_no, col_start, col_end in conventions_member_reference_spans(
+                    text, old
+                ):
+                    record(
+                        relative,
+                        line_no + 1,
+                        "member",
+                        old,
+                        (col_start, col_end),
+                    )
+
+        if (
+            len(relative_path.parts) >= 3
+            and relative_path.parts[:2] == ("_system", "docs")
+            and relative_path.suffix.lower() == ".md"
+        ):
+            for old in by_axis["product"]:
+                for line_no, col_start, col_end in system_product_reference_spans(
+                    text, registered_entities, old
+                ):
+                    record(
+                        relative,
+                        line_no + 1,
+                        "product",
+                        old,
+                        (col_start, col_end),
+                    )
 
         if relative == "_system/scripts/action-policy.yaml":
             # Structural, once per file: the writer locates these scalars the
@@ -1010,6 +1229,19 @@ def scoped_residuals(
                 for entry in values:
                     if isinstance(entry, dict) and entry.get("id") in members:
                         report("member:members:id", "_system/members.yaml", entry["id"])
+    members_path = system / "members.yaml"
+    if members_path.is_file():
+        try:
+            members_text = members_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            raise UnreadableFile("members.yaml could not be read") from exc
+        for value in _members_comment_reference_values(members_text):
+            if value in members:
+                report(
+                    "member:members:comment-member-reference",
+                    "_system/members.yaml",
+                    value,
+                )
 
     # workspaces: four typed fields, each owned by exactly one axis
     workspaces_doc = _load_yaml_file(system / "workspaces.yaml")
@@ -1069,6 +1301,36 @@ def scoped_residuals(
             ):
                 if values.get(field) in olds:
                     report(location, relative, values[field])
+            relative_path = Path(relative)
+            if (
+                relative_path.parent == Path("_system")
+                and relative_path.name.startswith("conventions")
+            ):
+                for value in _conventions_member_reference_values(text):
+                    if value in members:
+                        report(
+                            "member:system-doc:member-code-reference",
+                            relative,
+                            value,
+                        )
+            if (
+                len(relative_path.parts) >= 3
+                and relative_path.parts[:2] == ("_system", "docs")
+            ):
+                registered_entities = frozenset(
+                    (entities_doc.get("entities") or {}).keys()
+                    if isinstance(entities_doc, dict)
+                    else ()
+                )
+                for value in _system_product_reference_values(
+                    text, registered_entities
+                ):
+                    if value in products:
+                        report(
+                            "product:system-doc:entity-product-reference",
+                            relative,
+                            value,
+                        )
         elif candidate.suffix.lower() == ".yaml" and "outbox" in Path(relative).parts:
             document = _load_yaml_file(candidate)
             if not isinstance(document, dict):

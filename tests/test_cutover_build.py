@@ -266,6 +266,63 @@ def approved(vault: Path, dispositions=None, databases=None) -> tuple[bytes, App
     )
 
 
+def test_build_rewrites_supported_system_document_references(tmp_path: Path):
+    vault = cutover_vault(tmp_path / "vault")
+    system = vault / "_system"
+    docs = system / "docs"
+    docs.mkdir()
+    entities = system / "entities.yaml"
+    entities.write_text(
+        entities.read_text(encoding="utf-8")
+        + "  alpha:\n    label: Unaffected entity\n",
+        encoding="utf-8",
+    )
+    (system / "conventions-v2.1-additions.md").write_text(
+        "Known member: `m7`; example `member: m7`.\n",
+        encoding="utf-8",
+    )
+    members = system / "members.yaml"
+    members.write_text(
+        "# Example `member: m7`.\n" + members.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (docs / "guide.md").write_text(
+        "Product pair: `alpha` / q7.\nShell cd remains ordinary.\n",
+        encoding="utf-8",
+    )
+    commit_in(vault, "add structural system-document references")
+    raw, record = approved(vault)
+
+    result = build_cutover(vault, raw, record)
+
+    conventions = subprocess.run(
+        ["git", "show", f"{result.commit}:_system/conventions-v2.1-additions.md"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    migrated_members = subprocess.run(
+        ["git", "show", f"{result.commit}:_system/members.yaml"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    guide = subprocess.run(
+        ["git", "show", f"{result.commit}:_system/docs/guide.md"],
+        cwd=vault,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "`m7-member`" in conventions
+    assert "`member: m7-member`" in conventions
+    assert "`member: m7-member`" in migrated_members
+    assert "`alpha` / q7-product" in guide
+    assert "Shell cd remains ordinary" in guide
+
+
 def executor_record(repo: Path, *, commit: str | None = None) -> ApprovalRecord:
     return ApprovalRecord(
         manifest_sha256="a" * 64,

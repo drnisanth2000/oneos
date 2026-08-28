@@ -138,11 +138,14 @@ from .cutover_locations import (
     advisory_occurrences,
     location_keys,
     rewrite_front_matter_field,
+    rewrite_conventions_member_references,
     rewrite_mapping_key,
+    rewrite_members_comment_references,
     rewrite_registry_entry_scalar,
     rewrite_root_scalar,
     rewrite_path_head,
     rewrite_policy_path_heads,
+    rewrite_system_product_references,
     rewrite_yaml_path_head_field,
     rewrite_yaml_value_field,
     scoped_residuals,
@@ -336,12 +339,33 @@ def _apply_value_mapping(root: Path, axis: str, old: str, new: str) -> None:
     else:
         registry = system / "members.yaml"
         if registry.is_file():
+            text = rewrite_registry_entry_scalar(
+                registry.read_text(encoding="utf-8"), "members", "id", old, new
+            )
             registry.write_text(
-                rewrite_registry_entry_scalar(
-                    registry.read_text(encoding="utf-8"), "members", "id", old, new
-                ),
+                rewrite_members_comment_references(text, old, new),
                 encoding="utf-8",
             )
+        for conventions in sorted(system.glob("conventions*.md")):
+            if conventions.is_symlink() or not conventions.is_file():
+                continue
+            text = conventions.read_text(encoding="utf-8")
+            rewritten = rewrite_conventions_member_references(text, old, new)
+            if rewritten != text:
+                conventions.write_text(rewritten, encoding="utf-8")
+    if axis == "product":
+        registered_entities = frozenset(existing_identifiers(root)["entity"])
+        docs = system / "docs"
+        if docs.is_dir() and not docs.is_symlink():
+            for document in sorted(docs.rglob("*.md")):
+                if document.is_symlink() or not document.is_file():
+                    continue
+                text = document.read_text(encoding="utf-8")
+                rewritten = rewrite_system_product_references(
+                    text, registered_entities, old, new
+                )
+                if rewritten != text:
+                    document.write_text(rewritten, encoding="utf-8")
     for markdown in _markdown_files(root):
         text = markdown.read_text(encoding="utf-8")
         rewritten = rewrite_front_matter_field(text, axis, old, new)
