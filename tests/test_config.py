@@ -30,7 +30,7 @@ def test_configured_vault_replaced_at_the_same_path_is_unavailable(
     configured.rename(tmp_path / "original-root")
     configured.mkdir()
 
-    with pytest.raises(VaultRootUnavailable, match="^configured vault root is unavailable$"):
+    with pytest.raises(VaultRootUnavailable, match=r"^configured vault root is unavailable$"):
         vault_root()
 
 
