@@ -39,9 +39,9 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider
 run from the repository root with no path or `-k` argument — the whole public
 suite — at the close of round one, before the round-two and round-three
 corrections added tests. The same command on the current tree reports
-**1,752 passed** (round two closed at 1,744; round three adds eight
-isolating regressions). No production diff was outstanding at any of the
-three checkpoints.
+**1,753 passed** (round two closed at 1,744; round three adds nine
+regressions). No production diff was outstanding at any of the three
+checkpoints.
 
 ## Method notes
 
@@ -1759,7 +1759,7 @@ E         Use -v to get more diff
 
 All 56 round-one mutations restored byte-identically: every `cmp` reported
 no difference and every before/after SHA-256 matched. The same holds for
-rounds two and three — 84 proofs in total, no exceptions. After the campaign,
+rounds two and three — 85 proofs in total, no exceptions. After the campaign,
 `git diff app/ tools/` was empty apart from the deliberate `a5fe98f`
 defect fix, which is committed rather than restored.
 
@@ -2615,9 +2615,27 @@ E         Right contains 2 more items, first extra item: ('note.md', 'm7', 4)
 
 ## Round three — CodeRabbit findings on `bfb7949`
 
-Eight findings on the rewritten branch tip. Two were substantive: the reader
-invariant missed an entire API shape, and a set of rows recorded a RED that
-its named guard had not caused. The rest were documentation and lint.
+Eight findings on the rewritten branch tip, each accounted for below:
+
+1. The reader invariant missed an entire API shape — new code, Mutation R1.
+2. Several ledger proofs were not attributable to their named guard — the
+   re-examination table below.
+3. Mutation 19 was challenged and **retained**: independently verified as
+   already attributable, then strengthened rather than removed. It is a
+   finding in its own right, not part of item 2's remediation.
+4. Mutation 21's edit named an unimported `contextlib` — replaced with an
+   executable no-op context manager.
+5. Totals corrected only after every retained row had an attributable RED —
+   *Round-three arithmetic*.
+6. The `1,656 passed` figure labelled as the round-one checkpoint, with its
+   exact command and scope.
+7. Fenced blocks without a language identifier labelled `text` (MD040).
+8. The unused `name` loop variable in `rewrite_root_scalar` renamed `_name`.
+
+Items 1–5 are substantive; 6–8 are documentation and lint. CodeRabbit's broad
+80% docstring suggestion was **not** undertaken — it is generic, high-churn,
+and outside this task's acceptance gates. Its ReDoS note was likewise not
+actioned.
 
 The rule applied throughout: **a RED that a different guard, a `NameError`,
 an `AttributeError`, or a later assertion produced is not proof of the named
@@ -2640,31 +2658,26 @@ retired.
 | B1f | — | re-run unchanged, confirmed attributable |
 | B1g | `AttributeError` in the caller | direct `_policy_path_values` call — `DID NOT RAISE` |
 
-Three findings needed no mutation: fenced blocks without a language
-identifier were labelled `text` (MD040), the unused `name` loop variable in
-`rewrite_root_scalar` became `_name`, and the closing-suite figure above was
-labelled as the historical checkpoint it is. CodeRabbit's broad 80% docstring
-suggestion was **not** undertaken — it is generic, high-churn, and outside
-this task's acceptance gates. Its ReDoS note was likewise not actioned.
+Items 6, 7 and 8 needed no mutation: they change documentation and a name,
+not behaviour. Item 1 needed new code, carrying two mutations of its own.
 
-One finding needed new code, recorded as Mutation R1 below.
-
-#### Mutation R1 — `tests/test_console_readers.py`
+### Mutation R1 — `tests/test_console_readers.py`
 
 The reader invariant resolved a structured read's receiver to a module, so
 `from ruamel.yaml import YAML as R` followed by `R().load(p)` — the ruamel
 API's ordinary entry point — presented as a plain local call and passed
 unseen. A direct probe confirmed it before any change: the aliased and
 unaliased class forms both returned no offender, while the attribute form
-`ruamel.yaml.YAML().load(p)` was already caught. Loader classes imported from
-a `yaml` module are now tracked alongside module aliases, and a receiver that
-is a call to one is a structured read.
+`ruamel.yaml.YAML().load(p)` was already caught, its receiver resolving to
+the yaml module. Loader classes imported from a `yaml` module are now
+tracked alongside module aliases, and a receiver that is a call to one is a
+structured read. The qualified form needs no separate rule.
 
 **Edit:**
 
 ```diff
-- if name in loader_classes or name in _YAML_LOADER_CLASSES:
-+ if False and (name in loader_classes or name in _YAML_LOADER_CLASSES):
+- and func.value.func.id in loader_classes
++ and False and func.value.func.id in loader_classes
 ```
 
 **Command:**
@@ -2684,23 +2697,66 @@ E            +  where [] = _collect_offenders(<ast.Module object at 0x…>, Posi
 ```
 
 **Restoration:** preimage copied back; `cmp` identical; SHA-256
-`88dc9a592f811683…` before and `88dc9a592f811683…` after — byte-identical.
+`351dcc7fe3c64d0f…` before and `351dcc7fe3c64d0f…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.03s`
 
+### Mutation R2 — `tests/test_console_readers.py`
+
+Detection must turn on where a class came from, not on how it is spelled. A
+first form matched the bare name `YAML` against a constant, so an ordinary
+local `class YAML` — or one imported from an unrelated package — would have
+been reported as a structured read. A guard that cries wolf gets suppressed
+rather than obeyed, so the constant now only decides which *imported* names
+are tracked; the membership test reads `loader_classes` alone.
+
+This mutation restores the removed fallback.
+
+**Edit:**
+
+```diff
+- and func.value.func.id in loader_classes
++ and func.value.func.id in loader_classes | _YAML_LOADER_CLASSES
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_console_readers.py::test_an_unimported_yaml_name_is_not_a_structured_read
+```
+
+**RED** (exit 1):
+
+```text
+E           AssertionError: class YAML:
+E                 def load(self, p):
+E                     return p
+E             def f(p):
+E                 return YAML().load(p)
+E           assert not ['synthetic.py:5']
+```
+
+**Restoration:** preimage copied back; `cmp` identical; SHA-256
+`351dcc7fe3c64d0f…` before and `351dcc7fe3c64d0f…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.04s`
+
 ### Round-three arithmetic
 
-- **1 new mutant edit** (R1), proved RED → byte-identical restore → GREEN.
+- **2 new mutant edits** (R1, R2), each proved RED → byte-identical restore
+  → GREEN. R1 proves the loader-class detection; R2 proves the import-origin
+  restriction that keeps it from flagging an unrelated `YAML`.
 - **10 rows re-proved or re-examined**; these are re-runs of existing edits,
   not new ones, so they add nothing to the count. Mutation 21's edit changed
   form (`contextlib.nullcontext()` → `memoryview(b"")`); it remains one edit.
 - **1 row retired** (N1b), removed from the count.
-- Round one 53 + round two 27 + round three 1 = **81 Stage A mutant edits**,
-  plus 3 integration mutations, **84 total proofs**.
-- Eight isolating regressions were added, all of them tests: one in
-  `tests/test_console_readers.py`, two in `tests/test_cutover_build.py`,
-  three in `tests/test_cutover_locations.py`, one in
-  `tests/test_cutover_manifest.py`, one in `tests/test_cutover_promotion.py`.
-  Regression counts and mutant-edit counts are kept separate throughout.
+- Round one 53 + round two 27 + round three 2 = **82 Stage A mutant edits**,
+  plus 3 integration mutations, **85 total proofs**.
+- Nine regressions were added, all of them tests: two in
+  `tests/test_console_readers.py` (one positive, one negative), two in
+  `tests/test_cutover_build.py`, three in `tests/test_cutover_locations.py`,
+  one in `tests/test_cutover_manifest.py`, one in
+  `tests/test_cutover_promotion.py`. Regression counts and mutant-edit counts
+  are kept separate throughout.
 - Six discarded attempts from round two, seven retired round-one rows, and
   N1b are excluded from every count above.
