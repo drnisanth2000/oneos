@@ -1,9 +1,8 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — revision 15. Stage A exists, but the private
-inventory found structurally meaningful references in system documentation;
-revisions 13–15 add their syntax-confined locations. No migration has been
-executed.
+**Status:** APPROVED DESIGN — revision 16. Stage A and the accepted private
+cutover are complete; Stage B remains to enforce the approved floor at the
+four registry axes without changing unrelated registry vocabulary.
 
 **Base:** freshly fetched merged `origin/main` at
 `e4478fc1beef985fecc16e485b0974568b4fc004`. Fresh public baseline:
@@ -80,6 +79,14 @@ when the qualifier is documented shorthand rather than a registry entity. The
 qualifier itself is rewritten only when it independently names an in-scope
 registered entity. Unquoted shell commands and ordinary prose remain outside
 the closed list.
+**Revision 16 corrects the Stage B validator boundary after trusted-local
+preflight:** the earlier five-copy table incorrectly treated generic module,
+block, flag, and submodule grammar checks as if they validated the four
+migrated axes. The live registries legitimately contain sub-five-character
+values in those unrelated vocabularies, and the private cutover did not rename
+them. Stage B therefore enforces the floor only where entity, product, member,
+or workspace identifiers are accepted. Generic registry names retain their
+existing grammar and no new convention is inferred for them.
 
 ## Objective
 
@@ -385,31 +392,41 @@ axis and per location rather than per token.
 
 ## Affected interfaces
 
-### Identifier validation — five copies that must agree
+### Identifier validation — four-axis floor, generic grammar unchanged
 
-The same grammar is restated in five places, none enforcing any length:
+The grammar `^[a-z0-9]+(?:-[a-z0-9]+)*$` is reused for several different
+vocabularies. Only four of them were migrated and approved for the new floor:
+entity, product, member, and workspace identifiers. Module names, block names,
+flags, submodule ids, and the `project` rename axis are not registry axes in
+this cutover and must not acquire a new length rule.
 
-| Site | Symbol |
+Stage B consumes the single `IDENTIFIER_MINIMUM_LENGTH` rule through
+`app.identifiers.meets_floor` at these boundaries:
+
+| Boundary | Values governed |
 |---|---|
-| [app/entities.py:12](app/entities.py:12) | `_ENTITY_SLUG` |
-| [app/vault.py:31](app/vault.py:31) | `_REGISTRY_ID` |
-| [app/destinations.py:57](app/destinations.py:57) | `_REGISTRY_ID` |
-| [app/rename.py:46](app/rename.py:46) | `SLUG_RE` |
-| [app/action_receipts.py:32](app/action_receipts.py:32) | `_ENTITY` |
+| `EntityCatalog.load` and `EntityCatalog.require` | entity ids |
+| action-receipt entity selection and offline entity-root discovery | entity ids |
+| product/member/workspace registry readers and direct writers | their own axis only |
+| `plan_rename` / `build_rename_plan` | entity, product, member, and workspace `new`; never `project` |
+| the private `oneos_wizard` mirror and private registry tests | the same four axes |
 
-A sixth restatement lives in the vault's own wizard, which `app/rename.py`
-documents as a mirror it cannot import. That copy is private and is the trusted
-local agent's responsibility; this repository must not read it.
+The `_REGISTRY_ID` helpers in `app/vault.py` and `app/destinations.py` remain
+grammar-only because their callers validate module, block, flag, and submodule
+names. Applying the floor there would reject values outside the approved
+migration and make the accepted post-cutover vault unreadable. Product,
+member, and workspace floor checks belong in `app/registry.py`, where those
+axes are actually parsed or written.
 
-`AGENTS.md` records the failure mode duplicated rules produce: when the sidebar
-and the validator disagree about what exists, the disagreement stays invisible
-until something breaks. Five independent length checks would reproduce it. The
-floor must be expressed once and consumed by every site, and a public
-structural test must assert no module defines its own registry-identifier
-length rule.
+`AGENTS.md` records the failure mode duplicated rules produce: when readers
+disagree about what exists, the disagreement stays invisible until something
+breaks. The floor must therefore be expressed once and consumed by every
+four-axis boundary above. Public tests must prove each boundary rejects a
+sub-floor id, that the `project` axis and generic registry vocabulary remain
+unchanged, and that no second minimum-length constant is introduced.
 
-Collapsing the five grammar copies is a broader refactor than this cutover
-needs. Only the length rule must be single-sourced.
+Collapsing the grammar copies is a broader refactor than this cutover needs.
+Only the length rule is single-sourced.
 
 ### Records and paths
 
@@ -964,8 +981,10 @@ Required coverage:
   because the cutover refuses instead.
 - **Already-suffixed.** An in-scope identifier ending in any axis suffix
   refuses rather than double-suffixing.
-- **Floor enforcement.** Every validation site rejects a sub-floor identifier,
-  and a structural test asserts the length rule is single-sourced.
+- **Floor enforcement.** Every four-axis validation boundary rejects a
+  sub-floor identifier, generic registry vocabulary remains accepted under its
+  existing grammar, and a structural test asserts the length rule is
+  single-sourced.
 - **One commit.** A multi-mapping cutover produces exactly one new commit, and
   an immediate revert before writers restart restores the tree including every
   database.
@@ -1048,8 +1067,8 @@ app would refuse to start against the very vault awaiting migration.
   the synthetic tests. No read-time floor; the tool must read a pre-cutover
   vault.
 - **Private cutover** runs between the stages.
-- **Stage B** — floor enforcement at every validation site, plus the public
-  synthetic fixtures that currently use sub-floor slugs.
+- **Stage B** — floor enforcement at every four-axis validation boundary, plus
+  the public synthetic fixtures that currently use sub-floor slugs.
 
 Stage B's public churn is bounded and mechanical: the dominant synthetic entity
 slug in the existing suite is four characters and appears in the low hundreds
@@ -1198,7 +1217,8 @@ Work halts and returns to the product owner on any of these:
   other than the five-character identifier convention, deterministic
   axis-suffixed registry values, and digest-bound private manifest/record this
   design explicitly approves.
-- Collapsing the five grammar copies beyond single-sourcing the length rule.
+- Collapsing the existing grammar copies beyond single-sourcing the length
+  rule.
 
 ## Completion
 
