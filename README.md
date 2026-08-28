@@ -7,4 +7,4 @@ This repository uses a dual/source-available licensing model to support individu
 
 ### Commercial Licensing & Terms
 If you are using this project inside a commercial product or company, please reach out to obtain a commercial license:
-📧 **Contact:** license@yourdomain.com (Replace with your actual contact email)
+📧 **Contact:** info@nambisons.com (Replace with your actual contact email)
