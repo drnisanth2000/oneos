@@ -1,8 +1,9 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — public design task only, revision 12. The Stage A
-implementation plan exists; no application code or test has been modified, and
-no migration has been executed.
+**Status:** APPROVED DESIGN — revision 14. Stage A exists, but the private
+inventory found structurally meaningful references in system documentation;
+revisions 13–14 add their syntax-confined locations and bind both components
+of explicit entity/product pairs. No migration has been executed.
 
 **Base:** freshly fetched merged `origin/main` at
 `e4478fc1beef985fecc16e485b0974568b4fc004`. Fresh public baseline:
@@ -58,6 +59,19 @@ are defined completely, duplicate keys and non-canonical paths refuse, and the
 separate approval record binds the exact clean Stage A executor commit. It also
 defines the exact `CLEAN\n` success contract for both public-audit modes and
 moves prerequisite branch/checkpoint details out of the public design.
+**Revision 13 closes the private-inventory documentation gap:** explicit member
+references in the conventions additions and members-registry comments, plus
+registered entity/product pairs in system documentation, join the closed typed
+rewrite list. Ordinary shell commands and unrelated prose remain advisory and
+unchanged. Writer spans and advisory exclusions are identical; the residual
+gate enumerates the same supported shapes independently.
+**Revision 14 closes the ordered-pair gap found in review:** an explicit
+registered entity/product pair owns both components. The entity pass rewrites
+the entity component and the product pass rewrites the product component.
+Writer qualification and both independent gates accept the source and mapped
+registry names, so an old or half-migrated pair cannot disappear between the
+sequential passes. Ordinary shell commands and unrelated prose remain outside
+the closed list.
 
 ## Objective
 
@@ -225,18 +239,34 @@ appears twice.
 - `_system/scripts/action-policy.yaml` — the first path component of each
   pattern in `paths:` and in `except:`. Both are rewritten in the same pass;
   see the fail-open rule below.
+- `_system/docs/**/*.md` — the entity component of an explicit
+  ``<entity> / <registered-product>`` reference, where the entity component is
+  an inline-code token. The paired product must name either the source or
+  mapped value of a registered product in this cutover. Bare words and shell
+  commands are not references.
 
 **Product axis**
 
 - `_system/products.yaml` — the product key within its entity's mapping.
 - Markdown front matter — the `product:` field value.
 - `_system/workspaces.yaml` — `product:` values only. **Never an `id:`.**
+- `_system/docs/**/*.md` — the product component of an explicit
+  ``<registered-entity> / <product>`` reference, where the entity component is
+  an inline-code token that names either the source or mapped value of a
+  registered entity in this cutover. Bare words and shell commands are not
+  references.
 - Approved `books.db` `(path, table, column, axis)` targets whose `axis` is
   `product`, and no others.
 
 **Member axis**
 
 - `_system/members.yaml` — the entry `id:` value within its entity's list.
+- `_system/members.yaml` comment-only lines — the value inside an explicit
+  inline-code ``member: <id>`` example. A bare code token, a trailing comment,
+  and a `#` inside a quoted YAML scalar are not owned.
+- `_system/conventions*.md` — inline-code spans whose complete content is the
+  member id, or whose complete content is ``member: <id>``. Ordinary prose is
+  not owned.
 - Markdown front matter — the `member:` field value.
 - `_system/workspaces.yaml` — `member:` values.
 - Approved `books.db` `(path, table, column, axis)` targets whose `axis` is
