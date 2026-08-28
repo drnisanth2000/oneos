@@ -32,7 +32,7 @@ from .action_receipts import (
     resolve_head_receipt,
 )
 from .classifier import Classifier
-from .config import build_catalog, build_scope
+from .config import VaultRootUnavailable, build_catalog, build_scope
 from .console_errors import ConsoleError, describe
 from .console_render import is_fragment, status_for
 from .console_routing import console_route
@@ -290,6 +290,13 @@ _FRAMEWORK_SAFE_BODY = (
 @app.exception_handler(EntitySelectionError)
 async def _entity_selection_error_handler(
     request: Request, exc: EntitySelectionError
+) -> HTMLResponse:
+    return _render_console_error(request, describe(exc))
+
+
+@app.exception_handler(VaultRootUnavailable)
+async def _vault_root_unavailable_handler(
+    request: Request, exc: VaultRootUnavailable
 ) -> HTMLResponse:
     return _render_console_error(request, describe(exc))
 

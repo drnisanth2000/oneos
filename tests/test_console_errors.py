@@ -279,6 +279,12 @@ def test_map_DestinationRegistryError():
     assert _code_of(DestinationRegistryError("probe")) == "E-CONFIG"
 
 
+def test_map_VaultRootUnavailable():
+    from app.config import VaultRootUnavailable
+
+    assert _code_of(VaultRootUnavailable("probe")) == "E-TAMPER"
+
+
 def test_map_SystemRegistryPathError():
     from app.entities import SystemRegistryPathError
 

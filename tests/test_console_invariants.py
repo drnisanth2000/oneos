@@ -126,6 +126,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
 
     from app import (
         action_receipts,
+        config,
         cutover_build,
         cutover_db,
         cutover_inventory,
@@ -203,6 +204,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         destinations.MissingDestination: "E-DEST",
         destinations.DestinationError: "E-DEST",
         vault.DestinationRegistryError: "E-CONFIG",
+        config.VaultRootUnavailable: "E-TAMPER",
         entities.SystemRegistryPathError: "E-TAMPER",
         entities.RecipientConfigurationError: "E-CONFIG",
         entities.EntityManifestError: "E-CONFIG",
