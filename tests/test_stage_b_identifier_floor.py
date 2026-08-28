@@ -15,6 +15,7 @@ from app.action_receipts import (
     _head_canonical_roots,
     receipt_relative_path,
 )
+from app.destinations import _is_registry_id as is_destination_registry_id
 from app.entities import (
     EntityCatalog,
     EntityDefinition,
@@ -33,6 +34,7 @@ from app.registry import (
 from app.rename import RenameError, plan_rename
 from app.scope import Scope
 from app.vault import Vault
+from app.vault import _is_registry_id as is_vault_registry_id
 from tests.conftest import git_entity_vault, git_vault, write_vault
 
 
@@ -256,6 +258,8 @@ def test_generic_registry_vocabulary_keeps_its_existing_grammar(
 
     assert bundle.flags == ("x",)
     assert bundle.modules[0].block == "grow"
+    assert is_vault_registry_id("x")
+    assert is_destination_registry_id("x")
 
 
 def test_the_public_minimum_length_constant_has_one_definition() -> None:
