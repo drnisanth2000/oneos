@@ -108,12 +108,18 @@ def _is_trigger_call(node: ast.Call, modules=None, bare=None,
     if isinstance(func, ast.Attribute):
         # `YAML().load(p)` has no module receiver: the receiver is a freshly
         # instantiated loader class, which is the ruamel API's normal entry
-        # point. A module-only rule never sees it.
-        if func.attr in _YAML_LOADERS and isinstance(func.value, ast.Call):
-            target = func.value.func
-            name = getattr(target, "id", None) or getattr(target, "attr", None)
-            if name in loader_classes or name in _YAML_LOADER_CLASSES:
-                return True
+        # point. A module-only rule never sees it. Origin decides, not the
+        # name: only a class imported from a yaml module counts, so a local
+        # `class YAML` and a `YAML` imported from anywhere else stay
+        # untouched. The qualified `ruamel.yaml.YAML()` needs no special
+        # case — its receiver resolves to the yaml module below.
+        if (
+            func.attr in _YAML_LOADERS
+            and isinstance(func.value, ast.Call)
+            and isinstance(func.value.func, ast.Name)
+            and func.value.func.id in loader_classes
+        ):
+            return True
         chain = _resolved_chain(func.value, modules)
         if func.attr in _YAML_LOADERS and "yaml" in chain:
             return True
@@ -888,3 +894,19 @@ def test_a_yaml_loader_class_is_detected():
     ):
         tree = ast.parse(textwrap.dedent(src))
         assert _collect_offenders(tree, pathlib.Path("synthetic.py")), src
+
+
+def test_an_unimported_yaml_name_is_not_a_structured_read():
+    """Origin decides, not spelling.
+
+    Flagging every receiver called `YAML` would make an ordinary local class
+    — or a same-named class from an unrelated package — a false offender,
+    and a guard that cries wolf gets suppressed rather than obeyed.
+    """
+    for src in (
+        "class YAML:\n    def load(self, p):\n        return p\n"
+        "def f(p):\n    return YAML().load(p)",
+        "from unrelated import YAML\ndef f(p):\n    return YAML().load(p)",
+    ):
+        tree = ast.parse(textwrap.dedent(src))
+        assert not _collect_offenders(tree, pathlib.Path("synthetic.py")), src
