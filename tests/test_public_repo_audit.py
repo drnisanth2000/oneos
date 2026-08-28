@@ -326,7 +326,9 @@ def test_short_markdown_finding_never_echoes_term_or_line(tmp_path: Path):
 
     assert len(findings) == 1
     assert findings[0].category == "instance-value"
-    assert findings[0].location.endswith(":docs/note.md:1")
+    assert findings[0].location.endswith(":1")
+    assert ":path-" in findings[0].location
+    assert "docs/note.md" not in repr(findings)
     assert "q7x" not in repr(findings)
     assert "before" not in repr(findings)
     assert "after" not in repr(findings)

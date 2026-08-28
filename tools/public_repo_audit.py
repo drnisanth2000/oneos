@@ -27,6 +27,7 @@ TEXT_FIELDS = frozenset(
     {"entity", "product", "member", "workspace", "owner", "id", "slug"}
 )
 DATABASE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
+MARKDOWN_SUFFIXES = frozenset({".md", ".markdown"})
 PRIVATE_PATH_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9:/])/(?:Users|home)/[^/\s]+/"),
     # macOS per-user temporary namespace, with or without the `/private`
@@ -213,13 +214,16 @@ def scan_text(
     short_terms: set[str],
 ) -> list[Finding]:
     findings: list[Finding] = []
+    is_markdown = PurePosixPath(relative_path).suffix.lower() in MARKDOWN_SUFFIXES
     for line_number, line in enumerate(text.splitlines(), start=1):
         location = safe_location(revision, relative_path, line_number)
         if any(pattern.search(line) for pattern in PRIVATE_PATH_PATTERNS):
             findings.append(finding("absolute-private-path", location))
-        if contains_long_term(line, long_terms):
+        if contains_long_term(line, long_terms) or (
+            is_markdown and contains_exact_term(line, short_terms)
+        ):
             findings.append(finding("instance-value", location))
-    if structured_values(relative_path, text) & short_terms:
+    if not is_markdown and structured_values(relative_path, text) & short_terms:
         findings.append(finding("instance-value", safe_location(revision, relative_path)))
     return findings
 
@@ -261,11 +265,15 @@ def collect_structured_values(value: Any) -> set[str]:
     return found
 
 
-def contains_long_term(text: str, terms: set[str]) -> bool:
+def contains_exact_term(text: str, terms: set[str]) -> bool:
     return any(
         re.search(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", text)
         for term in terms
     )
+
+
+def contains_long_term(text: str, terms: set[str]) -> bool:
+    return contains_exact_term(text, terms)
 
 
 def path_contains_term(path: str, long_terms: set[str], short_terms: set[str]) -> bool:
