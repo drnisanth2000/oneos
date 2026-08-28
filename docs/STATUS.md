@@ -234,14 +234,14 @@ broad typed handler can silently *retire* a narrower guard's coverage without
 changing behaviour, so whenever one is added above a layer declaring the same
 family, check the lower declaration is still pinned.
 
-**4. Remaining filesystem failure shapes.** Two realistic post-startup operator
-actions still reach the global fallback as `E-UNKNOWN` on four routes: the
-entity manifest with its permissions removed (`PermissionError`), and the vault
-root renamed or unmounted (`RuntimeError` from the root resolver). Both raise
-inside dependency resolution, so no route-level `except` can answer them; both
-are the same design §5 instance — relying on the fallback is a failure, not a
-silent default. The manifest reader is a declared `registry`-category structured
-reader, so the permission escape is invariant-4 adjacent.
+**4. Remaining filesystem failure shapes — PUBLIC IMPLEMENTATION COMPLETE.**
+A configured vault root that becomes unavailable now renders `E-TAMPER`, while
+an unreadable entity manifest renders `E-CONFIG`, across every entity-scoped
+Console endpoint derived from FastAPI's dependency metadata. Neither condition
+reaches the global fallback, reflects raw exception or submitted data, exposes
+an action control, or mutates the synthetic vault; lower route catches remain
+independently pinned. Trusted-local private gates and preservation proof remain
+outstanding.
 
 **5. Independent reviewer and mutation-tested verification — retained as
 method, not as an option.** Across roughly twenty review rounds on S6, nearly
