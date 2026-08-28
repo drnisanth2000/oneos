@@ -1631,7 +1631,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         "app.inbox.read_inbox": ((RedirectedPathError,), ()),
         "app.destinations.resolve_classification_destination": (
             amended_destination,
-            (),
+            (EntityCatalog.load,),
         ),
         "app.outbox.propose_classification": (
             (OutboxError,),
@@ -1850,6 +1850,9 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
         "app.main.entity_scope": {"app.config.build_scope"},
         "app.outbox.propose_classification": {
             "app.destinations.resolve_classification_destination"
+        },
+        "app.destinations.resolve_classification_destination": {
+            "app.entities.EntityCatalog.load"
         },
     }
     for caller, callees in declared_edges.items():

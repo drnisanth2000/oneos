@@ -124,7 +124,8 @@ def _require_real_directory(scope: Scope, *parts: str) -> Path:
         EntityManifestError,
         SystemRegistryPathError,
         EntitySelectionError,
-    )
+    ),
+    calls=(EntityCatalog.load,),
 )
 def resolve_classification_destination(
     scope: Scope,
