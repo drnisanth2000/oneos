@@ -25,9 +25,23 @@ difference is load-bearing when checking coverage:
 - **53 Stage A mutant edits** = 52 rows + 1 for the 51a/51b split.
 - **Plus 3 integration mutations** (M-A, M-B, M-C) covering the Console
   taxonomy and reader-category declarations.
-- **56 total proofs**, every one of which is recorded in full below.
+- **56 total proofs** in round one, every one of which is recorded in full
+  below. Rounds two and three add their own; the closing tally is under
+  *Round-three arithmetic*.
 
-Closing suite **1656 passed**, no production diff outstanding.
+Closing suite at that point: **1,656 passed**. That figure is a historical
+checkpoint, not the current total. It was produced by
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider
+```
+
+run from the repository root with no path or `-k` argument — the whole public
+suite — at the close of round one, before the round-two and round-three
+corrections added tests. The same command on the current tree reports
+**1,752 passed** (round two closed at 1,744; round three adds eight
+isolating regressions). No production diff was outstanding at any of the
+three checkpoints.
 
 ## Method notes
 
@@ -46,7 +60,7 @@ not go red is not weaker evidence, it is no evidence.
 |---|---|---|---|
 | 14 | `exempt_former_slugs = relative in FORMER_SLUGS_FILES` → `True` | The exemption is gated on the filename **and** the line shape `^\s*former_slugs:\s*\[`; the member entry `- {id: m7-member, former_slugs: [m7]}` never matches that regex, so forcing the filename check true changed nothing | Retargeted to restore the blanket substring exemption `if "former_slugs" in line:` |
 | 47 | `if status:` → `if False:` | Left the body over-indented; failed with `IndentationError`, so the guard was never exercised. A syntax error is not a mutation proof | Retargeted to the syntax-preserving `if status and False:` |
-| 19 | live-HEAD precheck → `if False:` | `git merge --ff-only` independently refuses the non-fast-forward and raises `CutoverError` anyway, so the test passed on the fallback primitive | Test strengthened with `match="live HEAD moved since the build"`; mutation kept, so it now proves the precheck rather than the fallback |
+| 19 | live-HEAD precheck → `if False:` | `git merge --ff-only` independently refuses the non-fast-forward and raises `CutoverError` anyway, so the test passed on the fallback primitive | Test strengthened with `match="live HEAD moved since the build"`, which the fallback's message cannot satisfy; mutation kept. Round three added a second node that also isolates it by control flow — see Mutation 19 |
 | 5 | resolver body → `return next(root.rglob("books.db"))` | Enumeration happened to return the approved database first, so the correct file was updated | Retargeted to `sorted(root.rglob("books.db"))[-1]`, which the fixture guarantees selects `zz/books.db` |
 | 15 | first advisory `raise UnreadableFile` → `return []` | `_typed_token_spans` reads the file first and raises; the advisory scan's own read is masked in the end-to-end test | Isolated regression added that neutralises `_typed_token_spans`; mutation retargeted at the second advisory read block |
 | 11 | `_require_dispositions(...)` → `pass` | Not equivalent to the specified relocation; the test observes the tree the check ran against | Applied the exact relocation instead |
@@ -57,13 +71,13 @@ not go red is not weaker evidence, it is no evidence.
 Row 17's strengthened fixture — a product workspace whose `id` equals its
 product slug — could not build at all:
 
-```
+```text
 CutoverError: post-migration advisory report changed from the approved incidental set
 ```
 
 Simulation on that fixture, before the fix:
 
-```
+```text
 pre : 5 occurrences
 post: 1 occurrence
 vanished: ('_system/products.yaml',   'workspace', 'q7')
@@ -113,7 +127,7 @@ uv run python -m pytest -q tests/test_cutover_identifiers.py::test_floor_is_one_
 
 **RED** (exit 1):
 
-```
+```text
 >       assert IDENTIFIER_MINIMUM_LENGTH == 5
 E       assert 4 == 5
 ```
@@ -134,17 +148,20 @@ E       assert 4 == 5
 **Command:**
 
 ```bash
-uv run python -m pytest -q tests/test_cutover_build.py::test_build_refuses_a_mapping_that_is_not_the_deterministic_result
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_identifiers.py::test_validate_mapping_pair_refuses_a_hand_edited_new_value
 ```
 
 **RED** (exit 1):
 
+```text
+>       with pytest.raises(AxisError):
+E       Failed: DID NOT RAISE AxisError
 ```
->       with pytest.raises(Exception, match="deterministic"):
-E       AssertionError: Regex pattern did not match.
-E         Expected regex: 'deterministic'
-E         Actual message: 'approved dispositions do not exactly match the source advisory report; re-run from inventory'
-```
+
+**Attribution:** retargeted in round three. Driven through `build_cutover`
+the mutant still refused — from the disposition check further down — so the
+RED named a guard that was not under test. `validate_mapping_pair` is called
+directly here, leaving its own comparison as the only thing that can raise.
 
 **Restoration:** preimage copied back; `cmp` identical; SHA-256 `b370e309d5d3d7d2…` before and `b370e309d5d3d7d2…` after — byte-identical.
 
@@ -167,7 +184,7 @@ uv run python -m pytest -q tests/test_cutover_db.py::test_a_product_target_recei
 
 **RED** (exit 1):
 
-```
+```text
 >       assert read(tmp_path / "ab" / "books.db", "SELECT product FROM ledger") == [
 E       AssertionError: assert [('ab-member',)] == [('ab-product',)]
 E
@@ -196,7 +213,7 @@ uv run python -m pytest -q tests/test_cutover_db.py::test_only_the_allowlisted_c
 
 **RED** (exit 1):
 
-```
+```text
 >       assert read(tmp_path / "ab" / "books.db", "SELECT tag FROM ledger") == [("ab",)]
 E       AssertionError: assert [('ab-product',)] == [('ab',)]
 E
@@ -226,7 +243,7 @@ uv run python -m pytest -q tests/test_cutover_db.py::test_a_matching_column_name
 
 **RED** (exit 1):
 
-```
+```text
 >       assert read(tmp_path / "zz" / "books.db", "SELECT product FROM ledger") == [("ab",)]
 E       AssertionError: assert [('ab-product',)] == [('ab',)]
 E
@@ -255,7 +272,7 @@ uv run python -m pytest -q tests/test_cutover_db.py::test_a_symlinked_component_
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(DatabaseCutoverError):
 E       Failed: DID NOT RAISE DatabaseCutoverError
 ```
@@ -276,19 +293,25 @@ E       Failed: DID NOT RAISE DatabaseCutoverError
 **Command:**
 
 ```bash
-uv run python -m pytest -q tests/test_cutover_build.py::test_build_gate_refuses_a_database_writer_that_leaves_the_old_value
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_the_post_update_database_gate_stops_before_any_file_rewrite
 ```
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(CutoverError, match="database residual after update"):
 E       AssertionError: Regex pattern did not match.
 E         Expected regex: 'database residual after update'
-E         Actual message: 'database residual after migration'
+E         Actual message: 'reached the rewrite step'
 ```
 
-**Restoration:** preimage copied back; `cmp` identical; SHA-256 `73977aa91b1e04c3…` before and `73977aa91b1e04c3…` after — byte-identical.
+**Attribution:** retargeted in round three. The original node let the second
+residual gate — `database residual after migration` — refuse instead, so the
+RED proved that gate, not this one. The new node makes `_apply_mappings_in_order`
+fatal: the sentinel can only be reached if this gate did not refuse first,
+which is exactly the contract (refuse before the tree is rewritten).
+
+**Restoration:** preimage copied back; `cmp` identical; SHA-256 `9b48b0e532e90e70…` before and `9b48b0e532e90e70…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.16s`
 
@@ -309,7 +332,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_build_gate_refuses_
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(CutoverError, match="entity:action-policy:except"):
 E       Failed: DID NOT RAISE CutoverError
 ```
@@ -335,7 +358,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_build_refuses_a_col
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(Exception, match="collides"):
 E       Failed: DID NOT RAISE Exception
 ```
@@ -361,7 +384,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_build_refuses_an_en
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(Exception, match="ignored or untracked"):
 E       Failed: DID NOT RAISE Exception
 ```
@@ -382,7 +405,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_dispositions_are_ch
 
 **RED** (exit 1):
 
-```
+```text
 >       build_cutover(vault, raw, record)
 >       assert (root / "ab").is_dir(), "dispositions were not checked on the source tree"
 E       AssertionError: dispositions were not checked on the source tree
@@ -412,7 +435,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_sensitive_reads_are
 
 **RED** (exit 1):
 
-```
+```text
 >       promoted(vault)
 >           raise CutoverError(
 E           app.cutover_build.CutoverError: approved dispositions do not exactly match the source advisory report; re-run from inventory
@@ -439,7 +462,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_advisory_does_n
 
 **RED** (exit 1):
 
-```
+```text
 >       assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == []
 E       AssertionError: assert [AdvisoryOccu...48a', line=1)] == []
 E
@@ -470,7 +493,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_former_slugs_is
 
 **RED** (exit 1):
 
-```
+```text
 >       assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[2:3]) == [
 E       AssertionError: assert [] == [AdvisoryOccu...b79', line=3)]
 E
@@ -504,7 +527,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_advisory_scan_i
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(UnreadableFile, match="the advisory scan cannot pass"):
 E       Failed: DID NOT RAISE UnreadableFile
 ```
@@ -543,7 +566,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_former_slugs_is_wri
 
 **RED** (exit 1):
 
-```
+```text
 >       promoted(vault)
 >           raise CutoverError(f"renamed registry key {key!r} is absent")
 E           app.cutover_build.CutoverError: renamed registry key 'm7-member' is absent
@@ -578,7 +601,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_a_product_kind_work
 
 **RED** (exit 1):
 
-```
+```text
 >       assert "id: q7-workspace" in workspaces, "product claimed workspace id"
 E       AssertionError: product claimed workspace id
 E       assert 'id: q7-workspace' in 'workspaces:\n  - {id: q7-product, entity: ab-entity, product: q7-product, member: m7-member, kind: product}\n'
@@ -611,7 +634,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_sequential_applicat
 
 **RED** (exit 1):
 
-```
+```text
 >       assert "entity: ab-entity" in workspaces, "entity rewrite was lost"
 E       AssertionError: entity rewrite was lost
 E       assert 'entity: ab-entity' in 'workspaces:\n  - {id: w7-workspace, entity: ab, product: q7, member: m7, kind: product}\n'
@@ -633,19 +656,29 @@ E       assert 'entity: ab-entity' in 'workspaces:\n  - {id: w7-workspace, entit
 **Command:**
 
 ```bash
-uv run python -m pytest -q tests/test_cutover_promotion.py::test_promotion_refuses_a_moved_head
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_promotion.py::test_the_head_precheck_refuses_before_the_merge_is_attempted
 ```
 
 **RED** (exit 1):
 
-```
->       with pytest.raises(
+```text
+>       with pytest.raises(CutoverError, match="live HEAD moved since the build"):
 E       AssertionError: Regex pattern did not match.
 E         Expected regex: 'live HEAD moved since the build'
-E         Actual message: 'fast-forward promotion refused; the vault is unchanged'
+E         Actual message: 'reached the entity check'
 ```
 
-**Restoration:** preimage copied back; `cmp` identical; SHA-256 `f8c42dc96c361980…` before and `f8c42dc96c361980…` after — byte-identical.
+**Attribution:** the original node — `test_promotion_refuses_a_moved_head` —
+was re-examined in round three and is valid: its regex is the precheck's own
+message, which `git merge --ff-only`'s fallback (`fast-forward promotion
+refused; the vault is unchanged`) cannot satisfy, so the RED did record the
+precheck falling silent rather than a bare `CutoverError`. It was retained
+unchanged. What it could not show is *control flow*: the fallback refuses the
+same scenario, so wording alone never proved the merge was skipped. The node
+above adds that half by making the last step before the merge fatal. Both
+nodes are kept; the second is the one recorded here.
+
+**Restoration:** preimage copied back; `cmp` identical; SHA-256 `e5ca53096863a0bf…` before and `e5ca53096863a0bf…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.21s`
 
@@ -666,7 +699,7 @@ uv run python -m pytest -q tests/test_cutover_promotion.py::test_promotion_repea
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(
 E       Failed: DID NOT RAISE UnmigratableContentError
 ```
@@ -681,24 +714,32 @@ E       Failed: DID NOT RAISE UnmigratableContentError
 
 ```diff
 - with action_lock(vault):
-+ with contextlib.nullcontext():
++ with memoryview(b""):
 ```
 
 **Command:**
 
 ```bash
-uv run python -m pytest -q tests/test_cutover_promotion.py::test_promotion_takes_the_shared_action_lock
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_promotion.py::test_promotion_takes_the_shared_action_lock
 ```
 
 **RED** (exit 1):
 
-```
->       promote(vault, built, head, git_status_bytes(vault), [])
->           with contextlib.nullcontext():
-E           NameError: name 'contextlib' is not defined. Did you forget to import 'contextlib'?
+```text
+>       assert taken == [vault]
+E       AssertionError: assert [] == [PosixPath('…/vault')]
+E         Right contains one more item: PosixPath('…/vault')
 ```
 
-**Restoration:** preimage copied back; `cmp` identical; SHA-256 `f8c42dc96c361980…` before and `f8c42dc96c361980…` after — byte-identical.
+**Attribution:** re-proved in round three. The first form named `contextlib`,
+which `app/cutover.py` does not import, so the mutant died on a `NameError`
+before `promote` ran — no evidence either way. `memoryview(b"")` is a builtin
+context manager with no import and no side effect, so the body executes
+exactly as before and the recorded list stays empty only because the lock was
+never taken. The absolute temporary path in the assertion is elided here; the
+publication audit forbids it in tracked text.
+
+**Restoration:** preimage copied back; `cmp` identical; SHA-256 `e5ca53096863a0bf…` before and `e5ca53096863a0bf…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.18s`
 
@@ -719,7 +760,7 @@ uv run python -m pytest -q tests/test_cutover_promotion.py::test_a_failed_promot
 
 **RED** (exit 1):
 
-```
+```text
 >       assert not isinstance(caught.value, CutoverCommittedError), (
 E       AssertionError: uncommitted failure reported committed
 E       assert not True
@@ -750,7 +791,7 @@ uv run python -m pytest -q tests/test_cutover_cli.py::test_dry_run_builds_and_sh
 
 **RED** (exit 1):
 
-```
+```text
 >       assert code == 0
 E       assert 1 == 0
 ```
@@ -779,7 +820,7 @@ uv run python -m pytest -q tests/test_public_repo_audit.py::test_term_collection
 
 **RED** (exit 1):
 
-```
+```text
 >       assert "ab" not in short_terms and "ab" not in long_terms
 E       AssertionError: assert ('ab' not in {'ab'})
 ```
@@ -810,7 +851,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_yaml_value_fiel
 
 **RED** (exit 1):
 
-```
+```text
 >       assert rewrite_yaml_value_field(text, "id", "ab", "ab-member") == text
 E       AssertionError: assert 'members:\n  ...abel: Keep}\n' == 'members:\n  ...abel: Keep}\n'
 E
@@ -843,7 +884,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_typed_registry_
 
 **RED** (exit 1):
 
-```
+```text
 >       assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS) == [
 E       AssertionError: assert [AdvisoryOccu... line=2), ...] == [AdvisoryOccu...c48', line=7)]
 E
@@ -873,7 +914,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_a_symlink_is_sc
 
 **RED** (exit 1):
 
-```
+```text
 >       assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
 E       AssertionError: assert [] == [AdvisoryOccu...f5c', line=1)]
 E
@@ -907,7 +948,7 @@ uv run python -m pytest -q tests/test_cutover_db.py::test_schema_inventory_refus
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(DatabaseCutoverError, match="symlink"):
 E       Failed: DID NOT RAISE DatabaseCutoverError
 ```
@@ -933,7 +974,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_build_regenerates_t
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(Exception, match="advisory report changed"):
 E       Failed: DID NOT RAISE Exception
 ```
@@ -959,7 +1000,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_validators_run_afte
 
 **RED** (exit 1):
 
-```
+```text
 >       assert observed == [(True, result.source_head)]
 E       AssertionError: assert [] == [(True, 'c20d...06149fc6520')]
 E
@@ -988,7 +1029,7 @@ uv run python -m pytest -q tests/test_cutover_promotion.py::test_a_commit_confir
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(CutoverCommittedError, match="does not equal the built commit"):
 E       Failed: DID NOT RAISE CutoverCommittedError
 ```
@@ -1014,7 +1055,7 @@ uv run python -m pytest -q tests/test_cutover_cli.py::test_inventory_refuses_a_d
 
 **RED** (exit 1):
 
-```
+```text
 >       assert code == 1
 E       assert 0 == 1
 ```
@@ -1040,7 +1081,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_existing_former_slu
 
 **RED** (exit 1):
 
-```
+```text
 >       assert text.count("former_slugs:") == 1
 E       AssertionError: assert 2 == 1
 E        +  where 2 = <built-in method count of str object at 0x10b318fb0>('former_slugs:')
@@ -1071,7 +1112,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_proposal_prefixes_a
 
 **RED** (exit 1):
 
-```
+```text
 >       assert 'opaque: "keep: [x]"  # exact' in text, (
 E       AssertionError: proposal rewrite altered bytes outside the approved fields
 E       assert 'opaque: "keep: [x]"  # exact' in "id: 20260826T120000-cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\naction: classify\nentity: ab-entity\nsrc: ab-entity/00-inbox/active/x.md\ndst: ab-entity/09-marketing/active/x.md\nopaque: 'keep: [x]'\n"
@@ -1098,7 +1139,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_default_validator_d
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(CutoverError, match="0 error"):
 E       Failed: DID NOT RAISE CutoverError
 ```
@@ -1127,7 +1168,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_post_advisory_ident
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(Exception, match="advisory report changed"):
 E       Failed: DID NOT RAISE Exception
 ```
@@ -1153,7 +1194,7 @@ uv run python -m pytest -q tests/test_cutover_cli.py::test_inventory_reads_track
 
 **RED** (exit 1):
 
-```
+```text
 >       assert "entity: ab -> ab-entity" in out
 E       AssertionError: assert 'entity: ab -> ab-entity' in 'source HEAD: 1a1acbd8132ecb466d2f7e62a4687fba0b13bf27\nentity: zz -> zz-entity\nproduct: q7 -> q7-product\nmember: m7...: path=ab/books.db table=roster column=member axis=member old=m7 count=1\n[INVENTORY] read-only; nothing was written\n'
 ```
@@ -1182,7 +1223,7 @@ uv run python -m pytest -q tests/test_cutover_cli.py::test_inventory_discards_re
 
 **RED** (exit 1):
 
-```
+```text
 >       assert main(["inventory", "--vault-root", str(vault)]) == 1
 E       AssertionError: assert 0 == 1
 E        +  where 0 = main(['inventory', '--vault-root', '<temporary-path-redacted>
@@ -1209,7 +1250,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_advisory_identi
 
 **RED** (exit 1):
 
-```
+```text
 >       assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
 E       AssertionError: assert [AdvisoryOccu...049', line=1)] == [AdvisoryOccu...049', line=1)]
 E
@@ -1238,7 +1279,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_build_collision_che
 
 **RED** (exit 1):
 
-```
+```text
 >           build_cutover(vault, raw, record)
 >               raise CollisionError(
 E               app.cutover_inventory.CollisionError: new value collides with an existing identifier on axis 'entity'
@@ -1265,7 +1306,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_stable_context_
 
 **RED** (exit 1):
 
-```
+```text
 >       assert stable_advisory_context(before, ADVISORY_MAPPINGS) == (
 E       AssertionError: assert '3b6a471a0f35...5c98db86c8401' == '4489cca5fb4c...cca2add7442e0'
 E
@@ -1294,7 +1335,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_post_advisory_ident
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(CutoverError, match="advisory report changed"):
 E       Failed: DID NOT RAISE CutoverError
 ```
@@ -1320,7 +1361,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_a_typed_scalar_
 
 **RED** (exit 1):
 
-```
+```text
 >       assert advisory_occurrences(tmp_path, ADVISORY_MAPPINGS[:1]) == [
 E       AssertionError: assert [] == [AdvisoryOccu...60b', line=2)]
 E
@@ -1349,7 +1390,7 @@ uv run python -m pytest -q tests/test_cutover_manifest.py::test_canonical_bytes_
 
 **RED** (exit 1):
 
-```
+```text
 >       assert raw.endswith(b"\n") and not raw.endswith(b"\n\n")
 E       assert (False)
 E        +  where False = <built-in method endswith of bytes object at 0xa69a98280>(b'\n')
@@ -1372,19 +1413,23 @@ E        +    where <built-in method endswith of bytes object at 0xa69a98280> = 
 **Command:**
 
 ```bash
-uv run python -m pytest -q tests/test_cutover_manifest.py::test_duplicate_object_keys_are_refused_even_with_a_matching_digest
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_manifest.py::test_the_loader_alone_refuses_duplicate_object_keys
 ```
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(ManifestError, match="duplicate"):
-E       AssertionError: Regex pattern did not match.
-E         Expected regex: 'duplicate'
-E         Actual message: 'approval manifest is not in canonical form'
+E       Failed: DID NOT RAISE ManifestError
 ```
 
-**Restoration:** preimage copied back; `cmp` identical; SHA-256 `fa80185aae7e7cfa…` before and `fa80185aae7e7cfa…` after — byte-identical.
+**Attribution:** retargeted in round three. `verify_manifest` re-serialises
+and compares bytes, so a collapsed duplicate key is refused downstream as
+`approval manifest is not in canonical form` — the original RED named that
+check, not the hook. Calling `load_manifest` alone removes the canonical-form
+comparison, leaving `object_pairs_hook` as the only thing that can refuse.
+
+**Restoration:** preimage copied back; `cmp` identical; SHA-256 `2f20f663140cf72d…` before and `2f20f663140cf72d…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.01s`
 
@@ -1405,7 +1450,7 @@ uv run python -m pytest -q tests/test_cutover_manifest.py::test_manifest_paths_m
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(ManifestError, match="path"):
 E       Failed: DID NOT RAISE ManifestError
 ```
@@ -1433,7 +1478,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_executor_revision_r
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(cutover_build.CutoverError, match="executor worktree"):
 E       Failed: DID NOT RAISE CutoverError
 ```
@@ -1459,7 +1504,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_executor_revision_r
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(cutover_build.CutoverError, match="executor commit"):
 E       Failed: DID NOT RAISE CutoverError
 ```
@@ -1485,7 +1530,7 @@ uv run python -m pytest -q tests/test_cutover_cli.py::test_action_commands_refus
 
 **RED** (exit 1):
 
-```
+```text
 >       assert main(argv) == 1
 E       AssertionError: assert 0 == 1
 E        +  where 0 = main(['dry-run', '--vault-root', '<temporary-path-redacted> '--approval', ...])
@@ -1512,7 +1557,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_final_database_gate
 
 **RED** (exit 1):
 
-```
+```text
 >           build_cutover(vault, raw, record)
 >           raise DatabaseCutoverError("approved database is missing or not a regular file")
 E           app.cutover_db.DatabaseCutoverError: approved database is missing or not a regular file
@@ -1554,7 +1599,7 @@ uv run python -m pytest -q tests/test_cutover_locations.py::test_a_typed_span_is
 
 **RED** (exit 1):
 
-```
+```text
 >       assert found == [], "a typed span was misreported on another axis"
 E       AssertionError: a typed span was misreported on another axis
 E       assert [AdvisoryOccu...27c', line=2)] == []
@@ -1584,7 +1629,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_run_vault_validator
 
 **RED** (exit 1):
 
-```
+```text
 >       assert list(vault.rglob("*.pyc")) == []
 E       AssertionError: assert [PosixPath('/...hon-313.pyc')] == []
 E
@@ -1613,7 +1658,7 @@ uv run python -m pytest -q tests/test_cutover_build.py::test_a_validator_that_wr
 
 **RED** (exit 1):
 
-```
+```text
 >       with pytest.raises(CutoverError, match="validator changed the isolated tree"):
 E       Failed: DID NOT RAISE CutoverError
 ```
@@ -1639,7 +1684,7 @@ uv run python -m pytest -q tests/test_console_invariants.py::test_every_applicat
 
 **RED** (exit 1):
 
-```
+```text
 >           assert describe(_probe(cls)).code == code, cls.__qualname__
 E           AssertionError: CutoverCommittedError
 E           assert 'E-ADMIN' == 'E-COMMITTED'
@@ -1669,7 +1714,7 @@ uv run python -m pytest -q tests/test_console_invariants.py::test_every_applicat
 
 **RED** (exit 1):
 
-```
+```text
 >           assert code != "E-UNKNOWN", f"{cls.__module__}.{cls.__qualname__} is unmapped"
 E           AssertionError: app.cutover_db.DatabaseCutoverError is unmapped
 E           assert 'E-UNKNOWN' != 'E-UNKNOWN'
@@ -1697,7 +1742,7 @@ uv run python -m pytest -q tests/test_console_readers.py::test_every_structured_
 
 **RED** (exit 1):
 
-```
+```text
 >       assert offenders == [], f"{_TRIGGER_HELP}: {offenders}"
 E       AssertionError: structured read site without a @structured_reader category declaration: ['app/cutover_locations.py:544']
 E       assert ['<absolute-path-redacted>'] == []
@@ -1712,8 +1757,9 @@ E         Use -v to get more diff
 
 ## Restoration summary
 
-All 56 mutations restored byte-identically: every `cmp` reported
-no difference and every before/after SHA-256 matched. After the campaign,
+All 56 round-one mutations restored byte-identically: every `cmp` reported
+no difference and every before/after SHA-256 matched. The same holds for
+rounds two and three — 84 proofs in total, no exceptions. After the campaign,
 `git diff app/ tools/` was empty apart from the deliberate `a5fe98f`
 defect fix, which is committed rather than restored.
 
@@ -1792,7 +1838,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE DatabaseCutoverError
 ```
 
@@ -1800,34 +1846,17 @@ E       Failed: DID NOT RAISE DatabaseCutoverError
 
 **GREEN** (exit 0): `1 passed in 0.02s`
 
-#### Mutation N1b — `app/cutover_db.py`
+#### Mutation N1b — retired
 
-**Edit:**
-
-```diff
--     if ".." in pure.parts:
--         raise DatabaseCutoverError("database path must not traverse upward")
-+     if False:
-+         raise DatabaseCutoverError("database path must not traverse upward")
-```
-
-**Command:**
-
-```bash
-PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_db.py::test_resolve_refuses_an_upward_traversal_that_escapes_the_root
-```
-
-**RED** (exit 1):
-
-```
-E       AssertionError: Regex pattern did not match.
-E         Expected regex: 'must not traverse upward'
-E         Actual message: 'database path leaves the vault root'
-```
-
-**Restoration:** `cmp` identical; SHA-256 `679ef99fb9672117…` before and `679ef99fb9672117…` after — byte-identical.
-
-**GREEN** (exit 0): `1 passed in 0.02s`
+This row applied the *same* edit as N1c — disabling
+`if ".." in pure.parts:` in `app/cutover_db.py` — and differed only in the
+node it ran. Its fixture escaped the root, which
+`database path leaves the vault root` refuses independently, so its RED named
+that guard rather than the traversal check. N1c applies the identical edit to
+a path that re-enters the root, where nothing else can refuse, and reports
+`DID NOT RAISE DatabaseCutoverError`. The guard is therefore proved; N1b is
+retired as a duplicate edit with a non-attributable result and is excluded
+from every count.
 
 #### Mutation N1c — `app/cutover_db.py`
 
@@ -1848,7 +1877,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE DatabaseCutoverError
 ```
 
@@ -1873,7 +1902,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       assert 5 == (5 + 1)
 ```
 
@@ -1900,7 +1929,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       app.cutover_build.CutoverCommittedError: committed but unconfirmed
 E           BrokenPipeError: stdout closed
 ```
@@ -1926,7 +1955,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E           AssertionError: .obsidian content was rewritten outside every gate
 E           assert b'---\nentity...the ab word\n' == b'---\nentity...the ab word\n'
 E
@@ -1958,7 +1987,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       OSError: device busy
 ```
 
@@ -1983,7 +2012,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE CutoverError
 ```
 
@@ -2008,7 +2037,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       AssertionError: body exception text reached public output
 E       assert '<absolute-path-redacted>' not in 'build faile... it manually'
 E
@@ -2037,7 +2066,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       AssertionError: the stranding regression leaked a temporary tree
 E       assert not [PosixPath('<temporary-path-redacted>
 ```
@@ -2067,7 +2096,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE ManifestError
 ```
 
@@ -2093,7 +2122,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE CutoverError
 ```
 
@@ -2119,7 +2148,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE CutoverError
 ```
 
@@ -2149,7 +2178,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E           Failed: DID NOT RAISE CutoverError
 ```
 
@@ -2174,7 +2203,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E           Failed: DID NOT RAISE CutoverError
 ```
 
@@ -2199,7 +2228,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       AssertionError: _tree_state re-queries path state: ['is_dir']
 E       assert ['is_dir'] == []
 E
@@ -2222,18 +2251,24 @@ E         Left contains one more item: 'is_dir'
 **Command:**
 
 ```bash
-PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_build_refuses_a_manifest_that_omits_a_sub_floor_identifier
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_build.py::test_the_completeness_check_refuses_before_the_disposition_check
 ```
 
 **RED** (exit 1):
 
-```
+```text
 E       AssertionError: Regex pattern did not match.
 E         Expected regex: 'does not cover every sub-floor'
-E         Actual message: 'approved dispositions do not exactly match the source advisory report; re-run from inventory'
+E         Actual message: 'reached the disposition check'
 ```
 
-**Restoration:** `cmp` identical; SHA-256 `c37046e7da0312ee…` before and `c37046e7da0312ee…` after — byte-identical.
+**Attribution:** retargeted in round three. A manifest that omits a mapping
+also omits its dispositions, so the disposition check refused the mutant and
+the RED named that guard. Making `_require_dispositions` fatal turns the
+question into control flow: the sentinel is reached only if the completeness
+check did not refuse first.
+
+**Restoration:** `cmp` identical; SHA-256 `9b48b0e532e90e70…` before and `9b48b0e532e90e70…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.23s`
 
@@ -2257,7 +2292,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE UnreadableFile
 ```
 
@@ -2285,7 +2320,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE UnreadableFile
 ```
 
@@ -2310,7 +2345,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE UnreadableFile
 ```
 
@@ -2332,18 +2367,25 @@ E       Failed: DID NOT RAISE UnreadableFile
 **Command:**
 
 ```bash
-PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_policy_writer_refuses_a_wrongly_shaped_field[scalar-paths]
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_the_policy_sequence_guard_is_what_refuses_an_empty_field
 ```
 
 **RED** (exit 1):
 
-```
-E       AssertionError: Regex pattern did not match.
-E         Expected regex: 'expected a sequence'
-E         Actual message: "action-policy.yaml has an unsupported shape inside 'paths': expected a scalar"
+```text
+>       with pytest.raises(UnreadableFile, match="expected a sequence"):
+E       Failed: DID NOT RAISE UnreadableFile
 ```
 
-**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+**Attribution:** retargeted in round three. With `paths: "ab/**"` the mutant
+still refused, because iterating the scalar yields characters and the item
+guard rejects them — the tightened `expected a sequence` assertion recorded
+the *absence* of this guard, but the RED itself came from the other one. An
+empty `paths:` decodes to `None`, so the item loop cannot run at all: without
+the sequence guard the writer returns the file unchanged and the stale rule
+ships. That silent pass is the failure this guard exists to prevent.
+
+**Restoration:** `cmp` identical; SHA-256 `221fc2526ee12ca3…` before and `221fc2526ee12ca3…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.05s`
 
@@ -2361,16 +2403,24 @@ E         Actual message: "action-policy.yaml has an unsupported shape inside 'p
 **Command:**
 
 ```bash
-PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_policy_writer_refuses_a_wrongly_shaped_field[non-string-item]
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_the_policy_item_guard_refuses_before_any_span_is_recorded
 ```
 
 **RED** (exit 1):
 
-```
-E       AttributeError: 'list' object has no attribute 'partition'
+```text
+>       with pytest.raises(UnreadableFile, match="expected a scalar"):
+E       Failed: DID NOT RAISE UnreadableFile
 ```
 
-**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+**Attribution:** retargeted in round three. Driven through
+`rewrite_policy_path_heads` the mutant crashed inside the rewriter with
+`AttributeError: 'list' object has no attribute 'partition'`, which proves
+only that something downstream could not cope. Calling `policy_path_scalars`
+alone shows the real defect: the locator records a span whose value is a
+mapping node, silently, with nothing refusing.
+
+**Restoration:** `cmp` identical; SHA-256 `221fc2526ee12ca3…` before and `221fc2526ee12ca3…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.05s`
 
@@ -2393,11 +2443,16 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       Failed: DID NOT RAISE UnreadableFile
 ```
 
-**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+**Attribution:** re-run unchanged in round three and confirmed attributable.
+A scalar `except:` iterates as characters, every one of which is a `str`, so
+the item guard has nothing to reject and no other check fires — the gate
+returns normally. `DID NOT RAISE` therefore names this guard and no other.
+
+**Restoration:** `cmp` identical; SHA-256 `221fc2526ee12ca3…` before and `221fc2526ee12ca3…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.05s`
 
@@ -2415,16 +2470,23 @@ E       Failed: DID NOT RAISE UnreadableFile
 **Command:**
 
 ```bash
-PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_residual_gate_refuses_a_wrongly_shaped_field[non-string-item]
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_cutover_locations.py::test_the_gate_item_guard_refuses_before_any_value_is_recorded
 ```
 
 **RED** (exit 1):
 
-```
-E               AttributeError: 'dict' object has no attribute 'partition'
+```text
+>       with pytest.raises(UnreadableFile, match="expected a scalar"):
+E       Failed: DID NOT RAISE UnreadableFile
 ```
 
-**Restoration:** `cmp` identical; SHA-256 `66939f93d9a42ebd…` before and `66939f93d9a42ebd…` after — byte-identical.
+**Attribution:** retargeted in round three, for the same reason as B1e. The
+`AttributeError` raised through `scoped_residuals` was the caller failing, not
+this guard refusing. `_policy_path_values` on its own returns
+`[('paths', {'glob': 'ab/**'}), ('except', 'ab/.sensitive/**')]` under the
+mutant — a non-string value recorded with nothing to stop it.
+
+**Restoration:** `cmp` identical; SHA-256 `221fc2526ee12ca3…` before and `221fc2526ee12ca3…` after — byte-identical.
 
 **GREEN** (exit 0): `1 passed in 0.05s`
 
@@ -2446,7 +2508,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       AssertionError: structured read site without a @structured_reader category declaration: ['app/cutover_locations.py:194']
 E       assert ['<absolute-path-redacted>'] == []
 E
@@ -2475,7 +2537,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       AssertionError: structured read site without a @structured_reader category declaration: ['app/cutover_locations.py:200']
 E       assert ['<absolute-path-redacted>'] == []
 E
@@ -2503,7 +2565,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E           AssertionError: guard missed an undeclared reader shape:
 E             def f(p):
 E                 return yaml.parse(p)
@@ -2531,7 +2593,7 @@ PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider 
 
 **RED** (exit 1):
 
-```
+```text
 E       AssertionError: nested front-matter values were suppressed as typed
 E       assert [] == [('note.md', ...md', 'm7', 6)]
 E
@@ -2545,7 +2607,100 @@ E         Right contains 2 more items, first extra item: ('note.md', 'm7', 4)
 ### Round-two arithmetic
 
 - **28 round-two mutant edits**, every one proved RED → byte-identical
-  restore → GREEN.
+  restore → GREEN. Round three later retired one of them (N1b), leaving 27.
 - Round one contributed 53 Stage A mutant edits plus 3 integration mutations.
-- **81 Stage A mutant edits and 3 integration mutations, 84 total proofs.**
 - Six discarded attempts are excluded from every count above.
+
+---
+
+## Round three — CodeRabbit findings on `bfb7949`
+
+Eight findings on the rewritten branch tip. Two were substantive: the reader
+invariant missed an entire API shape, and a set of rows recorded a RED that
+its named guard had not caused. The rest were documentation and lint.
+
+The rule applied throughout: **a RED that a different guard, a `NameError`,
+an `AttributeError`, or a later assertion produced is not proof of the named
+guard.** Ten rows were re-examined against it. Nine were retargeted or
+re-proved; one (B1f) was re-run unchanged and confirmed already attributable;
+one (N1b) could not be made attributable without duplicating N1c and was
+retired.
+
+| Row | Was | Now |
+|---|---|---|
+| 2 | disposition check refused the mutant | direct `validate_mapping_pair` call — `DID NOT RAISE AxisError` |
+| 7 | second residual gate refused | rewrite step made fatal — sentinel reached |
+| 19 | already distinguished by message | second node isolates it by control flow too |
+| 21 | `NameError: contextlib` | `memoryview(b"")`, an importless builtin context manager |
+| 45 | canonical-form check refused | direct `load_manifest` call — `DID NOT RAISE ManifestError` |
+| N1b | root-escape guard refused | retired: duplicate edit of N1c, which is attributable |
+| S4 | disposition check refused | disposition check made fatal — sentinel reached |
+| B1d | item guard refused | empty `paths:` — item loop cannot run, `DID NOT RAISE` |
+| B1e | `AttributeError` in the rewriter | direct `policy_path_scalars` call — `DID NOT RAISE` |
+| B1f | — | re-run unchanged, confirmed attributable |
+| B1g | `AttributeError` in the caller | direct `_policy_path_values` call — `DID NOT RAISE` |
+
+Three findings needed no mutation: fenced blocks without a language
+identifier were labelled `text` (MD040), the unused `name` loop variable in
+`rewrite_root_scalar` became `_name`, and the closing-suite figure above was
+labelled as the historical checkpoint it is. CodeRabbit's broad 80% docstring
+suggestion was **not** undertaken — it is generic, high-churn, and outside
+this task's acceptance gates. Its ReDoS note was likewise not actioned.
+
+One finding needed new code, recorded as Mutation R1 below.
+
+#### Mutation R1 — `tests/test_console_readers.py`
+
+The reader invariant resolved a structured read's receiver to a module, so
+`from ruamel.yaml import YAML as R` followed by `R().load(p)` — the ruamel
+API's ordinary entry point — presented as a plain local call and passed
+unseen. A direct probe confirmed it before any change: the aliased and
+unaliased class forms both returned no offender, while the attribute form
+`ruamel.yaml.YAML().load(p)` was already caught. Loader classes imported from
+a `yaml` module are now tracked alongside module aliases, and a receiver that
+is a call to one is a structured read.
+
+**Edit:**
+
+```diff
+- if name in loader_classes or name in _YAML_LOADER_CLASSES:
++ if False and (name in loader_classes or name in _YAML_LOADER_CLASSES):
+```
+
+**Command:**
+
+```bash
+PYTHONPYCACHEPREFIX=$(mktemp -d) uv run python -m pytest -q -p no:cacheprovider tests/test_console_readers.py::test_a_yaml_loader_class_is_detected
+```
+
+**RED** (exit 1):
+
+```text
+E           AssertionError: from ruamel.yaml import YAML as R
+E             def f(p):
+E                 return R().load(p)
+E           assert []
+E            +  where [] = _collect_offenders(<ast.Module object at 0x…>, PosixPath('synthetic.py'))
+```
+
+**Restoration:** preimage copied back; `cmp` identical; SHA-256
+`88dc9a592f811683…` before and `88dc9a592f811683…` after — byte-identical.
+
+**GREEN** (exit 0): `1 passed in 0.03s`
+
+### Round-three arithmetic
+
+- **1 new mutant edit** (R1), proved RED → byte-identical restore → GREEN.
+- **10 rows re-proved or re-examined**; these are re-runs of existing edits,
+  not new ones, so they add nothing to the count. Mutation 21's edit changed
+  form (`contextlib.nullcontext()` → `memoryview(b"")`); it remains one edit.
+- **1 row retired** (N1b), removed from the count.
+- Round one 53 + round two 27 + round three 1 = **81 Stage A mutant edits**,
+  plus 3 integration mutations, **84 total proofs**.
+- Eight isolating regressions were added, all of them tests: one in
+  `tests/test_console_readers.py`, two in `tests/test_cutover_build.py`,
+  three in `tests/test_cutover_locations.py`, one in
+  `tests/test_cutover_manifest.py`, one in `tests/test_cutover_promotion.py`.
+  Regression counts and mutant-edit counts are kept separate throughout.
+- Six discarded attempts from round two, seven retired round-one rows, and
+  N1b are excluded from every count above.
