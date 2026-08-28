@@ -8,6 +8,7 @@ import re
 import yaml
 
 from .console_routing import structured_reader
+from .identifiers import meets_floor
 
 _ENTITY_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -93,7 +94,11 @@ class EntityCatalog:
         parsed: list[EntityDefinition] = []
         recipient_owners: dict[str, str] = {}
         for slug, raw in records.items():
-            if not isinstance(slug, str) or not _ENTITY_SLUG.fullmatch(slug):
+            if (
+                not isinstance(slug, str)
+                or not _ENTITY_SLUG.fullmatch(slug)
+                or not meets_floor(slug)
+            ):
                 raise EntityManifestError("entities manifest contains an invalid slug")
             spec = {} if raw is None else raw
             if not isinstance(spec, dict):
@@ -137,7 +142,11 @@ class EntityCatalog:
         return dict(self.recipient_routes).get(normalized)
 
     def require(self, slug: str) -> EntityDefinition:
-        if not isinstance(slug, str) or not _ENTITY_SLUG.fullmatch(slug):
+        if (
+            not isinstance(slug, str)
+            or not _ENTITY_SLUG.fullmatch(slug)
+            or not meets_floor(slug)
+        ):
             raise EntitySelectionError("invalid entity selection")
         for entity in self.entities:
             if entity.slug == slug:

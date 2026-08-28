@@ -23,15 +23,15 @@ import pytest
 from tests.conftest import write_vault
 from app.console_errors import describe
 
-ENTITIES = 'version: "1.0"\nentities:\n  demo: {label: Demo, flags: []}\n'
+ENTITIES = 'version: "1.0"\nentities:\n  demo1: {label: Demo, flags: []}\n'
 
 
 def _scope(tmp_path):
     from app.scope import Scope
 
     write_vault(tmp_path, ENTITIES)
-    (tmp_path / "demo").mkdir(exist_ok=True)
-    return Scope(tmp_path, "demo")
+    (tmp_path / "demo1").mkdir(exist_ok=True)
+    return Scope(tmp_path, "demo1")
 
 
 @contextlib.contextmanager
@@ -182,7 +182,7 @@ def test_get_delete_proposal_oserror_becomes_unreadable(tmp_path):
 
     scope = _scope(tmp_path)
     proposal_id = "20260815T090703-" + "ab" * 16
-    outbox = tmp_path / "demo" / "outbox"
+    outbox = tmp_path / "demo1" / "outbox"
     outbox.mkdir(parents=True)
     path = outbox / f"{proposal_id}.yaml"
     path.write_text("action: delete\n", encoding="utf-8")
@@ -199,7 +199,7 @@ def test_get_delete_proposal_unicode_decode_error_becomes_unreadable(tmp_path):
 
     scope = _scope(tmp_path)
     proposal_id = "20260815T090703-" + "cd" * 16
-    outbox = tmp_path / "demo" / "outbox"
+    outbox = tmp_path / "demo1" / "outbox"
     outbox.mkdir(parents=True)
     path = outbox / f"{proposal_id}.yaml"
     path.write_bytes(b"\xff\xfe not utf-8")

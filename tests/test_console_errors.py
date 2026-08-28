@@ -358,7 +358,7 @@ RECEIPT = textwrap.dedent(
     ---
     type: inbox-item
     title: Synthetic receipt
-    entity: demo
+    entity: demo1
     product: null
     status: active
     created: 2026-01-01
@@ -385,14 +385,14 @@ def _outbox_fixture(tmp_path):
 
     vault = git_entity_vault(
         tmp_path,
-        ("demo",),
+        ("demo1",),
         {
             "_system/archetypes.yaml": OUTBOX_ARCHETYPES,
-            "demo/00-inbox/active/note.md": RECEIPT,
-            "demo/11-knowledge/active/.gitkeep": "",
+            "demo1/00-inbox/active/note.md": RECEIPT,
+            "demo1/11-knowledge/active/.gitkeep": "",
         },
     )
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal = propose_classification(
         scope,
         scope.resolve("00-inbox", "active", "note.md"),
@@ -416,15 +416,15 @@ def _registry_fixture(tmp_path):
 
     vault = git_entity_vault(
         tmp_path,
-        ("demo",),
+        ("demo1",),
         {
             "_system/products.yaml": (
-                'version: "1.0"\nproducts:\n  demo:\n    widgetx:\n'
+                'version: "1.0"\nproducts:\n  demo1:\n    widgetx:\n'
                 "      label: Widgetx\n"
             ),
         },
     )
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal = propose_delete(scope, "product", "widgetx")
     return vault, scope, proposal
 

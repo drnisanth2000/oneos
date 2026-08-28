@@ -17,7 +17,7 @@ STD = textwrap.dedent(
     ---
     type: note
     title: Example
-    entity: demo
+    entity: demo1
     product: null
     status: active
     created: 2026-01-01
@@ -53,7 +53,7 @@ def test_valid_system_doc_needs_no_entity_or_product():
 
 
 def test_missing_required_field_is_invalid():
-    text = STD.replace("entity: demo\n", "")
+    text = STD.replace("entity: demo1\n", "")
     ok, problems = validate_file_text(text)
     assert not ok
     assert any("entity" in p for p in problems)
@@ -105,7 +105,7 @@ def test_validate_front_matter_on_mapping_directly():
         {
             "type": "note",
             "title": "x",
-            "entity": "demo",
+            "entity": "demo1",
             "product": None,
             "status": "active",
             "created": "2026-01-01",

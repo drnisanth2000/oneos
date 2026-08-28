@@ -138,7 +138,7 @@ def _products_vault(tmp_path, referenced=True):
             """\
             version: "1.0"
             products:
-              demo:
+              demo1:
                 widgetx:
                   label: Widgetx
                 other:
@@ -149,21 +149,21 @@ def _products_vault(tmp_path, referenced=True):
             """\
             version: "1.0"
             workspaces:
-              - {id: main, label: Main, kind: entity, entity: demo, default_view: blocks}
+              - {id: main1, label: Main, kind: entity, entity: demo1, default_view: blocks}
             """
         ),
     }
     if referenced:
-        files["demo/07-finance/active/inv.md"] = (
-            "---\ntype: note\ntitle: Inv\nentity: demo\nproduct: widgetx\n"
+        files["demo1/07-finance/active/inv.md"] = (
+            "---\ntype: note\ntitle: Inv\nentity: demo1\nproduct: widgetx\n"
             "status: active\ncreated: 2026-01-01\nupdated: 2026-01-01\n---\n"
         )
         files["_system/workspaces.yaml"] += (
-            "  - {id: widgetx, label: Widgetx, kind: product, entity: demo, product: widgetx, default_view: blocks}\n"
+            "  - {id: widgetx, label: Widgetx, kind: product, entity: demo1, product: widgetx, default_view: blocks}\n"
         )
-    vault = git_entity_vault(tmp_path, ("demo",), files)
+    vault = git_entity_vault(tmp_path, ("demo1",), files)
     if referenced:
-        db = tmp_path / "demo" / "books.db"
+        db = tmp_path / "demo1" / "books.db"
         conn = sqlite3.connect(db)
         conn.executescript("CREATE TABLE products (tag TEXT, name TEXT);"
                            "CREATE TABLE invoices (id INTEGER PRIMARY KEY, product TEXT);")
@@ -191,12 +191,12 @@ def two_entity_registry_vault(tmp_path):
                   label: Alpha Unused
                 alpha-only:
                   label: Alpha Only
-              beta:
+              beta1:
                 shared:
                   label: Beta Registry Marker
                 unused:
                   label: Beta Unused
-                beta-only:
+                beta1-only:
                   label: Beta Only
             """
         ),
@@ -208,7 +208,7 @@ def two_entity_registry_vault(tmp_path):
                 label: Alpha Cross
                 kind: cross
                 primary_entity: alpha
-                entities: [alpha, beta]
+                entities: [alpha, beta1]
                 product: shared
                 default_view: blocks
             """
@@ -218,13 +218,13 @@ def two_entity_registry_vault(tmp_path):
             "product: shared\nstatus: active\ncreated: 2026-01-01\n"
             "updated: 2026-01-01\n---\nalpha-registry-marker\n"
         ),
-        "beta/07-finance/active/beta-one.md": (
-            "---\ntype: note\ntitle: Beta Registry Marker One\nentity: beta\n"
+        "beta1/07-finance/active/beta1-one.md": (
+            "---\ntype: note\ntitle: Beta Registry Marker One\nentity: beta1\n"
             "product: shared\nstatus: active\ncreated: 2026-01-01\n"
             "updated: 2026-01-01\n---\nbeta-registry-marker-one\n"
         ),
-        "beta/09-marketing/active/beta-two.md": (
-            "---\ntype: note\ntitle: Beta Registry Marker Two\nentity: beta\n"
+        "beta1/09-marketing/active/beta1-two.md": (
+            "---\ntype: note\ntitle: Beta Registry Marker Two\nentity: beta1\n"
             "product: shared\nstatus: active\ncreated: 2026-01-01\n"
             "updated: 2026-01-01\n---\nbeta-registry-marker-two\n"
         ),
@@ -238,11 +238,11 @@ def two_entity_registry_vault(tmp_path):
             "---\ntype: note\ntitle: Staging\nentity: alpha\nproduct: shared\n---\n"
         ),
     }
-    vault = git_entity_vault(tmp_path, ("alpha", "beta"), files)
-    (vault / "alpha/07-finance/active/beta-link.md").symlink_to(
-        vault / "beta/07-finance/active/beta-one.md"
+    vault = git_entity_vault(tmp_path, ("alpha", "beta1"), files)
+    (vault / "alpha/07-finance/active/beta1-link.md").symlink_to(
+        vault / "beta1/07-finance/active/beta1-one.md"
     )
-    for entity, rows in (("alpha", ("product", "tag")), ("beta", ("product",))):
+    for entity, rows in (("alpha", ("product", "tag")), ("beta1", ("product",))):
         connection = sqlite3.connect(vault / entity / "books.db")
         connection.executescript(
             "CREATE TABLE entries (id INTEGER PRIMARY KEY, product TEXT, tag TEXT);"
@@ -265,7 +265,7 @@ def two_entity_registry_vault(tmp_path):
 
 def test_reference_count_finds_every_reference(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    r = reference_count(Scope(vault, "demo"), "product", "widgetx")
+    r = reference_count(Scope(vault, "demo1"), "product", "widgetx")
     assert r.sources.get("front-matter") == 1
     assert r.sources.get("workspaces") == 1
     assert r.sources.get("books.db") == 2      # products.tag + invoices.product
@@ -274,7 +274,7 @@ def test_reference_count_finds_every_reference(tmp_path):
 
 def test_reference_count_zero_when_unused(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    r = reference_count(Scope(vault, "demo"), "product", "widgetx")
+    r = reference_count(Scope(vault, "demo1"), "product", "widgetx")
     assert r.total == 0
 
 
@@ -282,18 +282,18 @@ def test_reference_count_reads_only_bound_entity(two_entity_registry_vault):
     alpha = reference_count(
         Scope(two_entity_registry_vault, "alpha"), "product", "shared"
     )
-    beta = reference_count(
-        Scope(two_entity_registry_vault, "beta"), "product", "shared"
+    beta1 = reference_count(
+        Scope(two_entity_registry_vault, "beta1"), "product", "shared"
     )
     assert alpha.sources == {"front-matter": 1, "workspaces": 1, "books.db": 2}
-    assert beta.sources == {"front-matter": 2, "workspaces": 0, "books.db": 1}
+    assert beta1.sources == {"front-matter": 2, "workspaces": 0, "books.db": 1}
 
 
 def test_reference_count_never_opens_another_entity_or_sensitive_paths(
     two_entity_registry_vault, monkeypatch
 ):
     scope = Scope(two_entity_registry_vault, "alpha")
-    beta_root = (two_entity_registry_vault / "beta").resolve()
+    beta_root = (two_entity_registry_vault / "beta1").resolve()
     hidden = (two_entity_registry_vault / "alpha/.sensitive/hidden.md").resolve()
     beta_db = (beta_root / "books.db").resolve()
     real_read_text = registry.Path.read_text
@@ -309,7 +309,7 @@ def test_reference_count_never_opens_another_entity_or_sensitive_paths(
 
     def guarded_connect(database, *args, **kwargs):
         if str(beta_db) in str(database):
-            raise AssertionError("beta books.db was opened from alpha scope")
+            raise AssertionError("beta1 books.db was opened from alpha scope")
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(registry.Path, "read_text", guarded_read_text)
@@ -324,7 +324,7 @@ def test_reference_count_does_not_follow_cross_entity_books_db_symlink(
 ):
     scope = Scope(two_entity_registry_vault, "alpha")
     alpha_db = two_entity_registry_vault / "alpha/books.db"
-    beta_db = (two_entity_registry_vault / "beta/books.db").resolve()
+    beta_db = (two_entity_registry_vault / "beta1/books.db").resolve()
     alpha_db.rename(two_entity_registry_vault / "alpha/original-books.db")
     alpha_db.symlink_to(beta_db)
     real_connect = registry.sqlite3.connect
@@ -332,7 +332,7 @@ def test_reference_count_does_not_follow_cross_entity_books_db_symlink(
     def guarded_connect(database, *args, **kwargs):
         raw_path = str(database).removeprefix("file:").split("?", 1)[0]
         if registry.Path(raw_path).resolve() == beta_db:
-            raise AssertionError("beta books.db was opened through an alpha symlink")
+            raise AssertionError("beta1 books.db was opened through an alpha symlink")
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(registry.sqlite3, "connect", guarded_connect)
@@ -347,20 +347,20 @@ def test_products_for_reads_only_bound_registry_namespace(two_entity_registry_va
         "unused",
         "alpha-only",
     ]
-    assert registry.products_for(Scope(two_entity_registry_vault, "beta")) == [
+    assert registry.products_for(Scope(two_entity_registry_vault, "beta1")) == [
         "shared",
         "unused",
-        "beta-only",
+        "beta1-only",
     ]
 
 
 def test_add_workspace_is_direct_and_commits(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     before = git_count_commits(vault)
-    add_workspace(scope, {"id": "rti", "label": "RTI", "kind": "matter", "entity": "demo"})
+    add_workspace(scope, {"id": "rti01", "label": "RTI", "kind": "matter", "entity": "demo1"})
     ws = (vault / "_system/workspaces.yaml").read_text()
-    assert "id: rti" in ws
+    assert "id: rti01" in ws
     assert git_count_commits(vault) == before + 1
     assert git_head_message(vault).startswith("registry: add workspace")
     assert git_is_clean_apart_from_quarantine(vault)
@@ -368,7 +368,7 @@ def test_add_workspace_is_direct_and_commits(tmp_path):
 
 def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     assert prop.path.exists()
     text = prop.path.read_text()
@@ -379,7 +379,7 @@ def test_propose_delete_writes_impact_and_removes_nothing(tmp_path):
 
 def test_propose_delete_keeps_untrusted_slug_out_of_proposal_filename(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     target = scope.resolve("13-analytics", "kpis.yaml")
     target.parent.mkdir(parents=True)
     original = b"version: '1.0'\nkpis: unchanged\n"
@@ -397,9 +397,9 @@ def test_propose_delete_rejects_redirected_outbox_without_creating_target(
     tmp_path,
 ):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
-    redirected = vault / "demo/redirected-outbox"
-    outbox_link = vault / "demo/outbox"
+    scope = Scope(vault, "demo1")
+    redirected = vault / "demo1/redirected-outbox"
+    outbox_link = vault / "demo1/outbox"
     outbox_link.parent.mkdir(parents=True)
     outbox_link.symlink_to(redirected)
 
@@ -413,7 +413,7 @@ def test_propose_delete_preserves_collision_before_writing_later_candidate(
     tmp_path, monkeypatch
 ):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     first_id = "20260815T090703-" + "ab" * 16
     second_id = "20260815T090703-" + "cd" * 16
     first_path = scope.resolve("outbox", f"{first_id}.yaml")
@@ -436,7 +436,7 @@ def test_propose_delete_raises_after_four_collisions_without_modifying_files(
     tmp_path, monkeypatch
 ):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal_ids = tuple(
         f"20260815T090703-{'ab' * 15}{suffix}"
         for suffix in ("aa", "bb", "cc", "dd")
@@ -470,7 +470,7 @@ def test_same_second_delete_proposals_are_distinct_and_preserved(
     tmp_path, monkeypatch
 ):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     monkeypatch.setattr(registry, "datetime", _FixedDatetime)
 
     first = propose_delete(scope, "product", "widgetx")
@@ -485,7 +485,7 @@ def test_same_second_delete_proposals_are_distinct_and_preserved(
 
 def test_delete_record_id_must_equal_filename(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
     record["id"] = "20260815T090703-" + "ab" * 16
@@ -497,7 +497,7 @@ def test_delete_record_id_must_equal_filename(tmp_path):
 
 def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     target = scope.resolve("13-analytics", "kpis.yaml")
     target.parent.mkdir(parents=True)
     target.write_text(
@@ -505,7 +505,7 @@ def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_pat
             """\
             id: ../13-analytics/kpis
             action: delete
-            entity: demo
+            entity: demo1
             kind: product
             slug: widgetx
             status: pending
@@ -532,7 +532,7 @@ def test_delete_proposal_id_cannot_traverse_outbox_or_unlink_entity_file(tmp_pat
 
 def test_execute_delete_refuses_while_referenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review_sha256 = _fingerprint_of(scope, prop.id)
     assert registry.reference_count(scope, prop.kind, prop.slug).total > 0
@@ -559,7 +559,7 @@ def _fingerprint_of(scope, proposal_id: str) -> str:
 
 def test_execute_delete_removes_when_unreferenced(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     execute_delete(scope, prop.id, _fingerprint_of(scope, prop.id))
     prods = (vault / "_system/products.yaml").read_text()
@@ -571,13 +571,13 @@ def test_execute_delete_removes_when_unreferenced(tmp_path):
 
 def test_execute_delete_commits_the_exact_review_receipt_with_the_action(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
 
     deleted = execute_delete(scope, prop.id, review.sha256)
 
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     assert git_changed_paths(vault) == sorted(
         ("_system/products.yaml", receipt_path)
     )
@@ -591,11 +591,11 @@ def test_execute_delete_commits_the_exact_review_receipt_with_the_action(tmp_pat
 
 def test_execute_delete_refuses_a_receipt_committed_before_the_lock(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
     receipt = make_action_receipt(prop.id, "0" * 64, "registry deletion")
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     stored = vault / receipt_path
     stored.parent.mkdir(mode=0o700)
     stored.write_bytes(render_action_receipt(receipt))
@@ -617,13 +617,13 @@ def test_execute_delete_refuses_a_receipt_committed_before_the_lock(tmp_path):
 
 def test_execute_delete_rechecks_receipts_under_its_lock(tmp_path, monkeypatch):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
     receipt = make_action_receipt(
         prop.id, review.sha256, "registry deletion"
     )
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     real_lookup = registry._head_action_receipt
     lookups = []
 
@@ -650,10 +650,10 @@ def test_execute_delete_rechecks_receipts_under_its_lock(tmp_path, monkeypatch):
 
 def test_execute_delete_fails_closed_on_a_malformed_matching_receipt(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     stored = vault / receipt_path
     stored.parent.mkdir(mode=0o700)
     stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
@@ -673,7 +673,7 @@ def test_reverting_a_post_commit_consumption_failure_reenables_the_pending_delet
     tmp_path, monkeypatch
 ):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
     real_quarantine = git_transaction.quarantine_path_if_unchanged
@@ -694,7 +694,7 @@ def test_reverting_a_post_commit_consumption_failure_reenables_the_pending_delet
         raised.value.__cause__, git_transaction.PostCommitConsumptionError
     )
     action_oid = git_head(vault)
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     assert (vault / receipt_path).exists()
     assert prop.path.exists()
 
@@ -724,13 +724,13 @@ def test_delete_with_unrelated_staged_unstaged_and_untracked_work_commits_only_r
 ):
     vault = _products_vault(tmp_path, referenced=False)
     unrelated, unrelated_index = _add_unrelated_git_dirt(vault)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal = propose_delete(scope, "product", "widgetx")
     head_before = git_head(vault)
 
     execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
 
-    receipt_path = receipt_relative_path("demo", proposal.id)
+    receipt_path = receipt_relative_path("demo1", proposal.id)
     assert git_changed_paths(vault) == sorted(
         ["_system/products.yaml", receipt_path]
     )
@@ -749,7 +749,7 @@ def test_dirty_reviewed_registry_is_refused_before_proposal_or_registry_mutation
     tmp_path,
 ):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal = propose_delete(scope, "product", "widgetx")
     registry_path = scope.system_path("products.yaml")
     registry_bytes = registry_path.read_bytes()
@@ -774,7 +774,7 @@ def test_dirty_reviewed_registry_is_refused_before_proposal_or_registry_mutation
 
 def test_registry_delete_busy_error_preserves_exact_state(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal = propose_delete(scope, "product", "widgetx")
     registry_path = scope.system_path("products.yaml")
     registry_bytes = registry_path.read_bytes()
@@ -800,7 +800,7 @@ def test_registry_delete_commit_failure_restores_registry_and_proposal_bytes(
 ):
     vault = _products_vault(tmp_path, referenced=False)
     unrelated, unrelated_index = _add_unrelated_git_dirt(vault)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal = propose_delete(scope, "product", "widgetx")
     registry_path = scope.system_path("products.yaml")
     registry_bytes = registry_path.read_bytes()
@@ -894,7 +894,7 @@ def test_delete_removes_only_bound_registry_key(two_entity_registry_vault):
     execute_delete(scope, proposal.id, _fingerprint_of(scope, proposal.id))
     cfg = yaml.safe_load(scope.system_path("products.yaml").read_text())
     assert "unused" not in cfg["products"]["alpha"]
-    assert "unused" in cfg["products"]["beta"]
+    assert "unused" in cfg["products"]["beta1"]
 
 
 def test_forged_delete_proposal_cannot_be_read_or_executed(
@@ -908,7 +908,7 @@ def test_forged_delete_proposal_cannot_be_read_or_executed(
             """\
             id: forged-delete
             action: delete
-            entity: beta
+            entity: beta1
             kind: product
             slug: unused
             status: pending
@@ -934,7 +934,7 @@ def test_same_outbox_leaf_symlink_cannot_redirect_requested_delete(
     tmp_path, monkeypatch
 ):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     requested, target = _same_outbox_leaf_alias(scope, monkeypatch)
     target_before = target.path.read_bytes()
     registry_path = scope.system_path("products.yaml")
@@ -957,10 +957,10 @@ def test_delete_proposal_read_rejects_cross_entity_leaf_symlink(
 ):
     scope = Scope(two_entity_registry_vault, "alpha")
     proposal_id = "20260815T090703-" + "ab" * 16
-    foreign = two_entity_registry_vault / "beta/outbox" / f"{proposal_id}.yaml"
+    foreign = two_entity_registry_vault / "beta1/outbox" / f"{proposal_id}.yaml"
     foreign.parent.mkdir(parents=True, exist_ok=True)
     foreign.write_text(
-        f"id: {proposal_id}\naction: delete\nentity: beta\nkind: product\nslug: unused\n",
+        f"id: {proposal_id}\naction: delete\nentity: beta1\nkind: product\nslug: unused\n",
         encoding="utf-8",
     )
     linked = scope.resolve("outbox") / f"{proposal_id}.yaml"
@@ -986,11 +986,11 @@ def test_add_workspace_rejects_another_entity_entry(two_entity_registry_vault):
         add_workspace(
             scope,
             {
-                "id": "beta-cross",
+                "id": "beta1-cross",
                 "label": "Beta Cross",
                 "kind": "cross",
-                "primary_entity": "beta",
-                "entities": ["alpha", "beta"],
+                "primary_entity": "beta1",
+                "entities": ["alpha", "beta1"],
             },
         )
 
@@ -1009,7 +1009,7 @@ def test_get_delete_review_returns_the_value_its_bytes_and_their_hash(tmp_path):
     import hashlib
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
 
     review = registry.get_delete_review(scope, prop.id)
@@ -1031,7 +1031,7 @@ def test_the_delete_review_value_and_hash_come_from_one_capture(tmp_path):
     import app.registry as reg
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     original = prop.path.read_bytes()
 
@@ -1068,7 +1068,7 @@ def test_execute_delete_requires_a_fingerprint_with_no_default():
 
 def test_execute_delete_has_no_id_only_compatibility_path(tmp_path):
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     before = (vault / "_system/products.yaml").read_bytes()
 
@@ -1086,7 +1086,7 @@ def test_execute_delete_refuses_a_malformed_fingerprint(tmp_path, fingerprint):
     from app.review_tokens import InvalidReviewToken
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     before = (vault / "_system/products.yaml").read_bytes()
 
@@ -1102,7 +1102,7 @@ def test_a_replaced_delete_proposal_refuses_and_changes_nothing(tmp_path, label)
     from app.review_tokens import ReviewedProposalChanged
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
 
@@ -1130,7 +1130,7 @@ def test_a_replaced_delete_proposal_refuses_and_changes_nothing(tmp_path, label)
 def test_execute_delete_returns_the_bound_proposal_it_executed(tmp_path):
     """The route needs no earlier unbound read for its success copy."""
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
 
     returned = registry.execute_delete(scope, prop.id, _delete_fp(scope, prop.id))
@@ -1145,12 +1145,12 @@ def test_a_new_live_reference_refuses_an_otherwise_matching_review(tmp_path):
     """The fingerprint binds the proposal, not the registries. A reference
     that appears after the review must still refuse the deletion."""
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
 
     # A brand-new reference lands after the operator reviewed the proposal.
-    referencing = vault / "demo/11-knowledge/active/note.md"
+    referencing = vault / "demo1/11-knowledge/active/note.md"
     referencing.parent.mkdir(parents=True, exist_ok=True)
     referencing.write_text(
         "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
@@ -1170,7 +1170,7 @@ def test_the_reference_count_is_repeated_against_current_state(tmp_path):
     import app.registry as reg
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = reg.get_delete_review(scope, prop.id)
 
@@ -1211,7 +1211,7 @@ def test_delete_owns_the_reviewed_state_not_whatever_arrives_later(tmp_path):
     from app.console_errors import describe
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = reg.get_delete_review(scope, prop.id)
     registry_before = (vault / "_system/products.yaml").read_bytes()
@@ -1258,7 +1258,7 @@ def test_a_review_taken_while_referenced_is_never_actionable(tmp_path):
     deletion again — both the recorded impact and the live count must
     permit it."""
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
     assert review.value.total > 0, "the fixture must start with references"
@@ -1282,7 +1282,7 @@ def test_a_review_taken_while_referenced_is_never_actionable(tmp_path):
 def test_a_fresh_review_after_clearing_references_does_delete(tmp_path):
     """The other half: reviewing again is what makes it actionable."""
     vault = _products_vault(tmp_path, referenced=True)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     stale = propose_delete(scope, "product", "widgetx")
     assert registry.get_delete_review(scope, stale.id).value.total > 0
 
@@ -1321,7 +1321,7 @@ def test_a_malformed_saved_impact_is_refused(tmp_path, field, value):
     gates the deletion, so it is validated like every other stored field
     rather than trusted as whatever YAML happened to hold."""
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
 
     record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
@@ -1343,7 +1343,7 @@ def test_a_path_integrity_race_stays_in_the_registry_family(tmp_path):
     from app.scope import CrossScopeError
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
 
     real_capture = reg.capture_path_state
@@ -1381,7 +1381,7 @@ def test_a_saved_impact_that_contradicts_its_own_total_is_refused(
     from app.outbox import UnreadableProposalRecord
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
 
     record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
@@ -1396,7 +1396,7 @@ def test_a_saved_impact_that_contradicts_its_own_total_is_refused(
 def test_a_consistent_saved_impact_is_accepted(tmp_path):
     """The control: a total that matches its breakdown still reads."""
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
 
     record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
@@ -1476,7 +1476,7 @@ def test_the_delete_no_mutation_matrix(tmp_path, state):
     from app.review_tokens import InvalidReviewToken
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = registry.get_delete_review(scope, prop.id)
     token = review.sha256
@@ -1514,7 +1514,7 @@ def test_the_delete_no_mutation_matrix(tmp_path, state):
         prop.path.unlink()
         prop.path.mkdir()
     elif state == "new-live-reference":
-        note = vault / "demo/11-knowledge/active/note.md"
+        note = vault / "demo1/11-knowledge/active/note.md"
         note.parent.mkdir(parents=True, exist_ok=True)
         note.write_text(
             "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
@@ -1567,7 +1567,7 @@ def test_a_reference_committed_before_the_lock_still_refuses_the_delete(tmp_path
     import app.registry as reg
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = reg.get_delete_review(scope, prop.id)
     products_before = (vault / "_system/products.yaml").read_bytes()
@@ -1577,7 +1577,7 @@ def test_a_reference_committed_before_the_lock_still_refuses_the_delete(tmp_path
 
     def reference_appears_then_execute(vault_arg, plan):
         if not landed:
-            note = vault / "demo/11-knowledge/active/late.md"
+            note = vault / "demo1/11-knowledge/active/late.md"
             note.parent.mkdir(parents=True, exist_ok=True)
             note.write_text(
                 "---\ntype: note\nproduct: widgetx\n---\nbody\n", encoding="utf-8"
@@ -1616,7 +1616,7 @@ def test_the_reference_recount_holds_the_approval_lock(tmp_path):
     import app.registry as reg
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     review = reg.get_delete_review(scope, prop.id)
 
@@ -1670,7 +1670,7 @@ def test_execute_delete_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
     import yaml
 
     vault = _products_vault(tmp_path, referenced=False)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_delete(scope, "product", "widgetx")
     fingerprint = _fingerprint_of(scope, prop.id)
     reviewed_bytes = prop.path.read_bytes()

@@ -67,7 +67,7 @@ ENTITY_FILES = {
         version: "1.0"
         members:
           oldentity:
-            - {id: nn, label: NN}
+            - {id: member-two, label: NN}
         """
     ),
     "_system/workspaces.yaml": textwrap.dedent(
@@ -676,7 +676,7 @@ PRODUCT_FILES = {
         """\
         version: "1.0"
         products:
-          acme:
+          acme1:
             oldprod:
               label: Old
             other:
@@ -687,15 +687,15 @@ PRODUCT_FILES = {
         """\
         version: "1.0"
         workspaces:
-          - {id: oldprod, label: Old, kind: product, entity: acme, product: oldprod, default_view: blocks}
+          - {id: oldprod, label: Old, kind: product, entity: acme1, product: oldprod, default_view: blocks}
         """
     ),
-    "acme/07-finance/active/inv.md": textwrap.dedent(
+    "acme1/07-finance/active/inv.md": textwrap.dedent(
         """\
         ---
         type: note
         title: Inv
-        entity: acme
+        entity: acme1
         product: oldprod
         status: active
         created: 2026-01-01
@@ -710,7 +710,7 @@ def test_product_rename_scoped_and_reports_books_db(tmp_path):
     from tests.conftest import write_tree, _git
 
     write_tree(tmp_path, PRODUCT_FILES)
-    _make_books_db(tmp_path / "acme" / "books.db", "oldprod")
+    _make_books_db(tmp_path / "acme1" / "books.db", "oldprod")
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "config", "user.email", "t@e.com")
     _git(tmp_path, "config", "user.name", "t")
@@ -725,11 +725,11 @@ def test_product_rename_scoped_and_reports_books_db(tmp_path):
     prods = (vault / "_system/products.yaml").read_text()
     assert "newprod:" in prods and "former_slugs: [oldprod]" in prods
     assert "other:" in prods  # unrelated key untouched
-    assert "product: newprod" in (vault / "acme/07-finance/active/inv.md").read_text()
+    assert "product: newprod" in (vault / "acme1/07-finance/active/inv.md").read_text()
     assert "product: newprod" in (vault / "_system/workspaces.yaml").read_text()
 
     # ...but the DB was NOT modified (deferred per spec §2.2c).
-    conn = sqlite3.connect(vault / "acme" / "books.db")
+    conn = sqlite3.connect(vault / "acme1" / "books.db")
     assert conn.execute("SELECT tag FROM products").fetchone()[0] == "oldprod"
     conn.close()
     assert git_is_clean(vault)
@@ -742,8 +742,8 @@ def test_member_rename(tmp_path):
             version: "1.0"
             members:
               personal:
-                - {id: oldm, label: OldM}
-                - {id: nn, label: NN}
+                - {id: oldmember, label: OldM}
+                - {id: member-two, label: NN}
             """
         ),
         "personal/07-finance/active/itr.md": textwrap.dedent(
@@ -753,7 +753,7 @@ def test_member_rename(tmp_path):
             title: ITR
             entity: personal
             product: null
-            member: oldm
+            member: oldmember
             status: active
             created: 2026-01-01
             updated: 2026-01-01
@@ -762,10 +762,10 @@ def test_member_rename(tmp_path):
         ),
     }
     vault = git_vault(tmp_path, files)
-    apply_rename(vault, plan_rename(vault, "member", "oldm", "newm"))
+    apply_rename(vault, plan_rename(vault, "member", "oldmember", "newmember"))
     mem = (vault / "_system/members.yaml").read_text()
-    assert "id: newm" in mem and "id: nn" in mem
-    assert "member: newm" in (vault / "personal/07-finance/active/itr.md").read_text()
+    assert "id: newmember" in mem and "id: member-two" in mem
+    assert "member: newmember" in (vault / "personal/07-finance/active/itr.md").read_text()
     assert git_is_clean(vault)
 
 
@@ -775,7 +775,7 @@ def test_workspace_rename(tmp_path):
             """\
             version: "1.0"
             workspaces:
-              - {id: oldws, label: W, kind: matter, entity: acme, default_view: folders}
+              - {id: oldws, label: W, kind: matter, entity: acme1, default_view: folders}
             """
         ),
     }
@@ -787,12 +787,12 @@ def test_workspace_rename(tmp_path):
 
 def test_project_rename_moves_dir_and_updates_references(tmp_path):
     files = {
-        "acme/02-pipeline/active/oldproj/index.md": textwrap.dedent(
+        "acme1/02-pipeline/active/oldproj/index.md": textwrap.dedent(
             """\
             ---
             type: project
             title: Old Project
-            entity: acme
+            entity: acme1
             product: null
             status: active
             created: 2026-01-01
@@ -802,27 +802,27 @@ def test_project_rename_moves_dir_and_updates_references(tmp_path):
             See [[oldproj]] for details.
             """
         ),
-        "acme/11-knowledge/active/ref.md": textwrap.dedent(
+        "acme1/11-knowledge/active/ref.md": textwrap.dedent(
             """\
             ---
             type: note
             title: Ref
-            entity: acme
+            entity: acme1
             product: null
             status: active
             created: 2026-01-01
             updated: 2026-01-01
             ---
-            Linked [[oldproj]] at acme/02-pipeline/active/oldproj/index.md
+            Linked [[oldproj]] at acme1/02-pipeline/active/oldproj/index.md
             """
         ),
     }
     vault = git_vault(tmp_path, files)
     apply_rename(vault, plan_rename(vault, "project", "oldproj", "newproj"))
-    assert (vault / "acme/02-pipeline/active/newproj").is_dir()
-    assert not (vault / "acme/02-pipeline/active/oldproj").exists()
-    idx = (vault / "acme/02-pipeline/active/newproj/index.md").read_text()
+    assert (vault / "acme1/02-pipeline/active/newproj").is_dir()
+    assert not (vault / "acme1/02-pipeline/active/oldproj").exists()
+    idx = (vault / "acme1/02-pipeline/active/newproj/index.md").read_text()
     assert "[[newproj]]" in idx and "repo: ~/code/newproj" in idx
-    ref = (vault / "acme/11-knowledge/active/ref.md").read_text()
+    ref = (vault / "acme1/11-knowledge/active/ref.md").read_text()
     assert "[[newproj]]" in ref and "newproj/index.md" in ref
     assert git_is_clean(vault)

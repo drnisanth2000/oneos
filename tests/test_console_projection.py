@@ -86,7 +86,7 @@ def _note(body: str = "Synthetic receipt body.\n") -> str:
         ---
         type: inbox-item
         title: Synthetic note
-        entity: demo
+        entity: demo1
         status: active
         created: 2026-01-01
         updated: 2026-01-01
@@ -99,25 +99,25 @@ def _note(body: str = "Synthetic receipt body.\n") -> str:
 
 def _vault(tmp_path) -> Path:
     files = {
-        "demo/00-inbox/active/note.md": _note(),
-        "demo/11-knowledge/active/.gitkeep": "",
-        "demo/11-library/active/.gitkeep": "",
+        "demo1/00-inbox/active/note.md": _note(),
+        "demo1/11-knowledge/active/.gitkeep": "",
+        "demo1/11-library/active/.gitkeep": "",
     }
-    return _projection_vault(tmp_path, ("demo",), files)
+    return _projection_vault(tmp_path, ("demo1",), files)
 
 
 def _two_note_vault(tmp_path) -> Path:
     files = {
-        "demo/00-inbox/active/note-a.md": _note("Alpha receipt body.\n"),
-        "demo/00-inbox/active/note-b.md": _note("Beta receipt body.\n"),
-        "demo/11-knowledge/active/.gitkeep": "",
-        "demo/11-library/active/.gitkeep": "",
+        "demo1/00-inbox/active/note-a.md": _note("Alpha receipt body.\n"),
+        "demo1/00-inbox/active/note-b.md": _note("Beta receipt body.\n"),
+        "demo1/11-knowledge/active/.gitkeep": "",
+        "demo1/11-library/active/.gitkeep": "",
     }
-    return _projection_vault(tmp_path, ("demo",), files)
+    return _projection_vault(tmp_path, ("demo1",), files)
 
 
 def _propose(vault: Path):
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     src = scope.resolve("00-inbox", "active", "note.md")
     prop = propose_classification(
         scope, src, module="11-knowledge", sub="kb", claimed_block="govern",
@@ -137,7 +137,7 @@ def _delete_record(delete_id: str) -> str:
         {
             "id": delete_id,
             "action": "delete",
-            "entity": "demo",
+            "entity": "demo1",
             "kind": "product",
             "slug": "invented-product",
             "status": "pending",
@@ -149,7 +149,7 @@ def _delete_record(delete_id: str) -> str:
 
 def _commit_receipt(vault: Path, proposal_id: str, action_kind: str) -> None:
     receipt = make_action_receipt(proposal_id, "a" * 64, action_kind)
-    relative = receipt_relative_path("demo", proposal_id)
+    relative = receipt_relative_path("demo1", proposal_id)
     stored = vault / relative
     stored.parent.mkdir(mode=0o700, exist_ok=True)
     stored.write_bytes(render_action_receipt(receipt))
@@ -195,7 +195,7 @@ def test_receipt_first_projection_never_opens_any_spent_leaf_shape(
     tmp_path, monkeypatch, shape
 ):
     vault = _two_note_vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     spent = propose_classification(
         scope,
         scope.resolve("00-inbox", "active", "note-a.md"),
@@ -280,7 +280,7 @@ def test_receipt_first_projection_never_opens_any_spent_leaf_shape(
 
 def test_blocked_listing_preserves_spent_rows_pending_record_evidence(tmp_path):
     vault = _two_note_vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     spent = propose_classification(
         scope,
         scope.resolve("00-inbox", "active", "note-a.md"),
@@ -325,7 +325,7 @@ def test_malformed_matching_receipt_is_one_linkless_row_without_proposal_read(
 ):
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
-    relative = receipt_relative_path("demo", prop.id)
+    relative = receipt_relative_path("demo1", prop.id)
     stored = vault / relative
     stored.parent.mkdir(mode=0o700, exist_ok=True)
     stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
@@ -356,7 +356,7 @@ def test_receipt_store_failure_aborts_the_whole_entity_projection(
     tmp_path, monkeypatch
 ):
     vault = _two_note_vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     propose_classification(
         scope,
         scope.resolve("00-inbox", "active", "note-a.md"),
@@ -376,7 +376,7 @@ def test_receipt_store_failure_aborts_the_whole_entity_projection(
 
 def test_malformed_matching_receipt_does_not_disable_a_valid_sibling(tmp_path):
     vault = _two_note_vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     bad = propose_classification(
         scope,
         scope.resolve("00-inbox", "active", "note-a.md"),
@@ -391,7 +391,7 @@ def test_malformed_matching_receipt_does_not_disable_a_valid_sibling(tmp_path):
         sub="reference",
         claimed_block="govern",
     )
-    relative = receipt_relative_path("demo", bad.id)
+    relative = receipt_relative_path("demo1", bad.id)
     stored = vault / relative
     stored.parent.mkdir(mode=0o700, exist_ok=True)
     stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
@@ -418,7 +418,7 @@ def test_malformed_matching_receipt_does_not_disable_a_valid_sibling(tmp_path):
 
 def test_unblocked_listing_renders_all_valid_rows_with_controls(tmp_path):
     vault = _two_note_vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     a = propose_classification(
         scope, scope.resolve("00-inbox", "active", "note-a.md"),
         module="11-knowledge", sub="kb", claimed_block="govern",
@@ -517,7 +517,7 @@ def test_well_formed_delete_proposal_is_skipped_not_blocking(tmp_path):
 
 def test_outbox_of_only_deletes_renders_empty_not_blocked(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     delete_id = "20260815T090703-" + "44" * 16
     _write_record(scope, f"{delete_id}.yaml", _delete_record(delete_id))
 
@@ -554,7 +554,7 @@ def test_projection_never_reenters_strict_loading(tmp_path, monkeypatch):
 
 def test_undiffable_utf8_row_keeps_reject_loses_approve(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
     # Invalid UTF-8 baked in *before* proposing, so the recorded source_sha256
     # matches these exact bytes and approve() reaches the same decode step
@@ -579,7 +579,7 @@ def test_undiffable_utf8_row_keeps_reject_loses_approve(tmp_path):
 @pytest.mark.parametrize("condition", ["missing", "redirected", "non-utf8", "permission"])
 def test_undiffable_row_error_matches_approve_outcome(tmp_path, monkeypatch, condition):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
     if condition == "non-utf8":
         source.write_bytes(
@@ -690,7 +690,7 @@ _PHASE1_RECORDS = {
     "unknown action": "id: {id}\naction: transmute\n",
     "identity failure": "id: not-a-canonical-id\naction: classify\n",
     "malformed required field": (
-        "id: {id}\naction: classify\nentity: demo\nsrc: 1\n"
+        "id: {id}\naction: classify\nentity: demo1\nsrc: 1\n"
         "source_sha256: 2\ndst: 3\nmodule: 4\nsub: 5\nblock: 6\n"
     ),
 }
@@ -817,15 +817,15 @@ def test_the_row_token_is_what_the_action_boundary_will_compare(tmp_path):
 def test_two_proposals_get_distinct_tokens(tmp_path):
     vault = _projection_vault(
         tmp_path,
-        ("demo",),
+        ("demo1",),
         {
-            "demo/00-inbox/active/note-a.md": _note("Alpha receipt body.\n"),
-            "demo/00-inbox/active/note-b.md": _note("Beta receipt body.\n"),
-            "demo/11-knowledge/active/.gitkeep": "",
-            "demo/11-library/active/.gitkeep": "",
+            "demo1/00-inbox/active/note-a.md": _note("Alpha receipt body.\n"),
+            "demo1/00-inbox/active/note-b.md": _note("Beta receipt body.\n"),
+            "demo1/11-knowledge/active/.gitkeep": "",
+            "demo1/11-library/active/.gitkeep": "",
         },
     )
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     for name in ("note-a.md", "note-b.md"):
         propose_classification(
             scope,
@@ -851,7 +851,7 @@ def test_an_unavailable_source_keeps_reject_and_its_proposal_token(tmp_path):
     rejecting it is still a safe, reviewed action."""
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
-    (vault / "demo/00-inbox/active/note.md").unlink()
+    (vault / "demo1/00-inbox/active/note.md").unlink()
 
     row = next(r for r in project_outbox(scope).rows if r.proposal is not None)
 
@@ -863,7 +863,7 @@ def test_an_unavailable_source_keeps_reject_and_its_proposal_token(tmp_path):
 
 def test_an_unreadable_record_exposes_no_token_and_no_controls(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     _write_record(scope, "malformed.yaml", "action: classify\nmodule: [unterminated\n")
 
     listing = project_outbox(scope)
@@ -901,7 +901,7 @@ def test_a_blocked_listing_withholds_every_token_not_just_every_control(tmp_path
         ("clean", lambda vault, scope, prop: None),
         (
             "missing-source",
-            lambda vault, scope, prop: (vault / "demo/00-inbox/active/note.md").unlink(),
+            lambda vault, scope, prop: (vault / "demo1/00-inbox/active/note.md").unlink(),
         ),
         (
             "blocked-sibling",
@@ -1003,7 +1003,7 @@ def test_the_projected_value_and_hash_come_from_one_capture(tmp_path):
             record = yaml.safe_load(original.decode("utf-8"))
             record["module"] = "11-library"
             record["sub"] = "reference"
-            record["dst"] = "demo/11-library/active/note.md"
+            record["dst"] = "demo1/11-library/active/note.md"
             raw = yaml.safe_dump(record, sort_keys=False).encode("utf-8")
             prop.path.write_bytes(raw)
             replaced.append(raw)

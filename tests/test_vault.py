@@ -165,15 +165,15 @@ def test_discovers_every_bundle_from_entities_yaml(make_vault):
               alpha:
                 label: Alpha
                 flags: [special]
-              beta:
+              beta1:
                 label: Beta
                 flags: [other]
             """
         )
     )
     bundles = Vault(EntityCatalog.load(root)).bundles()
-    assert [b.slug for b in bundles] == ["alpha", "beta"]
-    assert {b.slug: b.label for b in bundles} == {"alpha": "Alpha", "beta": "Beta"}
+    assert [b.slug for b in bundles] == ["alpha", "beta1"]
+    assert {b.slug: b.label for b in bundles} == {"alpha": "Alpha", "beta1": "Beta"}
 
 
 def test_vault_rejects_registry_leaf_redirected_outside_system(make_vault, tmp_path):
@@ -253,7 +253,7 @@ def test_module_carries_block_from_registry(make_vault):
         """
         version: "1.0"
         entities:
-          x: { label: X, flags: [special] }
+          xxxxx: { label: X, flags: [special] }
         """
     )
     (bundle,) = Vault(EntityCatalog.load(root)).bundles()
@@ -273,11 +273,11 @@ def test_e4_module_required_by_flags_but_missing_on_disk(make_vault):
         """
         version: "1.0"
         entities:
-          gap: { label: Gap, flags: [special] }
+          gapxx: { label: Gap, flags: [special] }
         """
     )
     # Scaffold everything EXCEPT the gated module -> zz-extra is missing.
-    scaffold_modules(root, "gap", BASE_MODULES)
+    scaffold_modules(root, "gapxx", BASE_MODULES)
     (bundle,) = Vault(EntityCatalog.load(root)).bundles()
     # Still listed (count unchanged), but flagged missing.
     assert len(bundle.modules) == 4

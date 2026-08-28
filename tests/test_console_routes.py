@@ -2115,7 +2115,7 @@ def _outbox_new_path_in_entity(
     assert len(new_paths) == 1, f"expected exactly one new proposal, got {new_paths}"
     (new_path,) = new_paths
     # Compare resolved PATHS, not directory names. A name-only check accepts
-    # `<vault>/beta/alpha/outbox/x.yaml` — a write that escaped the bound
+    # `<vault>/beta1/alpha/outbox/x.yaml` — a write that escaped the bound
     # entity while still having an ancestor *named* `alpha`. That case is
     # currently caught by `git_status_bytes` only because `.gitignore`'s
     # `*/outbox/*.yaml` is single-level, which is luck, not a guarantee.
@@ -2131,14 +2131,14 @@ def test_outbox_new_path_helper_rejects_an_escape_with_a_matching_name(tmp_path)
     that difference — reverting it to the name comparison left every other
     test in this file green.
 
-    `<vault>/beta/alpha/outbox/x.yaml` escapes the bound entity while still
+    `<vault>/beta1/alpha/outbox/x.yaml` escapes the bound entity while still
     having an ancestor *named* `alpha`. The persistence tests happen to catch
     it through `git_status_bytes`, but only because `.gitignore`'s
     `*/outbox/*.yaml` is single-level — luck, not a guarantee, and the helper's
     own contract has to hold on its own.
     """
     inside = tmp_path / "alpha/outbox/ok.yaml"
-    escaped = tmp_path / "beta/alpha/outbox/x.yaml"
+    escaped = tmp_path / "beta1/alpha/outbox/x.yaml"
     for path in (inside, escaped):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x", encoding="utf-8")
@@ -3448,7 +3448,7 @@ def _state_proof_unknown_concurrent_writer(tmp_path, monkeypatch):
     decoy = vault / "alpha/outbox/.consumed/not-this-record.yaml"
     decoy.parent.mkdir()
     decoy.write_bytes(b"decoy\n")
-    other = vault / "beta/outbox/.consumed"
+    other = vault / "beta1/outbox/.consumed"
     other.mkdir(parents=True, exist_ok=True)
     (other / "another-entity.yaml").write_bytes(b"decoy\n")
     try:
@@ -6235,7 +6235,7 @@ def test_check_again_refuses_every_unreviewable_shape_read_only(
         proposal.mkdir()
     else:
         record = yaml.safe_load(outside.read_text(encoding="utf-8"))
-        record["entity"] = "beta-not-bound"
+        record["entity"] = "beta1-not-bound"
         proposal.write_text(
             yaml.safe_dump(record, sort_keys=False), encoding="utf-8"
         )

@@ -21,7 +21,7 @@ import pytest
 
 from tests.conftest import write_vault
 
-ENTITIES = 'version: "1.0"\nentities:\n  demo: {label: Demo, flags: []}\n'
+ENTITIES = 'version: "1.0"\nentities:\n  demo1: {label: Demo, flags: []}\n'
 ARCHETYPES = """
 version: "2.0"
 flags: {}
@@ -47,10 +47,10 @@ def test_destinations_external_symlink_at_module_dir_is_tamper_not_scope(tmp_pat
     vault = _vault(tmp_path)
     outside = tmp_path.parent / "outside_module_target"
     outside.mkdir(exist_ok=True)
-    (vault / "demo").mkdir()
-    (vault / "demo" / "01-core").symlink_to(outside, target_is_directory=True)
+    (vault / "demo1").mkdir()
+    (vault / "demo1" / "01-core").symlink_to(outside, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(RedirectedDestination) as raised:
         _require_real_directory(scope, "01-core")
     assert not isinstance(raised.value, OutOfScopeError)
@@ -63,10 +63,10 @@ def test_destinations_external_symlink_at_inbox_dir_is_tamper_not_scope(tmp_path
     vault = _vault(tmp_path)
     outside = tmp_path.parent / "outside_inbox_target"
     outside.mkdir(exist_ok=True)
-    (vault / "demo").mkdir()
-    (vault / "demo" / "00-inbox").symlink_to(outside, target_is_directory=True)
+    (vault / "demo1").mkdir()
+    (vault / "demo1" / "00-inbox").symlink_to(outside, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(RedirectedDestination) as raised:
         _require_real_directory(scope, "00-inbox")
     assert not isinstance(raised.value, OutOfScopeError)
@@ -80,12 +80,12 @@ def test_destinations_internal_symlink_still_redirected(tmp_path):
     from app.scope import Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo").mkdir()
-    real = vault / "demo" / "01-core-real"
+    (vault / "demo1").mkdir()
+    real = vault / "demo1" / "01-core-real"
     real.mkdir()
-    (vault / "demo" / "01-core").symlink_to(real, target_is_directory=True)
+    (vault / "demo1" / "01-core").symlink_to(real, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(RedirectedDestination):
         _require_real_directory(scope, "01-core")
 
@@ -97,9 +97,9 @@ def test_destinations_missing_directory_still_missing_not_tamper(tmp_path):
     from app.scope import Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo").mkdir()
+    (vault / "demo1").mkdir()
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(MissingDestination):
         _require_real_directory(scope, "01-core")
 
@@ -110,11 +110,11 @@ def test_destinations_ordinary_directory_still_resolves(tmp_path):
     from app.scope import Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo" / "01-core").mkdir(parents=True)
+    (vault / "demo1" / "01-core").mkdir(parents=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     resolved = _require_real_directory(scope, "01-core")
-    assert resolved == (vault / "demo" / "01-core").resolve()
+    assert resolved == (vault / "demo1" / "01-core").resolve()
 
 
 # --- app/inbox.py::_require_real_directory ---------------------------------
@@ -127,10 +127,10 @@ def test_inbox_external_symlink_at_inbox_dir_is_tamper_not_scope(tmp_path):
     vault = _vault(tmp_path)
     outside = tmp_path.parent / "outside_inbox_target_2"
     outside.mkdir(exist_ok=True)
-    (vault / "demo").mkdir()
-    (vault / "demo" / "00-inbox").symlink_to(outside, target_is_directory=True)
+    (vault / "demo1").mkdir()
+    (vault / "demo1" / "00-inbox").symlink_to(outside, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(RedirectedPathError) as raised:
         _require_real_directory(scope, "00-inbox")
     assert not isinstance(raised.value, OutOfScopeError)
@@ -143,12 +143,12 @@ def test_inbox_internal_symlink_still_redirected(tmp_path):
     from app.scope import Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo").mkdir()
-    real = vault / "demo" / "00-inbox-real"
+    (vault / "demo1").mkdir()
+    real = vault / "demo1" / "00-inbox-real"
     real.mkdir()
-    (vault / "demo" / "00-inbox").symlink_to(real, target_is_directory=True)
+    (vault / "demo1" / "00-inbox").symlink_to(real, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(Exception) as raised:
         _require_real_directory(scope, "00-inbox")
     from app.scope import RedirectedPathError
@@ -163,9 +163,9 @@ def test_inbox_absent_directory_returns_none_not_tamper(tmp_path):
     from app.scope import Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo").mkdir()
+    (vault / "demo1").mkdir()
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     assert _require_real_directory(scope, "00-inbox") is None
 
 
@@ -174,11 +174,11 @@ def test_inbox_ordinary_directory_still_resolves(tmp_path):
     from app.scope import Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo" / "00-inbox").mkdir(parents=True)
+    (vault / "demo1" / "00-inbox").mkdir(parents=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     resolved = _require_real_directory(scope, "00-inbox")
-    assert resolved == vault / "demo" / "00-inbox"
+    assert resolved == vault / "demo1" / "00-inbox"
 
 
 # --- end-to-end: resolve_classification_destination / read_inbox ----------
@@ -195,14 +195,14 @@ def test_resolve_classification_destination_reports_tamper_for_external_symlink(
     vault = _vault(tmp_path)
     outside = tmp_path.parent / "outside_module_target_e2e"
     outside.mkdir(exist_ok=True)
-    (vault / "demo" / "00-inbox" / "active").mkdir(parents=True)
-    (vault / "demo" / "00-inbox" / "active" / "note.md").write_text(
+    (vault / "demo1" / "00-inbox" / "active").mkdir(parents=True)
+    (vault / "demo1" / "00-inbox" / "active" / "note.md").write_text(
         "body\n", encoding="utf-8"
     )
-    (vault / "demo" / "01-core").symlink_to(outside, target_is_directory=True)
+    (vault / "demo1" / "01-core").symlink_to(outside, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
-    item_path = vault / "demo" / "00-inbox" / "active" / "note.md"
+    scope = Scope(vault, "demo1")
+    item_path = vault / "demo1" / "00-inbox" / "active" / "note.md"
 
     with pytest.raises(RedirectedDestination) as raised:
         resolve_classification_destination(
@@ -239,15 +239,15 @@ def test_destinations_external_symlink_at_destination_leaf_is_tamper_not_scope(
     vault = _vault(tmp_path)
     outside = tmp_path.parent / "outside_destination_leaf_target"
     outside.write_text("hostile\n", encoding="utf-8")
-    (vault / "demo" / "00-inbox" / "active").mkdir(parents=True)
-    (vault / "demo" / "00-inbox" / "active" / "note.md").write_text(
+    (vault / "demo1" / "00-inbox" / "active").mkdir(parents=True)
+    (vault / "demo1" / "00-inbox" / "active" / "note.md").write_text(
         "body\n", encoding="utf-8"
     )
-    (vault / "demo" / "01-core" / "active").mkdir(parents=True)
-    (vault / "demo" / "01-core" / "active" / "note.md").symlink_to(outside)
+    (vault / "demo1" / "01-core" / "active").mkdir(parents=True)
+    (vault / "demo1" / "01-core" / "active" / "note.md").symlink_to(outside)
 
-    scope = Scope(vault, "demo")
-    item_path = vault / "demo" / "00-inbox" / "active" / "note.md"
+    scope = Scope(vault, "demo1")
+    item_path = vault / "demo1" / "00-inbox" / "active" / "note.md"
 
     with pytest.raises(RedirectedDestination) as raised:
         resolve_classification_destination(
@@ -269,10 +269,10 @@ def test_outbox_external_symlink_at_outbox_dir_is_tamper_not_scope(tmp_path):
     vault = _vault(tmp_path)
     outside = tmp_path.parent / "outside_outbox_target"
     outside.mkdir(exist_ok=True)
-    (vault / "demo").mkdir()
-    (vault / "demo" / "outbox").symlink_to(outside, target_is_directory=True)
+    (vault / "demo1").mkdir()
+    (vault / "demo1" / "outbox").symlink_to(outside, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(RedirectedPathError) as raised:
         load_proposals(scope)
     assert not isinstance(raised.value, OutOfScopeError)
@@ -285,12 +285,12 @@ def test_outbox_internal_symlink_at_outbox_dir_still_redirected(tmp_path):
     from app.scope import RedirectedPathError, Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo").mkdir()
-    real = vault / "demo" / "outbox-real"
+    (vault / "demo1").mkdir()
+    real = vault / "demo1" / "outbox-real"
     real.mkdir()
-    (vault / "demo" / "outbox").symlink_to(real, target_is_directory=True)
+    (vault / "demo1" / "outbox").symlink_to(real, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     with pytest.raises(RedirectedPathError):
         load_proposals(scope)
 
@@ -307,10 +307,10 @@ def test_registry_external_symlink_at_outbox_dir_is_tamper_not_scope(tmp_path):
     vault = _vault(tmp_path)
     outside = tmp_path.parent / "outside_registry_outbox_target"
     outside.mkdir(exist_ok=True)
-    (vault / "demo").mkdir()
-    (vault / "demo" / "outbox").symlink_to(outside, target_is_directory=True)
+    (vault / "demo1").mkdir()
+    (vault / "demo1" / "outbox").symlink_to(outside, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal_id = "20260815T090703-" + "ab" * 16
     with pytest.raises(RedirectedPathError) as raised:
         get_delete_proposal(scope, proposal_id)
@@ -324,12 +324,12 @@ def test_registry_internal_symlink_at_outbox_dir_still_redirected(tmp_path):
     from app.scope import RedirectedPathError, Scope
 
     vault = _vault(tmp_path)
-    (vault / "demo").mkdir()
-    real = vault / "demo" / "outbox-real"
+    (vault / "demo1").mkdir()
+    real = vault / "demo1" / "outbox-real"
     real.mkdir()
-    (vault / "demo" / "outbox").symlink_to(real, target_is_directory=True)
+    (vault / "demo1" / "outbox").symlink_to(real, target_is_directory=True)
 
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal_id = "20260815T090703-" + "cd" * 16
     with pytest.raises(RedirectedPathError):
         get_delete_proposal(scope, proposal_id)

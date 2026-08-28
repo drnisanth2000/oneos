@@ -164,12 +164,12 @@ def _assert_unrelated_git_dirt(
 
 def _vault(tmp_path):
     files = {
-        "demo/00-inbox/active/note.md": textwrap.dedent(
+        "demo1/00-inbox/active/note.md": textwrap.dedent(
             """\
             ---
             type: inbox-item
             title: Clinical study protocol
-            entity: demo
+            entity: demo1
             product: null
             status: active
             created: 2026-01-01
@@ -180,14 +180,14 @@ def _vault(tmp_path):
             Randomised trial protocol body.
             """
         ),
-        "demo/11-knowledge/active/.gitkeep": "",
-        "demo/11-library/active/.gitkeep": "",
+        "demo1/11-knowledge/active/.gitkeep": "",
+        "demo1/11-library/active/.gitkeep": "",
     }
-    return _outbox_vault(tmp_path, ("demo",), files)
+    return _outbox_vault(tmp_path, ("demo1",), files)
 
 
 def _propose(vault):
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     src = scope.resolve("00-inbox", "active", "note.md")
     return scope, propose_classification(
         scope, src, module="11-knowledge", sub="kb", claimed_block="govern",
@@ -213,27 +213,27 @@ def two_entity_vault(tmp_path):
             alpha-source-marker
             """
         ),
-        "beta/00-inbox/active/beta.md": textwrap.dedent(
+        "beta1/00-inbox/active/beta1.md": textwrap.dedent(
             """\
             ---
             type: inbox-item
             title: Beta note
-            entity: beta
+            entity: beta1
             status: active
             created: 2026-01-01
             updated: 2026-01-01
             sub: triage
             source: folder
             ---
-            beta-source-marker
+            beta1-source-marker
             """
         ),
         "alpha/11-knowledge/active/.gitkeep": "",
-        "beta/11-knowledge/active/.gitkeep": "",
+        "beta1/11-knowledge/active/.gitkeep": "",
         "alpha/11-library/active/.gitkeep": "",
-        "beta/11-library/active/.gitkeep": "",
+        "beta1/11-library/active/.gitkeep": "",
     }
-    return _outbox_vault(tmp_path, ("alpha", "beta"), files)
+    return _outbox_vault(tmp_path, ("alpha", "beta1"), files)
 
 
 _MISSING = object()
@@ -258,16 +258,16 @@ def _canonical_alpha_record(scope: Scope) -> dict:
 
 
 def _forged_beta_record(scope: Scope) -> dict:
-    source = scope.root / "beta/00-inbox/active/beta.md"
+    source = scope.root / "beta1/00-inbox/active/beta1.md"
     return {
         "id": "20260815T090703-" + "22" * 16,
         "action": "classify",
-        "entity": "beta",
+        "entity": "beta1",
         "created": "2026-01-02T03:04:05",
         "status": "pending",
-        "src": "beta/00-inbox/active/beta.md",
+        "src": "beta1/00-inbox/active/beta1.md",
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-        "dst": "beta/11-knowledge/active/beta.md",
+        "dst": "beta1/11-knowledge/active/beta1.md",
         "module": "11-knowledge",
         "sub": "kb",
         "block": "govern",
@@ -325,7 +325,7 @@ def test_same_second_classification_proposals_are_distinct_and_preserved(
     tmp_path, monkeypatch
 ):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
     monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
     suffixes = iter(("11" * 16, "22" * 16))
@@ -349,7 +349,7 @@ def test_same_second_classification_proposals_are_distinct_and_preserved(
 
 def test_proposal_hash_is_sha256_of_exact_receipt_bytes(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
     exact = source.read_bytes()
 
@@ -366,7 +366,7 @@ def test_snapshot_rejects_receipt_leaf_swapped_to_in_scope_symlink(
     tmp_path, monkeypatch
 ):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
     redirected = scope.resolve("redirected-receipt.md")
     redirected.write_bytes(b"redirected receipt bytes\n")
@@ -410,15 +410,15 @@ def test_propose_writes_proposal_and_moves_nothing(tmp_path):
     assert scope.resolve("00-inbox", "active", "note.md").exists()
     assert not scope.resolve("11-knowledge", "active", "note.md").exists()
 
-    assert prop.src == "demo/00-inbox/active/note.md"
-    assert prop.dst == "demo/11-knowledge/active/note.md"
+    assert prop.src == "demo1/00-inbox/active/note.md"
+    assert prop.dst == "demo1/11-knowledge/active/note.md"
     assert prop.sub == "kb" and prop.module == "11-knowledge"
     assert prop.status == "pending"
 
 
 def test_proposal_derives_block_and_canonical_destination(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
 
     prop = propose_classification(
@@ -426,11 +426,11 @@ def test_proposal_derives_block_and_canonical_destination(tmp_path):
     )
 
     record = yaml.safe_load(prop.path.read_text(encoding="utf-8"))
-    assert record["entity"] == "demo"
+    assert record["entity"] == "demo1"
     assert record["module"] == "11-library"
     assert record["sub"] == "reference"
     assert record["block"] == "govern"
-    assert record["dst"] == "demo/11-library/active/note.md"
+    assert record["dst"] == "demo1/11-library/active/note.md"
 
 
 def test_proposal_interface_has_no_entity_or_trusted_block_authority():
@@ -444,7 +444,7 @@ def test_proposal_creation_is_exclusive_and_preserves_existing_record(
     tmp_path, monkeypatch
 ):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
     monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
     monkeypatch.setattr(
@@ -481,10 +481,10 @@ def test_proposal_creation_rejects_same_entity_outbox_directory_redirect(
     tmp_path,
 ):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     redirected = scope.resolve("redirected-outbox")
     redirected.mkdir()
-    lexical_outbox = vault / "demo/outbox"
+    lexical_outbox = vault / "demo1/outbox"
     lexical_outbox.symlink_to(redirected, target_is_directory=True)
     before_head = git_head(vault)
     before_paths = git_tracked_paths(vault)
@@ -507,14 +507,14 @@ def test_proposal_creation_rejects_same_entity_leaf_symlink_without_write(
     tmp_path, monkeypatch
 ):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     monkeypatch.setattr(outbox, "datetime", _FixedDatetime)
     monkeypatch.setattr(
         proposal_identity.secrets, "token_hex", lambda size: "11" * 16
     )
-    outbox_dir = vault / "demo/outbox"
+    outbox_dir = vault / "demo1/outbox"
     outbox_dir.mkdir()
-    protected = vault / "demo/.sensitive/protected.yaml"
+    protected = vault / "demo1/.sensitive/protected.yaml"
     protected.parent.mkdir()
     protected.write_text("protected-marker\n", encoding="utf-8")
     proposal = outbox_dir / ("20260102T030405-" + "11" * 16 + ".yaml")
@@ -550,12 +550,12 @@ def test_invalid_classification_leaves_vault_and_outbox_unchanged(
     tmp_path, module, sub, claimed_block, item
 ):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     source = scope.resolve("00-inbox", "active", "note.md")
     item_path = source if item == "canonical" else scope.resolve(
         "11-knowledge", "active", "note.md"
     )
-    attempted_destination = vault / "demo" / module / "active" / source.name
+    attempted_destination = vault / "demo1" / module / "active" / source.name
     before_head = git_head(vault)
     before_paths = git_tracked_paths(vault)
     before_tree = _vault_tree(vault)
@@ -584,7 +584,7 @@ def test_module_general_approval_removes_triage_sub_in_one_revertible_commit(
     import subprocess
 
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     prop = propose_classification(
         scope,
         scope.resolve("00-inbox", "active", "note.md"),
@@ -727,8 +727,8 @@ def test_loading_rejects_same_entity_outbox_directory_redirect_without_read(
 ):
     vault = _vault(tmp_path)
     scope, proposal = _propose(vault)
-    lexical_outbox = vault / "demo/outbox"
-    redirected = vault / "demo/redirected-outbox"
+    lexical_outbox = vault / "demo1/outbox"
+    redirected = vault / "demo1/redirected-outbox"
     lexical_outbox.rename(redirected)
     lexical_outbox.symlink_to(redirected, target_is_directory=True)
     proposal_target = redirected / proposal.path.name
@@ -788,7 +788,7 @@ def test_loading_classifications_skips_valid_registry_delete_record(tmp_path):
             {
                 "id": delete_id,
                 "action": "delete",
-                "entity": "demo",
+                "entity": "demo1",
                 "kind": "product",
                 "slug": "invented-product",
                 "status": "pending",
@@ -803,14 +803,14 @@ def test_loading_classifications_skips_valid_registry_delete_record(tmp_path):
 
 def test_loading_rejects_unknown_proposal_action(tmp_path):
     vault = _vault(tmp_path)
-    scope = Scope(vault, "demo")
+    scope = Scope(vault, "demo1")
     proposal_id = "20260815T090703-" + "33" * 16
     record = {
         "id": proposal_id,
         "action": "publish",
-        "entity": "demo",
-        "src": "demo/00-inbox/active/note.md",
-        "dst": "demo/11-knowledge/active/note.md",
+        "entity": "demo1",
+        "src": "demo1/00-inbox/active/note.md",
+        "dst": "demo1/11-knowledge/active/note.md",
         "module": "11-knowledge",
         "sub": "kb",
         "block": "govern",
@@ -1034,7 +1034,7 @@ def test_approval_with_unrelated_staged_unstaged_and_untracked_work_commits_only
 
     approve(scope, prop.id, _fp(scope, prop.id))
 
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     assert git_changed_paths(vault) == sorted(
         [prop.src, prop.dst, receipt_path]
     )
@@ -1338,8 +1338,8 @@ def test_approval_never_scaffolds_destination_parent_after_validation(
 
     def change_parent_after_lookup(bound_scope, proposal_id):
         review = real_get(bound_scope, proposal_id)
-        active = vault / "demo/11-knowledge/active"
-        saved = vault / "demo/11-knowledge/saved-active"
+        active = vault / "demo1/11-knowledge/active"
+        saved = vault / "demo1/11-knowledge/saved-active"
         active.rename(saved)
         if shape == "redirected":
             active.symlink_to(saved, target_is_directory=True)
@@ -1366,10 +1366,10 @@ def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
         {
             "id": proposal_id,
             "action": "classify",
-            "entity": "beta",
-            "src": "beta/00-inbox/active/note.md",
+            "entity": "beta1",
+            "src": "beta1/00-inbox/active/note.md",
             "source_sha256": hashlib.sha256(source).hexdigest(),
-            "dst": "beta/11-knowledge/active/note.md",
+            "dst": "beta1/11-knowledge/active/note.md",
             "module": "11-knowledge",
             "sub": "kb",
             "block": "govern",
@@ -1377,21 +1377,21 @@ def test_proposal_discovery_rejects_cross_scope_leaf_symlink(tmp_path):
     )
     vault = _outbox_vault(
         tmp_path,
-        ("alpha", "beta"),
+        ("alpha", "beta1"),
         {
             "alpha/00-inbox/active/.gitkeep": "",
-            "beta/00-inbox/active/.gitkeep": "",
-            "beta/00-inbox/active/note.md": source.decode("utf-8"),
+            "beta1/00-inbox/active/.gitkeep": "",
+            "beta1/00-inbox/active/note.md": source.decode("utf-8"),
             "alpha/11-knowledge/active/.gitkeep": "",
-            "beta/11-knowledge/active/.gitkeep": "",
+            "beta1/11-knowledge/active/.gitkeep": "",
             "alpha/11-library/active/.gitkeep": "",
-            "beta/11-library/active/.gitkeep": "",
+            "beta1/11-library/active/.gitkeep": "",
             "alpha/outbox/.gitkeep": "",
-            f"beta/outbox/{proposal_id}.yaml": record,
+            f"beta1/outbox/{proposal_id}.yaml": record,
         },
     )
     (vault / "alpha/outbox/linked.yaml").symlink_to(
-        vault / "beta/outbox" / f"{proposal_id}.yaml"
+        vault / "beta1/outbox" / f"{proposal_id}.yaml"
     )
 
     with pytest.raises(CrossScopeError):
@@ -1404,7 +1404,7 @@ def test_loading_mismatched_proposal_fails_before_other_entity_source_read(
     scope = Scope(two_entity_vault, "alpha")
     record = _forged_beta_record(scope)
     _write_record(scope, f"{record['id']}.yaml", yaml.safe_dump(record))
-    beta_source = two_entity_vault / "beta/00-inbox/active/beta.md"
+    beta_source = two_entity_vault / "beta1/00-inbox/active/beta1.md"
     real_read = Path.read_text
 
     def guarded(path, *args, **kwargs):
@@ -1436,8 +1436,8 @@ def test_public_routes_remain_single_proposal_actions():
 
 def test_propose_rejects_item_path_from_another_entity(two_entity_vault):
     alpha = Scope(two_entity_vault, "alpha")
-    beta_item = two_entity_vault / "beta/00-inbox/active/beta.md"
-    attempted_destination = alpha.resolve("11-knowledge", "active", "beta.md")
+    beta_item = two_entity_vault / "beta1/00-inbox/active/beta1.md"
+    attempted_destination = alpha.resolve("11-knowledge", "active", "beta1.md")
     before_head = git_head(two_entity_vault)
     before_paths = git_tracked_paths(two_entity_vault)
     before_tree = _vault_tree(two_entity_vault)
@@ -1470,10 +1470,10 @@ def test_preview_diff_rejects_proposal_bound_to_another_entity(two_entity_vault)
         id=record["id"],
         path=record_path,
         action="classify",
-        entity="beta",
-        src="beta/00-inbox/active/beta.md",
+        entity="beta1",
+        src="beta1/00-inbox/active/beta1.md",
         source_sha256=record["source_sha256"],
-        dst="beta/11-knowledge/active/beta.md",
+        dst="beta1/11-knowledge/active/beta1.md",
         module="11-knowledge",
         sub="kb",
         block="govern",
@@ -1481,7 +1481,7 @@ def test_preview_diff_rejects_proposal_bound_to_another_entity(two_entity_vault)
         created="",
     )
     record_before = record_path.read_bytes()
-    source = two_entity_vault / "beta/00-inbox/active/beta.md"
+    source = two_entity_vault / "beta1/00-inbox/active/beta1.md"
     source_before = source.read_bytes()
 
     with pytest.raises(outbox.OutboxScopeError):
@@ -1496,19 +1496,19 @@ def test_mutation_rejects_foreign_record_and_leaves_both_entities_unchanged(
     two_entity_vault, operation
 ):
     alpha = Scope(two_entity_vault, "alpha")
-    beta = Scope(two_entity_vault, "beta")
+    beta1 = Scope(two_entity_vault, "beta1")
     record = _forged_beta_record(alpha)
     alpha_record = _write_record(
         alpha, f"{record['id']}.yaml", yaml.safe_dump(record)
     )
     beta_record = _write_record(
-        beta, f"{record['id']}.yaml", yaml.safe_dump(record)
+        beta1, f"{record['id']}.yaml", yaml.safe_dump(record)
     )
     watched = (
         alpha_record,
         beta_record,
         two_entity_vault / "alpha/00-inbox/active/alpha.md",
-        two_entity_vault / "beta/00-inbox/active/beta.md",
+        two_entity_vault / "beta1/00-inbox/active/beta1.md",
     )
     before = {path: path.read_bytes() for path in watched}
 
@@ -1518,15 +1518,15 @@ def test_mutation_rejects_foreign_record_and_leaves_both_entities_unchanged(
         operation(alpha, record["id"], "0" * 64)
 
     assert {path: path.read_bytes() for path in watched} == before
-    assert not (two_entity_vault / "alpha/11-knowledge/active/beta.md").exists()
-    assert not (two_entity_vault / "beta/11-knowledge/active/beta.md").exists()
+    assert not (two_entity_vault / "alpha/11-knowledge/active/beta1.md").exists()
+    assert not (two_entity_vault / "beta1/11-knowledge/active/beta1.md").exists()
 
 
 @pytest.mark.parametrize(
     ("field", "foreign_value"),
     [
-        ("src", "beta/00-inbox/active/beta.md"),
-        ("dst", "beta/11-knowledge/active/beta.md"),
+        ("src", "beta1/00-inbox/active/beta1.md"),
+        ("dst", "beta1/11-knowledge/active/beta1.md"),
     ],
 )
 def test_loading_wraps_foreign_stored_path_as_destination_error(
@@ -1558,7 +1558,7 @@ def test_loading_wraps_destination_registry_error(two_entity_vault):
 
 def test_concurrent_proposals_are_written_only_to_the_bound_entity(two_entity_vault):
     alpha = Scope(two_entity_vault, "alpha")
-    beta = Scope(two_entity_vault, "beta")
+    beta1 = Scope(two_entity_vault, "beta1")
     barrier = threading.Barrier(2)
     real_propose = propose_classification
 
@@ -1577,15 +1577,15 @@ def test_concurrent_proposals_are_written_only_to_the_bound_entity(two_entity_va
             overlapped, alpha, two_entity_vault / "alpha/00-inbox/active/alpha.md"
         )
         beta_future = pool.submit(
-            overlapped, beta, two_entity_vault / "beta/00-inbox/active/beta.md"
+            overlapped, beta1, two_entity_vault / "beta1/00-inbox/active/beta1.md"
         )
     alpha_future.result()
     beta_future.result()
 
     assert list((two_entity_vault / "alpha/outbox").glob("*.yaml"))
-    assert list((two_entity_vault / "beta/outbox").glob("*.yaml"))
-    assert not list((two_entity_vault / "alpha/outbox").glob("*beta*.yaml"))
-    assert not list((two_entity_vault / "beta/outbox").glob("*alpha*.yaml"))
+    assert list((two_entity_vault / "beta1/outbox").glob("*.yaml"))
+    assert not list((two_entity_vault / "alpha/outbox").glob("*beta1*.yaml"))
+    assert not list((two_entity_vault / "beta1/outbox").glob("*alpha*.yaml"))
 
 
 # --- S7 Task 2: one byte snapshot behind every classification review --------
@@ -1653,7 +1653,7 @@ def test_review_value_and_hash_come_from_one_capture_not_a_second_read(tmp_path)
                 prop.path,
                 module="11-library",
                 sub="reference",
-                dst="demo/11-library/active/note.md",
+                dst="demo1/11-library/active/note.md",
             )
         return state
 
@@ -1775,12 +1775,12 @@ def test_review_refuses_a_redirected_proposal_leaf(tmp_path):
 
 
 def test_review_refuses_a_cross_scope_proposal(two_entity_vault):
-    """An alpha-entity record sitting in beta's outbox: the filename and id
+    """An alpha-entity record sitting in beta1's outbox: the filename and id
     are canonical, so only the scope check refuses it."""
     get_proposal_review = _review_imports()
     vault = two_entity_vault
     alpha_scope = Scope(vault, "alpha")
-    beta_scope = Scope(vault, "beta")
+    beta_scope = Scope(vault, "beta1")
     record = _canonical_alpha_record(alpha_scope)
     path = _write_record(
         beta_scope, f"{record['id']}.yaml", yaml.safe_dump(record, sort_keys=False)
@@ -1825,8 +1825,8 @@ def test_pending_presence_never_uses_a_swapped_outbox_target(
         "positive control: the real pending leaf was not observed"
     )
 
-    lexical = tmp_path / "demo/outbox"
-    held = tmp_path / "demo/outbox-held"
+    lexical = tmp_path / "demo1/outbox"
+    held = tmp_path / "demo1/outbox-held"
     outside = tmp_path / "outside-outbox"
     outside.mkdir()
     (outside / prop.path.name).write_bytes(b"outside-metadata-marker")
@@ -1877,12 +1877,12 @@ def test_pending_presence_cleanup_failure_never_overrides_receipt_evidence(
 
 def _two_note_review_vault(tmp_path):
     files = {
-        "demo/00-inbox/active/note.md": textwrap.dedent(
+        "demo1/00-inbox/active/note.md": textwrap.dedent(
             """\
             ---
             type: inbox-item
             title: Clinical study protocol
-            entity: demo
+            entity: demo1
             product: null
             status: active
             created: 2026-01-01
@@ -1893,12 +1893,12 @@ def _two_note_review_vault(tmp_path):
             Randomised trial protocol body.
             """
         ),
-        "demo/00-inbox/active/other.md": textwrap.dedent(
+        "demo1/00-inbox/active/other.md": textwrap.dedent(
             """\
             ---
             type: inbox-item
             title: Second protocol
-            entity: demo
+            entity: demo1
             product: null
             status: active
             created: 2026-01-01
@@ -1909,11 +1909,11 @@ def _two_note_review_vault(tmp_path):
             Second protocol body.
             """
         ),
-        "demo/11-knowledge/active/.gitkeep": "",
-        "demo/11-library/active/.gitkeep": "",
+        "demo1/11-knowledge/active/.gitkeep": "",
+        "demo1/11-library/active/.gitkeep": "",
     }
-    vault = _outbox_vault(tmp_path, ("demo",), files)
-    scope = Scope(vault, "demo")
+    vault = _outbox_vault(tmp_path, ("demo1",), files)
+    scope = Scope(vault, "demo1")
     target = propose_classification(
         scope, scope.resolve("00-inbox", "active", "note.md"),
         module="11-knowledge", sub="kb", claimed_block="govern",
@@ -1937,7 +1937,7 @@ def test_review_refuses_when_a_sibling_destination_is_non_canonical(tmp_path):
     _vault_root, scope, target, sibling = _two_note_review_vault(tmp_path)
 
     record = yaml.safe_load(sibling.path.read_text(encoding="utf-8"))
-    record["dst"] = "demo/11-library/active/other.md"   # module says knowledge
+    record["dst"] = "demo1/11-library/active/other.md"   # module says knowledge
     sibling.path.write_text(yaml.safe_dump(record, sort_keys=False), encoding="utf-8")
 
     # The strict loader refuses ...
@@ -1965,7 +1965,7 @@ def test_the_strict_scan_never_follows_a_leaf_swapped_after_its_lexical_check(
     planted = yaml.safe_load(target.path.read_text(encoding="utf-8"))
     planted["module"] = "11-library"
     planted["sub"] = "reference"
-    planted["dst"] = "demo/11-library/active/note.md"
+    planted["dst"] = "demo1/11-library/active/note.md"
     outside.write_text(yaml.safe_dump(planted, sort_keys=False), encoding="utf-8")
 
     original_bytes = target.path.read_bytes()
@@ -2045,7 +2045,7 @@ def _rewrite_same_id_meaningfully(prop: Proposal) -> bytes:
         prop.path,
         module="11-library",
         sub="reference",
-        dst="demo/11-library/active/note.md",
+        dst="demo1/11-library/active/note.md",
     )
 
 
@@ -2117,7 +2117,7 @@ def test_approve_commits_the_exact_review_receipt_with_the_action(tmp_path):
 
     approved = approve(scope, prop.id, review.sha256)
 
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     assert git_changed_paths(vault) == sorted(
         (approved.src, approved.dst, receipt_path)
     )
@@ -2136,7 +2136,7 @@ def test_classification_action_refuses_a_receipt_committed_before_the_lock(
     scope, prop = _propose(vault)
     review = _review_of(scope, prop)
     receipt = make_action_receipt(prop.id, "0" * 64, "approval")
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     stored = vault / receipt_path
     stored.parent.mkdir(mode=0o700)
     stored.write_bytes(render_action_receipt(receipt))
@@ -2164,7 +2164,7 @@ def test_classification_action_rechecks_receipts_under_its_lock(
     scope, prop = _propose(vault)
     review = _review_of(scope, prop)
     receipt = make_action_receipt(prop.id, review.sha256, "approval")
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     real_lookup = outbox._head_action_receipt
     lookups = []
 
@@ -2196,7 +2196,7 @@ def test_classification_action_fails_closed_on_a_malformed_matching_receipt(
     vault = _vault(tmp_path)
     scope, prop = _propose(vault)
     review = _review_of(scope, prop)
-    receipt_path = receipt_relative_path("demo", prop.id)
+    receipt_path = receipt_relative_path("demo1", prop.id)
     stored = vault / receipt_path
     stored.parent.mkdir(mode=0o700)
     stored.write_bytes(b"version: 1\nproposal_id: wrong\n")
@@ -2310,7 +2310,7 @@ def test_a_replacement_between_the_comparison_and_the_mutation_refuses(
     # `.git/oneos-approval.lock` is the transaction's own lock file, created
     # by taking the lock and not vault content.
     ignored = {proposal_rel, ".git/oneos-approval.lock",
-               "demo/outbox/.consumed"}
+               "demo1/outbox/.consumed"}
 
     def _comparable(tree):
         return tuple(entry for entry in tree if entry[0] not in ignored)
@@ -2504,7 +2504,7 @@ def test_action_refuses_a_replacement_swapped_after_the_internal_state_capture(
         real_move(from_fd, from_name, to_fd, to_name)
         if not swapped and from_name == leaf_name:
             swapped.append(True)
-            next((vault / "demo/outbox" / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(
+            next((vault / "demo1/outbox" / gt.QUARANTINE_DIRECTORY).iterdir()).write_bytes(
                 replacement
             )
         return None
@@ -2827,8 +2827,8 @@ def test_approve_parses_the_bytes_it_compared_not_a_fresh_read(tmp_path):
     reviewed_bytes = prop.path.read_bytes()
 
     reviewed_dst = vault / prop.dst
-    hostile_dst = vault / "demo/11-library/active/note.md"
-    assert prop.dst != "demo/11-library/active/note.md"
+    hostile_dst = vault / "demo1/11-library/active/note.md"
+    assert prop.dst != "demo1/11-library/active/note.md"
 
     real_match = outbox.require_review_match
     real_parse = outbox._parse_record_bytes
@@ -2932,7 +2932,7 @@ def test_an_unmovable_record_is_a_refusal_not_an_unhandled_error(tmp_path, actio
     if action == "approve":
         assert after["head"] != before["head"]
         assert after["index"] == before["index"]
-        receipt_path = receipt_relative_path("demo", prop.id)
+        receipt_path = receipt_relative_path("demo1", prop.id)
         assert receipt_path in git_changed_paths(vault)
         assert after["worktree"] == before["worktree"]
         assert not (vault / prop.src).exists()
@@ -2977,7 +2977,7 @@ def test_reject_refuses_every_post_move_quarantine_condition(tmp_path, condition
         if outcome != 0 or fired:
             return outcome
         fired.append(True)
-        landed = next((vault / "demo/outbox" / gt.QUARANTINE_DIRECTORY).iterdir())
+        landed = next((vault / "demo1/outbox" / gt.QUARANTINE_DIRECTORY).iterdir())
         if condition == "replaced":
             other = landed.with_name(landed.name + ".other")
             other.write_bytes(decoy)

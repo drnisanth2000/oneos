@@ -542,10 +542,10 @@ def test_process_drop_interface_accepts_only_bound_scope_identity():
 def test_bound_scope_alone_selects_receipt_entity(tmp_path):
     vault = git_entity_vault(
         tmp_path / "vault",
-        ("alpha", "beta"),
+        ("alpha", "beta1"),
         {
             "alpha/00-inbox/active/.gitkeep": "",
-            "beta/00-inbox/active/.gitkeep": "",
+            "beta1/00-inbox/active/.gitkeep": "",
         },
     )
     source = tmp_path / "drop/item.txt"
@@ -555,7 +555,7 @@ def test_bound_scope_alone_selects_receipt_entity(tmp_path):
     result = process_drop(Scope(vault, "alpha"), source, raw_archive=tmp_path / "raw")
 
     assert result.path.is_relative_to(vault / "alpha/00-inbox/active")
-    assert not list((vault / "beta/00-inbox/active").glob("*.md"))
+    assert not list((vault / "beta1/00-inbox/active").glob("*.md"))
 
 
 def test_unknown_folder_entity_is_rejected_before_source_move(tmp_path):
