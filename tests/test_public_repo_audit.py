@@ -286,7 +286,9 @@ def test_long_term_uses_identifier_boundaries(tmp_path: Path):
     assert audit_repository(repo, vault, False) == []
 
 
-def test_short_term_matches_only_component_or_structured_identifier(tmp_path: Path):
+def test_short_term_matches_components_structured_values_and_markdown_tokens(
+    tmp_path: Path,
+):
     vault = synthetic_vault(tmp_path / "vault", entity="abc")
     component = git_repo(tmp_path / "component", {"abc/note.md": "clean\n"})
     structured = git_repo(
@@ -301,8 +303,35 @@ def test_short_term_matches_only_component_or_structured_identifier(tmp_path: Pa
     assert categories(structured, vault) == ["instance-value"]
     assert categories(yaml_mapping, vault) == ["instance-value"]
     assert categories(json_object, vault) == ["instance-value"]
-    assert categories(prose, vault) == []
+    assert categories(prose, vault) == ["instance-value"]
     assert categories(substring, vault) == []
+
+
+def test_short_markdown_term_is_found_after_removal_from_head(tmp_path: Path):
+    vault = synthetic_vault(tmp_path / "vault", entity="q7x")
+    repo = git_repo(tmp_path / "repo", {"note.md": "public words only\n"})
+    commit(repo, {"note.md": "the q7x pattern\n"}, "add exact synthetic term")
+    commit(repo, {"note.md": "public words only\n"}, "remove exact synthetic term")
+
+    assert categories(repo, vault, history=False) == []
+    assert categories(repo, vault, history=True) == ["instance-value"]
+
+
+def test_short_markdown_finding_never_echoes_term_or_line(tmp_path: Path):
+    vault = synthetic_vault(tmp_path / "vault", entity="q7x")
+    repo = git_repo(tmp_path / "repo", {"docs/note.md": "before q7x after\n"})
+    source_registry = vault / "_system" / "entities.yaml"
+
+    findings = audit_repository(repo, vault=vault, include_history=False)
+
+    assert len(findings) == 1
+    assert findings[0].category == "instance-value"
+    assert findings[0].location.endswith(":docs/note.md:1")
+    assert "q7x" not in repr(findings)
+    assert "before" not in repr(findings)
+    assert "after" not in repr(findings)
+    assert str(source_registry) not in repr(findings)
+    assert str(vault) not in repr(findings)
 
 
 def test_short_term_is_ignored_in_unapproved_structured_field(tmp_path: Path):
