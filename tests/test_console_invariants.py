@@ -1891,6 +1891,256 @@ def _registered_console_endpoints(app):
         yield endpoint
 
 
+def _expected_route_services(main):
+    return {
+        main.shell: (main.Vault.bundles,),
+        main.pulse: (),
+        main.triage_default: (main.Vault.bundles,),
+        main.triage: (
+            main.read_inbox,
+            main.resolve_classification_destination,
+            main.Vault.bundles,
+        ),
+        main.propose: (main.propose_classification, main.preview_diff),
+        main.outbox_screen: (main.project_outbox, main.Vault.bundles),
+        main.outbox_approve: (
+            main.approve,
+            main.project_outbox,
+            main.resolve_head_receipt,
+            main.pending_proposal_entry_exists,
+        ),
+        main.outbox_reject: (
+            main.reject,
+            main.project_outbox,
+            main.resolve_head_receipt,
+            main.pending_proposal_entry_exists,
+        ),
+        main.outbox_review_fragment: (main.project_outbox,),
+        main.registry_products: (main.products_for, main.Vault.bundles),
+        main.registry_delete_preview: (
+            main.propose_delete,
+            main.get_delete_receipt_or_review,
+        ),
+        main.registry_delete_execute: (
+            main.execute_delete,
+            main.get_delete_receipt_or_review,
+            main.resolve_head_receipt,
+        ),
+        main.registry_delete_review_fragment: (
+            main.get_delete_receipt_or_review,
+        ),
+    }
+
+
+def test_registered_routes_declare_the_exact_body_service_inventory(
+    tmp_path, monkeypatch
+):
+    main = _load_console_app(tmp_path, monkeypatch)
+    expected = _expected_route_services(main)
+    endpoints = list(_registered_console_endpoints(main.app))
+    assert len(endpoints) == 13, endpoints
+    assert set(endpoints) == set(expected), (
+        "registered route/service inventory mismatch: "
+        f"missing={set(endpoints) - set(expected)}, "
+        f"extra={set(expected) - set(endpoints)}"
+    )
+    for endpoint in endpoints:
+        assert endpoint.__console_route__.services == expected[endpoint], (
+            f"{endpoint.__qualname__}: expected services "
+            f"{tuple(service.__qualname__ for service in expected[endpoint])}, "
+            f"got {tuple(service.__qualname__ for service in endpoint.__console_route__.services)}"
+        )
+
+
+def _recursive_fastapi_dependency_calls(route):
+    found = set()
+    pending = list(route.dependant.dependencies)
+    while pending:
+        dependant = pending.pop()
+        if dependant.call is not None:
+            found.add(_normalized_callable(dependant.call))
+        pending.extend(dependant.dependencies)
+    return found
+
+
+def test_actual_application_dependencies_carry_failure_contracts(
+    tmp_path, monkeypatch
+):
+    import typing
+
+    from fastapi.routing import APIRoute
+
+    from app.console_routing import FailureContract
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    entity_scope = _normalized_callable(main.entity_scope)
+    entity_scoped = []
+    discovered = []
+    missing = []
+    for route in main.app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        endpoint = route.endpoint
+        if endpoint not in set(_registered_console_endpoints(main.app)):
+            continue
+        dependency_calls = _recursive_fastapi_dependency_calls(route)
+        discovered.extend(dependency_calls)
+        hints = typing.get_type_hints(endpoint, include_extras=True)
+        if main.EntityScope in hints.values():
+            entity_scoped.append(endpoint.__qualname__)
+            assert entity_scope in dependency_calls, endpoint.__qualname__
+        for dependency in dependency_calls:
+            if not (getattr(dependency, "__module__", "") or "").startswith("app."):
+                continue
+            if not isinstance(
+                getattr(dependency, "__failure_contract__", None), FailureContract
+            ):
+                missing.append(
+                    f"{endpoint.__qualname__}: {dependency.__qualname__}"
+                )
+
+    assert len(entity_scoped) >= 8, entity_scoped
+    assert entity_scope in discovered
+    assert missing == []
+
+
+def _route_reachable_call_names(endpoint, main):
+    import inspect
+
+    pending = [endpoint]
+    visited = set()
+    names = set()
+    while pending:
+        function = pending.pop()
+        function = _normalized_callable(function)
+        if function in visited or not inspect.isfunction(function):
+            continue
+        visited.add(function)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        definition = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
+            None,
+        )
+        if definition is None:
+            continue
+        for statement in definition.body:
+            for node in ast.walk(statement):
+                if not isinstance(node, ast.Call):
+                    continue
+                called_name = getattr(
+                    node.func, "id", getattr(node.func, "attr", None)
+                )
+                if called_name is None:
+                    continue
+                names.add(called_name)
+                helper = function.__globals__.get(called_name)
+                if (
+                    inspect.isfunction(helper)
+                    and (helper.__module__ or "").startswith("app.")
+                ):
+                    pending.append(helper)
+    return names
+
+
+def test_route_service_declarations_bind_to_executable_bodies(
+    tmp_path, monkeypatch
+):
+    main = _load_console_app(tmp_path, monkeypatch)
+    for endpoint in _registered_console_endpoints(main.app):
+        reachable = _route_reachable_call_names(endpoint, main)
+        for service in endpoint.__console_route__.services:
+            assert service.__name__ in reachable, (
+                f"{endpoint.__qualname__}: declared service "
+                f"{service.__qualname__} is not called by its executable body"
+            )
+
+
+def _contract_outcomes(boundary):
+    pending = [boundary]
+    visited = set()
+    outcomes = []
+    while pending:
+        current = pending.pop()
+        current = _normalized_callable(current)
+        if current in visited:
+            continue
+        visited.add(current)
+        contract = current.__failure_contract__
+        outcomes.extend(
+            (current, exception, None) for exception in contract.raises
+        )
+        outcomes.extend(
+            (current, item.exception, item) for item in contract.deliberate_unknown
+        )
+        pending.extend(contract.calls)
+    return outcomes
+
+
+def test_registered_routes_cover_transitive_body_and_dependency_failures(
+    tmp_path, monkeypatch
+):
+    from fastapi.routing import APIRoute
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    route_by_endpoint = {
+        route.endpoint: route
+        for route in main.app.routes
+        if isinstance(route, APIRoute)
+    }
+    typed_handlers = tuple(
+        exception
+        for exception in main.app.exception_handlers
+        if isinstance(exception, type)
+        and issubclass(exception, BaseException)
+        and exception not in (Exception, BaseException)
+    )
+    failures = []
+
+    for endpoint in _registered_console_endpoints(main.app):
+        declaration = endpoint.__console_route__
+        for service in declaration.services:
+            for boundary, exported, unknown in _contract_outcomes(service):
+                handled = any(
+                    issubclass(exported, caught) for caught in declaration.catches
+                )
+                if handled and unknown is not None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} is both handled and deliberate E-UNKNOWN"
+                    )
+                elif not handled and unknown is None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} has no route disposition"
+                    )
+
+        route = route_by_endpoint[endpoint]
+        for dependency in _recursive_fastapi_dependency_calls(route):
+            if not hasattr(dependency, "__failure_contract__"):
+                continue
+            for boundary, exported, unknown in _contract_outcomes(dependency):
+                handled = any(
+                    issubclass(exported, registered)
+                    for registered in typed_handlers
+                )
+                if handled and unknown is not None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} is both handled and deliberate E-UNKNOWN"
+                    )
+                elif not handled and unknown is None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} has no typed dependency handler"
+                    )
+
+    assert failures == [], "\n".join(failures)
+
+
 def test_every_registered_route_declares_its_catch_family(tmp_path, monkeypatch):
     from app.console_routing import ConsoleRoute
 
