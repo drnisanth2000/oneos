@@ -1,9 +1,9 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — revision 14. Stage A exists, but the private
+**Status:** APPROVED DESIGN — revision 15. Stage A exists, but the private
 inventory found structurally meaningful references in system documentation;
-revisions 13–14 add their syntax-confined locations and bind both components
-of explicit entity/product pairs. No migration has been executed.
+revisions 13–15 add their syntax-confined locations. No migration has been
+executed.
 
 **Base:** freshly fetched merged `origin/main` at
 `e4478fc1beef985fecc16e485b0974568b4fc004`. Fresh public baseline:
@@ -71,6 +71,14 @@ the entity component and the product pass rewrites the product component.
 Writer qualification and both independent gates accept the source and mapped
 registry names, so an old or half-migrated pair cannot disappear between the
 sequential passes. Ordinary shell commands and unrelated prose remain outside
+the closed list.
+**Revision 15 closes the final private-inventory gaps:** a top-level
+``member:`` scalar inside a fenced `yaml`/`yml` example in the conventions
+additions is an owned member reference; and the product component of an
+explicit ``<inline-code qualifier> / <registered product>`` pair is owned even
+when the qualifier is documented shorthand rather than a registry entity. The
+qualifier itself is rewritten only when it independently names an in-scope
+registered entity. Unquoted shell commands and ordinary prose remain outside
 the closed list.
 
 ## Objective
@@ -251,10 +259,10 @@ appears twice.
 - Markdown front matter — the `product:` field value.
 - `_system/workspaces.yaml` — `product:` values only. **Never an `id:`.**
 - `_system/docs/**/*.md` — the product component of an explicit
-  ``<registered-entity> / <product>`` reference, where the entity component is
-  an inline-code token that names either the source or mapped value of a
-  registered entity in this cutover. Bare words and shell commands are not
-  references.
+  ``<inline-code qualifier> / <product>`` reference. The product must be an
+  in-scope registered product; the qualifier may be a registered entity or
+  documented shorthand and is not changed by the product pass. Bare words and
+  shell commands are not references.
 - Approved `books.db` `(path, table, column, axis)` targets whose `axis` is
   `product`, and no others.
 
@@ -266,7 +274,9 @@ appears twice.
   and a `#` inside a quoted YAML scalar are not owned.
 - `_system/conventions*.md` — inline-code spans whose complete content is the
   member id, or whose complete content is ``member: <id>``. Ordinary prose is
-  not owned.
+  not owned. A top-level ``member: <id>`` scalar inside a fenced `yaml` or
+  `yml` example is also owned; nested scalars and text outside the fence are
+  not.
 - Markdown front matter — the `member:` field value.
 - `_system/workspaces.yaml` — `member:` values.
 - Approved `books.db` `(path, table, column, axis)` targets whose `axis` is

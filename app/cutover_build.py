@@ -367,7 +367,6 @@ def _apply_value_mapping(root: Path, axis: str, old: str, new: str) -> None:
             if rewritten != text:
                 conventions.write_text(rewritten, encoding="utf-8")
     if axis == "product":
-        registered_entities = frozenset(existing_identifiers(root)["entity"])
         docs = system / "docs"
         if docs.is_dir() and not docs.is_symlink():
             for document in sorted(docs.rglob("*.md")):
@@ -375,7 +374,7 @@ def _apply_value_mapping(root: Path, axis: str, old: str, new: str) -> None:
                     continue
                 text = document.read_text(encoding="utf-8")
                 rewritten = rewrite_system_product_references(
-                    text, registered_entities, old, new
+                    text, old, new
                 )
                 if rewritten != text:
                     document.write_text(rewritten, encoding="utf-8")
