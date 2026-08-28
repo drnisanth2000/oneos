@@ -15,6 +15,10 @@ from .scope import Scope
 ENV_VAULT = "ONEOS_VAULT"
 
 
+class VaultRootUnavailable(RuntimeError):
+    """A configured vault root is no longer available at request time."""
+
+
 def vault_root() -> Path:
     raw = os.environ.get(ENV_VAULT)
     if not raw:
@@ -23,7 +27,7 @@ def vault_root() -> Path:
         )
     root = Path(raw).expanduser()
     if not root.is_dir():
-        raise RuntimeError(f"{ENV_VAULT}={raw!r} is not a directory")
+        raise VaultRootUnavailable("configured vault root is unavailable")
     return root
 
 
