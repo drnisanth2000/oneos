@@ -154,6 +154,24 @@ def test_canonical_bytes_have_exact_utf8_json_framing():
     ).encode("utf-8")
 
 
+def test_the_loader_alone_refuses_duplicate_object_keys():
+    """Duplicate-key refusal must not lean on the canonical-form check.
+
+    `verify_manifest` re-serialises and compares bytes, so a duplicate key
+    that the decoder silently collapses is refused downstream as well.
+    Calling the loader on its own leaves the duplicate-key hook as the only
+    thing that can refuse.
+    """
+    raw = canonical_bytes(sample_manifest()).replace(
+        b'{"source_head":',
+        b'{"source_head":"' + b"b" * 40 + b'","source_head":',
+        1,
+    )
+
+    with pytest.raises(ManifestError, match="duplicate"):
+        load_manifest(raw)
+
+
 def test_duplicate_object_keys_are_refused_even_with_a_matching_digest():
     manifest = sample_manifest()
     raw = canonical_bytes(manifest)

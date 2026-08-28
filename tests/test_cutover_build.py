@@ -507,6 +507,29 @@ def test_build_gate_refuses_a_database_writer_that_leaves_the_old_value(
         build_cutover(vault, raw, record)
 
 
+def test_the_post_update_database_gate_stops_before_any_file_rewrite(
+    tmp_path: Path, monkeypatch
+):
+    """The immediate residual gate must refuse before the tree is rewritten.
+
+    A second gate downstream also sees a no-op database writer, so matching
+    on a message alone cannot say which of the two refused. Making the
+    rewrite step fatal isolates the early gate: if it does not stop the
+    build, the sentinel is reached instead.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    raw, record = approved(vault)
+    monkeypatch.setattr(cutover_build, "apply_database_mappings", lambda *_: ())
+    monkeypatch.setattr(
+        cutover_build,
+        "_apply_mappings_in_order",
+        lambda *_: (_ for _ in ()).throw(CutoverError("reached the rewrite step")),
+    )
+
+    with pytest.raises(CutoverError, match="database residual after update"):
+        build_cutover(vault, raw, record)
+
+
 def test_sequential_application_preserves_every_mapping_touching_one_file(
     tmp_path: Path,
 ):
@@ -1362,6 +1385,38 @@ def test_build_refuses_a_manifest_that_omits_a_sub_floor_identifier(tmp_path: Pa
         manifest_sha256=manifest_digest(manifest),
         executor_commit=approved(vault)[1].executor_commit,
         approved_by="owner",
+    )
+
+    with pytest.raises(CutoverError, match="does not cover every sub-floor"):
+        build_cutover(vault, raw, record)
+
+
+def test_the_completeness_check_refuses_before_the_disposition_check(
+    tmp_path: Path, monkeypatch
+):
+    """A partial manifest also carries no dispositions, so two guards refuse.
+
+    Matching on a message cannot say which one did. Making the disposition
+    check fatal isolates the completeness check: if it does not refuse first,
+    the sentinel is what the caller sees.
+    """
+    vault = cutover_vault(tmp_path / "vault")
+    manifest = ApprovalManifest(
+        source_head=git_head(vault),
+        mappings=(Mapping(axis="entity", old="ab", new="ab-entity"),),
+        databases=(),
+        dispositions=(),
+    )
+    raw = canonical_bytes(manifest)
+    record = ApprovalRecord(
+        manifest_sha256=manifest_digest(manifest),
+        executor_commit=approved(vault)[1].executor_commit,
+        approved_by="owner",
+    )
+    monkeypatch.setattr(
+        cutover_build,
+        "_require_dispositions",
+        lambda *_: (_ for _ in ()).throw(CutoverError("reached the disposition check")),
     )
 
     with pytest.raises(CutoverError, match="does not cover every sub-floor"):

@@ -78,6 +78,32 @@ def test_promotion_refuses_a_moved_head(tmp_path: Path):
     assert git_head(vault) == moved
 
 
+def test_the_head_precheck_refuses_before_the_merge_is_attempted(
+    tmp_path: Path, monkeypatch
+):
+    """`git merge --ff-only` refuses a moved HEAD too, so isolate the precheck.
+
+    Matching the precheck's own message already separates it from the merge
+    fallback, but only by wording. Making the last step before the merge
+    fatal separates them by control flow: if the precheck does not refuse,
+    the sentinel is what the caller sees, and the merge is never reached.
+    """
+    vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
+    head = git_head(vault)
+    built = build_a_commit(vault, head)
+    (vault / "b.md").write_text("y\n", encoding="utf-8")
+    moved = commit_in(vault, "concurrent")
+    monkeypatch.setattr(
+        cutover,
+        "require_clean_entities",
+        lambda *_: (_ for _ in ()).throw(CutoverError("reached the entity check")),
+    )
+
+    with pytest.raises(CutoverError, match="live HEAD moved since the build"):
+        promote(vault, built, head, git_status_bytes(vault), [], [])
+    assert git_head(vault) == moved
+
+
 def test_promotion_refuses_a_changed_status(tmp_path: Path):
     vault = git_vault(tmp_path / "vault", {"a.md": "x\n"})
     head = git_head(vault)

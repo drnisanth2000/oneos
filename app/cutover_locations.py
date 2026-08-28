@@ -274,7 +274,7 @@ def rewrite_root_scalar(
 ) -> str:
     """Rewrite one root-level scalar in place, never nested data."""
     lines = text.splitlines(keepends=True)
-    for name, line_no, col_start, col_end, value in sorted(
+    for _name, line_no, col_start, col_end, value in sorted(
         root_scalar_spans(text, (field,)), reverse=True
     ):
         replacement = (

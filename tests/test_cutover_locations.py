@@ -838,6 +838,51 @@ def test_residual_gate_refuses_a_wrongly_shaped_field(
         )
 
 
+EMPTY_PATHS_POLICY = """\
+actors:
+  h:
+    allow:
+      - action: read
+        paths:
+        except: ["ab/.sensitive/**"]
+"""
+
+
+def test_the_policy_sequence_guard_is_what_refuses_an_empty_field():
+    """An empty `paths:` isolates the sequence guard from the item guard.
+
+    With a scalar field the item guard also raises, so a message match
+    cannot say which one refused. An empty field decodes to `None`: the
+    item loop cannot run, so only the sequence guard can refuse — and
+    without it the writer returns the file unchanged and the stale rule
+    ships.
+    """
+    with pytest.raises(UnreadableFile, match="expected a sequence"):
+        rewrite_policy_path_heads(EMPTY_PATHS_POLICY, "ab", "ab-entity")
+
+
+def test_the_policy_item_guard_refuses_before_any_span_is_recorded():
+    """The locator must refuse, not hand a non-scalar span to the rewriter.
+
+    Exercised through `rewrite_policy_path_heads` the missing guard surfaces
+    as an `AttributeError` from the rewriter, which proves only that
+    something downstream crashed. Calling the locator alone leaves the item
+    guard as the only thing that can refuse.
+    """
+    from app.cutover_locations import policy_path_scalars
+
+    with pytest.raises(UnreadableFile, match="expected a scalar"):
+        policy_path_scalars(NON_STRING_ITEM_POLICY)
+
+
+def test_the_gate_item_guard_refuses_before_any_value_is_recorded():
+    """The gate's own item guard, isolated from the caller that crashes."""
+    from app.cutover_locations import _load_policy_document, _policy_path_values
+
+    with pytest.raises(UnreadableFile, match="expected a scalar"):
+        _policy_path_values(_load_policy_document(NON_STRING_ITEM_POLICY))
+
+
 NESTED_FRONT_MATTER = """\
 ---
 entity: ab
