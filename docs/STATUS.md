@@ -210,7 +210,7 @@ absorb it. The precedent is exact: S4 bound the source receipt's bytes and
 refused stale approvals; this binds the proposal record's bytes one artifact
 further out. S6 neither introduced nor widened the exposure.
 
-**2. Prose-leakage enforcement.** This repository has structural invariants for
+**2. Prose-leakage enforcement — PUBLIC IMPLEMENTATION COMPLETE.** This repository has structural invariants for
 catch-alls, `hx-vals`, reader categories and route declarations — and **none for
 its own documentation**. AGENTS.md's one rule is enforced solely by the combined
 repo+vault audit, which needs the private vault and therefore cannot run in CI
@@ -218,6 +218,9 @@ or in a cloud task. A private value consequently survived fifty commits and
 several careful readings of the exact line that carried it, and was caught only
 at the final gate. A check over tracked documentation, seeded from the manifest
 at gate time, would have caught it at the first commit.
+Exact short registry-derived tokens in tracked Markdown now fail both
+current-tree and history audit modes; the final live-vault audit and
+preservation proof remain trusted-local gates.
 
 **3. Declaration-completeness gaps.** The declaration-driven totality sweep
 reads each endpoint's own declared catch tuple at test time, so decorator/body
