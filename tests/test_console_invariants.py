@@ -1576,7 +1576,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         propose_classification,
         reject,
     )
-    from app.proposal_identity import ProposalIdentityError
+    from app.proposal_identity import ProposalIdentityError, require_proposal_id
     from app.registry import RegistryError
     from app.review_tokens import (
         InvalidReviewToken,
@@ -1647,7 +1647,10 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
             outbox_projection[:6] + (ReviewTokenError,) + receipt_failures,
             (),
         ),
-        "app.outbox.pending_proposal_entry_exists": ((CrossScopeError,), ()),
+        "app.outbox.pending_proposal_entry_exists": (
+            (),
+            (require_proposal_id,),
+        ),
         "app.registry.products_for": (
             (RegistryError, CrossScopeError, DestinationRegistryError),
             (),
@@ -1677,7 +1680,10 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
             ),
             (),
         ),
-        "app.action_receipts.resolve_head_receipt": (receipt_failures, ()),
+        "app.action_receipts.resolve_head_receipt": (
+            receipt_failures,
+            (require_proposal_id,),
+        ),
         "app.proposal_identity.require_proposal_id": ((ProposalIdentityError,), ()),
         "app.review_tokens.require_review_sha256": (
             (InvalidReviewToken, ReviewContractViolation),
@@ -1735,7 +1741,7 @@ def _normalized_callable(value):
     return getattr(value, "__func__", value)
 
 
-def _executable_contracted_calls(boundary, contracted):
+def _executable_resolved_call_sites(boundary):
     """Resolve direct calls through names, class attributes and bound locals.
 
     This is deliberately a closed-inventory resolver. It does not claim to
@@ -1752,7 +1758,6 @@ def _executable_contracted_calls(boundary, contracted):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     )
     globals_map = function.__globals__
-    normalized = {_normalized_callable(item) for item in contracted}
     local_types = {}
 
     def global_value(name):
@@ -1785,16 +1790,87 @@ def _executable_contracted_calls(boundary, contracted):
             if isinstance(target, ast.Name):
                 local_types[target.id] = constructor
 
-    found = set()
+    found = []
     for statement in definition.body:
         for node in ast.walk(statement):
             if not isinstance(node, ast.Call):
                 continue
             called = resolve(node.func)
             called = _normalized_callable(called)
-            if called in normalized:
-                found.add(called)
-    return found
+            if called is not None:
+                found.append((called, node))
+    parents = {
+        child: parent
+        for parent in ast.walk(definition)
+        for child in ast.iter_child_nodes(parent)
+    }
+    return function, found, parents
+
+
+def _executable_resolved_calls(boundary):
+    _function, sites, _parents = _executable_resolved_call_sites(boundary)
+    return {called for called, _node in sites}
+
+
+def _call_is_fully_caught(function, call, parents, outcomes):
+    """Whether one helper contains every contracted outcome at the call.
+
+    Route-level catches are dispositions and therefore remain service edges;
+    this helper is used only while traversing uncontracted helpers below an
+    endpoint. A service whose complete contract is caught inside such a helper
+    cannot export a failure to the route and is not a route-service root.
+    """
+
+    def resolve_handler(expression):
+        def resolve_value(value):
+            if isinstance(value, ast.Name):
+                return function.__globals__.get(value.id)
+            if isinstance(value, ast.Attribute):
+                owner = resolve_value(value.value)
+                return (
+                    getattr(owner, value.attr, None)
+                    if owner is not None
+                    else None
+                )
+            return None
+
+        if expression is None:
+            return (BaseException,)
+        if isinstance(expression, ast.Tuple):
+            return tuple(
+                item
+                for element in expression.elts
+                for item in resolve_handler(element)
+            )
+        value = resolve_value(expression)
+        if isinstance(value, tuple):
+            return tuple(value)
+        return (value,) if isinstance(value, type) else ()
+
+    child = call
+    parent = parents.get(child)
+    while parent is not None:
+        if isinstance(parent, ast.Try) and child in parent.body:
+            caught = tuple(
+                exception
+                for handler in parent.handlers
+                for exception in resolve_handler(handler.type)
+                if isinstance(exception, type)
+                and issubclass(exception, BaseException)
+            )
+            if caught and all(
+                any(issubclass(exported, exception) for exception in caught)
+                for exported in outcomes
+            ):
+                return True
+        child = parent
+        parent = parents.get(child)
+    return False
+
+
+def _executable_contracted_calls(boundary, contracted):
+    normalized = {_normalized_callable(item) for item in contracted}
+    return _executable_resolved_calls(boundary) & normalized
 
 
 def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeypatch):
@@ -1854,7 +1930,33 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
         "app.destinations.resolve_classification_destination": {
             "app.entities.EntityCatalog.load"
         },
+        "app.outbox.pending_proposal_entry_exists": {
+            "app.proposal_identity.require_proposal_id"
+        },
+        "app.action_receipts.resolve_head_receipt": {
+            "app.proposal_identity.require_proposal_id"
+        },
     }
+    summarized_or_contained_edges = {
+        "app.outbox.project_outbox": {
+            "app.outbox.pending_proposal_entry_exists",
+            "app.proposal_identity.require_proposal_id",
+        },
+        "app.registry.get_delete_receipt_or_review": {
+            "app.action_receipts.resolve_head_receipt",
+            "app.proposal_identity.require_proposal_id",
+        },
+    }
+    assert set(declared_edges) & set(summarized_or_contained_edges) == set()
+    classified_edges = {
+        caller: declared_edges.get(caller, set())
+        | summarized_or_contained_edges.get(caller, set())
+        for caller in set(declared_edges) | set(summarized_or_contained_edges)
+    }
+    assert classified_edges == actual, (
+        "every executable contracted call must be classified as a propagating "
+        "contract edge or a contained/prevalidated call"
+    )
     for caller, callees in declared_edges.items():
         assert callees <= actual[caller], caller
     _contract_graph_is_acyclic(universe)
@@ -1911,26 +2013,37 @@ def _expected_route_services(main):
             main.project_outbox,
             main.resolve_head_receipt,
             main.pending_proposal_entry_exists,
+            main.require_proposal_id,
         ),
         main.outbox_reject: (
             main.reject,
             main.project_outbox,
             main.resolve_head_receipt,
             main.pending_proposal_entry_exists,
+            main.require_proposal_id,
         ),
-        main.outbox_review_fragment: (main.project_outbox,),
+        main.outbox_review_fragment: (
+            main.project_outbox,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
+        ),
         main.registry_products: (main.products_for, main.Vault.bundles),
         main.registry_delete_preview: (
             main.propose_delete,
             main.get_delete_receipt_or_review,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
         ),
         main.registry_delete_execute: (
             main.execute_delete,
             main.get_delete_receipt_or_review,
-            main.resolve_head_receipt,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
         ),
         main.registry_delete_review_fragment: (
             main.get_delete_receipt_or_review,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
         ),
     }
 
@@ -1940,6 +2053,7 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
+    assert sum(len(services) for services in expected.values()) == 35
     endpoints = list(_registered_console_endpoints(main.app))
     assert len(endpoints) == 13, endpoints
     assert set(endpoints) == set(expected), (
@@ -2007,59 +2121,59 @@ def test_actual_application_dependencies_carry_failure_contracts(
     assert missing == []
 
 
-def _route_reachable_call_names(endpoint, main):
+def _route_reachable_contracted_calls(endpoint, main, contracted, declared):
     import inspect
 
+    normalized = {_normalized_callable(item) for item in contracted}
     pending = [endpoint]
     visited = set()
-    names = set()
+    found = set()
     while pending:
         function = pending.pop()
         function = _normalized_callable(function)
         if function in visited or not inspect.isfunction(function):
             continue
         visited.add(function)
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        definition = next(
-            (
-                node
-                for node in tree.body
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            ),
-            None,
-        )
-        if definition is None:
-            continue
-        for statement in definition.body:
-            for node in ast.walk(statement):
-                if not isinstance(node, ast.Call):
-                    continue
-                called_name = getattr(
-                    node.func, "id", getattr(node.func, "attr", None)
+        current, sites, parents = _executable_resolved_call_sites(function)
+        for called, call in sites:
+            if called in normalized:
+                outcomes = tuple(
+                    exported
+                    for _boundary, exported, _unknown in _contract_outcomes(called)
                 )
-                if called_name is None:
-                    continue
-                names.add(called_name)
-                helper = function.__globals__.get(called_name)
                 if (
-                    inspect.isfunction(helper)
-                    and (helper.__module__ or "").startswith("app.")
+                    function is endpoint
+                    or called in declared
+                    or not _call_is_fully_caught(current, call, parents, outcomes)
                 ):
-                    pending.append(helper)
-    return names
+                    found.add(called)
+            elif (
+                inspect.isfunction(called)
+                and called.__module__ == main.__name__
+                and not hasattr(called, "__failure_contract__")
+            ):
+                pending.append(called)
+    return found
 
 
 def test_route_service_declarations_bind_to_executable_bodies(
     tmp_path, monkeypatch
 ):
     main = _load_console_app(tmp_path, monkeypatch)
+    contracted = tuple(_inventory_objects(main).values())
     for endpoint in _registered_console_endpoints(main.app):
-        reachable = _route_reachable_call_names(endpoint, main)
-        for service in endpoint.__console_route__.services:
-            assert service.__name__ in reachable, (
-                f"{endpoint.__qualname__}: declared service "
-                f"{service.__qualname__} is not called by its executable body"
-            )
+        declared = {
+            _normalized_callable(service)
+            for service in endpoint.__console_route__.services
+        }
+        reachable = _route_reachable_contracted_calls(
+            endpoint, main, contracted, declared
+        )
+        assert declared == reachable, (
+            f"{endpoint.__qualname__}: route service mismatch: "
+            f"undeclared={sorted(item.__qualname__ for item in reachable - declared)}, "
+            f"not_executable={sorted(item.__qualname__ for item in declared - reachable)}"
+        )
 
 
 def _contract_outcomes(boundary):

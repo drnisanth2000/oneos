@@ -360,7 +360,8 @@ def resolve_head_receipts(
         InvalidActionReceipt,
         ReceiptStoreIntegrityError,
         ReceiptStoreUnavailable,
-    )
+    ),
+    calls=(require_proposal_id,),
 )
 def resolve_head_receipt(
     vault: Path, entity: str, proposal_id: str

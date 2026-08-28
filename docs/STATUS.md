@@ -224,12 +224,12 @@ preservation proof remain trusted-local gates.
 
 **3. Declaration completeness — PUBLIC IMPLEMENTATION COMPLETE.** Immutable
 failure metadata now closes the reviewed inventory of 20 route-facing service
-and dependency boundaries. Thirteen registered Console routes declare 26
+and dependency boundaries. Thirteen registered Console routes declare 35
 executable body-service edges; structural traversal proves every known domain
 failure exported through those contracts has a route-owned catch, typed
 dependency handler, or exact deliberate-`E-UNKNOWN` disposition. Executable
 call-edge, FastAPI dependency, lower-ownership, and route/body binding checks
-fail independently under six semantic mutations and every one of the 26
+fail independently under seven semantic mutations and every one of the 35
 route/service removals, with byte-identical restoration before each GREEN run.
 Representative real-filesystem root-loss, manifest-permission, whole-system
 redirect, missing-manifest, and leaf-redirect vehicles remain part of the

@@ -605,6 +605,7 @@ def propose(
 _OUTBOX_CATCHES = (
     OutboxError, CrossScopeError, DestinationRegistryError,
     EntityManifestError, EntitySelectionError,  # see _TRIAGE_CATCHES
+    ProposalIdentityError,
     ReviewTokenError,
     InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
@@ -1248,7 +1249,7 @@ def _review_unavailable_response(
 @console_route(
     catches=_OUTBOX_CATCHES,
     surface="fragment-only",
-    services=(project_outbox,),
+    services=(project_outbox, pending_proposal_entry_exists, require_proposal_id),
 )
 def outbox_review_fragment(
     request: Request, scope: EntityScope, proposal_id: str
@@ -1330,6 +1331,7 @@ def outbox_review_fragment(
         project_outbox,
         resolve_head_receipt,
         pending_proposal_entry_exists,
+        require_proposal_id,
     ),
 )
 def outbox_approve(
@@ -1445,6 +1447,7 @@ def _outbox_approve_response(
         project_outbox,
         resolve_head_receipt,
         pending_proposal_entry_exists,
+        require_proposal_id,
     ),
 )
 def outbox_reject(
@@ -1574,6 +1577,7 @@ _REGISTRY_PRODUCTS_CATCHES = (
 #: outbox actions needed.
 _REGISTRY_DELETE_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError, UnreadableProposalRecord,
+    ProposalIdentityError,
     ReviewTokenError,
     InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
@@ -1612,7 +1616,12 @@ def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
 @console_route(
     catches=_REGISTRY_DELETE_CATCHES,
     surface="fragment-only",
-    services=(propose_delete, get_delete_receipt_or_review),
+    services=(
+        propose_delete,
+        get_delete_receipt_or_review,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
 )
 def registry_delete_preview(
     request: Request, scope: EntityScope, slug: str = Form(...)
@@ -1723,7 +1732,11 @@ def _impact_signature(sources) -> str:
 @console_route(
     catches=_REGISTRY_DELETE_CATCHES,
     surface="fragment-only",
-    services=(get_delete_receipt_or_review,),
+    services=(
+        get_delete_receipt_or_review,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
 )
 def registry_delete_review_fragment(
     request: Request, scope: EntityScope, proposal_id: str
@@ -1774,7 +1787,12 @@ def registry_delete_review_fragment(
 @console_route(
     catches=_REGISTRY_DELETE_CATCHES,
     surface="fragment-only",
-    services=(execute_delete, get_delete_receipt_or_review, resolve_head_receipt),
+    services=(
+        execute_delete,
+        get_delete_receipt_or_review,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
 )
 def registry_delete_execute(
     request: Request,

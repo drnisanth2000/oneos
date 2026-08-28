@@ -28,6 +28,7 @@ from app.action_receipts import (
     validate_head_receipt_store,
 )
 from app.review_tokens import InvalidReviewToken
+from app.proposal_identity import ProposalIdentityError
 
 
 ENTITY = "synthetic"
@@ -263,6 +264,11 @@ def test_receipt_relative_path_is_entity_local_and_id_bound():
 
 
 # --- current HEAD authority and per-id resolution ---------------------------
+
+
+def test_one_receipt_resolution_exports_noncanonical_id_as_domain_failure(repo):
+    with pytest.raises(ProposalIdentityError):
+        resolve_head_receipt(repo, ENTITY, "not-a-proposal-id")
 
 
 def test_worktree_deletion_does_not_hide_a_head_receipt(repo):

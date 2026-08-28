@@ -237,7 +237,9 @@ def _require_outbox_path(
     return candidate
 
 
-@failure_contract(raises=(CrossScopeError,))
+@failure_contract(
+    calls=(require_proposal_id,),
+)
 def pending_proposal_entry_exists(scope: Scope, proposal_id: str) -> bool:
     """Report whether a real pending-record leaf is present, without reading it.
 
