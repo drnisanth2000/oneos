@@ -3891,70 +3891,90 @@ def _route_totality_plan(main) -> dict:
     """
     return {
         main.shell: {
-            "request": lambda c: c.get("/"),
+            "request": lambda c, submitted=None: c.get("/"),
             "patch_targets": [(main.Vault, "bundles")],
         },
         main.triage_default: {
-            "request": lambda c: c.get("/triage"),
+            "request": lambda c, submitted=None: c.get("/triage"),
             "patch_targets": [(main.Vault, "bundles")],
         },
         main.triage: {
-            "request": lambda c: c.get("/triage/alpha"),
+            "request": lambda c, submitted=None: c.get("/triage/alpha"),
             "patch_targets": [(main, "read_inbox")],
         },
         main.propose: {
-            "request": lambda c: c.post(
+            "request": lambda c, submitted=None: c.post(
                 "/triage/alpha/propose",
-                data={"filename": "note.md", "module": "02-work", "sub": ""},
+                data={
+                    "filename": submitted or "note.md",
+                    "module": "02-work",
+                    "sub": "",
+                },
             ),
             "patch_targets": [(main, "propose_classification")],
         },
         main.outbox_screen: {
-            "request": lambda c: c.get("/outbox/alpha"),
+            "request": lambda c, submitted=None: c.get("/outbox/alpha"),
             "patch_targets": [(main, "project_outbox")],
         },
         main.outbox_approve: {
-            "request": lambda c: c.post(
-                "/outbox/alpha/approve", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
+            "request": lambda c, submitted=None: c.post(
+                "/outbox/alpha/approve",
+                data={
+                    "id": submitted or "irrelevant",
+                    "review_sha256": _UNBOUND_FINGERPRINT,
+                },
             ),
             "patch_targets": [(main, "approve")],
         },
         main.outbox_reject: {
-            "request": lambda c: c.post(
-                "/outbox/alpha/reject", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
+            "request": lambda c, submitted=None: c.post(
+                "/outbox/alpha/reject",
+                data={
+                    "id": submitted or "irrelevant",
+                    "review_sha256": _UNBOUND_FINGERPRINT,
+                },
             ),
             "patch_targets": [(main, "reject")],
         },
         main.registry_products: {
-            "request": lambda c: c.get("/registry/alpha/products"),
+            "request": lambda c, submitted=None: c.get("/registry/alpha/products"),
             "patch_targets": [(main, "products_for")],
         },
         main.registry_delete_preview: {
-            "request": lambda c: c.post(
-                "/registry/alpha/product/delete-preview", data={"slug": "widget"}
+            "request": lambda c, submitted=None: c.post(
+                "/registry/alpha/product/delete-preview",
+                data={"slug": submitted or "widget"},
             ),
             "patch_targets": [(main, "propose_delete")],
         },
         main.registry_delete_execute: {
-            "request": lambda c: c.post(
-                "/registry/alpha/product/delete-execute", data={"id": "irrelevant", "review_sha256": _UNBOUND_FINGERPRINT}
+            "request": lambda c, submitted=None: c.post(
+                "/registry/alpha/product/delete-execute",
+                data={
+                    "id": submitted or "irrelevant",
+                    "review_sha256": _UNBOUND_FINGERPRINT,
+                },
             ),
             "patch_targets": [(main, "execute_delete")],
         },
         main.outbox_review_fragment: {
-            "request": lambda c: c.get(
+            "request": lambda c, submitted=None: c.get(
                 "/outbox/alpha/review/20260815T090703-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
             "patch_targets": [(main, "project_outbox")],
         },
         main.registry_delete_review_fragment: {
-            "request": lambda c: c.get(
+            "request": lambda c, submitted=None: c.get(
                 "/registry/alpha/product/review/"
                 "20260815T090703-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
             "patch_targets": [(main, "get_delete_receipt_or_review")],
         },
-        main.pulse: {"request": lambda c: c.get("/blocks/pulse"), "patch_targets": []},
+        main.pulse: {
+            "request": lambda c, submitted=None: c.get("/blocks/pulse"),
+            "patch_targets": [],
+        },
     }
 
 
@@ -4397,6 +4417,179 @@ def _fs_snapshot(root: Path) -> list[tuple[str, str]]:
         else:
             entries.append((rel, hashlib.sha256(p.read_bytes()).hexdigest()))
     return entries
+
+
+def _entity_scope_dependency_routes(main) -> dict:
+    """Return actual FastAPI routes whose dependency graph uses entity_scope."""
+    from fastapi.routing import APIRoute
+
+    def calls(dependant, target) -> bool:
+        return dependant.call is target or any(
+            calls(child, target) for child in dependant.dependencies
+        )
+
+    return {
+        route.endpoint: route
+        for route in main.app.routes
+        if isinstance(route, APIRoute) and calls(route.dependant, main.entity_scope)
+    }
+
+
+def _assert_dependency_failure(
+    response,
+    *,
+    code: str,
+    vault: Path,
+    raw_marker: str,
+    submitted_sentinel: str | None,
+) -> None:
+    from app.console_errors import _CODES
+
+    assert response.status_code == _CODES[code].page_status
+    assert code in response.text
+    assert str(vault) not in response.text
+    assert raw_marker not in response.text
+    assert "hx-post" not in response.text
+    assert "review_sha256" not in response.text
+    if submitted_sentinel is not None:
+        assert submitted_sentinel not in response.text
+
+
+def _drive_entity_scope_dependency_matrix(main, client, vault, code, raw_marker):
+    routes = _entity_scope_dependency_routes(main)
+    plan = _route_totality_plan(main)
+    assert len(routes) >= 10, f"only {len(routes)} entity-scoped routes were derived"
+    missing = [endpoint.__qualname__ for endpoint in routes if endpoint not in plan]
+    assert missing == []
+
+    driven = []
+    for endpoint, route in routes.items():
+        submitted = None
+        if route.dependant.body_params or route.dependant.query_params:
+            submitted = f"submitted-{endpoint.__name__}-marker"
+        response = plan[endpoint]["request"](client, submitted)
+        _assert_dependency_failure(
+            response,
+            code=code,
+            vault=vault,
+            raw_marker=raw_marker,
+            submitted_sentinel=submitted,
+        )
+        driven.append(endpoint.__qualname__)
+    return driven
+
+
+def test_post_startup_vault_root_loss_is_e_tamper_on_every_entity_scope_route(
+    tmp_path, monkeypatch
+):
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    vault = Path(tmp_path)
+    moved = vault.with_name(vault.name + "-moved")
+    before = _fs_snapshot(vault)
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+    vault.rename(moved)
+    try:
+        driven = _drive_entity_scope_dependency_matrix(
+            main,
+            client,
+            vault,
+            "E-TAMPER",
+            "configured vault root is unavailable",
+        )
+    finally:
+        moved.rename(vault)
+
+    assert len(driven) >= 10
+    assert reached == []
+    assert _fs_snapshot(vault) == before
+
+
+def test_unreadable_manifest_is_e_config_on_every_entity_scope_route(
+    tmp_path, monkeypatch
+):
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    vault = Path(tmp_path)
+    manifest = vault / "_system/entities.yaml"
+    before = _fs_snapshot(vault)
+    original_read_text = Path.read_text
+    denied = []
+
+    def deny_manifest(path: Path, *args, **kwargs):
+        if path == manifest:
+            denied.append(path)
+            raise PermissionError("deterministic manifest denial marker")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_manifest)
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    driven = _drive_entity_scope_dependency_matrix(
+        main,
+        client,
+        vault,
+        "E-CONFIG",
+        "deterministic manifest denial marker",
+    )
+
+    assert len(denied) == len(driven)
+    assert reached == []
+    assert _fs_snapshot(vault) == before
+
+
+def test_real_manifest_permission_denial_is_e_config_on_every_entity_scope_route(
+    tmp_path, monkeypatch
+):
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    vault = Path(tmp_path)
+    manifest = vault / "_system/entities.yaml"
+    original_mode = manifest.stat().st_mode
+    before = _fs_snapshot(vault)
+    reached = []
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    client = TestClient(main.app, raise_server_exceptions=False)
+    manifest.chmod(0)
+    try:
+        try:
+            manifest.read_text(encoding="utf-8")
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("executing account can read a mode-000 manifest")
+        driven = _drive_entity_scope_dependency_matrix(
+            main,
+            client,
+            vault,
+            "E-CONFIG",
+            "entities manifest could not be read",
+        )
+    finally:
+        manifest.chmod(original_mode)
+
+    assert len(driven) >= 10
+    assert reached == []
+    assert _fs_snapshot(vault) == before
 
 
 def test_real_post_startup_system_directory_redirect_shows_e_tamper_everywhere(

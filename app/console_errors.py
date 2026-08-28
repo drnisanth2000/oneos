@@ -280,6 +280,7 @@ MAX_DEPTH = 4
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 
 from . import action_receipts as _action_receipts  # noqa: E402
+from . import config as _config  # noqa: E402
 from . import destinations as _destinations  # noqa: E402
 from . import entities as _entities  # noqa: E402
 from . import git_transaction as _git_transaction  # noqa: E402
@@ -306,6 +307,7 @@ CLOSED_FAMILY = _git_transaction.GitTransactionError
 
 #: `exact` — the entry applies to that class only, never through MRO.
 _EXACT: dict[type[BaseException], ConsoleError] = {
+    _config.VaultRootUnavailable: _CODES["E-TAMPER"],
     _rename.RenameCommittedError: _CODES["E-COMMITTED"],
     _cutover_build.CutoverCommittedError: _CODES["E-COMMITTED"],
     _git_transaction.GitTransactionCommittedError: _CODES["E-COMMITTED"],
