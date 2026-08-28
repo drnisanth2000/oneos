@@ -1,6 +1,6 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — revision 16. Stage A and the accepted private
+**Status:** APPROVED DESIGN — revision 17. Stage A and the accepted private
 cutover are complete; Stage B remains to enforce the approved floor at the
 four registry axes without changing unrelated registry vocabulary.
 
@@ -87,6 +87,11 @@ values in those unrelated vocabularies, and the private cutover did not rename
 them. Stage B therefore enforces the floor only where entity, product, member,
 or workspace identifiers are accepted. Generic registry names retain their
 existing grammar and no new convention is inferred for them.
+**Revision 17 clarifies the implementation boundary after Stage B review:**
+`app.identifiers.meets_floor` is the single shared rule inside the public
+repository. The private wizard cannot import the public app and independently
+mirrors the approved literal floor of five; its private offline test prevents
+that mirror from drifting silently.
 
 ## Objective
 
@@ -400,8 +405,9 @@ entity, product, member, and workspace identifiers. Module names, block names,
 flags, submodule ids, and the `project` rename axis are not registry axes in
 this cutover and must not acquire a new length rule.
 
-Stage B consumes the single `IDENTIFIER_MINIMUM_LENGTH` rule through
-`app.identifiers.meets_floor` at these boundaries:
+Inside the public repository, Stage B consumes the single
+`IDENTIFIER_MINIMUM_LENGTH` rule through `app.identifiers.meets_floor` at
+these boundaries:
 
 | Boundary | Values governed |
 |---|---|
@@ -409,7 +415,11 @@ Stage B consumes the single `IDENTIFIER_MINIMUM_LENGTH` rule through
 | action-receipt entity selection and offline entity-root discovery | entity ids |
 | product/member/workspace registry readers and direct writers | their own axis only |
 | `plan_rename` / `build_rename_plan` | entity, product, member, and workspace `new`; never `project` |
-| the private `oneos_wizard` mirror and private registry tests | the same four axes |
+
+The private vault is a separate execution boundary and does not import the
+public app. Its `oneos_wizard` independently mirrors the approved literal
+minimum of five for new entity ids, while its offline registry test checks all
+four migrated axes and pins the mirror against drift.
 
 The `_REGISTRY_ID` helpers in `app/vault.py` and `app/destinations.py` remain
 grammar-only because their callers validate module, block, flag, and submodule

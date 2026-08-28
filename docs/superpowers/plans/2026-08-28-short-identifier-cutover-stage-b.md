@@ -299,7 +299,7 @@ revision 16.
 - [ ] **Step 2: Prove both exclusions**
 
   Mutate rename so `project` receives the floor and require the project
-  non-regression node to RED. Mutate either generic `_REGISTRY_ID` helper to
+  non-regression node to RED. Mutate either generic `_is_registry_id` helper to
   consume `meets_floor` and require the generic-vocabulary node to RED. Restore
   each preimage byte-identically.
 
