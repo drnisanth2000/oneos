@@ -83,7 +83,11 @@ class EntityCatalog:
         if not path.is_file():
             raise EntityManifestError("entities manifest is missing")
         try:
-            cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise EntityManifestError("entities manifest could not be read") from exc
+        try:
+            cfg = yaml.safe_load(text) or {}
         except yaml.YAMLError as exc:
             raise EntityManifestError("entities manifest is invalid YAML") from exc
         if not isinstance(cfg, dict):
