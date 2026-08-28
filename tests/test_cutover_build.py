@@ -272,7 +272,8 @@ def test_build_rewrites_supported_system_document_references(tmp_path: Path):
     docs = system / "docs"
     docs.mkdir()
     (system / "conventions-v2.1-additions.md").write_text(
-        "Known member: `m7`; example `member: m7`.\n",
+        "Known member: `m7`; example `member: m7`.\n"
+        "```yaml\nmember: m7        # registry reference\n```\n",
         encoding="utf-8",
     )
     members = system / "members.yaml"
@@ -281,7 +282,9 @@ def test_build_rewrites_supported_system_document_references(tmp_path: Path):
         encoding="utf-8",
     )
     (docs / "guide.md").write_text(
-        "Product pair: `ab` / q7.\nShell cd remains ordinary.\n",
+        "Product pair: `ab` / q7.\n"
+        "Documented shorthand: `brand` / q7.\n"
+        "Shell cd remains ordinary.\n",
         encoding="utf-8",
     )
     commit_in(vault, "add structural system-document references")
@@ -312,8 +315,10 @@ def test_build_rewrites_supported_system_document_references(tmp_path: Path):
     ).stdout
     assert "`m7-member`" in conventions
     assert "`member: m7-member`" in conventions
+    assert "member: m7-member        # registry reference" in conventions
     assert "`member: m7-member`" in migrated_members
     assert "`ab-entity` / q7-product" in guide
+    assert "`brand` / q7-product" in guide
     assert "Shell cd remains ordinary" in guide
 
 

@@ -144,6 +144,21 @@ def conventions_member_reference_spans(
                         offset + reference.end("value"),
                     )
                 )
+    in_yaml_fence = False
+    fenced_scalar = re.compile(
+        rf"^member:[ \t]*(?P<value>{re.escape(old)})[ \t]*(?:#.*)?$"
+    )
+    for line_no, line in enumerate(text.splitlines()):
+        if not in_yaml_fence:
+            if re.fullmatch(r"```(?:yaml|yml)[ \t]*", line):
+                in_yaml_fence = True
+            continue
+        if re.fullmatch(r"```[ \t]*", line):
+            in_yaml_fence = False
+            continue
+        match = fenced_scalar.fullmatch(line)
+        if match is not None:
+            found.append((line_no, match.start("value"), match.end("value")))
     return found
 
 
@@ -186,9 +201,9 @@ def rewrite_members_comment_references(text: str, old: str, new: str) -> str:
 
 
 def system_product_reference_spans(
-    text: str, registered_entities: frozenset[str], old: str
+    text: str, old: str
 ) -> list[tuple[int, int, int]]:
-    """Product ids in explicit ``<registered entity> / <product>`` pairs."""
+    """Product ids in explicit ``<inline-code qualifier> / <product>`` pairs."""
     pair = re.compile(
         rf"(?<!`)`(?P<entity>[^`\n]+)`(?!`)[ \t]*/[ \t]*"
         rf"(?P<product>{re.escape(old)})(?![\w-])"
@@ -196,21 +211,19 @@ def system_product_reference_spans(
     found: list[tuple[int, int, int]] = []
     for line_no, line in enumerate(text.splitlines()):
         for match in pair.finditer(line):
-            if match.group("entity") in registered_entities:
-                found.append(
-                    (line_no, match.start("product"), match.end("product"))
-                )
+            found.append(
+                (line_no, match.start("product"), match.end("product"))
+            )
     return found
 
 
 def rewrite_system_product_references(
     text: str,
-    registered_entities: frozenset[str],
     old: str,
     new: str,
 ) -> str:
     return _rewrite_reference_spans(
-        text, system_product_reference_spans(text, registered_entities, old), new
+        text, system_product_reference_spans(text, old), new
     )
 
 
@@ -252,6 +265,21 @@ def _conventions_member_reference_values(text: str) -> list[str]:
             code = match.group("code")
             reference = explicit.fullmatch(code)
             found.append(reference.group("value") if reference else code)
+    in_yaml_fence = False
+    fenced_scalar = re.compile(
+        r"^member:[ \t]*(?P<value>[a-z0-9][a-z0-9-]*)[ \t]*(?:#.*)?$"
+    )
+    for line in text.splitlines():
+        if not in_yaml_fence:
+            if re.fullmatch(r"```(?:yaml|yml)[ \t]*", line):
+                in_yaml_fence = True
+            continue
+        if re.fullmatch(r"```[ \t]*", line):
+            in_yaml_fence = False
+            continue
+        match = fenced_scalar.fullmatch(line)
+        if match is not None:
+            found.append(match.group("value"))
     return found
 
 
@@ -273,10 +301,8 @@ def _members_comment_reference_values(text: str) -> list[str]:
     return found
 
 
-def _system_product_reference_values(
-    text: str, registered_entities: frozenset[str]
-) -> list[str]:
-    """Independently enumerate registered-entity/product pairs for the gate."""
+def _system_product_reference_values(text: str) -> list[str]:
+    """Independently enumerate inline-code-qualifier/product pairs."""
     pair = re.compile(
         r"`(?P<entity>[^`\n]+)`[ \t]*/[ \t]*"
         r"(?P<product>[a-z0-9][a-z0-9-]*)(?![\w-])"
@@ -285,7 +311,6 @@ def _system_product_reference_values(
         match.group("product")
         for line in text.splitlines()
         for match in pair.finditer(line)
-        if match.group("entity") in registered_entities
     ]
 
 
@@ -799,12 +824,6 @@ def _typed_token_spans(
         if isinstance(values, dict)
         for product in values
     )
-    pair_entities = registered_entities | frozenset(
-        value
-        for mapping in mappings
-        if mapping.axis == "entity"
-        for value in (mapping.old, mapping.new)
-    )
     pair_products = registered_products | frozenset(
         value
         for mapping in mappings
@@ -922,7 +941,7 @@ def _typed_token_spans(
                     )
             for old in by_axis["product"]:
                 for line_no, col_start, col_end in system_product_reference_spans(
-                    text, pair_entities, old
+                    text, old
                 ):
                     record(
                         relative,
@@ -1300,16 +1319,6 @@ def scoped_residuals(
                 for key in values:
                     if key in products:
                         report("product:products:key", "_system/products.yaml", key)
-    registered_pair_entities = frozenset(
-        (entities_doc.get("entities") or {}).keys()
-        if isinstance(entities_doc, dict)
-        else ()
-    ) | frozenset(
-        value
-        for mapping in mappings
-        if mapping.axis == "entity"
-        for value in (mapping.old, mapping.new)
-    )
     registered_pair_products = frozenset(
         product
         for values in (
@@ -1431,9 +1440,7 @@ def scoped_residuals(
                             relative,
                             value,
                         )
-                for value in _system_product_reference_values(
-                    text, registered_pair_entities
-                ):
+                for value in _system_product_reference_values(text):
                     if value in products:
                         report(
                             "product:system-doc:entity-product-reference",
