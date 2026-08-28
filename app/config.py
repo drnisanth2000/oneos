@@ -7,6 +7,8 @@ the same code drives a different vault.
 from __future__ import annotations
 
 import os
+import stat
+from functools import cache
 from pathlib import Path
 
 from .entities import EntityCatalog
@@ -19,14 +21,31 @@ class VaultRootUnavailable(RuntimeError):
     """A configured vault root is no longer available at request time."""
 
 
+def _vault_root_identity(root: Path) -> tuple[Path, int, int]:
+    try:
+        resolved = root.resolve(strict=True)
+        info = root.stat()
+    except (OSError, RuntimeError) as exc:
+        raise VaultRootUnavailable("configured vault root is unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise VaultRootUnavailable("configured vault root is unavailable")
+    return resolved, info.st_dev, info.st_ino
+
+
+@cache
+def _pinned_vault_root_identity(root: Path) -> tuple[Path, int, int]:
+    """Remember the root first observed for this configured lexical path."""
+    return _vault_root_identity(root)
+
+
 def vault_root() -> Path:
     raw = os.environ.get(ENV_VAULT)
     if not raw:
         raise RuntimeError(
             f"{ENV_VAULT} is not set — point it at the vault root before starting."
         )
-    root = Path(raw).expanduser()
-    if not root.is_dir():
+    root = Path(raw).expanduser().absolute()
+    if _vault_root_identity(root) != _pinned_vault_root_identity(root):
         raise VaultRootUnavailable("configured vault root is unavailable")
     return root
 

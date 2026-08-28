@@ -34,3 +34,16 @@ def test_unreadable_entity_manifest_raises_safe_typed_error(
     assert str(raised.value) == "entities manifest could not be read"
     assert "private marker" not in str(raised.value)
     assert str(manifest) not in str(raised.value)
+
+
+def test_invalid_utf8_entity_manifest_raises_safe_typed_error(tmp_path: Path):
+    manifest = tmp_path / "_system" / "entities.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b"\xff")
+
+    with pytest.raises(EntityManifestError) as raised:
+        EntityCatalog.load(tmp_path)
+
+    assert type(raised.value) is EntityManifestError
+    assert str(raised.value) == "entities manifest could not be read"
+    assert str(manifest) not in str(raised.value)

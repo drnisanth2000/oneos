@@ -84,7 +84,7 @@ class EntityCatalog:
             raise EntityManifestError("entities manifest is missing")
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             raise EntityManifestError("entities manifest could not be read") from exc
         try:
             cfg = yaml.safe_load(text) or {}
