@@ -27,7 +27,7 @@ ENTITIES = """
 version: "1.0"
 entities:
   alpha: { label: Alpha, flags: [special] }
-  beta:  { label: Beta,  flags: [other] }
+  beta1:  { label: Beta,  flags: [other] }
 """
 
 HTTP_ARCHETYPES = textwrap.dedent(
@@ -111,9 +111,9 @@ products:
   alpha:
     shared: {label: Alpha Shared}
     alpha-only: {label: Alpha Only}
-  beta:
+  beta1:
     shared: {label: Beta Registry Marker}
-    beta-only: {label: Beta Only}
+    beta1-only: {label: Beta Only}
 """,
         encoding="utf-8",
     )
@@ -124,15 +124,15 @@ workspaces:
     label: Alpha Cross
     kind: cross
     primary_entity: alpha
-    entities: [alpha, beta]
+    entities: [alpha, beta1]
     product: shared
     default_view: blocks
 """,
         encoding="utf-8",
     )
     scaffold_modules(tmp_path, "alpha", ["00-intake", "01-core", "02-work", "zz-extra"])
-    scaffold_modules(tmp_path, "beta", ["00-intake", "01-core", "02-work"])
-    for entity, marker in (("alpha", "alpha-marker"), ("beta", "beta-marker")):
+    scaffold_modules(tmp_path, "beta1", ["00-intake", "01-core", "02-work"])
+    for entity, marker in (("alpha", "alpha-marker"), ("beta1", "beta1-marker")):
         (tmp_path / entity / "02-work" / "active").mkdir(parents=True)
         path = tmp_path / entity / "00-inbox" / "active" / "marker.md"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,8 +172,8 @@ workspaces:
     )
     for entity, relative, marker in (
         ("alpha", "07-finance/active/alpha.md", "alpha-registry-marker"),
-        ("beta", "07-finance/active/beta-one.md", "beta-registry-marker-one"),
-        ("beta", "09-marketing/active/beta-two.md", "beta-registry-marker-two"),
+        ("beta1", "07-finance/active/beta1-one.md", "beta1-registry-marker-one"),
+        ("beta1", "09-marketing/active/beta1-two.md", "beta1-registry-marker-two"),
     ):
         path = tmp_path / entity / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,7 +183,7 @@ workspaces:
             f"updated: 2026-01-01\n---\n{marker}\n",
             encoding="utf-8",
         )
-    for entity, columns in (("alpha", ("product", "tag")), ("beta", ("product",))):
+    for entity, columns in (("alpha", ("product", "tag")), ("beta1", ("product",))):
         connection = sqlite3.connect(tmp_path / entity / "books.db")
         connection.execute(
             "CREATE TABLE entries (id INTEGER PRIMARY KEY, product TEXT, tag TEXT)"
@@ -331,11 +331,11 @@ def test_concurrent_triage_requests_keep_entity_rows_isolated(client, monkeypatc
     monkeypatch.setattr(app.main, "read_inbox", overlapped)
     with ThreadPoolExecutor(max_workers=2) as pool:
         alpha = pool.submit(client.get, "/triage/alpha")
-        beta = pool.submit(client.get, "/triage/beta")
+        beta1 = pool.submit(client.get, "/triage/beta1")
     assert "alpha-marker" in alpha.result().text
-    assert "beta-marker" not in alpha.result().text
-    assert "beta-marker" in beta.result().text
-    assert "alpha-marker" not in beta.result().text
+    assert "beta1-marker" not in alpha.result().text
+    assert "beta1-marker" in beta1.result().text
+    assert "alpha-marker" not in beta1.result().text
 
 
 def test_concurrent_proposal_requests_keep_canonical_destinations_isolated(
@@ -343,7 +343,7 @@ def test_concurrent_proposal_requests_keep_canonical_destinations_isolated(
 ):
     import app.outbox as outbox
 
-    for entity in ("alpha", "beta"):
+    for entity in ("alpha", "beta1"):
         for proposal in (client.vault / entity / "outbox").glob("*.yaml"):
             proposal.unlink()
 
@@ -361,25 +361,25 @@ def test_concurrent_proposal_requests_keep_canonical_destinations_isolated(
     data = {"filename": "marker.md", "module": "02-work", "sub": "general"}
     with ThreadPoolExecutor(max_workers=2) as pool:
         alpha = pool.submit(client.post, "/triage/alpha/propose", data=data)
-        beta = pool.submit(client.post, "/triage/beta/propose", data=data)
+        beta1 = pool.submit(client.post, "/triage/beta1/propose", data=data)
 
     assert alpha.result().status_code == 200
-    assert beta.result().status_code == 200
+    assert beta1.result().status_code == 200
     records = {}
-    for entity in ("alpha", "beta"):
+    for entity in ("alpha", "beta1"):
         paths = list((client.vault / entity / "outbox").glob("*.yaml"))
         assert len(paths) == 1
         records[entity] = yaml.safe_load(paths[0].read_text(encoding="utf-8"))
     assert records["alpha"]["entity"] == "alpha"
     assert records["alpha"]["src"] == "alpha/00-inbox/active/marker.md"
     assert records["alpha"]["dst"] == "alpha/02-work/active/marker.md"
-    assert records["beta"]["entity"] == "beta"
-    assert records["beta"]["src"] == "beta/00-inbox/active/marker.md"
-    assert records["beta"]["dst"] == "beta/02-work/active/marker.md"
+    assert records["beta1"]["entity"] == "beta1"
+    assert records["beta1"]["src"] == "beta1/00-inbox/active/marker.md"
+    assert records["beta1"]["dst"] == "beta1/02-work/active/marker.md"
     assert len(destinations) == 4
     assert len({id(destination) for destination in destinations}) == 4
     assert [destination.entity for destination in destinations].count("alpha") == 2
-    assert [destination.entity for destination in destinations].count("beta") == 2
+    assert [destination.entity for destination in destinations].count("beta1") == 2
 
 
 @pytest.mark.parametrize("data", [
@@ -388,7 +388,7 @@ def test_concurrent_proposal_requests_keep_canonical_destinations_isolated(
     {"filename": "marker.md", "module": "missing", "sub": "general"},
     {"filename": "marker.md", "module": "02-work", "sub": "wrong-module"},
     {"filename": "marker.md", "module": "02-work", "sub": "general", "block": "growth"},
-    {"filename": "marker.md", "module": "02-work", "sub": "general", "entity": "beta"},
+    {"filename": "marker.md", "module": "02-work", "sub": "general", "entity": "beta1"},
 ])
 def test_tampered_proposal_form_writes_nothing(client, data):
     # Task 11 / design §8 regression table, third row: `propose` is
@@ -405,13 +405,13 @@ def test_tampered_proposal_form_writes_nothing(client, data):
     route_client = TestClient(client.app, raise_server_exceptions=False)
     route_client.vault = client.vault
     before_head = git_head(route_client.vault)
-    before = snapshot_entity_bytes(route_client.vault, ("alpha", "beta"))
+    before = snapshot_entity_bytes(route_client.vault, ("alpha", "beta1"))
 
     response = route_client.post("/triage/alpha/propose", data=data)
 
     assert response.status_code == 200
     assert git_head(route_client.vault) == before_head
-    assert snapshot_entity_bytes(route_client.vault, ("alpha", "beta")) == before
+    assert snapshot_entity_bytes(route_client.vault, ("alpha", "beta1")) == before
     assert not list((route_client.vault / "alpha/outbox").glob("*.yaml"))
 
     expected_code = "E-INVALID" if "entity" in data else "E-DEST"
@@ -444,11 +444,11 @@ def test_concurrent_outbox_requests_keep_entity_diffs_isolated(client, monkeypat
     monkeypatch.setattr(main, "project_outbox", overlapped)
     with ThreadPoolExecutor(max_workers=2) as pool:
         alpha = pool.submit(client.get, "/outbox/alpha")
-        beta = pool.submit(client.get, "/outbox/beta")
+        beta1 = pool.submit(client.get, "/outbox/beta1")
     alpha_html = alpha.result().text
-    beta_html = beta.result().text
-    assert "alpha-diff-marker" in alpha_html and "beta-diff-marker" not in alpha_html
-    assert "beta-diff-marker" in beta_html and "alpha-diff-marker" not in beta_html
+    beta_html = beta1.result().text
+    assert "alpha-diff-marker" in alpha_html and "beta1-diff-marker" not in alpha_html
+    assert "beta1-diff-marker" in beta_html and "alpha-diff-marker" not in beta_html
     # The barrier can only reach its target if both concurrent requests
     # actually called the patched function — otherwise a future refactor that
     # moves the outbox routes off `project_outbox` would leave this green
@@ -598,13 +598,13 @@ def _outbox_action_data(vault, proposal_id, entity="alpha"):
 @pytest.mark.parametrize("action", ["approve", "reject"])
 def test_alpha_outbox_action_cannot_touch_beta_proposal(client, action):
     beta_id = "20260815T090703-" + "22" * 16
-    beta_proposal = client.vault / "beta/outbox" / f"{beta_id}.yaml"
-    beta_source = client.vault / "beta/00-inbox/active/marker.md"
+    beta_proposal = client.vault / "beta1/outbox" / f"{beta_id}.yaml"
+    beta_source = client.vault / "beta1/00-inbox/active/marker.md"
     proposal_before = beta_proposal.read_bytes()
     source_before = beta_source.read_bytes()
 
     # The scope refusal is independent of the fingerprint and must come
-    # first: alpha can offer no review of a beta proposal at all.
+    # first: alpha can offer no review of a beta1 proposal at all.
     response = client.post(
         f"/outbox/alpha/{action}",
         data={"id": beta_id, "review_sha256": _UNBOUND_FINGERPRINT},
@@ -614,14 +614,14 @@ def test_alpha_outbox_action_cannot_touch_beta_proposal(client, action):
     assert beta_proposal.read_bytes() == proposal_before
     assert beta_source.read_bytes() == source_before
     assert "alpha-diff-marker" in response.text
-    assert "beta-diff-marker" not in response.text
+    assert "beta1-diff-marker" not in response.text
 
 
 def test_registry_products_route_reads_only_bound_namespace(client):
     alpha_html = client.get("/registry/alpha/products").text
-    beta_html = client.get("/registry/beta/products").text
-    assert "alpha-only" in alpha_html and "beta-only" not in alpha_html
-    assert "beta-only" in beta_html and "alpha-only" not in beta_html
+    beta_html = client.get("/registry/beta1/products").text
+    assert "alpha-only" in alpha_html and "beta1-only" not in alpha_html
+    assert "beta1-only" in beta_html and "alpha-only" not in beta_html
 
 
 def test_alpha_delete_impact_excludes_beta_totals_and_marker_text(client):
@@ -633,7 +633,7 @@ def test_alpha_delete_impact_excludes_beta_totals_and_marker_text(client):
     assert "front-matter: 1" in response.text
     assert "books.db: 2" in response.text
     assert "front-matter: 2" not in response.text
-    assert "beta-registry-marker" not in response.text
+    assert "beta1-registry-marker" not in response.text
 
 
 def test_registry_transaction_error_is_a_registry_error(client, monkeypatch):
@@ -696,13 +696,13 @@ def test_concurrent_delete_previews_keep_reference_totals_isolated(
             "/registry/alpha/product/delete-preview",
             data={"slug": "shared"},
         )
-        beta = pool.submit(
+        beta1 = pool.submit(
             client.post,
-            "/registry/beta/product/delete-preview",
+            "/registry/beta1/product/delete-preview",
             data={"slug": "shared"},
         )
     alpha_html = alpha.result().text
-    beta_html = beta.result().text
+    beta_html = beta1.result().text
     assert "orphan 4 reference(s)" in alpha_html
     assert "orphan 3 reference(s)" not in alpha_html
     assert "orphan 3 reference(s)" in beta_html

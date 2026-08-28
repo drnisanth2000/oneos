@@ -25,14 +25,14 @@ import pytest
 
 from tests.conftest import write_vault
 
-ENTITIES = 'version: "1.0"\nentities:\n  demo: {label: Demo, flags: []}\n'
+ENTITIES = 'version: "1.0"\nentities:\n  demo1: {label: Demo, flags: []}\n'
 
 
 def _scope(tmp_path):
     from app.scope import Scope
 
     write_vault(tmp_path, ENTITIES)
-    (tmp_path / "demo").mkdir(exist_ok=True)
+    (tmp_path / "demo1").mkdir(exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     subprocess.run(
         ["git", "add", "-A"], cwd=tmp_path, check=True
@@ -52,11 +52,11 @@ def _scope(tmp_path):
         cwd=tmp_path,
         check=True,
     )
-    return Scope(tmp_path, "demo")
+    return Scope(tmp_path, "demo1")
 
 
 def _write_delete_proposal(tmp_path, proposal_id: str, body: str):
-    outbox = tmp_path / "demo" / "outbox"
+    outbox = tmp_path / "demo1" / "outbox"
     outbox.mkdir(parents=True, exist_ok=True)
     (outbox / f"{proposal_id}.yaml").write_text(body, encoding="utf-8")
 
@@ -65,7 +65,7 @@ def _base_record(proposal_id: str) -> dict:
     return {
         "id": proposal_id,
         "action": "delete",
-        "entity": "demo",
+        "entity": "demo1",
         "kind": "product",
         "slug": "widget",
     }
@@ -137,7 +137,7 @@ def test_wrong_action_type_keeps_its_own_message(tmp_path):
 
     scope = _scope(tmp_path)
     proposal_id = "20260815T090703-" + "ef" * 16
-    record = {"id": proposal_id, "action": "classify", "entity": "demo"}
+    record = {"id": proposal_id, "action": "classify", "entity": "demo1"}
     _write_delete_proposal(tmp_path, proposal_id, _dump(record))
 
     with pytest.raises(RegistryError, match="is not a delete proposal"):
@@ -186,7 +186,7 @@ def test_well_formed_delete_proposal_still_constructs(tmp_path):
     prop = get_delete_proposal(scope, proposal_id)
     assert prop.kind == "product"
     assert prop.slug == "widget"
-    assert prop.entity == "demo"
+    assert prop.entity == "demo1"
     assert prop.id == proposal_id
 
 

@@ -47,7 +47,7 @@ RULES = textwrap.dedent(
 
 
 def _vault(tmp_path, with_rules=True):
-    root = write_vault(tmp_path, 'version: "1.0"\nentities:\n  acme: {label: Acme, flags: [personal]}\n', ARCH)
+    root = write_vault(tmp_path, 'version: "1.0"\nentities:\n  acme1: {label: Acme, flags: [personal]}\n', ARCH)
     if with_rules:
         (root / "_system" / "classifier").mkdir(parents=True, exist_ok=True)
         (root / "_system" / "classifier" / "rules.yaml").write_text(RULES)
@@ -55,10 +55,10 @@ def _vault(tmp_path, with_rules=True):
 
 
 def _inbox_note(root, name, title, summary, source="folder"):
-    d = root / "acme" / "00-inbox" / "active"
+    d = root / "acme1" / "00-inbox" / "active"
     d.mkdir(parents=True, exist_ok=True)
     (d / name).write_text(
-        f"---\ntype: inbox-item\ntitle: {title}\nentity: acme\nproduct: null\n"
+        f"---\ntype: inbox-item\ntitle: {title}\nentity: acme1\nproduct: null\n"
         f"status: active\ncreated: 2026-01-01\nupdated: 2026-01-01\nsub: triage\n"
         f"source: {source}\n---\n{summary}\n"
     )
@@ -111,7 +111,7 @@ def test_read_inbox_returns_triage_items_with_proposals(tmp_path):
     root = _vault(tmp_path)
     _inbox_note(root, "a.md", "March invoice", "amount due", "folder")
     _inbox_note(root, "b.md", "random musing", "hello", "folder")
-    items = read_inbox(Scope(root, "acme"))
+    items = read_inbox(Scope(root, "acme1"))
     assert {i.title for i in items} == {"March invoice", "random musing"}
     assert all(i.fm.get("sub") == "triage" for i in items)
 
@@ -123,12 +123,12 @@ def test_read_inbox_rejects_cross_scope_leaf_symlink(tmp_path):
         "---\ntype: inbox-item\ntitle: outside marker\nsub: triage\n---\noutside body\n",
         encoding="utf-8",
     )
-    inbox = root / "acme/00-inbox/active"
+    inbox = root / "acme1/00-inbox/active"
     inbox.mkdir(parents=True)
     (inbox / "linked.md").symlink_to(outside)
 
     with pytest.raises(CrossScopeError):
-        read_inbox(Scope(root, "acme"))
+        read_inbox(Scope(root, "acme1"))
 
 
 @pytest.mark.parametrize("redirect", ("directory", "leaf"))
@@ -137,9 +137,9 @@ def test_read_inbox_rejects_same_entity_sensitive_redirect_before_body_read(
 ):
     root = _vault(tmp_path)
     _inbox_note(root, "safe.md", "Safe", "safe body")
-    scope = Scope(root, "acme")
-    active = root / "acme/00-inbox/active"
-    sensitive = root / "acme/.sensitive"
+    scope = Scope(root, "acme1")
+    active = root / "acme1/00-inbox/active"
+    sensitive = root / "acme1/.sensitive"
     sensitive.mkdir()
     if redirect == "directory":
         target = sensitive / "redirected-active"

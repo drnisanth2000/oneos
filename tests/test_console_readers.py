@@ -294,15 +294,15 @@ def test_every_declaration_names_a_literal_known_category():
     assert bad == [], f"non-literal or unknown reader category: {bad}"
 
 
-ENTITIES = 'version: "1.0"\nentities:\n  demo: {label: Demo, flags: []}\n'
+ENTITIES = 'version: "1.0"\nentities:\n  demo1: {label: Demo, flags: []}\n'
 
 
 def _scope(tmp_path):
     from app.scope import Scope
 
     write_vault(tmp_path, ENTITIES)
-    (tmp_path / "demo").mkdir(exist_ok=True)
-    return Scope(tmp_path, "demo")
+    (tmp_path / "demo1").mkdir(exist_ok=True)
+    return Scope(tmp_path, "demo1")
 
 
 def test_registry_reader_unparseable_yaml_becomes_config(tmp_path):
@@ -401,7 +401,7 @@ def test_proposal_reader_failure_is_unreadable_not_config(tmp_path):
 
     scope = _scope(tmp_path)
     proposal_id = "20260815T090703-" + "ab" * 16
-    outbox = tmp_path / "demo/outbox"
+    outbox = tmp_path / "demo1/outbox"
     outbox.mkdir(parents=True)
     (outbox / f"{proposal_id}.yaml").write_text(
         "action: delete\nslug: [unterminated\n", encoding="utf-8"
@@ -445,7 +445,7 @@ def test_front_matter_counter_still_skips_an_unreadable_file(tmp_path):
     """The fifth tolerance row: an unreadable markdown file is skipped."""
     from app import registry
 
-    entity_root = tmp_path / "demo"
+    entity_root = tmp_path / "demo1"
     (entity_root / "01-core").mkdir(parents=True)
     good = entity_root / "01-core" / "good.md"
     good.write_text("---\nproduct: p\n---\nbody\n", encoding="utf-8")
@@ -465,7 +465,7 @@ def test_corrupt_books_db_is_a_registry_refusal_not_unknown(tmp_path):
     from app import registry
     from app.console_errors import describe
 
-    entity_root = tmp_path / "demo"
+    entity_root = tmp_path / "demo1"
     entity_root.mkdir(parents=True)
     (entity_root / "books.db").write_bytes(b"this is not a sqlite database at all")
     with pytest.raises(Exception) as raised:
@@ -479,7 +479,7 @@ def test_workspaces_tolerates_every_falsy_entry(tmp_path):
 
     scope = _scope(tmp_path)
     system = tmp_path / "_system"
-    real = "  - {entity: demo, product: p}\n"
+    real = "  - {entity: demo1, product: product1}\n"
     for falsy in ("  - false\n", "  - ''\n", "  - 0\n", "  -\n"):
         # Pair each falsy entry with a real one and assert 1, not 0: asserting
         # 0 alone would also pass if the reader bailed out and tolerated
@@ -487,7 +487,7 @@ def test_workspaces_tolerates_every_falsy_entry(tmp_path):
         (system / "workspaces.yaml").write_text(
             "workspaces:\n" + falsy + real, encoding="utf-8"
         )
-        assert registry._count_workspaces(scope, "product", "p") == 1
+        assert registry._count_workspaces(scope, "product", "product1") == 1
 
 
 def test_mid_approval_reread_of_a_vanished_record_is_unreadable(tmp_path, monkeypatch):
@@ -531,7 +531,7 @@ def test_wrongly_shaped_product_list_is_config_not_unknown(tmp_path):
     from app.console_errors import describe
 
     scope = _scope(tmp_path)
-    payload = b"products:\n  demo:\n  - p\n  - q\n"
+    payload = b"products:\n  demo1:\n  - p\n  - q\n"
     with pytest.raises(Exception) as raised:
         registry._remove_scoped_registry_value(scope, "product", "p", payload)
     assert describe(raised.value).code == "E-CONFIG"
@@ -587,7 +587,7 @@ def test_entities_unknown_flag_is_config_not_unknown(tmp_path):
 
     write_vault(
         tmp_path,
-        'version: "1.0"\nentities:\n  demo: {label: Demo, flags: [nosuchflag]}\n',
+        'version: "1.0"\nentities:\n  demo1: {label: Demo, flags: [nosuchflag]}\n',
     )
     with pytest.raises(DestinationRegistryError) as raised:
         Vault(EntityCatalog.load(tmp_path)).bundles()
@@ -749,15 +749,15 @@ def test_flags_as_plain_list_activates_a_gated_module(tmp_path):
 
     archetypes = {
         "version": "2.0",
-        "flags": ["beta"],
+        "flags": ["beta1"],
         "modules": {
             "00-intake": {"block": "system"},
-            "zz-extra": {"block": "system", "requires_flag": "beta"},
+            "zz-extra": {"block": "system", "requires_flag": "beta1"},
         },
     }
     write_vault(
         tmp_path,
-        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: [beta]}\n',
+        'version: "1.0"\nentities:\n  alpha: {label: Alpha, flags: [beta1]}\n',
         yaml.safe_dump(archetypes),
     )
     vault = Vault(EntityCatalog.load(tmp_path))

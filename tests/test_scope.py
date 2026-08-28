@@ -22,12 +22,12 @@ from tests.conftest import entities_yaml, write_vault
 
 
 def test_catalog_preserves_manifest_order_and_public_entity_fields(tmp_path):
-    write_vault(tmp_path, entities_yaml("beta", "alpha"))
+    write_vault(tmp_path, entities_yaml("beta1", "alpha"))
 
     catalog = EntityCatalog.load(tmp_path)
 
     assert catalog.entities == (
-        EntityDefinition(slug="beta", label="Beta", flags=(), email_addresses=()),
+        EntityDefinition(slug="beta1", label="Beta1", flags=(), email_addresses=()),
         EntityDefinition(slug="alpha", label="Alpha", flags=(), email_addresses=()),
     )
     assert tuple(field.name for field in dataclasses.fields(EntityDefinition)) == (
@@ -128,9 +128,9 @@ def test_manifest_rejects_malformed_recipient_address(tmp_path, value):
 
 def test_manifest_rejects_duplicate_normalized_address_ownership(tmp_path):
     write_vault(tmp_path, entities_yaml(
-        "alpha", "beta", ingest={
+        "alpha", "beta1", ingest={
             "alpha": ["shared@example.invalid"],
-            "beta": ["SHARED@example.invalid"],
+            "beta1": ["SHARED@example.invalid"],
         },
     ))
     with pytest.raises(RecipientConfigurationError, match="duplicate ownership"):
@@ -200,11 +200,11 @@ def test_scope_is_immutable(tmp_path):
     write_vault(tmp_path, entities_yaml("alpha"))
     scope = Scope(tmp_path, "alpha")
     with pytest.raises((AttributeError, dataclasses.FrozenInstanceError)):
-        scope._entity = "beta"
+        scope._entity = "beta1"
 
 
 def test_inbox_interface_has_one_identity_authority(tmp_path):
-    write_vault(tmp_path, entities_yaml("alpha", "beta"))
+    write_vault(tmp_path, entities_yaml("alpha", "beta1"))
     assert tuple(inspect.signature(read_inbox).parameters) == ("scope",)
 
 
@@ -231,23 +231,23 @@ def test_entity_sensitive_interfaces_take_only_bound_scope():
 
 
 def test_stored_path_must_name_bound_entity(tmp_path):
-    write_vault(tmp_path, entities_yaml("alpha", "beta"))
+    write_vault(tmp_path, entities_yaml("alpha", "beta1"))
     with pytest.raises(CrossScopeError):
-        Scope(tmp_path, "alpha").resolve_stored("beta/00-inbox/active/item.md")
+        Scope(tmp_path, "alpha").resolve_stored("beta1/00-inbox/active/item.md")
 
 
 def test_vault_relative_rejects_another_entity_path(tmp_path):
-    write_vault(tmp_path, entities_yaml("alpha", "beta"))
+    write_vault(tmp_path, entities_yaml("alpha", "beta1"))
     with pytest.raises(CrossScopeError):
-        Scope(tmp_path, "alpha").vault_relative(tmp_path / "beta/00-inbox/item.md")
+        Scope(tmp_path, "alpha").vault_relative(tmp_path / "beta1/00-inbox/item.md")
 
 
 def test_system_path_does_not_grant_another_entity_path(tmp_path):
-    write_vault(tmp_path, entities_yaml("alpha", "beta"))
+    write_vault(tmp_path, entities_yaml("alpha", "beta1"))
     scope = Scope(tmp_path, "alpha")
     assert scope.system_path("entities.yaml") == tmp_path / "_system/entities.yaml"
     with pytest.raises(CrossScopeError):
-        scope.resolve("..", "beta", "00-inbox")
+        scope.resolve("..", "beta1", "00-inbox")
 
 
 def test_scope_system_path_rejects_system_root_redirected_after_binding(tmp_path):
@@ -265,11 +265,11 @@ def test_scope_system_path_rejects_system_root_redirected_after_binding(tmp_path
 
 
 def test_entity_root_symlink_cannot_redirect_bound_scope(tmp_path):
-    write_vault(tmp_path, entities_yaml("alpha", "beta"))
-    beta = tmp_path / "beta"
-    beta.mkdir()
-    (beta / "private.md").write_text("beta-private\n", encoding="utf-8")
-    (tmp_path / "alpha").symlink_to(beta, target_is_directory=True)
+    write_vault(tmp_path, entities_yaml("alpha", "beta1"))
+    beta1 = tmp_path / "beta1"
+    beta1.mkdir()
+    (beta1 / "private.md").write_text("beta1-private\n", encoding="utf-8")
+    (tmp_path / "alpha").symlink_to(beta1, target_is_directory=True)
 
     scope = Scope(tmp_path, "alpha")
     assert scope.current_entity() == "alpha"

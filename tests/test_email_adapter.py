@@ -105,14 +105,14 @@ def _msg(
 def email_vault(tmp_path):
     return git_entity_vault(
         tmp_path / "email-vault",
-        ("alpha", "beta"),
+        ("alpha", "beta1"),
         {
             "alpha/00-inbox/active/.gitkeep": "",
-            "beta/00-inbox/active/.gitkeep": "",
+            "beta1/00-inbox/active/.gitkeep": "",
         },
         ingest={
             "alpha": ["intake-alpha@example.invalid", "alias@example.invalid"],
-            "beta": ["intake-beta@example.invalid"],
+            "beta1": ["intake-beta1@example.invalid"],
         },
     )
 
@@ -124,7 +124,7 @@ def test_recipient_parser_uses_only_approved_headers():
     message["X-Original-To"] = "alias@example.invalid"
     message["Envelope-To"] = "Alias <alias@example.invalid>"
     message["Cc"] = "cc@example.invalid"
-    message["Reply-To"] = "intake-beta@example.invalid"
+    message["Reply-To"] = "intake-beta1@example.invalid"
     assert recipient_addresses(message) == frozenset({
         "intake-alpha@example.invalid", "alias@example.invalid", "cc@example.invalid"
     })
@@ -136,21 +136,21 @@ def test_shared_email_routes_to_exactly_one_entity(email_vault):
         _msg("alpha body", to="intake-alpha@example.invalid"),
     )
     assert result.path.is_relative_to(email_vault / "alpha/00-inbox/active")
-    assert not list((email_vault / "beta/00-inbox/active").glob("*.md"))
+    assert not list((email_vault / "beta1/00-inbox/active").glob("*.md"))
 
 
 def test_sender_subject_and_body_never_select_an_entity(email_vault):
     result = process_shared_email(
         email_vault,
         _msg(
-            "intake-beta@example.invalid must not route this body",
+            "intake-beta1@example.invalid must not route this body",
             to="intake-alpha@example.invalid",
-            sender="intake-beta@example.invalid",
-            subject="intake-beta@example.invalid",
+            sender="intake-beta1@example.invalid",
+            subject="intake-beta1@example.invalid",
         ),
     )
     assert result.path.is_relative_to(email_vault / "alpha/00-inbox/active")
-    assert not list((email_vault / "beta/00-inbox/active").glob("*.md"))
+    assert not list((email_vault / "beta1/00-inbox/active").glob("*.md"))
 
 
 def test_multiple_recipients_for_one_entity_are_not_ambiguous(email_vault):
@@ -166,14 +166,14 @@ def test_multiple_recipients_for_one_entity_are_not_ambiguous(email_vault):
 
 @pytest.mark.parametrize("recipients,error", [
     (["unknown@example.invalid"], UnmappedRecipientError),
-    (["intake-alpha@example.invalid", "intake-beta@example.invalid"], AmbiguousRecipientError),
+    (["intake-alpha@example.invalid", "intake-beta1@example.invalid"], AmbiguousRecipientError),
 ])
 def test_routing_error_creates_no_receipt_or_commit(email_vault, recipients, error):
     before_head = git_head(email_vault)
     before_paths = git_tracked_paths(email_vault)
     before_inboxes = {
         entity: list((email_vault / entity / "00-inbox/active").iterdir())
-        for entity in ("alpha", "beta")
+        for entity in ("alpha", "beta1")
     }
     message = _msg("must not be written", to=", ".join(recipients))
     with pytest.raises(error):
@@ -182,7 +182,7 @@ def test_routing_error_creates_no_receipt_or_commit(email_vault, recipients, err
     assert git_tracked_paths(email_vault) == before_paths
     assert {
         entity: list((email_vault / entity / "00-inbox/active").iterdir())
-        for entity in ("alpha", "beta")
+        for entity in ("alpha", "beta1")
     } == before_inboxes
     assert not list(email_vault.glob("*/00-inbox/active/*.md"))
 
@@ -190,11 +190,11 @@ def test_routing_error_creates_no_receipt_or_commit(email_vault, recipients, err
 def test_poll_rejects_duplicate_ownership_before_opening_imap(tmp_path, monkeypatch):
     vault = git_entity_vault(
         tmp_path / "duplicate-vault",
-        ("alpha", "beta"),
+        ("alpha", "beta1"),
         {},
         ingest={
             "alpha": ["shared@example.invalid"],
-            "beta": ["SHARED@example.invalid"],
+            "beta1": ["SHARED@example.invalid"],
         },
     )
 
@@ -280,7 +280,7 @@ def test_poll_commit_failure_does_not_acknowledge_and_cleans_up(
 
 @pytest.mark.parametrize("recipients,error", [
     (["unknown@example.invalid"], UnmappedRecipientError),
-    (["intake-alpha@example.invalid", "intake-beta@example.invalid"], AmbiguousRecipientError),
+    (["intake-alpha@example.invalid", "intake-beta1@example.invalid"], AmbiguousRecipientError),
 ])
 def test_poll_routing_failure_peeks_without_mailbox_or_vault_mutation(
     email_vault, monkeypatch, recipients, error

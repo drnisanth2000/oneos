@@ -30,7 +30,7 @@ from app.console_errors import describe
 from app.entities import EntityCatalog
 from app.vault import DestinationRegistryError, Vault
 
-ENTITIES = 'version: "1.0"\nentities:\n  demo: {label: Demo, flags: []}\n'
+ENTITIES = 'version: "1.0"\nentities:\n  demo1: {label: Demo, flags: []}\n'
 
 
 def _vault(tmp_path):

@@ -42,6 +42,7 @@ from .review_tokens import (
     require_review_match,
 )
 from .inbox import split_front_matter
+from .identifiers import meets_floor
 from .outbox import UnreadableProposalRecord
 from .proposal_identity import (
     ProposalIdentityError,
@@ -62,6 +63,41 @@ _SKIP_DIRS = {".git", ".obsidian", ".sensitive", "outbox", "staging"}
 
 class RegistryError(Exception):
     pass
+
+
+def _require_stored_axis_identifier(axis: str, value: object) -> str:
+    if not isinstance(value, str) or not meets_floor(value):
+        raise DestinationRegistryError(f"{axis} identifier is invalid")
+    return value
+
+
+def _require_requested_axis_identifier(axis: str, value: object) -> str:
+    if not isinstance(value, str) or not meets_floor(value):
+        raise RegistryError(f"{axis} identifier is invalid")
+    return value
+
+
+def _validate_workspace_axis_identifiers(
+    entry: dict, error_type: type[DestinationRegistryError] | type[RegistryError]
+) -> None:
+    require = (
+        _require_stored_axis_identifier
+        if error_type is DestinationRegistryError
+        else _require_requested_axis_identifier
+    )
+    for field_name, axis in (
+        ("id", "workspace"),
+        ("entity", "entity"),
+        ("primary_entity", "entity"),
+        ("product", "product"),
+        ("member", "member"),
+    ):
+        if field_name in entry and entry[field_name] is not None:
+            require(axis, entry[field_name])
+    entities = entry.get("entities")
+    if isinstance(entities, list):
+        for entity in entities:
+            require("entity", entity)
 
 
 class MissingDeleteProposal(RegistryError):
@@ -206,6 +242,7 @@ def _count_workspaces(scope: Scope, kind: str, slug: str) -> int:
             continue
         if not isinstance(entry, dict):
             raise DestinationRegistryError("workspace entry is malformed")
+        _validate_workspace_axis_identifiers(entry, DestinationRegistryError)
         if (
             entry.get("entity", entry.get("primary_entity")) == entity
             and str(entry.get(kind)) == slug
@@ -311,7 +348,10 @@ def products_for(scope: Scope) -> list[str]:
     values = products.get(scope.current_entity()) or {}
     if not isinstance(values, dict):
         return []
-    return list(values.keys())
+    product_ids = list(values.keys())
+    for product_id in product_ids:
+        _require_stored_axis_identifier("product", product_id)
+    return product_ids
 
 
 # --- add (direct) ----------------------------------------------------------
@@ -319,6 +359,7 @@ def products_for(scope: Scope) -> list[str]:
 @structured_reader(category="registry")
 def add_workspace(scope: Scope, entry: dict) -> None:
     """Append a workspace. Direct write + commit (spec §2.2b)."""
+    _validate_workspace_axis_identifiers(entry, RegistryError)
     entity = entry.get("entity", entry.get("primary_entity"))
     if entity != scope.current_entity():
         raise RegistryError("workspace owner disagrees with selected scope")
@@ -365,6 +406,8 @@ def _delete_proposal_path(scope: Scope, proposal_id: str) -> Path:
 
 def propose_delete(scope: Scope, kind: str, slug: str) -> DeleteProposal:
     """Write a delete proposal carrying the reference count. Removes nothing."""
+    if kind in _DB_COLUMNS:
+        _require_requested_axis_identifier(kind, slug)
     entity = scope.current_entity()
     report = reference_count(scope, kind, slug)
     created_at = datetime.now()
@@ -580,12 +623,20 @@ def _remove_scoped_registry_value(
         raise DestinationRegistryError("registry section is malformed")
     values = registry.get(scope.current_entity())
     if isinstance(values, dict):
+        for identifier in values:
+            _require_stored_axis_identifier(kind, identifier)
         if slug not in values:
             raise RegistryError(f"unknown {kind} {slug!r} in selected entity")
         del values[slug]
     elif isinstance(values, list):
         try:
-            kept = [item for item in values if str((item or {}).get("id")) != slug]
+            kept = []
+            for item in values:
+                identifier = (item or {}).get("id")
+                if identifier is not None:
+                    _require_stored_axis_identifier(kind, identifier)
+                if str(identifier) != slug:
+                    kept.append(item)
         except AttributeError as exc:
             # A list of scalars where a list of mappings is expected: valid YAML,
             # wrong shape. Escapes raw today and reaches the delete-execute

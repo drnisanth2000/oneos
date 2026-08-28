@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .console_routing import structured_reader
+from .identifiers import AXES as REGISTRY_AXES, meets_floor
 from .git_transaction import (
     ActionLockCleanupFailure,
     GitTransactionFailure,
@@ -146,11 +147,13 @@ def grep_gate(vault: Path, old: str) -> list[tuple[str, int, str]]:
     return residuals
 
 
-def _validate_new_slug(new: str) -> None:
+def _validate_new_slug(axis: str, new: str) -> None:
     if not SLUG_RE.match(new):
         raise RenameError(f"invalid slug {new!r} — lowercase, digits, hyphens")
     if new in RESERVED:
         raise RenameError(f"{new!r} is a reserved name")
+    if axis in REGISTRY_AXES and not meets_floor(new):
+        raise RenameError("new registry identifier is shorter than five characters")
 
 
 def _insert_former_slug(text: str, key: str, old: str, indent_hint: int = 2) -> str:
@@ -429,7 +432,7 @@ def build_rename_plan(
         raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
     if old == new:
         raise RenameError("old and new slug are identical")
-    _validate_new_slug(new)
+    _validate_new_slug(axis, new)
     plan = RenamePlan(
         axis=axis,
         old=old,
@@ -452,7 +455,7 @@ def plan_rename(vault: Path | str, axis: str, old: str, new: str) -> RenamePlan:
         raise RenameError(f"unknown axis {axis!r} — one of {sorted(AXES)}")
     if old == new:
         raise RenameError("old and new slug are identical")
-    _validate_new_slug(new)
+    _validate_new_slug(axis, new)
     planned_head = _git(vault, "rev-parse", "HEAD").strip()
     return build_rename_plan(
         vault,

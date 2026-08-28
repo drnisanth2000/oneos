@@ -36,6 +36,6 @@ def test_record_id_must_equal_yaml_filename_stem():
     proposal_id = "20260815T090703-" + "ab" * 16
     with pytest.raises(identity.ProposalIdentityError):
         identity.require_proposal_identity(
-            Path("/vault/demo/outbox/20260815T090703-" + "cd" * 16 + ".yaml"),
+            Path("/vault/demo1/outbox/20260815T090703-" + "cd" * 16 + ".yaml"),
             proposal_id,
         )

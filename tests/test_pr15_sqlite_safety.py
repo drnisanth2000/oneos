@@ -30,7 +30,7 @@ _DB_COLUMNS_KIND = "product"
 
 
 def _entity_root(tmp_path):
-    root = tmp_path / "demo"
+    root = tmp_path / "demo1"
     root.mkdir()
     return root
 

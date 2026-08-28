@@ -17,6 +17,7 @@ from typing import Literal, cast
 import yaml
 
 from .console_routing import structured_reader
+from .identifiers import meets_floor
 from .proposal_identity import (
     ProposalIdentityError,
     require_proposal_id,
@@ -112,7 +113,11 @@ _UniqueKeyLoader.add_constructor(
 
 
 def _require_entity(entity: object) -> str:
-    if not isinstance(entity, str) or _ENTITY.fullmatch(entity) is None:
+    if (
+        not isinstance(entity, str)
+        or _ENTITY.fullmatch(entity) is None
+        or not meets_floor(entity)
+    ):
         raise ReceiptStoreIntegrityError("receipt entity is not canonical")
     return entity
 
@@ -420,7 +425,7 @@ def _head_canonical_roots(vault: Path) -> tuple[str, ...]:
             name = raw_name.decode("utf-8", "strict")
         except UnicodeDecodeError:
             continue
-        if _ENTITY.fullmatch(name) is not None:
+        if _ENTITY.fullmatch(name) is not None and meets_floor(name):
             roots.append(name)
     return tuple(sorted(set(roots)))
 
