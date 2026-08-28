@@ -126,9 +126,15 @@ def test_every_application_exception_resolves_to_its_designed_code():
 
     from app import (
         action_receipts,
+        cutover_build,
+        cutover_db,
+        cutover_inventory,
+        cutover_locations,
+        cutover_manifest,
         destinations,
         entities,
         git_transaction,
+        identifiers,
         outbox,
         proposal_identity,
         registry,
@@ -213,6 +219,17 @@ def test_every_application_exception_resolves_to_its_designed_code():
         ingest_base.IngestError: "E-INGEST",
         rename.RenameCommittedError: "E-COMMITTED",
         rename.RenameError: "E-ADMIN",
+        # Short-identifier cutover — administrative refusals, except a
+        # promotion that committed, which must never degrade to E-ADMIN.
+        cutover_build.CutoverCommittedError: "E-COMMITTED",
+        cutover_build.CutoverError: "E-ADMIN",
+        identifiers.AxisError: "E-ADMIN",
+        cutover_locations.LocationError: "E-ADMIN",
+        cutover_locations.UnreadableFile: "E-ADMIN",
+        cutover_manifest.ManifestError: "E-ADMIN",
+        cutover_db.DatabaseCutoverError: "E-ADMIN",
+        cutover_inventory.CollisionError: "E-ADMIN",
+        cutover_inventory.UnmigratableContentError: "E-ADMIN",
         RequestValidationError: "E-REQUEST",
     }
     for cls, code in expected.items():

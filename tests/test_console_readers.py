@@ -21,7 +21,11 @@ _APP_ROOT = pathlib.Path(__file__).resolve().parents[1] / "app"
 # guard matches on the call shape, not on an import alias, because its entire
 # purpose is catching sites nobody remembered to declare.
 _YAML_LOADERS = {"safe_load", "load", "full_load", "unsafe_load",
-                 "safe_load_all", "load_all"}
+                 "safe_load_all", "load_all",
+                 # Event stream and node graph: still structured reads of the
+                 # same file, and the layer a rewriter's offsets derive from.
+                 "parse", "compose", "compose_all"}
+_YAML_LOADER_CLASSES = {"YAML"}
 _SQLITE_OPENERS = {"connect", "Connection"}
 _BYTE_READERS = {"read_text", "read_bytes", "open"}
 
@@ -42,25 +46,36 @@ def _receiver_chain(node) -> list[str]:
             return names
 
 
-def _module_aliases(tree: ast.AST) -> tuple[dict, set]:
+def _module_aliases(tree: ast.AST) -> tuple[dict, set, set]:
     """Resolve this module's import aliases.
 
     `import yaml as y` must not defeat the guard, so receivers are matched
     against the module they actually name, and bare names imported with
-    `from yaml import safe_load as sl` are tracked too.
+    `from yaml import safe_load as sl` are tracked too. Loader *classes*
+    (`from ruamel.yaml import YAML as R`) are tracked separately because
+    they are read through an instance, not a module receiver.
     """
-    modules, bare = {}, set()
+    modules, bare, loader_classes = {}, set(), set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 modules[alias.asname or alias.name.split(".")[0]] = (
+                    alias.name
+                    if alias.asname
+                    else
                     alias.name.split(".")[0]
                 )
         elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
+            # `from ruamel.yaml import safe_load` is a yaml source too, so
+            # membership is tested over every dotted component.
+            components = (node.module or "").split(".")
+            root = "yaml" if "yaml" in components else components[0]
             for alias in node.names:
                 local = alias.asname or alias.name
-                if root == "yaml" and alias.name in _YAML_LOADERS:
+                if root == "yaml" and alias.name in _YAML_LOADER_CLASSES:
+                    loader_classes.add(local)
+                    modules[local] = alias.name
+                elif root == "yaml" and alias.name in _YAML_LOADERS:
                     bare.add(local)
                 elif alias.name == "split_front_matter":
                     bare.add(local)
@@ -68,20 +83,43 @@ def _module_aliases(tree: ast.AST) -> tuple[dict, set]:
                     bare.add(local)
                 else:
                     modules[local] = alias.name
-    return modules, bare
+    return modules, bare, loader_classes
 
 
 def _resolved_chain(node, modules: dict) -> list[str]:
-    return [modules.get(name, name) for name in _receiver_chain(node)]
+    """Receiver names with aliases resolved, split on dots.
+
+    `import a.b.yaml as y` binds `y` to the whole dotted module, so the alias
+    must expand to its components or a `yaml` receiver hides behind it.
+    """
+    resolved: list[str] = []
+    for name in _receiver_chain(node):
+        resolved.extend(str(modules.get(name, name)).split("."))
+    return resolved
 
 
 def _is_trigger_call(node: ast.Call, modules=None, bare=None,
-                     path_names=None) -> bool:
+                     path_names=None, loader_classes=None) -> bool:
     modules = modules or {}
     bare = bare or set()
     path_names = path_names or set()
+    loader_classes = loader_classes or set()
     func = node.func
     if isinstance(func, ast.Attribute):
+        # `YAML().load(p)` has no module receiver: the receiver is a freshly
+        # instantiated loader class, which is the ruamel API's normal entry
+        # point. A module-only rule never sees it. Origin decides, not the
+        # name: only a class imported from a yaml module counts, so a local
+        # `class YAML` and a `YAML` imported from anywhere else stay
+        # untouched. The qualified `ruamel.yaml.YAML()` needs no special
+        # case — its receiver resolves to the yaml module below.
+        if (
+            func.attr in _YAML_LOADERS
+            and isinstance(func.value, ast.Call)
+            and isinstance(func.value.func, ast.Name)
+            and func.value.func.id in loader_classes
+        ):
+            return True
         chain = _resolved_chain(func.value, modules)
         if func.attr in _YAML_LOADERS and "yaml" in chain:
             return True
@@ -96,7 +134,9 @@ def _is_trigger_call(node: ast.Call, modules=None, bare=None,
         ):
             return True
     if isinstance(func, ast.Name):
-        if func.id in _YAML_LOADERS | {"split_front_matter"} or func.id in bare:
+        # A bare `parse`/`compose`/`load` is a YAML reader only when it was
+        # imported from yaml. A local function that shares the name is not.
+        if func.id == "split_front_matter" or func.id in bare:
             return True
     return False
 
@@ -158,7 +198,7 @@ def _collect_offenders(tree: ast.AST, path: pathlib.Path) -> list[str]:
     on `self` are module-wide, since __init__ binds and another method reads.
     """
     offenders = []
-    modules, bare = _module_aliases(tree)
+    modules, bare, loader_classes = _module_aliases(tree)
     self_names = _system_path_attributes(tree)
 
     def visit(node, function_stack, path_names):
@@ -174,7 +214,7 @@ def _collect_offenders(tree: ast.AST, path: pathlib.Path) -> list[str]:
         for name in _bound_from_system_path(node):
             path_names.add(name)
         if isinstance(node, ast.Call) and _is_trigger_call(
-            node, modules, bare, path_names
+            node, modules, bare, path_names, loader_classes
         ):
             if not any(function_stack):
                 offenders.append(f"{path}:{node.lineno}")
@@ -212,13 +252,21 @@ def test_guard_catches_a_synthetic_undeclared_reader():
         "import yaml as y\ndef f(p):\n    return y.load(p)",
         "import sqlite3 as sq\ndef f(s):\n    return sq.connect(s)",
         "from yaml import safe_load as sl\ndef f(p):\n    return sl(p)",
+        "import a.b.yaml as y\ndef f(p):\n    return y.compose(p)",
+        "import ruamel.yaml\ndef f(p):\n    return ruamel.yaml.safe_load(p)",
+        "from ruamel.yaml import safe_load\ndef f(p):\n    return safe_load(p)",
         "def f(s):\n    return json.loads(s.system_path('x.json').read_text())",
         "def f(v):\n    p = v.system_path('members.yaml')\n    return p.read_bytes()",
         "def f(v):\n    p = v.system_path('x.json')\n    return json.loads(p.read_text())",
         "class C:\n    def __init__(self, v):\n        self._p = v.system_path('r.yaml')\n"
         "    def load(self):\n        return self._p.read_text()",
         "def f(p):\n    return yaml.safe_load_all(p)",
+        "def f(p):\n    return yaml.parse(p)",
+        "def f(p):\n    return yaml.compose(p)",
+        "from yaml import compose as c\ndef f(p):\n    return c(p)",
         "def f(t):\n    return split_front_matter(t)",
+        "from yaml import parse\ndef f(p):\n    return parse(p)",
+        "from yaml import compose as c\ndef f(p):\n    return c(p)",
     ]
     for src in shapes:
         tree = ast.parse(textwrap.dedent(src))
@@ -814,3 +862,51 @@ def test_boundary_readers_carry_no_blanket_try_of_their_own():
         "(`return read()`) — widening it defeats the per-access narrowness "
         "this helper exists to enforce"
     )
+
+
+def test_a_local_function_named_like_a_yaml_reader_is_not_flagged():
+    """Bare names count only when imported from yaml.
+
+    Treating any local `parse`, `compose` or `load` as a structured read makes
+    the guard fire on unrelated code, and a guard that cries wolf gets
+    silenced.
+    """
+    for src in (
+        "def parse(p):\n    return p\ndef f(p):\n    return parse(p)",
+        "def compose(a, b):\n    return a\ndef f(x):\n    return compose(x, x)",
+        "def load(self):\n    return 1\ndef f(o):\n    return load(o)",
+    ):
+        tree = ast.parse(textwrap.dedent(src))
+        assert _collect_offenders(tree, pathlib.Path("synthetic.py")) == [], src
+
+
+def test_a_yaml_loader_class_is_detected():
+    """`YAML().load(p)` is a structured read with no module receiver.
+
+    The guard resolved receivers to a `yaml` module, so an instantiated loader
+    class — the ruamel API's normal entry point — presented as an ordinary
+    local call and passed unseen.
+    """
+    for src in (
+        "from ruamel.yaml import YAML as R\ndef f(p):\n    return R().load(p)",
+        "from ruamel.yaml import YAML\ndef f(p):\n    return YAML().load(p)",
+        "import ruamel.yaml\ndef f(p):\n    return ruamel.yaml.YAML().load(p)",
+    ):
+        tree = ast.parse(textwrap.dedent(src))
+        assert _collect_offenders(tree, pathlib.Path("synthetic.py")), src
+
+
+def test_an_unimported_yaml_name_is_not_a_structured_read():
+    """Origin decides, not spelling.
+
+    Flagging every receiver called `YAML` would make an ordinary local class
+    — or a same-named class from an unrelated package — a false offender,
+    and a guard that cries wolf gets suppressed rather than obeyed.
+    """
+    for src in (
+        "class YAML:\n    def load(self, p):\n        return p\n"
+        "def f(p):\n    return YAML().load(p)",
+        "from unrelated import YAML\ndef f(p):\n    return YAML().load(p)",
+    ):
+        tree = ast.parse(textwrap.dedent(src))
+        assert not _collect_offenders(tree, pathlib.Path("synthetic.py")), src
