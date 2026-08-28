@@ -1,9 +1,9 @@
 # Short-Identifier Cutover
 
-**Status:** APPROVED DESIGN — revision 13. Stage A exists, but the private
+**Status:** APPROVED DESIGN — revision 14. Stage A exists, but the private
 inventory found structurally meaningful references in system documentation;
-revision 13 adds their syntax-confined locations. No migration has been
-executed.
+revisions 13–14 add their syntax-confined locations and bind both components
+of explicit entity/product pairs. No migration has been executed.
 
 **Base:** freshly fetched merged `origin/main` at
 `e4478fc1beef985fecc16e485b0974568b4fc004`. Fresh public baseline:
@@ -65,6 +65,13 @@ registered entity/product pairs in system documentation, join the closed typed
 rewrite list. Ordinary shell commands and unrelated prose remain advisory and
 unchanged. Writer spans and advisory exclusions are identical; the residual
 gate enumerates the same supported shapes independently.
+**Revision 14 closes the ordered-pair gap found in review:** an explicit
+registered entity/product pair owns both components. The entity pass rewrites
+the entity component and the product pass rewrites the product component.
+Writer qualification and both independent gates accept the source and mapped
+registry names, so an old or half-migrated pair cannot disappear between the
+sequential passes. Ordinary shell commands and unrelated prose remain outside
+the closed list.
 
 ## Objective
 
@@ -232,6 +239,11 @@ appears twice.
 - `_system/scripts/action-policy.yaml` — the first path component of each
   pattern in `paths:` and in `except:`. Both are rewritten in the same pass;
   see the fail-open rule below.
+- `_system/docs/**/*.md` — the entity component of an explicit
+  ``<entity> / <registered-product>`` reference, where the entity component is
+  an inline-code token. The paired product must name either the source or
+  mapped value of a registered product in this cutover. Bare words and shell
+  commands are not references.
 
 **Product axis**
 
@@ -240,8 +252,9 @@ appears twice.
 - `_system/workspaces.yaml` — `product:` values only. **Never an `id:`.**
 - `_system/docs/**/*.md` — the product component of an explicit
   ``<registered-entity> / <product>`` reference, where the entity component is
-  an inline-code token that names a current registry entity. Bare words and
-  shell commands are not references.
+  an inline-code token that names either the source or mapped value of a
+  registered entity in this cutover. Bare words and shell commands are not
+  references.
 - Approved `books.db` `(path, table, column, axis)` targets whose `axis` is
   `product`, and no others.
 

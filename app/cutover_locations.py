@@ -45,6 +45,7 @@ REWRITE_LOCATIONS: tuple[Location, ...] = (
     Location("entity", "proposal", "dst", "path-head"),
     Location("entity", "action-policy", "paths", "path-head"),
     Location("entity", "action-policy", "except", "path-head"),
+    Location("entity", "system-doc", "entity-product-entity", "value"),
     # --- product ----------------------------------------------------------
     Location("product", "products", "key", "key"),
     Location("product", "front-matter", "product", "value"),
@@ -213,6 +214,35 @@ def rewrite_system_product_references(
     )
 
 
+def system_entity_reference_spans(
+    text: str, registered_products: frozenset[str], old: str
+) -> list[tuple[int, int, int]]:
+    """Entity ids in explicit ``<entity> / <registered product>`` pairs."""
+    pair = re.compile(
+        rf"(?<!`)`(?P<entity>{re.escape(old)})`(?!`)[ \t]*/[ \t]*"
+        rf"(?P<product>[a-z0-9][a-z0-9-]*)(?![\w-])"
+    )
+    found: list[tuple[int, int, int]] = []
+    for line_no, line in enumerate(text.splitlines()):
+        for match in pair.finditer(line):
+            if match.group("product") in registered_products:
+                found.append(
+                    (line_no, match.start("entity"), match.end("entity"))
+                )
+    return found
+
+
+def rewrite_system_entity_references(
+    text: str,
+    registered_products: frozenset[str],
+    old: str,
+    new: str,
+) -> str:
+    return _rewrite_reference_spans(
+        text, system_entity_reference_spans(text, registered_products, old), new
+    )
+
+
 def _conventions_member_reference_values(text: str) -> list[str]:
     """Independently enumerate the member-reference shapes for the gate."""
     found: list[str] = []
@@ -256,6 +286,22 @@ def _system_product_reference_values(
         for line in text.splitlines()
         for match in pair.finditer(line)
         if match.group("entity") in registered_entities
+    ]
+
+
+def _system_entity_reference_values(
+    text: str, registered_products: frozenset[str]
+) -> list[str]:
+    """Independently enumerate entity/registered-product pairs for the gate."""
+    pair = re.compile(
+        r"`(?P<entity>[^`\n]+)`[ \t]*/[ \t]*"
+        r"(?P<product>[a-z0-9][a-z0-9-]*)(?![\w-])"
+    )
+    return [
+        match.group("entity")
+        for line in text.splitlines()
+        for match in pair.finditer(line)
+        if match.group("product") in registered_products
     ]
 
 
@@ -742,6 +788,29 @@ def _typed_token_spans(
         if isinstance(entities_doc, dict)
         else ()
     )
+    products_doc = _load_yaml_file(root / "_system" / "products.yaml")
+    registered_products = frozenset(
+        product
+        for values in (
+            (products_doc.get("products") or {}).values()
+            if isinstance(products_doc, dict)
+            else ()
+        )
+        if isinstance(values, dict)
+        for product in values
+    )
+    pair_entities = registered_entities | frozenset(
+        value
+        for mapping in mappings
+        if mapping.axis == "entity"
+        for value in (mapping.old, mapping.new)
+    )
+    pair_products = registered_products | frozenset(
+        value
+        for mapping in mappings
+        if mapping.axis == "product"
+        for value in (mapping.old, mapping.new)
+    )
 
     def record(
         relative: str,
@@ -840,9 +909,20 @@ def _typed_token_spans(
             and relative_path.parts[:2] == ("_system", "docs")
             and relative_path.suffix.lower() == ".md"
         ):
+            for old in by_axis["entity"]:
+                for line_no, col_start, col_end in system_entity_reference_spans(
+                    text, pair_products, old
+                ):
+                    record(
+                        relative,
+                        line_no + 1,
+                        "entity",
+                        old,
+                        (col_start, col_end),
+                    )
             for old in by_axis["product"]:
                 for line_no, col_start, col_end in system_product_reference_spans(
-                    text, registered_entities, old
+                    text, pair_entities, old
                 ):
                     record(
                         relative,
@@ -1220,6 +1300,31 @@ def scoped_residuals(
                 for key in values:
                     if key in products:
                         report("product:products:key", "_system/products.yaml", key)
+    registered_pair_entities = frozenset(
+        (entities_doc.get("entities") or {}).keys()
+        if isinstance(entities_doc, dict)
+        else ()
+    ) | frozenset(
+        value
+        for mapping in mappings
+        if mapping.axis == "entity"
+        for value in (mapping.old, mapping.new)
+    )
+    registered_pair_products = frozenset(
+        product
+        for values in (
+            (products_doc.get("products") or {}).values()
+            if isinstance(products_doc, dict)
+            else ()
+        )
+        if isinstance(values, dict)
+        for product in values
+    ) | frozenset(
+        value
+        for mapping in mappings
+        if mapping.axis == "product"
+        for value in (mapping.old, mapping.new)
+    )
     members_doc = _load_yaml_file(system / "members.yaml")
     if isinstance(members_doc, dict):
         for group, values in (members_doc.get("members") or {}).items():
@@ -1317,13 +1422,17 @@ def scoped_residuals(
                 len(relative_path.parts) >= 3
                 and relative_path.parts[:2] == ("_system", "docs")
             ):
-                registered_entities = frozenset(
-                    (entities_doc.get("entities") or {}).keys()
-                    if isinstance(entities_doc, dict)
-                    else ()
-                )
+                for value in _system_entity_reference_values(
+                    text, registered_pair_products
+                ):
+                    if value in entities:
+                        report(
+                            "entity:system-doc:entity-product-entity",
+                            relative,
+                            value,
+                        )
                 for value in _system_product_reference_values(
-                    text, registered_entities
+                    text, registered_pair_entities
                 ):
                     if value in products:
                         report(

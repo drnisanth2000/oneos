@@ -145,6 +145,7 @@ from .cutover_locations import (
     rewrite_root_scalar,
     rewrite_path_head,
     rewrite_policy_path_heads,
+    rewrite_system_entity_references,
     rewrite_system_product_references,
     rewrite_yaml_path_head_field,
     rewrite_yaml_value_field,
@@ -293,6 +294,18 @@ def _markdown_files(root: Path):
 
 def _apply_entity_mapping(root: Path, old: str, new: str) -> None:
     system = root / "_system"
+    registered_products = frozenset(existing_identifiers(root)["product"])
+    docs = system / "docs"
+    if docs.is_dir() and not docs.is_symlink():
+        for document in sorted(docs.rglob("*.md")):
+            if document.is_symlink() or not document.is_file():
+                continue
+            text = document.read_text(encoding="utf-8")
+            rewritten = rewrite_system_entity_references(
+                text, registered_products, old, new
+            )
+            if rewritten != text:
+                document.write_text(rewritten, encoding="utf-8")
     for name in ("products.yaml", "members.yaml"):
         path = system / name
         if path.is_file():

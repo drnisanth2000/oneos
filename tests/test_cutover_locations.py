@@ -63,6 +63,7 @@ from app.cutover_locations import (
     rewrite_members_comment_references,
     rewrite_path_head,
     rewrite_policy_path_heads,
+    rewrite_system_entity_references,
     rewrite_system_product_references,
     rewrite_yaml_path_head_field,
     rewrite_yaml_value_field,
@@ -217,6 +218,22 @@ def test_system_product_references_require_a_registered_entity_pair():
     assert result == (
         "Compact `ab`/q7-product and spaced `ab` / q7-product references migrate.\n"
         "Unregistered `zz`/q7 and shell cd q7 remain unchanged.\n"
+    )
+
+
+def test_system_entity_references_require_a_registered_product_pair():
+    text = (
+        "Compact `ab`/q7 and spaced `ab` / q7 references migrate.\n"
+        "Unregistered `ab`/x9 and ordinary ab prose remain unchanged.\n"
+    )
+
+    result = rewrite_system_entity_references(
+        text, frozenset({"q7"}), "ab", "ab-entity"
+    )
+
+    assert result == (
+        "Compact `ab-entity`/q7 and spaced `ab-entity` / q7 references migrate.\n"
+        "Unregistered `ab`/x9 and ordinary ab prose remain unchanged.\n"
     )
 
 
@@ -448,11 +465,11 @@ def test_supported_system_document_references_are_typed_but_prose_is_advisory(
     docs = system / "docs"
     docs.mkdir(parents=True)
     (system / "entities.yaml").write_text(
-        "entities:\n  ab:\n    label: A\n", encoding="utf-8"
+        "entities:\n  ab-entity:\n    label: A\n", encoding="utf-8"
     )
     (system / "members.yaml").write_text(
         "members:\n"
-        "  ab:\n"
+        "  ab-entity:\n"
         "    # A note tagged `member: m7` is explicit.\n"
         "    - {id: m7-member}\n",
         encoding="utf-8",
@@ -465,7 +482,7 @@ def test_supported_system_document_references_are_typed_but_prose_is_advisory(
         "Product pair: `ab` / q7.\nOrdinary q7 prose stays advisory.\n",
         encoding="utf-8",
     )
-    mappings = ADVISORY_MAPPINGS[1:3] + (
+    mappings = ADVISORY_MAPPINGS[:3] + (
         Mapping(axis="workspace", old="q7", new="q7-workspace"),
     )
 
@@ -569,11 +586,11 @@ def test_supported_system_document_references_are_scoped_residuals(
     docs = system / "docs"
     docs.mkdir(parents=True)
     (system / "entities.yaml").write_text(
-        "entities:\n  ab:\n    label: A\n", encoding="utf-8"
+        "entities:\n  ab-entity:\n    label: A\n", encoding="utf-8"
     )
     (system / "members.yaml").write_text(
         "members:\n"
-        "  ab:\n"
+        "  ab-entity:\n"
         "    # Example `member: m7`.\n"
         "    - {id: m7-member}\n",
         encoding="utf-8",
@@ -585,6 +602,7 @@ def test_supported_system_document_references_are_scoped_residuals(
         "Product pair: `ab`/q7.\n", encoding="utf-8"
     )
     mappings = (
+        Mapping(axis="entity", old="ab", new="ab-entity"),
         Mapping(axis="product", old="q7", new="q7-product"),
         Mapping(axis="member", old="m7", new="m7-member"),
     )
@@ -601,6 +619,48 @@ def test_supported_system_document_references_are_scoped_residuals(
             "member:members:comment-member-reference",
             "_system/members.yaml",
             "m7",
+        ),
+        (
+            "entity:system-doc:entity-product-entity",
+            "_system/docs/guide.md",
+            "ab",
+        ),
+        (
+            "product:system-doc:entity-product-reference",
+            "_system/docs/guide.md",
+            "q7",
+        ),
+    }
+
+
+def test_old_system_document_pair_remains_a_residual_after_registries_migrate(
+    tmp_path: Path,
+):
+    system = tmp_path / "_system"
+    docs = system / "docs"
+    docs.mkdir(parents=True)
+    (system / "entities.yaml").write_text(
+        "entities:\n  ab-entity:\n    label: A\n", encoding="utf-8"
+    )
+    (system / "products.yaml").write_text(
+        "products:\n  ab-entity:\n    q7-product:\n      label: Q\n",
+        encoding="utf-8",
+    )
+    (docs / "guide.md").write_text(
+        "Product pair: `ab` / q7.\n", encoding="utf-8"
+    )
+    mappings = (
+        Mapping(axis="entity", old="ab", new="ab-entity"),
+        Mapping(axis="product", old="q7", new="q7-product"),
+    )
+
+    found = scoped_residuals(tmp_path, mappings)
+
+    assert {(item.location, item.path, item.old) for item in found} == {
+        (
+            "entity:system-doc:entity-product-entity",
+            "_system/docs/guide.md",
+            "ab",
         ),
         (
             "product:system-doc:entity-product-reference",
