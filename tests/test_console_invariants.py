@@ -1487,6 +1487,395 @@ def _load_console_app(tmp_path, monkeypatch):
     return importlib.reload(main)
 
 
+EXPECTED_CONTRACTED_BOUNDARIES = (
+    ("app.config", "vault_root"),
+    ("app.config", "build_scope"),
+    ("app.main", "entity_scope"),
+    ("app.entities", "EntityCatalog.load"),
+    ("app.vault", "Vault.bundles"),
+    ("app.inbox", "read_inbox"),
+    ("app.destinations", "resolve_classification_destination"),
+    ("app.outbox", "propose_classification"),
+    ("app.outbox", "preview_diff"),
+    ("app.outbox", "project_outbox"),
+    ("app.outbox", "approve"),
+    ("app.outbox", "reject"),
+    ("app.outbox", "pending_proposal_entry_exists"),
+    ("app.registry", "products_for"),
+    ("app.registry", "propose_delete"),
+    ("app.registry", "get_delete_receipt_or_review"),
+    ("app.registry", "execute_delete"),
+    ("app.action_receipts", "resolve_head_receipt"),
+    ("app.proposal_identity", "require_proposal_id"),
+    ("app.review_tokens", "require_review_sha256"),
+)
+
+
+def _resolve_qualified(module, qualified_name):
+    value = module
+    for part in qualified_name.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def _inventory_objects(main):
+    import importlib
+
+    return {
+        f"{module_name}.{name}": _resolve_qualified(
+            main if module_name == "app.main" else importlib.import_module(module_name),
+            name,
+        )
+        for module_name, name in EXPECTED_CONTRACTED_BOUNDARIES
+    }
+
+
+def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypatch):
+    from app.console_routing import FailureContract
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
+    assert len(qualified) == 20
+    assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
+
+    missing = []
+    for qualified_name, boundary in _inventory_objects(main).items():
+        if not isinstance(
+            getattr(boundary, "__failure_contract__", None), FailureContract
+        ):
+            missing.append(qualified_name)
+
+    assert missing == [], f"route-facing boundaries without contracts: {missing}"
+
+
+def test_route_facing_failure_contracts_match_the_approved_inventory(
+    tmp_path, monkeypatch
+):
+    from app.action_receipts import (
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+        resolve_head_receipt,
+    )
+    from app.config import VaultRootUnavailable, build_scope, vault_root
+    from app.destinations import DestinationError, resolve_classification_destination
+    from app.entities import (
+        EntityCatalog,
+        EntityManifestError,
+        EntitySelectionError,
+        RecipientConfigurationError,
+        SystemRegistryPathError,
+    )
+    from app.outbox import (
+        OutboxError,
+        UnreadableProposalRecord,
+        approve,
+        pending_proposal_entry_exists,
+        preview_diff,
+        project_outbox,
+        propose_classification,
+        reject,
+    )
+    from app.proposal_identity import ProposalIdentityError
+    from app.registry import RegistryError
+    from app.review_tokens import (
+        InvalidReviewToken,
+        ReviewContractViolation,
+        ReviewTokenError,
+    )
+    from app.scope import CrossScopeError, RedirectedPathError
+    from app.vault import DestinationRegistryError
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    amended_destination = (
+        DestinationError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+    )
+    receipt_failures = (
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+    outbox_projection = (
+        OutboxError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+        *receipt_failures,
+    )
+    expected = {
+        "app.config.vault_root": ((VaultRootUnavailable,), ()),
+        "app.config.build_scope": (
+            (EntityManifestError, SystemRegistryPathError, EntitySelectionError),
+            (vault_root,),
+        ),
+        "app.main.entity_scope": ((), (build_scope,)),
+        "app.entities.EntityCatalog.load": (
+            (
+                EntityManifestError,
+                SystemRegistryPathError,
+                RecipientConfigurationError,
+            ),
+            (),
+        ),
+        "app.vault.Vault.bundles": (
+            (DestinationRegistryError, EntityManifestError, SystemRegistryPathError),
+            (),
+        ),
+        "app.inbox.read_inbox": ((RedirectedPathError,), ()),
+        "app.destinations.resolve_classification_destination": (
+            amended_destination,
+            (),
+        ),
+        "app.outbox.propose_classification": (
+            (OutboxError,),
+            (resolve_classification_destination,),
+        ),
+        "app.outbox.preview_diff": (outbox_projection[:6], ()),
+        "app.outbox.project_outbox": (outbox_projection, ()),
+        "app.outbox.approve": (
+            outbox_projection[:6] + (ReviewTokenError,) + receipt_failures,
+            (),
+        ),
+        "app.outbox.reject": (
+            outbox_projection[:6] + (ReviewTokenError,) + receipt_failures,
+            (),
+        ),
+        "app.outbox.pending_proposal_entry_exists": ((CrossScopeError,), ()),
+        "app.registry.products_for": (
+            (RegistryError, CrossScopeError, DestinationRegistryError),
+            (),
+        ),
+        "app.registry.propose_delete": (
+            (RegistryError, CrossScopeError, DestinationRegistryError),
+            (),
+        ),
+        "app.registry.get_delete_receipt_or_review": (
+            (
+                RegistryError,
+                CrossScopeError,
+                DestinationRegistryError,
+                UnreadableProposalRecord,
+                *receipt_failures,
+            ),
+            (),
+        ),
+        "app.registry.execute_delete": (
+            (
+                RegistryError,
+                CrossScopeError,
+                DestinationRegistryError,
+                UnreadableProposalRecord,
+                ReviewTokenError,
+                *receipt_failures,
+            ),
+            (),
+        ),
+        "app.action_receipts.resolve_head_receipt": (receipt_failures, ()),
+        "app.proposal_identity.require_proposal_id": ((ProposalIdentityError,), ()),
+        "app.review_tokens.require_review_sha256": (
+            (InvalidReviewToken, ReviewContractViolation),
+            (),
+        ),
+    }
+
+    boundaries = _inventory_objects(main)
+    assert set(boundaries) == set(expected)
+    for qualified_name, boundary in boundaries.items():
+        raises, calls = expected[qualified_name]
+        contract = boundary.__failure_contract__
+        assert contract.raises == raises, qualified_name
+        assert contract.calls == calls, qualified_name
+        assert contract.deliberate_unknown == (), qualified_name
+
+
+def _contract_graph_is_acyclic(boundaries):
+    active = []
+    complete = set()
+
+    def visit(boundary):
+        if boundary in active:
+            cycle = " -> ".join(item.__qualname__ for item in (*active, boundary))
+            raise AssertionError(f"failure contract cycle: {cycle}")
+        if boundary in complete:
+            return
+        active.append(boundary)
+        for called in boundary.__failure_contract__.calls:
+            visit(called)
+        active.pop()
+        complete.add(boundary)
+
+    for boundary in boundaries:
+        visit(boundary)
+
+
+def test_failure_contract_graph_rejects_a_cycle():
+    from app.console_routing import FailureContract, failure_contract
+
+    @failure_contract()
+    def first():
+        pass
+
+    @failure_contract(calls=(first,))
+    def second():
+        pass
+
+    first.__failure_contract__ = FailureContract((), (second,), ())
+    with pytest.raises(AssertionError, match="failure contract cycle"):
+        _contract_graph_is_acyclic((first, second))
+
+
+def _normalized_callable(value):
+    return getattr(value, "__func__", value)
+
+
+def _executable_contracted_calls(boundary, contracted):
+    """Resolve direct calls through names, class attributes and bound locals.
+
+    This is deliberately a closed-inventory resolver. It does not claim to
+    infer arbitrary Python dispatch; it recognizes only the executable shapes
+    used by the approved boundaries and route bodies.
+    """
+    import inspect
+
+    function = _normalized_callable(boundary)
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    definition = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    globals_map = function.__globals__
+    normalized = {_normalized_callable(item) for item in contracted}
+    local_types = {}
+
+    def global_value(name):
+        return globals_map.get(name)
+
+    def resolve(expression):
+        if isinstance(expression, ast.Name):
+            return local_types.get(expression.id, global_value(expression.id))
+        if not isinstance(expression, ast.Attribute):
+            return None
+        if isinstance(expression.value, ast.Call):
+            owner = resolve(expression.value.func)
+        else:
+            owner = resolve(expression.value)
+        if owner is None:
+            return None
+        return getattr(owner, expression.attr, None)
+
+    for node in ast.walk(definition):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        constructor = resolve(value.func)
+        if not isinstance(constructor, type):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        for target in targets:
+            if isinstance(target, ast.Name):
+                local_types[target.id] = constructor
+
+    found = set()
+    for statement in definition.body:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call):
+                continue
+            called = resolve(node.func)
+            called = _normalized_callable(called)
+            if called in normalized:
+                found.add(called)
+    return found
+
+
+def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeypatch):
+    main = _load_console_app(tmp_path, monkeypatch)
+    boundaries = _inventory_objects(main)
+    by_object = {
+        _normalized_callable(boundary): qualified_name
+        for qualified_name, boundary in boundaries.items()
+    }
+    expected_executable = {
+        "app.config.build_scope": {"app.config.vault_root"},
+        "app.main.entity_scope": {"app.config.build_scope"},
+        "app.destinations.resolve_classification_destination": {
+            "app.entities.EntityCatalog.load"
+        },
+        "app.outbox.propose_classification": {
+            "app.destinations.resolve_classification_destination"
+        },
+        "app.outbox.project_outbox": {
+            "app.outbox.pending_proposal_entry_exists",
+            "app.proposal_identity.require_proposal_id",
+        },
+        "app.outbox.pending_proposal_entry_exists": {
+            "app.proposal_identity.require_proposal_id"
+        },
+        "app.registry.get_delete_receipt_or_review": {
+            "app.action_receipts.resolve_head_receipt",
+            "app.proposal_identity.require_proposal_id",
+        },
+        "app.action_receipts.resolve_head_receipt": {
+            "app.proposal_identity.require_proposal_id"
+        },
+    }
+
+    actual = {}
+    universe = tuple(boundaries.values())
+    for qualified_name, boundary in boundaries.items():
+        calls = _executable_contracted_calls(boundary, universe)
+        if calls:
+            actual[qualified_name] = {by_object[called] for called in calls}
+    assert actual == expected_executable
+
+    declared_edges = {
+        qualified_name: {
+            by_object[_normalized_callable(called)]
+            for called in boundary.__failure_contract__.calls
+        }
+        for qualified_name, boundary in boundaries.items()
+        if boundary.__failure_contract__.calls
+    }
+    assert declared_edges == {
+        "app.config.build_scope": {"app.config.vault_root"},
+        "app.main.entity_scope": {"app.config.build_scope"},
+        "app.outbox.propose_classification": {
+            "app.destinations.resolve_classification_destination"
+        },
+    }
+    for caller, callees in declared_edges.items():
+        assert callees <= actual[caller], caller
+    _contract_graph_is_acyclic(universe)
+
+
+def test_executable_contract_call_resolver_handles_bound_calls_not_prose(
+    tmp_path, monkeypatch
+):
+    from app.vault import Vault
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    contracted = tuple(_inventory_objects(main).values())
+    assert _normalized_callable(Vault.bundles) in _executable_contracted_calls(
+        main._triage_page, contracted
+    )
+
+    def prose_only():
+        """Vault.bundles() appears only in this docstring."""
+        # Vault(catalog).bundles() is not executable either.
+        return None
+
+    assert _executable_contracted_calls(prose_only, contracted) == set()
+
+
 def _registered_console_endpoints(app):
     """Every endpoint the router will actually dispatch to, minus the
     framework's own. A Mount (the StaticFiles application) exposes no

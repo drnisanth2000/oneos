@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import secrets
 
+from .console_routing import failure_contract
+
 
 _PROPOSAL_ID = re.compile(
     r"^(?P<timestamp>[0-9]{8}T[0-9]{6})-(?P<random>[0-9a-f]{32})$"
@@ -26,6 +28,7 @@ def proposal_id_candidates(created: datetime) -> Iterator[str]:
         yield generate_proposal_id(created)
 
 
+@failure_contract(raises=(ProposalIdentityError,))
 def require_proposal_id(value: object) -> str:
     if not isinstance(value, str):
         raise ProposalIdentityError("proposal id must be a string")

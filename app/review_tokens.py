@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
+from .console_routing import failure_contract
+
 T = TypeVar("T")
 
 #: A submitted fingerprint is accepted only as lowercase 64-character
@@ -105,6 +107,7 @@ def make_review_snapshot(value: T, contents: bytes) -> ReviewSnapshot[T]:
     return ReviewSnapshot(value, raw, hashlib.sha256(raw).hexdigest())
 
 
+@failure_contract(raises=(InvalidReviewToken, ReviewContractViolation))
 def require_review_sha256(value: object) -> str:
     """Return `value` only when it is canonical lowercase SHA-256 hex."""
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:

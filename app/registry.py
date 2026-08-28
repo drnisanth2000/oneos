@@ -18,6 +18,9 @@ import yaml
 
 from .action_receipts import (
     ActionReceipt,
+    InvalidActionReceipt,
+    ReceiptStoreIntegrityError,
+    ReceiptStoreUnavailable,
     SpentAction,
     make_action_receipt,
     receipt_relative_path,
@@ -35,9 +38,10 @@ from .git_transaction import (
     capture_path_state,
     execute_transaction,
 )
-from .console_routing import structured_reader
+from .console_routing import failure_contract, structured_reader
 from .review_tokens import (
     ReviewSnapshot,
+    ReviewTokenError,
     make_review_snapshot,
     require_review_match,
 )
@@ -50,7 +54,7 @@ from .proposal_identity import (
     require_proposal_id,
     require_proposal_identity,
 )
-from .scope import OutOfScopeError, RedirectedPathError, Scope
+from .scope import CrossScopeError, OutOfScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError
 
 # Columns in books.db that carry a product/member value.
@@ -321,6 +325,9 @@ def reference_count(scope: Scope, kind: str, slug: str) -> ReferenceReport:
 
 
 @structured_reader(category="registry")
+@failure_contract(
+    raises=(RegistryError, CrossScopeError, DestinationRegistryError)
+)
 def products_for(scope: Scope) -> list[str]:
     path = scope.system_path("products.yaml")
     if not path.is_file():
@@ -404,6 +411,9 @@ def _delete_proposal_path(scope: Scope, proposal_id: str) -> Path:
     return candidate
 
 
+@failure_contract(
+    raises=(RegistryError, CrossScopeError, DestinationRegistryError)
+)
 def propose_delete(scope: Scope, kind: str, slug: str) -> DeleteProposal:
     """Write a delete proposal carrying the reference count. Removes nothing."""
     if kind in _DB_COLUMNS:
@@ -572,6 +582,17 @@ def get_delete_review(
     return make_review_snapshot(proposal, state.contents)
 
 
+@failure_contract(
+    raises=(
+        RegistryError,
+        CrossScopeError,
+        DestinationRegistryError,
+        UnreadableProposalRecord,
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+)
 def get_delete_receipt_or_review(
     scope: Scope, proposal_id: str
 ) -> ActionReceipt | ReviewSnapshot[DeleteProposal]:
@@ -655,6 +676,18 @@ def _remove_scoped_registry_value(
 
 
 @structured_reader(category="proposal")
+@failure_contract(
+    raises=(
+        RegistryError,
+        CrossScopeError,
+        DestinationRegistryError,
+        UnreadableProposalRecord,
+        ReviewTokenError,
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+)
 def execute_delete(
     scope: Scope, proposal_id: str, review_sha256: object
 ) -> RegistryDeleteResult:

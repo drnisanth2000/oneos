@@ -35,7 +35,7 @@ from .classifier import Classifier
 from .config import VaultRootUnavailable, build_catalog, build_scope
 from .console_errors import ConsoleError, describe
 from .console_render import is_fragment, status_for
-from .console_routing import console_route
+from .console_routing import console_route, failure_contract
 from .destinations import DestinationError, resolve_classification_destination
 from .entities import (
     EntityManifestError,
@@ -121,6 +121,7 @@ app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 catalog = build_catalog()
 
 
+@failure_contract(calls=(build_scope,))
 def entity_scope(entity: str) -> Scope:
     # Rule 6: no application code raises HTTPException. EntitySelectionError
     # propagates to its own dedicated handler below.

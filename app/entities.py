@@ -7,7 +7,7 @@ import re
 
 import yaml
 
-from .console_routing import structured_reader
+from .console_routing import failure_contract, structured_reader
 from .identifiers import meets_floor
 
 _ENTITY_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -77,6 +77,13 @@ class EntityCatalog:
 
     @classmethod
     @structured_reader(category="registry")
+    @failure_contract(
+        raises=(
+            EntityManifestError,
+            SystemRegistryPathError,
+            RecipientConfigurationError,
+        )
+    )
     def load(cls, root: Path | str) -> "EntityCatalog":
         root_path = Path(root).resolve()
         path = resolve_system_registry(root_path, "entities.yaml")

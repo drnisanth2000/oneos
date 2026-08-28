@@ -16,7 +16,7 @@ from typing import Literal, cast
 
 import yaml
 
-from .console_routing import structured_reader
+from .console_routing import failure_contract, structured_reader
 from .identifiers import meets_floor
 from .proposal_identity import (
     ProposalIdentityError,
@@ -342,6 +342,13 @@ def resolve_head_receipts(
     return resolutions
 
 
+@failure_contract(
+    raises=(
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+)
 def resolve_head_receipt(
     vault: Path, entity: str, proposal_id: str
 ) -> ReceiptResolution:

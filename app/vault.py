@@ -19,8 +19,13 @@ import re
 
 import yaml
 
-from .console_routing import structured_reader
-from .entities import EntityCatalog, resolve_system_registry
+from .console_routing import failure_contract, structured_reader
+from .entities import (
+    EntityCatalog,
+    EntityManifestError,
+    SystemRegistryPathError,
+    resolve_system_registry,
+)
 from .scope import Scope
 
 
@@ -343,6 +348,13 @@ class Vault:
 
     # --- sidebar model ------------------------------------------------------
 
+    @failure_contract(
+        raises=(
+            DestinationRegistryError,
+            EntityManifestError,
+            SystemRegistryPathError,
+        )
+    )
     def bundles(self) -> list[Bundle]:
         """Every bundle in entities.yaml, each with the modules its flags
         activate. Order follows the registry."""

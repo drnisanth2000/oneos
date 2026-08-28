@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from .console_routing import structured_reader
+from .console_routing import failure_contract, structured_reader
 from .scope import RedirectedPathError, Scope
 
 
@@ -68,6 +68,7 @@ def _require_real_receipt(directory: Path, discovered: Path) -> Path:
 
 
 @structured_reader(category="front-matter")
+@failure_contract(raises=(RedirectedPathError,))
 def read_inbox(scope: Scope) -> list[InboxItem]:
     if _require_real_directory(scope, "00-inbox") is None:
         return []
