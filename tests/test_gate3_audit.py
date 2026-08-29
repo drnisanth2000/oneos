@@ -1885,6 +1885,363 @@ def test_gate3_evidence_rejects_changed_status_or_index_across_walk(
     )
 
 
+def _classified(
+    path: str, kind: str, disposition: str
+) -> gate3.ClassifiedPathChange:
+    return gate3.ClassifiedPathChange(path, kind, disposition)
+
+
+def _audit_fs(before, after, rules, classified=()):
+    return gate3.audit_filesystem(
+        before, after, rules, classified_paths=tuple(classified)
+    )
+
+
+def test_filesystem_audit_preserves_unchanged_preexisting_special_entry(
+    tmp_path: Path,
+):
+    """A wrong-location FIFO that never changed is baseline, not a write."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    os.mkfifo(vault / "synthetic" / "stray", 0o600)
+    rules = gate3.AuditRules.load(vault)
+    before = gate3.collect_filesystem_fingerprints(vault)
+    after = gate3.collect_filesystem_fingerprints(vault)
+
+    audit = _audit_fs(before, after, rules)
+
+    assert audit.sanctioned_writes == []
+    assert audit.violating_writes == []
+    assert audit.ok
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "new-fifo",
+        "removed-fifo",
+        "replaced-fifo",
+        "fifo-to-symlink",
+        "symlink-target",
+        "socket",
+    ),
+)
+def test_filesystem_audit_rejects_new_removed_replaced_or_changed_special_entry(
+    tmp_path: Path, mutation: str
+):
+    """Every non-directory delta is a direct write with no sanction."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    target = vault / "synthetic" / "stray"
+    relative = "synthetic/stray"
+
+    if mutation in {"removed-fifo", "replaced-fifo", "fifo-to-symlink"}:
+        os.mkfifo(target, 0o600)
+    elif mutation == "symlink-target":
+        target.symlink_to("first")
+    elif mutation == "socket":
+        if not _make_socket(vault / "synthetic" / "sock"):
+            pytest.skip("host does not safely support UNIX sockets here")
+        relative = "synthetic/sock"
+
+    before = gate3.collect_filesystem_fingerprints(vault)
+
+    if mutation == "new-fifo":
+        os.mkfifo(target, 0o600)
+    elif mutation == "removed-fifo":
+        target.unlink()
+    elif mutation == "replaced-fifo":
+        target.unlink()
+        os.mkfifo(target, 0o600)
+    elif mutation == "fifo-to-symlink":
+        target.unlink()
+        target.symlink_to("elsewhere")
+    elif mutation == "symlink-target":
+        target.unlink()
+        target.symlink_to("second")
+    else:
+        (vault / "synthetic" / "sock").unlink()
+
+    after = gate3.collect_filesystem_fingerprints(vault)
+    audit = _audit_fs(before, after, rules)
+
+    assert audit.violating_writes == [relative]
+    assert audit.sanctioned_writes == []
+
+
+_DIR_BEFORE = {"synthetic/d": gate3.FilesystemFingerprint(
+    "directory", 0o755, "1" * 64, None
+)}
+_DIR_AFTER = {"synthetic/d": gate3.FilesystemFingerprint(
+    "directory", 0o755, "1" * 64, None
+)}
+
+
+def _dir_fp(mode: int = 0o755, identity: str = "1" * 64):
+    return gate3.FilesystemFingerprint("directory", mode, identity, None)
+
+
+def test_added_directory_inherits_a_sanctioned_added_descendant(tmp_path: Path):
+    """Ancestry a sanctioned write required is not a second finding."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {"synthetic/d": _dir_fp()},
+        rules,
+        [_classified("synthetic/d/note.md", "added", "sanctioned")],
+    )
+
+    assert audit.sanctioned_writes == ["synthetic/d"]
+    assert audit.violating_writes == []
+
+
+def test_removed_directory_inherits_a_sanctioned_removed_descendant(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {"synthetic/d": _dir_fp()},
+        {},
+        rules,
+        [_classified("synthetic/d/note.md", "removed", "sanctioned")],
+    )
+
+    assert audit.sanctioned_writes == ["synthetic/d"]
+    assert audit.violating_writes == []
+
+
+def test_directory_with_a_violating_descendant_is_not_a_duplicate_finding(
+    tmp_path: Path,
+):
+    """The descendant already fails the gate; the ancestor adds nothing."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {"synthetic/d": _dir_fp()},
+        rules,
+        [_classified("synthetic/d/note.md", "added", "violating")],
+    )
+
+    assert audit.violating_writes == []
+    assert audit.sanctioned_writes == []
+
+
+def test_mixed_descendants_never_let_a_sanctioned_one_erase_a_violation(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {"synthetic/d": _dir_fp()},
+        rules,
+        [
+            _classified("synthetic/d/ok.md", "added", "sanctioned"),
+            _classified("synthetic/d/bad.md", "added", "violating"),
+        ],
+    )
+
+    assert audit.sanctioned_writes == []
+    assert audit.violating_writes == []
+
+
+def test_added_directory_with_only_a_changed_descendant_violates(
+    tmp_path: Path,
+):
+    """`changed` is not the matching topology for an addition."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {"synthetic/d": _dir_fp()},
+        rules,
+        [_classified("synthetic/d/note.md", "changed", "sanctioned")],
+    )
+
+    assert audit.violating_writes == ["synthetic/d"]
+
+
+@pytest.mark.parametrize("direction", ("added", "removed"))
+def test_empty_directory_without_a_descendant_violates(
+    tmp_path: Path, direction: str
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    evidence = {"synthetic/d": _dir_fp()}
+    before, after = ({}, evidence) if direction == "added" else (evidence, {})
+
+    audit = _audit_fs(before, after, rules)
+
+    assert audit.violating_writes == ["synthetic/d"]
+
+
+def test_unrelated_empty_sibling_violates_beside_a_sanctioned_descendant(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {"synthetic/d": _dir_fp(), "synthetic/sibling": _dir_fp()},
+        rules,
+        [_classified("synthetic/d/note.md", "added", "sanctioned")],
+    )
+
+    assert audit.sanctioned_writes == ["synthetic/d"]
+    assert audit.violating_writes == ["synthetic/sibling"]
+
+
+def test_existing_directory_mode_or_identity_change_always_violates(
+    tmp_path: Path,
+):
+    """A directory that exists at both endpoints cannot inherit anything."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {"synthetic/d": _dir_fp(mode=0o755)},
+        {"synthetic/d": _dir_fp(mode=0o700)},
+        rules,
+        [_classified("synthetic/d/note.md", "added", "sanctioned")],
+    )
+
+    assert audit.violating_writes == ["synthetic/d"]
+
+
+def test_directory_to_symlink_replacement_violates_as_a_changed_path(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {"synthetic/d": _dir_fp()},
+        {
+            "synthetic/d": gate3.FilesystemFingerprint(
+                "symlink", 0o777, "2" * 64, "3" * 64
+            )
+        },
+        rules,
+        [_classified("synthetic/d/note.md", "added", "sanctioned")],
+    )
+
+    assert audit.violating_writes == ["synthetic/d"]
+
+
+def test_exact_canonical_quarantine_directory_addition_is_sanctioned(
+    tmp_path: Path,
+):
+    """The durable store may remain after a refusal leaves it empty."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs({}, {"synthetic/outbox/.consumed": _dir_fp()}, rules)
+
+    assert audit.sanctioned_writes == ["synthetic/outbox/.consumed"]
+    assert audit.violating_writes == []
+
+
+@pytest.mark.parametrize("mutation", ("removal", "replacement", "mode"))
+def test_canonical_quarantine_directory_removal_or_replacement_is_a_violation(
+    tmp_path: Path, mutation: str
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    path = "synthetic/outbox/.consumed"
+    before = {path: _dir_fp()}
+    if mutation == "removal":
+        after = {}
+    elif mutation == "replacement":
+        after = {
+            path: gate3.FilesystemFingerprint("symlink", 0o777, "2" * 64, "3" * 64)
+        }
+    else:
+        after = {path: _dir_fp(mode=0o700)}
+
+    audit = _audit_fs(before, after, rules)
+
+    assert audit.violating_writes == [path]
+    assert audit.sanctioned_writes == []
+
+
+def test_wrong_location_quarantine_lookalike_directory_is_a_violation(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {
+            "synthetic/.consumed": _dir_fp(),
+            "synthetic/11-library/outbox/.consumed": _dir_fp(),
+        },
+        rules,
+    )
+
+    assert audit.violating_writes == [
+        "synthetic/.consumed",
+        "synthetic/11-library/outbox/.consumed",
+    ]
+
+
+def test_unknown_entity_quarantine_lookalike_is_a_violation(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs({}, {"stranger/outbox/.consumed": _dir_fp()}, rules)
+
+    assert audit.violating_writes == ["stranger/outbox/.consumed"]
+
+
+def test_canonical_quarantine_directory_does_not_sanction_unrelated_sibling(
+    tmp_path: Path,
+):
+    """The directory exception authorizes the directory and nothing else."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {
+            "synthetic/outbox/.consumed": _dir_fp(),
+            "synthetic/outbox/stray": gate3.FilesystemFingerprint(
+                "fifo", 0o600, "9" * 64, None
+            ),
+        },
+        rules,
+    )
+
+    assert audit.sanctioned_writes == ["synthetic/outbox/.consumed"]
+    assert audit.violating_writes == ["synthetic/outbox/stray"]
+
+
+def test_nonregular_quarantine_record_cannot_enter_record_sanctioning(
+    tmp_path: Path,
+):
+    """A FIFO at a record path is a direct write, never a consumed record."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    path = "synthetic/outbox/.consumed/20260829T000000-" + "a" * 32 + ".yaml"
+
+    audit = _audit_fs(
+        {},
+        {path: gate3.FilesystemFingerprint("fifo", 0o600, "9" * 64, None)},
+        rules,
+    )
+
+    assert audit.violating_writes == [path]
+    assert audit.sanctioned_writes == []
+
+
 def _fs_fp(
     kind: gate3.FilesystemKind = "fifo",
     *,

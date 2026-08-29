@@ -245,6 +245,12 @@ class Audit:
 
 
 @dataclass(frozen=True)
+class CommitAuditResult:
+    audit: Audit
+    path_changes: tuple[ClassifiedPathChange, ...]
+
+
+@dataclass(frozen=True)
 class AuditRules:
     root: Path
     active_modules: dict[str, frozenset[str]]
@@ -1214,10 +1220,56 @@ def _parent_tree(
     return temporary, tree, tracked
 
 
+def _merge_disposition(
+    changes: dict[str, ClassifiedPathChange], candidate: ClassifiedPathChange
+) -> None:
+    """A path touched more than once takes its worst disposition."""
+    existing = changes.get(candidate.path)
+    if existing is None:
+        changes[candidate.path] = candidate
+        return
+    if existing.disposition == "violating":
+        return
+    if candidate.disposition == "violating":
+        changes[candidate.path] = ClassifiedPathChange(
+            existing.path, existing.kind, "violating"
+        )
+
+
+def _net_commit_path_changes(
+    vault: Path, snapshot_head: str, audit_head: str
+) -> tuple[tuple[str, str], ...]:
+    """The net status/path pairs between the two audit endpoints."""
+    if snapshot_head == audit_head:
+        return ()
+    raw = _git_bytes(
+        vault,
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "-z",
+        snapshot_head,
+        audit_head,
+    )
+    fields = [field for field in raw.split(b"\0") if field]
+    pairs: list[tuple[str, str]] = []
+    index = 0
+    while index + 1 < len(fields):
+        status = fields[index].decode("utf-8", "surrogateescape")
+        path = fields[index + 1].decode("utf-8", "surrogateescape")
+        pairs.append((status[:1], path))
+        index += 2
+    return tuple(pairs)
+
+
 def _audit_commit_history(
-    records: tuple[CommitRecord, ...], vault: Path
-) -> Audit:
+    records: tuple[CommitRecord, ...],
+    vault: Path,
+    snapshot_head: str,
+    audit_head: str,
+) -> CommitAuditResult:
     result = Audit()
+    violating_paths: set[str] = set()
     for record in records:
         temporary: tempfile.TemporaryDirectory[str] | None = None
         try:
@@ -1226,9 +1278,122 @@ def _audit_commit_history(
             audited = audit_commits((record,), commit_rules, vault)
             result.sanctioned_commits.extend(audited.sanctioned_commits)
             result.violating_commits.extend(audited.violating_commits)
+            if audited.violating_commits:
+                violating_paths.update(
+                    change.path for change in record.changes
+                )
         finally:
             if temporary is not None:
                 temporary.cleanup()
+    changes: dict[str, ClassifiedPathChange] = {}
+    for status, path in _net_commit_path_changes(
+        vault, snapshot_head, audit_head
+    ):
+        kind: ChangeKind = (
+            "added" if status == "A" else "removed" if status == "D" else "changed"
+        )
+        disposition: Disposition = (
+            "violating" if path in violating_paths else "sanctioned"
+        )
+        _merge_disposition(
+            changes, ClassifiedPathChange(path, kind, disposition)
+        )
+    return CommitAuditResult(
+        audit=result,
+        path_changes=tuple(changes[path] for path in sorted(changes)),
+    )
+
+
+def _classify_dirty_path_changes(
+    before: dict[str, DirtyFingerprint],
+    after: dict[str, DirtyFingerprint],
+    audit: Audit,
+) -> tuple[ClassifiedPathChange, ...]:
+    """Turn the dirty audit's own verdicts into ancestry-usable changes."""
+    dispositions: dict[str, Disposition] = {
+        path: "sanctioned" for path in audit.sanctioned_writes
+    }
+    for path in audit.violating_writes:
+        dispositions[path] = "violating"
+    changes: dict[str, ClassifiedPathChange] = {}
+    for path, disposition in dispositions.items():
+        current = after.get(path)
+        if current is None or current.kind == "absence":
+            kind: ChangeKind = "removed"
+        elif path not in before:
+            kind = "added"
+        else:
+            kind = "changed"
+        _merge_disposition(
+            changes, ClassifiedPathChange(path, kind, disposition)
+        )
+    return tuple(changes[path] for path in sorted(changes))
+
+
+def _is_canonical_quarantine_directory(
+    change: FilesystemChange, rules: AuditRules
+) -> bool:
+    """Exactly `<entity>/outbox/.consumed` added, for a manifest entity.
+
+    It authorizes that one directory and nothing inside or beside it: child
+    records still pass every unchanged S7 record predicate.
+    """
+    if change.kind != "added" or change.before is not None:
+        return False
+    if change.after is None or change.after.kind != "directory":
+        return False
+    parts = _path_parts(change.path)
+    return (
+        parts is not None
+        and len(parts) == 3
+        and parts[0] in rules.entities
+        and parts[1] == _OUTBOX_DIRECTORY_NAME
+        and parts[2] == _QUARANTINE_DIRECTORY_NAME
+    )
+
+
+def audit_filesystem(
+    before: dict[str, FilesystemFingerprint],
+    after: dict[str, FilesystemFingerprint],
+    rules: AuditRules,
+    *,
+    classified_paths: tuple[ClassifiedPathChange, ...],
+) -> Audit:
+    """Dispose of each supplemental delta, composing directory ancestry.
+
+    Only a directory presence change can inherit a descendant's disposition.
+    Every non-directory delta is a direct write: there is no general sanction
+    for one, and a non-regular lookalike can never reach the S7 record path.
+    """
+    result = Audit()
+    for change in compare_filesystem_evidence(before, after):
+        directory_presence = (
+            change.kind in {"added", "removed"}
+            and (change.before or change.after).kind == "directory"
+            and (change.before is None or change.after is None)
+        )
+        if not directory_presence:
+            result.violating_writes.append(change.path)
+            continue
+        relevant = [
+            candidate
+            for candidate in classified_paths
+            if candidate.path.startswith(change.path + "/")
+            and candidate.kind == change.kind
+        ]
+        if any(candidate.disposition == "violating" for candidate in relevant):
+            # The descendant already fails the gate; repeating its ancestor
+            # would be a duplicate finding for one event.
+            continue
+        if relevant:
+            result.sanctioned_writes.append(change.path)
+            continue
+        if _is_canonical_quarantine_directory(change, rules):
+            result.sanctioned_writes.append(change.path)
+            continue
+        result.violating_writes.append(change.path)
+    result.sanctioned_writes.sort()
+    result.violating_writes.sort()
     return result
 
 
@@ -2022,7 +2187,8 @@ def cmd_check() -> int:
     _validate_receipt_stores(vault, rules)
     records = collect_commit_records(vault, head, audit_head)
     after = collect_dirty_fingerprints(vault)
-    commit_audit = _audit_commit_history(records, vault)
+    commit_result = _audit_commit_history(records, vault, head, audit_head)
+    commit_audit = commit_result.audit
     dirty_audit = audit_dirty(before, after, rules, vault, records=records)
     result = Audit(
         sanctioned_commits=commit_audit.sanctioned_commits,
