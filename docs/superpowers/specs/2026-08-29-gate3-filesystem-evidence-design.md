@@ -1,17 +1,35 @@
 # Gate 3 Filesystem Evidence Boundary
 
-**Status:** REVISION 2 — AWAITING APPROVAL. Revision 1 adds the sanctioned
-rename topology rule in "Directory ancestry disposition" and reconciles every
-statement that previously said a directory delta without a classified
-descendant always violates. The original design was approved conversationally
-by the product owner on 2026-08-29; that approval does not extend to this
-revision.
+**Status:** REVISION 3 — AWAITING APPROVAL. Revision 3 extends verified
+rename-topology inheritance from directories to every included non-regular
+kind, replacing the blanket rule that made a sanctioned rename produce false
+violations, and consolidates rename evidence into one immutable per-record
+analysis. Revisions 0 through 2 are approved; that approval does not extend
+to this revision.
 
 **Revision history:**
 
 - Revision 0 — approved 2026-08-29. Implementation of Tasks 1–8 proceeded
   against it.
-- Revision 2 — this document. Structural approval of Revision 1 was given
+- Revision 3 — this document. Two owner-approved changes, both raised by an
+  independent review of the completed Task 10 implementation.
+
+  **I5.** Verified rename-topology inheritance is extended from directories to
+  every included pre-existing non-directory entry. The blanket rule that every
+  non-directory delta is a direct write is replaced by that exact exception.
+  This is **a regression this branch introduces relative to canonical
+  `origin/main`, not a pre-existing Gate 3 limitation.** Measured on identical
+  synthetic scenarios: canonical `origin/main` reports no violation for a
+  tracked symlink, FIFO or socket carried by a sanctioned rename; this branch
+  before Task 10 and at Task 10 reports two false violations for each. The
+  supplemental walk made those entries visible, and the blanket rule then
+  failed the gate on a sanctioned action.
+
+  **I4.** Rename analysis is consolidated into one immutable per-record
+  result. The implementation performs four parent-tree checkouts, eight
+  rename-plan builds and two full sanction verifications per rename-bearing
+  record where one analysis suffices.
+- Revision 2 — structural approval of Revision 1 was given
   subject to one documentation correction: the evidence model's inode-reuse
   limitation had to be stated explicitly, and the absolute detection claim
   for an independently created or deleted directory had to be qualified to
@@ -50,9 +68,9 @@ supplemental evidence alongside the existing Git-derived dirty evidence. New,
 removed, replaced, or changed evidence will be a session change. The existing
 exact S7 record-sanctioning predicates remain unchanged, and the exact
 canonical S7 quarantine-directory creation remains the sole **standalone**
-directory-only exception. A directory pair moved by a separately verified
-sanctioned rename inherits that rename's disposition; it is not a second
-standalone exception.
+directory-only exception. A pair moved by a separately verified sanctioned
+rename — a directory, or an entry of any included non-regular kind —
+inherits that rename's disposition; it is not a second standalone exception.
 
 ## Authority reconciliation
 
@@ -238,8 +256,9 @@ follow, and no more:
 - Identity equality is a **necessary** condition for pairing, never a
   sufficient one. Every other pairing requirement — a verified sanctioned
   rename, an unambiguous mapping from that rename's own plan, the exact
-  roots, the identical tail, real directories at both endpoints, equal mode
-  — must still hold independently. The limitation narrows what identity
+  roots, the identical tail, the identical included kind at both endpoints,
+  equal mode, and equal `target_digest` for symlinks — must still hold
+  independently. The limitation narrows what identity
   evidence proves; it does not remove a single requirement.
 - It is **not** permission for a broader rename whitelist, a name-similarity
   heuristic, or any relaxation of the fail-closed rules. An unpaired
@@ -337,12 +356,18 @@ spot rather than layering two partially overlapping discovery paths. It does
 not alter the downstream S7 sanctioning code.
 
 A non-directory filesystem delta has no general sanction. It is a direct-write
-violation. In particular, the exact S7 record sanction continues to require a
-regular file discovered through the existing Git-derived evidence and to pass
-every current record, pending-state, receipt, action, identity, byte, and
+violation **unless a separately verified sanctioned rename explains it under
+"Sanctioned rename topology" below** — the same requirements a directory pair
+must meet, plus symlink target equality. There is no other exception, and no
+requirement is relaxed to obtain this one.
+
+In particular, the exact S7 record sanction continues to require a regular
+file discovered through the existing Git-derived evidence and to pass every
+current record, pending-state, receipt, action, identity, byte, and
 commit-correlation predicate. Those predicates and their classifier taxonomy
 are unchanged. A non-regular lookalike at the same path cannot enter that
-sanctioning path.
+sanctioning path, and rename inheritance never places anything into it:
+inheritance disposes of a filesystem delta and never produces a record.
 
 ### Directory ancestry disposition
 
@@ -350,17 +375,37 @@ Only directory presence deltas participate in ancestry composition. Directory
 mode or identity changes at a path that exists at both endpoints are always
 violations, even when descendants changed validly.
 
+Disposition runs in three phases, in this order, and the order is normative:
+
+1. **Pair non-directory deltas.** Each is sanctioned by rename inheritance or
+   violating. A sanctioned one becomes neutral evidence; a violating one
+   becomes a classified violating descendant.
+2. **Run directory ancestry** over the classified descendants from commit
+   evidence, dirty evidence, and phase 1.
+3. **Pair leftover directory presence deltas** that ancestry did not dispose
+   of, then apply the exact quarantine-directory exception.
+
 For each added or removed real directory:
 
 1. Find already-classified changed descendant paths from commit evidence,
    dirty evidence, and non-directory filesystem evidence.
+
+   A non-directory entry that **rename inheritance** sanctioned is
+   **neutral** here: it neither sanctions nor suppresses an ancestor. It is
+   evidence that a verified rename carried that one entry, and nothing more.
+   Treating it as a sanctioning descendant would let it satisfy step 4 for a
+   directory whose *own* pairing requirement 5 refused — a directory moved by
+   the same rename but whose `mode` or `identity_digest` changed would then
+   inherit sanction from the symlink beside it, and that change would never
+   be reported. An enclosing directory must always pair on its own terms.
 2. A descendant is relevant only when the directory is a strict, necessary
    ancestor of that descendant in the matching before/after topology: an
    added directory must be necessary to a descendant addition in the current
    tree; a removed directory must have been necessary to a descendant removal
    in the snapshot tree.
 3. If a relevant descendant is violating, its finding already fails the gate;
-   suppress the ancestor as a duplicate.
+   suppress the ancestor as a duplicate. A non-directory delta that pairing
+   refused is violating and suppresses exactly as before.
 4. If all relevant descendants are sanctioned, inherit their sanctioned
    disposition for the ancestor topology rather than reporting a contradictory
    directory violation.
@@ -382,8 +427,10 @@ fail because a violating descendant cannot be erased by a sanctioned one.
 
 ### Sanctioned rename topology
 
-A removed directory and an added directory may inherit the disposition of a
-rename that Gate 3 has **already** proven sanctioned. A successful pair
+A removed entry and an added entry may inherit the disposition of a rename
+that Gate 3 has **already** proven sanctioned. This covers a real directory
+**and every included non-regular kind**: symlink, FIFO, socket, character
+device, block device, and any other classified special kind. A successful pair
 reports **both endpoints as sanctioned writes**, exactly as an ancestor that
 inherits from sanctioned descendants does; neither endpoint is a violation.
 Pairing is an inheritance, never a suppression. This is inheritance
@@ -427,21 +474,58 @@ or ambiguity fails closed and the delta is judged as if no pairing existed.
    early return, while the sanctioning decision keeps it.
 3. **Exact relative path beneath the roots.** For one mapped pair
    `(old_root, new_root)`, the removed path must be `old_root/tail` and the
-   added path must be `new_root/tail` for the identical `tail`. An empty
+   added path must be `new_root/tail` for the identical `tail`. When several
+   mapped pairs apply — a general and a specific mapping both do after a
+   nested rename — the unique **longest** matching `old_root` wins,
+   independently of the order the mappings are held in. Equally specific
+   candidates predicting different destinations are ambiguous and fail
+   closed. An empty
    `tail` pairs the roots themselves. A different tail, a different root, or
    a tail matched only by prefix is not a pair.
-4. **Both endpoints are real directories.** Both fingerprints must have kind
-   `directory`. A symlink, FIFO, socket, device, regular file, or any other
-   object at either endpoint is never paired.
+4. **Both endpoints have the same included kind.** Both fingerprints must
+   carry the *identical* `kind`, and that kind must be one the supplement
+   records: `directory`, `symlink`, `fifo`, `socket`, `char-device`,
+   `block-device`, or `other`. A kind change between the endpoints is a
+   replacement, never a move. Regular files are never paired here — they are
+   not supplemental evidence and remain under Git's rules.
+
+   Both endpoints must appear in the computed delta as the paired object:
+   the removed path as a **removal**, the added path as an **addition**.
+   Presence in the raw evidence maps is not enough.
+   A standalone newly created special entry has no removed counterpart and
+   therefore receives no sanction, whatever its kind.
 5. **Matching metadata and identity.** The two fingerprints must have equal
-   `mode` and equal `identity_digest`. A rename within one filesystem
+   `mode` and equal `identity_digest`, and — for `symlink` endpoints — equal
+   `target_digest`. A symlink whose target text changed is a content change,
+   never a move, and is refused even when every other condition holds. A rename within one filesystem
    preserves device and inode identity, so an **unequal** identity is
-   conclusive: the added directory is a different object merely occupying the
+   conclusive: the added entry is a different object merely occupying the
    expected name, and the pair is refused. An **equal** identity is necessary
    but not sufficient, because a reused inode can imitate it; see
    "Evidence-model limitation: identity is not proof of a move". Pairing
    therefore never rests on identity alone — requirements 1 through 4 must
    hold independently.
+
+#### Why Git-visible untracked entries are outside this inheritance
+
+The rename transaction refuses to run against a dirty working tree. A
+**non-ignored** untracked entry — an untracked symlink or regular file that
+`git status` reports — makes the tree dirty, so the verified transaction
+**cannot start** and never carries such an entry.
+
+An *ignored* symlink is untracked but invisible to `git status`, so the tree
+stays clean and the transaction carries it exactly as it carries a FIFO. It
+pairs under the same kind-based rules, which never consult tracked-ness. The
+distinction that matters is Git *visibility*, not tracked-ness, and the rule
+is stated in those terms deliberately. Excluding them is therefore not a policy choice
+but a consequence of the transaction's own precondition, and it must be
+pinned by a regression asserting the refusal rather than assumed.
+
+Git-*invisible* untracked entries are the opposite case and are included. A
+FIFO, socket or device leaves `git status` clean, so the transaction proceeds
+and physically carries it. Those are exactly the objects the supplemental walk
+exists to surface; surfacing them and then failing the gate on a sanctioned
+action would replace one blind spot with another.
 
 **Sequential renames** compose deterministically in audited commit order,
 oldest first. A later mapping `(o, n)` rewrites an earlier mapping's
@@ -460,14 +544,14 @@ sends one source to two destinations or two sources to one destination, the
 chain is conflicting; a conflicting or ambiguous chain contributes no
 mapping at all rather than a best guess.
 
-**Pairing cannot hide anything.** It is evaluated only after the
-violating-descendant rule, so a violating descendant beneath an otherwise
+**Pairing cannot hide anything.** *Directory* pairing is evaluated only after
+the violating-descendant rule, so a violating descendant beneath an otherwise
 paired directory still fails the gate and still suppresses its ancestor
 rather than sanctioning it. Pairing never reaches an unrelated sibling
 addition or removal, a move to or from a root the verified plan does not
-name, a replacement of either endpoint, a special file or symlink at either
-endpoint, or a directory independently created or deleted at a path that
-merely resembles a rename destination.
+name, a replacement of either endpoint, a kind change between endpoints, a
+symlink whose target text changed, or an entry independently created or
+deleted at a path that merely resembles a rename destination.
 
 Each of those remains a violation on its own terms **wherever the endpoints
 present distinguishable evidence** — a different root, a different tail, a
@@ -477,6 +561,109 @@ pair that a reused inode makes indistinguishable from the verified rename's
 own move, at exactly that rename's roots and tail. That is the accepted
 limitation recorded above, not a gap in these rules: no requirement is
 relaxed for it, and every other shape is still refused.
+
+### One immutable rename analysis per record
+
+Rename evidence is derived **once per commit record** and carried as an
+immutable value. The current implementation derives it four times over: the
+commit-relative audit checks out the parent tree, the sanctioning decision
+checks it out again, the mapping pass re-verifies sanctioning a third time,
+and the axis sweep checks it out a fourth — two full sanction verifications
+and 8 to 16 rename-plan builds where one analysis suffices.
+
+The plan-build figure is **not** a constant. Both the sanctioning check and
+the axis sweep iterate the axes in sorted order and the sanctioning check
+early-returns on its first match, so the total is
+`2 · (position of the matching axis) + 6` — measured as 8 on the first axis
+and 16 on the last. Only the checkout count (4) and the verification count
+(2) are axis-independent.
+
+The analysis carries exactly three things:
+
+```text
+RenameAnalysis
+  sanctioned:    the unchanged sanctioning result for this record
+  matched_axes:  every axis whose envelope equals the commit's change set
+  mappings:      the unique verified move mappings, or none on ambiguity
+```
+
+Binding rules:
+
+- Each axis's rename plan is built **exactly once**, and both that axis's
+  envelope and its move pairs are derived from that same plan object. A
+  second build for the move pairs is redundant and forbidden.
+- Rename analysis performs **exactly one** parent-tree checkout, cleaned in
+  `finally` on success and failure alike.
+- The analysis is computed once per record and passed **explicitly** to
+  commit sanctioning and to filesystem mapping. Sanction verification is
+  never repeated.
+- No global memoization, retained temporary checkout, cross-record cache,
+  shared mutable state, or persistent artifact. The value is per record,
+  immutable, and discarded with the record.
+- Ambiguity is unchanged: more than one matching axis yields no mappings,
+  while `sanctioned` keeps its existing meaning.
+
+#### Performance model and acceptance limits
+
+Per **rename-bearing** record:
+
+| Measure | Limit |
+|---|---|
+| total parent-tree checkouts | at most 2 — one commit-tree checkout for commit-relative rules, one for rename analysis |
+| checkouts inside rename analysis | exactly 1 |
+| `build_rename_plan` calls | at most `len(AXES)` |
+| semantic rename analyses | exactly 1, with no redundant sanction verification |
+
+Per **non-rename** record: at most 1 checkout **in the commit-history pass**
+and zero rename-plan builds. A receipt-bearing record incurs one further
+checkout of the same object id when the dirty audit loads its commit-relative
+rules. That second checkout is outside this change's surface — the dirty
+audit is on the "must remain equivalent" list below — so the limit is scoped
+to the commit-history pass rather than stated as a whole-command total.
+Deduplicating those two same-object checkouts is a separate, unapproved
+optimisation and is explicitly **not** part of this revision.
+
+These are enforced by instrumented call-count assertions rather than timing,
+because wall-clock varies with vault size and host. Each assertion must be
+RED against the current implementation before the change lands. Its measured
+figures are **4 checkouts** and **2 sanction verifications** on every axis,
+and **8 to 16 plan builds** depending on the matching axis's position. A
+plan-build assertion must therefore be written against the limit — greater
+than `len(AXES)` — never against the literal 8, which would be RED for the
+wrong reason on four of the five axes.
+
+#### Proving the sanctioning decision did not move
+
+Consolidation necessarily restructures the sanctioning helpers, so the
+AST-equivalence assertion that previously covered them can no longer hold for
+all of them. It must be **narrowed, not dropped**:
+
+- **May change:** the rename-analysis entry point and the helpers that now
+  receive the analysis explicitly — the rename sanction check, the
+  commit-sanctioned dispatcher, the commit auditor, the commit-history
+  driver, and the filesystem mapping call site. The **envelope builder** is
+  on this list too, and must be: it currently builds a plan and discards it
+  while the move-pairs helper rebuilds the same plan, so deriving both from
+  one plan object is impossible while it stays frozen. Leaving it frozen
+  would make the one-build rule and the `len(AXES)` limit mutually
+  unsatisfiable.
+- **Must remain equivalent:** every S7 record-sanctioning definition, the
+  outbox, registry and ingest envelope checks, the classifier taxonomy, the
+  dirty audit and its commit-relative rules loader, the quarantine-directory
+  exception, and the filesystem fingerprint and traversal primitives.
+
+Because structural identity is lost for the changed set, behaviour is proven
+instead by a **differential oracle**: load the baseline module from the
+approved design checkpoint and assert the new and baseline sanctioning
+decisions agree over a corpus spanning all five axes, sanctioned records,
+records with duplicated change entries, **records whose envelope more than
+one axis reproduces**, wrong-parent records, malformed envelopes, and
+non-rename messages. The ambiguous record matters most: it is where the
+sanctioning result and the matching-axis set diverge furthest, because one
+applies the duplicate-change guard and early-returns while the other does
+neither. Every existing sanctioning regression is
+retained unchanged alongside it. A differential disagreement is a stop
+condition, not a finding to triage.
 
 ### Exact S7 quarantine-directory exception
 
@@ -536,7 +723,8 @@ not require a live vault or privileged device creation.
 - A pre-existing FIFO, symlink, socket where supported, or empty directory is
   accepted when its fingerprint is unchanged.
 - Removal, same-kind replacement, type replacement, mode change, and symlink
-  target change of pre-existing evidence fail.
+  target change of pre-existing evidence fail when no verified
+  sanctioned-rename pairing explains them.
 - New and removed empty directories fail when they have no classified
   descendant and no verified sanctioned-rename pairing.
 - A directory containing only ignored regular content still contributes the
@@ -556,8 +744,9 @@ not require a live vault or privileged device creation.
 
 ### Sanctioned rename topology
 
-Every case below is adversarial and must be written RED before the pairing
-rule exists. Exactly three end sanctioned — the no-tracked-descendant case,
+Every case below is adversarial. The directory cases were written RED before
+the directory pairing rule landed; the non-directory and call-count cases
+below must be written RED against the current implementation. Exactly three end sanctioned — the no-tracked-descendant case,
 the ignored/untracked-content case, and the sequential-composition case.
 Every other case must still report a violation.
 
@@ -575,8 +764,9 @@ Every other case must still report a violation.
 - A pair whose `identity_digest` differs violates, proving the added
   directory is a different object occupying the expected name.
 - A pair whose `mode` differs violates.
-- A pair where either endpoint is a **symlink or any non-directory** violates,
-  and is never treated as ancestry.
+- A pair where the two endpoints have **different kinds** violates, and a
+  non-directory pair is never treated as directory *ancestry* — it is
+  disposed of by rename inheritance or not at all.
 - An **ambiguous** rename mapping — more than one axis reproducing
   one commit's matching envelope — contributes nothing and the delta
   violates.
@@ -591,6 +781,58 @@ Every other case must still report a violation.
   paired directory still violates.
 - A **violating descendant** beneath an otherwise paired directory still
   fails the gate, and its ancestor is suppressed rather than sanctioned.
+
+### Non-directory rename topology
+
+Sanctioned, one case per included kind. A socket case skips only where the
+host cannot safely bind one; character and block devices are exercised
+through synthetic fingerprints and mode classification, never by creating a
+device node:
+
+- a **tracked symlink**, **FIFO**, **socket**, **character device**, **block
+  device**, and **other** special kind carried by a sanctioned rename pairs
+  at both endpoints and the gate passes.
+
+Every one of the following still violates, per kind:
+
+- no sanctioned rename commit in the window;
+- a removed path outside the verified **old** root;
+- an added path outside the verified **new** root;
+- differing relative tails, including a tail matching only as a prefix;
+- a **kind change** between the endpoints;
+- a `mode` change;
+- an `identity_digest` change;
+- a **symlink `target_digest` change**, with every other condition holding;
+- an unrelated sibling special entry added or removed beside a correct pair;
+- an ambiguous rename mapping;
+- a conflicting rename chain;
+- a violating descendant beneath an otherwise paired directory;
+- a **standalone newly created** special entry with no removed counterpart,
+  whatever its kind;
+- a directory whose added endpoint has a changed `mode` or `identity_digest`,
+  containing a correctly paired symlink, **still violates at both endpoints**
+  — a paired non-directory descendant is neutral and can never sanction an
+  enclosing directory its own requirements refused.
+
+One further regression pins the exclusion rather than assuming it:
+
+- a **Git-visible untracked** symlink makes the working tree dirty and the
+  rename transaction **refuses to start**. The test asserts that refusal, so
+  the reason these entries are outside inheritance stays executable.
+
+### Rename analysis and call counts
+
+Instrumented call-count regressions, each RED against the current
+implementation's 4 checkouts, 8 plan builds and 2 sanction verifications:
+
+- a rename-bearing record performs at most 2 parent-tree checkouts in total
+  and exactly 1 inside rename analysis;
+- it performs at most `len(AXES)` rename-plan builds;
+- it performs exactly one semantic rename analysis with no repeated sanction
+  verification;
+- a non-rename record performs at most 1 checkout and zero plan builds;
+- a differential oracle agrees with the baseline sanctioning decision across
+  all five axes and the adversarial record corpus.
 
 ### Traversal and races
 
@@ -626,8 +868,8 @@ Every other case must still report a violation.
 
 This work does not:
 
-- introduce a general directory-move whitelist, or any directory sanction
-  that does not trace to separately verified evidence;
+- introduce a general directory or special-entry move whitelist, or any
+  filesystem sanction that does not trace to separately verified evidence;
 - change S7 transaction, quarantine, receipt, or recovery behavior;
 - change any S7 record-sanctioning predicate or sanctioned-content semantic;
 - change the classifier taxonomy, registries, conventions, dependencies, or
