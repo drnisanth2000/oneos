@@ -36,8 +36,17 @@ change.
   review reproduced finding I1: a sanctioned entity rename moving a
   directory with no tracked descendant reported both endpoints as
   unsanctioned direct writes.
-- Revision 2 — this document. Adds **Task 10** for I1 only. Tasks 1–9 are
-  unchanged.
+- Revision 2 — added Task 10 for I1. Superseded.
+- Revision 3 — this document. Task 10 corrected after owner review. Plan
+  Revision 2's composition was wrong for the **ancestor-then-nested** order:
+  it retained the general `a → b` mapping plus a mapping still rooted beneath
+  `b`, so an original path under `a/.../oldproduct/...` predicted the
+  intermediate `b/.../oldproduct/...` destination and never paired.
+  Composition now derives a later mapping's original source pre-image, and
+  pairing selects the unique most-specific applicable mapping instead of the
+  first tuple entry. Adds the missing wrong-old-root case and replaces the
+  grep-based unchanged-helpers claim with an exact AST comparison. Tasks 1–9
+  remain unchanged.
 
 ## Global Constraints
 
@@ -1381,14 +1390,15 @@ any new dependency, or a general directory-move whitelist to close it.
 - Test: `tests/test_gate3_audit.py`
 
 No other tracked file changes. The existing commit-sanctioning decision and
-the classifier taxonomy are unchanged by every step below.
+the classifier taxonomy are unchanged by every step below, and Step 21 proves
+it rather than asserting it.
 
 **Interfaces:**
 - Consumes: `CommitRecord`, `AuditRules`, `Audit`, `CommitAuditResult`,
   `ClassifiedPathChange`, `FilesystemChange`, `FilesystemFingerprint`,
   `_parent_tree()`, `_rename_envelope()`, `_sanctioned_rename()`,
-  `audit_commits()`, `_audit_commit_history()`, `audit_filesystem()`,
-  `_path_parts()`, and `build_rename_plan()` from `app.rename`.
+  `_audit_commit_history()`, `audit_filesystem()`, `_RENAME_MESSAGE`,
+  `AXES`, `RenameError`, and `build_rename_plan()` from `app.rename`.
 - Produces:
 
 ```text
@@ -1398,26 +1408,31 @@ class RenameMapping:
     new_root: str
 
 _rename_move_pairs(
-    tree: Path,
-    axis: str,
-    old: str,
-    new: str,
-    *,
-    parent_oid: str,
+    tree: Path, axis: str, old: str, new: str, *, parent_oid: str
 ) -> tuple[RenameMapping, ...]
+_matching_rename_axes(
+    record: CommitRecord, vault: Path, old: str, new: str
+) -> tuple[tuple[str, tuple[RenameMapping, ...]], ...]
 _verified_rename_mappings(
     record: CommitRecord, vault: Path
 ) -> tuple[RenameMapping, ...]
+_rewrite_destination(destination: str, mapping: RenameMapping) -> str | None
+_source_preimage(
+    old_root: str, composed: tuple[RenameMapping, ...]
+) -> str | None
 _compose_rename_mappings(
     ordered: tuple[tuple[RenameMapping, ...], ...]
 ) -> tuple[RenameMapping, ...]
+_predict_rename_destination(
+    path: str, mappings: tuple[RenameMapping, ...]
+) -> str | None
 _paired_rename_directories(
     changes: tuple[FilesystemChange, ...],
     mappings: tuple[RenameMapping, ...],
 ) -> frozenset[str]
 ```
 
-`_audit_commit_history()` gains one field on its existing result:
+`CommitAuditResult` gains one field:
 
 ```python
 @dataclass(frozen=True)
@@ -1440,14 +1455,37 @@ audit_filesystem(
 ) -> Audit
 ```
 
-**Data flow.** `_audit_commit_history()` already walks records oldest-first.
-For each record it now also calls `_verified_rename_mappings()`, which returns
-mappings **only** for a record the existing `_sanctioned_rename()` already
-accepted. The per-record tuples are collected in that same oldest-first order
-and folded by `_compose_rename_mappings()` into one composed tuple carried on
-`CommitAuditResult.rename_mappings`. `cmd_check()` passes it to
-`audit_filesystem()`, which consults it only after the violating-descendant
-rule and only for directory presence deltas.
+**Composition semantics.** Mappings fold oldest-first. Each new group does two
+things to the accumulated set:
+
+1. **Rewrite forward.** Every accumulated destination that the new mapping
+   names exactly, or is a proper path-prefix of, is rewritten through it.
+   This handles *nested rename then ancestor rename*.
+2. **Derive the original source.** A new mapping whose `old_root` sits at or
+   beneath an accumulated destination is recorded under that accumulated
+   mapping's **source** pre-image, not under its own `old_root`. This handles
+   *ancestor rename then nested rename*, which Plan Revision 2 got wrong: it
+   left `a → b` beside `b/M/oldproduct → b/M/newproduct`, so an original path
+   `a/M/oldproduct/x` matched only the general mapping and predicted the
+   intermediate `b/M/oldproduct/x`.
+
+The general mapping is retained alongside the derived specific one, so tails
+the nested rename does not touch still map. Two accumulated destinations
+matching one new `old_root`, two rewrites applying to one destination, a
+duplicated source, or a duplicated destination all return the empty tuple.
+
+**Pairing semantics.** Pairing never depends on tuple order. For a removed
+path, every mapping whose `old_root` matches is a candidate; the unique
+**longest** `old_root` wins. Equally specific candidates predicting different
+destinations fail closed, as do two destinations for one removed path and two
+removed paths for one added path.
+
+**Data flow.** `_audit_commit_history()` walks records oldest-first and, for
+each record whose commit its existing per-commit audit sanctioned, appends
+`_verified_rename_mappings(record, vault)`. The ordered groups fold through
+`_compose_rename_mappings()` onto `CommitAuditResult.rename_mappings`.
+`cmd_check()` passes that to `audit_filesystem()`, which consults it only
+after the violating-descendant rule and only for directory presence deltas.
 
 - [ ] **Step 1: Write the RED reproduction of I1**
 
@@ -1459,11 +1497,10 @@ def test_cli_sanctioned_rename_of_an_untracked_only_directory_passes(
 ):
     """A sanctioned rename must not fail the gate on a directory Git cannot see.
 
-    `archive/` here holds no tracked file, so no commit or dirty path is ever
-    classified beneath it. Before the pairing rule both endpoints were
-    reported as unsanctioned direct writes even though the rename commit
-    itself was sanctioned, and the operator had no remedy but to delete the
-    directory.
+    `archive/` holds no tracked file, so nothing is ever classified beneath
+    it. Both endpoints were reported as unsanctioned direct writes even though
+    the rename commit itself was sanctioned, and the operator had no remedy
+    but to delete the directory.
     """
     files, old, new = _rename_files("entity")
     vault = git_vault(tmp_path / "vault", files)
@@ -1480,17 +1517,15 @@ def test_cli_sanctioned_rename_of_an_untracked_only_directory_passes(
 
 - [ ] **Step 2: Run it and observe RED**
 
-Run:
-
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
   -k 'sanctioned_rename_of_an_untracked_only_directory' -q
 ```
 
-Expected: FAIL, exit code 1 from `check`, with
+Expected: FAIL. `check` exits 1 and prints
 `VIOLATION direct write: <new>/11-library/archive` and
-`VIOLATION direct write: <old>/11-library/archive` on stdout. Record both
-lines as the RED evidence for Task 10.
+`VIOLATION direct write: <old>/11-library/archive`. Record both lines as the
+RED evidence for Task 10.
 
 - [ ] **Step 3: Extract move pairs from the rename planner**
 
@@ -1506,17 +1541,12 @@ class RenameMapping:
 
 
 def _rename_move_pairs(
-    tree: Path,
-    axis: str,
-    old: str,
-    new: str,
-    *,
-    parent_oid: str,
+    tree: Path, axis: str, old: str, new: str, *, parent_oid: str
 ) -> tuple[RenameMapping, ...]:
     """The move pairs of one rename plan, in the planner's own order.
 
-    `_rename_envelope` computes these and discards them. Reproducing the
-    plan here keeps the envelope comparison byte-for-byte unchanged, so the
+    `_rename_envelope` computes these and discards them. Rebuilding the plan
+    here leaves the envelope comparison byte-for-byte unchanged, so the
     sanctioning decision cannot shift.
     """
     plan = build_rename_plan(tree, axis, old, new, planned_head=parent_oid)
@@ -1530,10 +1560,10 @@ def _rename_move_pairs(
     )
 ```
 
-- [ ] **Step 4: Write the RED test for ambiguity and unsanctioned commits**
+- [ ] **Step 4: Write RED tests for mapping authorization and axis ambiguity**
 
 ```python
-def _record(oid: str, message: str, changes) -> gate3.CommitRecord:
+def _rec(oid: str, message: str, changes) -> gate3.CommitRecord:
     return gate3.CommitRecord(
         oid=oid,
         message=message,
@@ -1544,13 +1574,11 @@ def _record(oid: str, message: str, changes) -> gate3.CommitRecord:
     )
 
 
-def test_unsanctioned_rename_commit_contributes_no_mapping(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_unsanctioned_rename_commit_contributes_no_mapping(tmp_path: Path):
     """Only a commit the existing verification accepted may map anything."""
     files, old, new = _rename_files("entity")
     vault = git_vault(tmp_path / "vault", files)
-    record = _record("a" * 40, f"rename: {old} → {new}", (("M", "unrelated.md"),))
+    record = _rec("a" * 40, f"rename: {old} → {new}", (("M", "unrelated.md"),))
 
     assert gate3._verified_rename_mappings(record, vault) == ()
 
@@ -1570,25 +1598,21 @@ def test_ambiguous_axis_match_contributes_no_mapping(
             ("product", (gate3.RenameMapping(old, new),)),
         ),
     )
-    record = _record("a" * 40, f"rename: {old} → {new}", (("M", "x.md"),))
+    record = _rec("a" * 40, f"rename: {old} → {new}", (("M", "x.md"),))
 
     assert gate3._verified_rename_mappings(record, vault) == ()
 ```
 
 - [ ] **Step 5: Run them and observe RED**
 
-Run:
-
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
   -k 'contributes_no_mapping' -q
 ```
 
-Expected: FAIL with `AttributeError` on `_verified_rename_mappings`.
+Expected: FAIL, `AttributeError` on `_verified_rename_mappings`.
 
 - [ ] **Step 6: Evaluate every axis without changing sanctioning**
-
-Add to `tools/gate3_audit.py`:
 
 ```python
 def _matching_rename_axes(
@@ -1597,9 +1621,9 @@ def _matching_rename_axes(
     """Every axis whose envelope equals the commit, evaluated to completion.
 
     `_sanctioned_rename` returns on its first matching axis and so can never
-    observe a second one. Ambiguity detection needs the full set, so this
-    walks all axes. It is a separate pass on purpose: the sanctioning
-    decision keeps its early return and its result is not consulted here.
+    observe a second one. Ambiguity detection needs the full set. This is a
+    separate pass on purpose: the sanctioning decision keeps its early return
+    and its behaviour is not altered here.
     """
     actual = frozenset((change.status, change.path) for change in record.changes)
     matches: list[tuple[str, tuple[RenameMapping, ...]]] = []
@@ -1645,9 +1669,7 @@ def _verified_rename_mappings(
     return matches[0][1]
 ```
 
-- [ ] **Step 7: Run and confirm GREEN for Step 4's tests**
-
-Run:
+- [ ] **Step 7: Run and confirm GREEN**
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
@@ -1656,7 +1678,7 @@ uv run python -m pytest tests/test_gate3_audit.py \
 
 Expected: 2 passed.
 
-- [ ] **Step 8: Write the RED composition tests**
+- [ ] **Step 8: Write RED composition tests for both nesting orders**
 
 ```python
 def _m(old_root: str, new_root: str) -> gate3.RenameMapping:
@@ -1669,13 +1691,47 @@ def test_rename_mappings_compose_oldest_first_over_exact_roots():
     assert composed == (_m("a", "c"),)
 
 
-def test_rename_mappings_compose_over_path_prefixes():
-    """Renames on different axes nest, so exact-root composition is not enough."""
+@pytest.mark.parametrize(
+    ("ordered", "expected"),
+    (
+        (
+            ((_m("a/M/op", "a/M/np"),), (_m("a", "b"),)),
+            (_m("a/M/op", "b/M/np"), _m("a", "b")),
+        ),
+        (
+            ((_m("a", "b"),), (_m("b/M/op", "b/M/np"),)),
+            (_m("a", "b"), _m("a/M/op", "b/M/np")),
+        ),
+    ),
+    ids=("nested-then-ancestor", "ancestor-then-nested"),
+)
+def test_rename_mappings_compose_across_nesting_orders(ordered, expected):
+    """Both nesting orders must end at the original source and final target.
+
+    Ancestor-then-nested is the order Plan Revision 2 got wrong: it kept
+    `a → b` beside `b/M/op → b/M/np`, so `a/M/op/x` matched only the general
+    mapping and predicted the intermediate `b/M/op/x`.
+    """
+    assert gate3._compose_rename_mappings(ordered) == expected
+
+
+def test_composed_mappings_retain_the_general_tail():
+    """A nested rename must not shadow tails it does not touch."""
     composed = gate3._compose_rename_mappings(
-        ((_m("a/11-library/p", "a/11-library/q"),), (_m("a", "b"),))
+        ((_m("a", "b"),), (_m("b/M/op", "b/M/np"),))
     )
 
-    assert composed == (_m("a/11-library/p", "b/11-library/q"), _m("a", "b"))
+    assert gate3._predict_rename_destination("a/other/x", composed) == "b/other/x"
+    assert (
+        gate3._predict_rename_destination("a/M/op/x", composed) == "b/M/np/x"
+    )
+
+
+def test_ambiguous_source_preimage_contributes_nothing():
+    """Two accumulated destinations matching one new source is ambiguous."""
+    ordered = ((_m("a", "shared"), _m("b", "shared/nested")), (_m("shared/nested", "c"),))
+
+    assert gate3._compose_rename_mappings(ordered) == ()
 
 
 @pytest.mark.parametrize(
@@ -1692,16 +1748,14 @@ def test_conflicting_rename_mappings_contribute_nothing(ordered):
 
 - [ ] **Step 9: Run them and observe RED**
 
-Run:
-
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'rename_mappings_compose or conflicting_rename_mappings' -q
+  -k 'rename_mappings_compose or composed_mappings_retain or ambiguous_source_preimage or conflicting_rename_mappings' -q
 ```
 
-Expected: FAIL with `AttributeError` on `_compose_rename_mappings`.
+Expected: FAIL, `AttributeError` on `_compose_rename_mappings`.
 
-- [ ] **Step 10: Implement deterministic oldest-first prefix composition**
+- [ ] **Step 10: Implement bidirectional prefix composition**
 
 ```python
 def _rewrite_destination(destination: str, mapping: RenameMapping) -> str | None:
@@ -1714,17 +1768,44 @@ def _rewrite_destination(destination: str, mapping: RenameMapping) -> str | None
     return None
 
 
+def _source_preimage(
+    old_root: str, composed: tuple[RenameMapping, ...]
+) -> str | None:
+    """The original source a later mapping's root sits under, if any.
+
+    Returns the sentinel `""` when nothing matches, so the caller can
+    distinguish "no earlier mapping applies" from an ambiguous match, which
+    returns None.
+    """
+    matches = [
+        mapping
+        for mapping in composed
+        if old_root == mapping.new_root
+        or old_root.startswith(mapping.new_root + "/")
+    ]
+    if len(matches) > 1:
+        return None
+    if not matches:
+        return ""
+    mapping = matches[0]
+    if old_root == mapping.new_root:
+        return mapping.old_root
+    tail = old_root[len(mapping.new_root) + 1:]
+    return mapping.old_root + "/" + tail
+
+
 def _compose_rename_mappings(
     ordered: tuple[tuple[RenameMapping, ...], ...],
 ) -> tuple[RenameMapping, ...]:
-    """Fold per-commit mappings oldest-first, failing closed on conflict.
+    """Fold per-commit mappings oldest-first, failing closed on ambiguity.
 
-    A later mapping rewrites an earlier destination when it names that
-    destination exactly or is a proper path-prefix of it. Renames on
-    different axes nest, so prefix rewriting is required and not a
-    refinement.
+    Two directions matter and both occur. A later ancestor rename rewrites an
+    earlier nested destination forward; a later nested rename is recorded
+    under the earlier ancestor's original source. Recording only the first
+    leaves an original path matching the general mapping alone and predicting
+    an intermediate destination that never exists on disk.
     """
-    composed: list[RenameMapping] = []
+    composed: tuple[RenameMapping, ...] = ()
     for group in ordered:
         rewritten: list[RenameMapping] = []
         for existing in composed:
@@ -1741,34 +1822,62 @@ def _compose_rename_mappings(
                 if applied
                 else existing
             )
-        composed = rewritten + [
-            mapping
-            for mapping in group
-            if not any(
-                existing.new_root == mapping.old_root for existing in composed
+        added: list[RenameMapping] = []
+        for mapping in group:
+            preimage = _source_preimage(mapping.old_root, composed)
+            if preimage is None:
+                return ()
+            added.append(
+                RenameMapping(preimage or mapping.old_root, mapping.new_root)
             )
-        ]
-    sources = [mapping.old_root for mapping in composed]
-    destinations = [mapping.new_root for mapping in composed]
-    if len(set(sources)) != len(sources) or len(set(destinations)) != len(
-        destinations
-    ):
-        return ()
-    return tuple(composed)
+        composed = tuple(rewritten + added)
+        sources = [mapping.old_root for mapping in composed]
+        destinations = [mapping.new_root for mapping in composed]
+        if len(set(sources)) != len(sources) or len(set(destinations)) != len(
+            destinations
+        ):
+            return ()
+    return composed
+
+
+def _predict_rename_destination(
+    path: str, mappings: tuple[RenameMapping, ...]
+) -> str | None:
+    """Where a verified rename says this path went, or None.
+
+    Selection is by longest matching `old_root`, never by tuple order: a
+    general and a specific mapping both apply to a nested path, and only the
+    specific one names the destination that exists on disk. Equally specific
+    candidates disagreeing is ambiguity, and fails closed.
+    """
+    candidates: list[tuple[int, str]] = []
+    for mapping in mappings:
+        if path == mapping.old_root:
+            candidates.append((len(mapping.old_root), mapping.new_root))
+        elif path.startswith(mapping.old_root + "/"):
+            tail = path[len(mapping.old_root) + 1:]
+            candidates.append(
+                (len(mapping.old_root), mapping.new_root + "/" + tail)
+            )
+    if not candidates:
+        return None
+    best = max(length for length, _ in candidates)
+    predicted = {value for length, value in candidates if length == best}
+    if len(predicted) != 1:
+        return None
+    return predicted.pop()
 ```
 
-- [ ] **Step 11: Run and confirm GREEN for Step 8's tests**
-
-Run:
+- [ ] **Step 11: Run and confirm GREEN**
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'rename_mappings_compose or conflicting_rename_mappings' -q
+  -k 'rename_mappings_compose or composed_mappings_retain or ambiguous_source_preimage or conflicting_rename_mappings' -q
 ```
 
-Expected: 4 passed.
+Expected: 7 passed.
 
-- [ ] **Step 12: Write the RED pairing tests for the remaining Revision 2 cases**
+- [ ] **Step 12: Write RED pairing tests, including the wrong-old-root case**
 
 ```python
 def _pair_fp(mode: int = 0o755, identity: str = "1" * 64):
@@ -1805,12 +1914,13 @@ def test_paired_rename_directories_are_sanctioned_at_both_endpoints(
 @pytest.mark.parametrize(
     ("before_path", "after_path", "before_fp", "after_fp", "mappings"),
     (
+        ("synthetic/d/empty", "renamed/d/empty", _pair_fp(), _pair_fp(), ()),
         (
-            "synthetic/d/empty",
+            "stranger/d/empty",
             "renamed/d/empty",
             _pair_fp(),
             _pair_fp(),
-            (),
+            (_m("synthetic", "renamed"),),
         ),
         (
             "synthetic/d/empty",
@@ -1850,6 +1960,7 @@ def test_paired_rename_directories_are_sanctioned_at_both_endpoints(
     ),
     ids=(
         "no-sanctioned-rename",
+        "wrong-old-root",
         "wrong-new-root",
         "different-tail",
         "identity-mismatch",
@@ -1860,6 +1971,12 @@ def test_paired_rename_directories_are_sanctioned_at_both_endpoints(
 def test_unpaired_rename_shapes_remain_violations(
     tmp_path: Path, before_path, after_path, before_fp, after_fp, mappings
 ):
+    """Every shape outside the verified mapping stays a direct-write violation.
+
+    `wrong-old-root` is the removed path sitting outside the verified old
+    root; `wrong-new-root` is the added path sitting outside the verified new
+    root. Both must fail, and for different reasons.
+    """
     vault = _audit_vault(tmp_path / "vault", initialize_git=True)
     rules = gate3.AuditRules.load(vault)
 
@@ -1898,17 +2015,13 @@ def test_violating_descendant_beneath_a_paired_directory_still_fails(
         {"renamed/d/empty": _pair_fp()},
         rules,
         (_m("synthetic", "renamed"),),
-        classified=[
-            _classified("renamed/d/empty/bad.md", "added", "violating"),
-        ],
+        classified=[_classified("renamed/d/empty/bad.md", "added", "violating")],
     )
 
     assert "renamed/d/empty" not in audit.sanctioned_writes
 ```
 
 - [ ] **Step 13: Run them and observe RED**
-
-Run:
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
@@ -1917,9 +2030,91 @@ uv run python -m pytest tests/test_gate3_audit.py \
 
 Expected: FAIL — `audit_filesystem()` does not accept `rename_mappings`.
 
-- [ ] **Step 14: Implement pairing inside the existing disposition order**
+- [ ] **Step 14: Write RED order-independence and candidate-ambiguity tests**
 
-Add beside `audit_filesystem()`:
+```python
+@pytest.mark.parametrize("order", ("general-first", "specific-first"))
+def test_pairing_selects_the_most_specific_mapping_regardless_of_order(
+    tmp_path: Path, order: str
+):
+    """Tuple order must not decide which destination is predicted."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    mappings = (_m("synthetic", "renamed"), _m("synthetic/d", "renamed/e"))
+    if order == "specific-first":
+        mappings = tuple(reversed(mappings))
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/e/empty": _pair_fp()},
+        rules,
+        mappings,
+    )
+
+    assert audit.sanctioned_writes == ["renamed/e/empty", "synthetic/d/empty"]
+    assert audit.violating_writes == []
+
+
+def test_equally_specific_mappings_that_disagree_fail_closed(tmp_path: Path):
+    """Two candidates of the same specificity are ambiguous, not a choice."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"), _m("synthetic", "other")),
+    )
+
+    assert audit.sanctioned_writes == []
+    assert "synthetic/d/empty" in audit.violating_writes
+
+
+def test_one_removed_path_never_sanctions_two_destinations(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp(), "other/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert "other/d/empty" in audit.violating_writes
+    assert audit.sanctioned_writes == ["renamed/d/empty", "synthetic/d/empty"]
+
+
+def test_two_removed_paths_never_share_one_added_path(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp(), "second/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"), _m("second", "renamed")),
+    )
+
+    assert audit.sanctioned_writes == []
+    assert sorted(audit.violating_writes) == [
+        "renamed/d/empty",
+        "second/d/empty",
+        "synthetic/d/empty",
+    ]
+```
+
+- [ ] **Step 15: Run them and observe RED**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'most_specific_mapping or equally_specific or two_destinations or two_removed_paths' -q
+```
+
+Expected: FAIL — `audit_filesystem()` does not accept `rename_mappings`.
+
+- [ ] **Step 16: Implement order-independent pairing**
 
 ```python
 def _paired_rename_directories(
@@ -1946,36 +2141,38 @@ def _paired_rename_directories(
         and change.after is not None
         and change.after.kind == "directory"
     }
+    proposed: dict[str, str] = {}
+    for old_path, old_fingerprint in sorted(removed.items()):
+        new_path = _predict_rename_destination(old_path, mappings)
+        if new_path is None:
+            continue
+        new_fingerprint = added.get(new_path)
+        if new_fingerprint is None:
+            continue
+        if (
+            new_fingerprint.mode != old_fingerprint.mode
+            or new_fingerprint.identity_digest != old_fingerprint.identity_digest
+        ):
+            continue
+        proposed[old_path] = new_path
+    claimed: dict[str, list[str]] = {}
+    for old_path, new_path in proposed.items():
+        claimed.setdefault(new_path, []).append(old_path)
     paired: set[str] = set()
-    for old_path, old_fingerprint in removed.items():
-        for mapping in mappings:
-            if old_path == mapping.old_root:
-                tail = ""
-            elif old_path.startswith(mapping.old_root + "/"):
-                tail = old_path[len(mapping.old_root) + 1:]
-            else:
-                continue
-            new_path = mapping.new_root if not tail else (
-                mapping.new_root + "/" + tail
-            )
-            new_fingerprint = added.get(new_path)
-            if new_fingerprint is None:
-                continue
-            if (
-                new_fingerprint.mode == old_fingerprint.mode
-                and new_fingerprint.identity_digest
-                == old_fingerprint.identity_digest
-            ):
-                paired.update({old_path, new_path})
-                break
+    for new_path, sources in claimed.items():
+        if len(sources) != 1:
+            # Two removed directories cannot both be this one added
+            # directory; neither claim is trustworthy.
+            continue
+        paired.update({sources[0], new_path})
     return frozenset(paired)
 ```
 
-Change the `audit_filesystem()` signature to accept
+Change `audit_filesystem()` to accept
 `rename_mappings: tuple[RenameMapping, ...] = ()`, compute
 `paired = _paired_rename_directories(changes, rename_mappings)` once after
 `changes` is built, and insert exactly one clause into the existing
-directory-disposition order, **after** the violating-descendant suppression
+directory-disposition order — **after** the violating-descendant suppression
 and the sanctioned-descendant inheritance, and **before** the canonical
 quarantine exception:
 
@@ -1985,20 +2182,16 @@ quarantine exception:
             continue
 ```
 
-- [ ] **Step 15: Run and confirm GREEN**
-
-Run:
+- [ ] **Step 17: Run Steps 12 and 14 GREEN**
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'paired_rename or unpaired_rename or pairing_does_not or violating_descendant_beneath' -q
+  -k 'paired_rename or unpaired_rename or pairing_does_not or violating_descendant_beneath or most_specific_mapping or equally_specific or two_destinations or two_removed_paths' -q
 ```
 
-Expected: 9 passed.
+Expected: 15 passed.
 
-- [ ] **Step 16: Thread mappings through the commit audit and the CLI**
-
-In `tools/gate3_audit.py`, add the field to the existing result type:
+- [ ] **Step 18: Thread mappings through the commit audit and the CLI**
 
 ```python
 @dataclass(frozen=True)
@@ -2008,14 +2201,12 @@ class CommitAuditResult:
     rename_mappings: tuple[RenameMapping, ...]
 ```
 
-In `_audit_commit_history()`, collect one entry per record inside the
-existing oldest-first loop, immediately after the per-commit audit:
+In `_audit_commit_history()`, inside the existing oldest-first loop and
+immediately after the per-commit audit:
 
 ```python
             if audited.sanctioned_commits:
-                ordered_mappings.append(
-                    _verified_rename_mappings(record, vault)
-                )
+                ordered_mappings.append(_verified_rename_mappings(record, vault))
 ```
 
 and return:
@@ -2030,7 +2221,7 @@ and return:
     )
 ```
 
-In `cmd_check()`, pass it through:
+In `cmd_check()`:
 
 ```python
     filesystem_audit = audit_filesystem(
@@ -2042,30 +2233,38 @@ In `cmd_check()`, pass it through:
     )
 ```
 
-- [ ] **Step 17: Run the I1 reproduction and confirm GREEN**
-
-Run:
+- [ ] **Step 19: Run the I1 reproduction and confirm GREEN**
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
   -k 'sanctioned_rename_of_an_untracked_only_directory' -q
 ```
 
-Expected: 1 passed — `check` now returns 0 for the rename that previously
-reported two false violations.
+Expected: 1 passed — `check` returns 0 where it printed two violations.
 
-- [ ] **Step 18: Write and run the nested sequential CLI regression**
+- [ ] **Step 20: Add CLI regressions for both nesting orders**
 
 ```python
-def test_cli_nested_sequential_renames_pair_an_untracked_only_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """Two sanctioned renames nest, so composition must rewrite by prefix."""
+def _nested_rename_files(order: str):
     files, old, new = _rename_files("entity")
     files["_system/products.yaml"] = (
         'version: "1.0"\nproducts:\n  ' + old + ":\n"
         "    oldproduct:\n      label: Old\n"
     )
+    return files, old, new
+
+
+@pytest.mark.parametrize("order", ("nested-then-ancestor", "ancestor-then-nested"))
+def test_cli_nested_renames_pair_an_untracked_only_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: str
+):
+    """Both nesting orders must reach the same final destination.
+
+    Ancestor-then-nested is the order Plan Revision 2's composition failed:
+    the original path matched only the general mapping and predicted the
+    intermediate destination.
+    """
+    files, old, new = _nested_rename_files(order)
     vault = git_vault(tmp_path / "vault", files)
     (vault / old / "11-library" / "archive").mkdir(parents=True, exist_ok=True)
     snapshot = tmp_path / "gate3.json"
@@ -2073,11 +2272,24 @@ def test_cli_nested_sequential_renames_pair_an_untracked_only_directory(
     monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
     assert gate3.main(["snapshot"]) == 0
 
-    apply_rename(
-        vault, plan_rename(vault, "product", "oldproduct", "newproduct"),
-        validators=[],
-    )
-    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    if order == "nested-then-ancestor":
+        apply_rename(
+            vault,
+            plan_rename(vault, "product", "oldproduct", "newproduct"),
+            validators=[],
+        )
+        apply_rename(
+            vault, plan_rename(vault, "entity", old, new), validators=[]
+        )
+    else:
+        apply_rename(
+            vault, plan_rename(vault, "entity", old, new), validators=[]
+        )
+        apply_rename(
+            vault,
+            plan_rename(vault, "product", "oldproduct", "newproduct"),
+            validators=[],
+        )
 
     assert gate3.main(["check"]) == 0
 ```
@@ -2086,65 +2298,109 @@ Run:
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'nested_sequential_renames' -q
+  -k 'nested_renames_pair' -q
 ```
 
-Expected: 1 passed. If it fails, composition is not rewriting by prefix;
-fix `_compose_rename_mappings()` rather than relaxing any pairing
-requirement.
+Expected: 2 passed. If `ancestor-then-nested` fails, composition is not
+deriving the source pre-image; fix `_source_preimage()` rather than relaxing
+any pairing requirement.
 
-- [ ] **Step 19: Confirm the taxonomy and sanctioning decision are untouched**
+- [ ] **Step 21: Prove the sanctioning helpers are byte-identical**
 
-Run:
+A name grep proves nothing about a function body. Compare the parsed source
+of each named definition against the approved design checkpoint. Write this
+as an **untracked** script outside the repository — do not add a tracked
+utility:
 
 ```bash
-uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'consumed or pending or receipt or unrelated or rename' -q
-git diff -- tools/gate3_audit.py | grep -E '^[-+].*(_commit_is_sanctioned|_sanctioned_outbox|_sanctioned_registry|_sanctioned_ingest|_load_consumed_record|_receipt_authorizations)'
+cat > /tmp/gate3_unchanged.py <<'PY'
+import ast, subprocess, sys
+BASE = "acc3f309f04a285fbec46acf0a0cc99d0175e101"
+NAMES = {
+    "_commit_is_sanctioned", "_sanctioned_outbox", "_sanctioned_registry",
+    "_sanctioned_ingest", "_sanctioned_rename", "_rename_envelope",
+    "_load_consumed_record", "_receipt_authorizations",
+    "_sanctioned_consumed_paths", "_new_proposal_is_sanctioned",
+    "audit_commits", "_authorization_matches",
+}
+def defs(source):
+    tree = ast.parse(source)
+    return {
+        node.name: ast.unparse(node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in NAMES
+    }
+old = defs(subprocess.run(
+    ["git", "show", f"{BASE}:tools/gate3_audit.py"],
+    capture_output=True, text=True, check=True).stdout)
+new = defs(open("tools/gate3_audit.py").read())
+missing = sorted(NAMES - set(old))
+if missing:
+    sys.exit(f"FAIL: not found at baseline: {missing}")
+changed = sorted(n for n in old if old[n] != new.get(n))
+absent = sorted(n for n in old if n not in new)
+if changed or absent:
+    sys.exit(f"FAIL changed={changed} absent={absent}")
+print(f"OK: {len(old)} sanctioning definitions byte-identical to {BASE[:8]}")
+PY
+uv run python /tmp/gate3_unchanged.py
 ```
 
-Expected: every selected test passes, and the `grep` prints nothing —
-no line inside any commit-sanctioning or record-sanctioning helper changed.
+Expected: `OK: 12 sanctioning definitions byte-identical to acc3f309`. Any
+`FAIL` is a stop condition: the sanctioning decision or the classifier
+taxonomy moved, which this task forbids.
 
-- [ ] **Step 20: Run the Gate 3 module and the full public suite**
+- [ ] **Step 22: Count the suites and compare against the enumerated total**
 
-Run:
+Task 10 adds exactly **27** pytest cases. Every parameterization is expanded,
+because a parameterized function is one `def` but many collected cases:
+
+| Group | Functions | Collected cases |
+|---|---|---|
+| I1 CLI reproduction (Step 1) | 1 | 1 |
+| mapping authorization and axis ambiguity (Step 4) | 2 | 2 |
+| composition (Step 8): exact roots 1, nesting orders ×2, general tail 1, source-preimage ambiguity 1, conflicts ×2 | 5 | 7 |
+| pairing (Step 12): both endpoints 1, unpaired shapes ×7, unrelated sibling 1, violating descendant 1 | 4 | 10 |
+| order independence (Step 14): most-specific ×2, equally specific 1, two destinations 1, two sources 1 | 4 | 5 |
+| nested CLI regressions (Step 20) ×2 | 1 | 2 |
+| **Total** | **17** | **27** |
+
+Treat the collector, not this table, as authoritative. If they disagree the
+plan is wrong and must be corrected before proceeding:
 
 ```bash
+uv run python -m pytest tests/test_gate3_audit.py --collect-only -q | tail -1
 uv run python -m pytest tests/test_gate3_audit.py -q
 uv run python -m pytest -q
 ```
 
-Expected: the Gate 3 module rises from 228 to **242 passed, 1 skipped**
-(13 Revision 2 cases plus the nested CLI regression), and the full public
-suite rises from 1950 to **1964 passed, 1 skipped**. A lower count is a stop
-condition.
+The Gate 3 module stands at **228 passed, 1 skipped** and the full public
+suite at **1950 passed, 1 skipped** before this task. Require afterwards:
 
-- [ ] **Step 21: Mutation-prove the pairing rule**
+- Gate 3 module: **at least 255 passed**, 1 skipped;
+- full public suite: **at least 1977 passed**, 1 skipped.
 
-Without committing, replace the single inserted clause in
-`audit_filesystem()` with `if False:` and run:
+These are floors, not equalities, because a review correction may add a
+regression. A count *below* a floor, or any new skip, is a stop condition.
 
-```bash
-uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'sanctioned_rename_of_an_untracked_only_directory' -q
-```
+- [ ] **Step 23: Mutation-prove the pairing rule and the composition direction**
 
-Expected: RED with two `VIOLATION direct write:` lines. Then mutate
-`_paired_rename_directories()` so identity equality is not required, and run:
+Without committing, apply each mutation, run its command, restore the file,
+verify byte-identity with `cmp` and SHA-256, and re-run to GREEN.
 
-```bash
-uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'unpaired_rename_shapes_remain_violations' -q
-```
+1. Replace the inserted clause in `audit_filesystem()` with `if False:`.
+   Run the Step 19 command. Expected RED with two `VIOLATION direct write:`
+   lines.
+2. Make `_paired_rename_directories()` skip its `identity_digest`
+   comparison. Run the Step 13 command. Expected RED on `identity-mismatch`.
+3. Make `_source_preimage()` return `""` unconditionally. Run the Step 20
+   command. Expected RED on `ancestor-then-nested` only — this is what
+   distinguishes the corrected composition from Plan Revision 2's.
+4. Make `_predict_rename_destination()` return the first candidate instead of
+   the longest. Run the Step 14 command. Expected RED on
+   `most_specific_mapping[general-first]`.
 
-Expected: RED on the `identity-mismatch` case. Restore the exact
-implementation after each mutation, verify with `cmp` and SHA-256 that the
-file is byte-identical to its preimage, and re-run both commands to GREEN.
-
-- [ ] **Step 22: Run the public acceptance gates**
-
-Run:
+- [ ] **Step 24: Run the public acceptance gates**
 
 ```bash
 git diff --check
@@ -2156,35 +2412,35 @@ git status --short
 
 Expected: whitespace clean; Gitleaks clean; both audits CLEAN; only
 `tools/gate3_audit.py` and `tests/test_gate3_audit.py` modified. Confirm
-`ONEOS_VAULT` is still unset.
+`ONEOS_VAULT` is still unset and remove `/tmp/gate3_unchanged.py`.
 
-- [ ] **Step 23: Commit the implementation checkpoint**
+- [ ] **Step 25: Commit the implementation checkpoint**
 
-Commit only those two files, in one sanitized commit that records the RED
-evidence, the two mutation proofs, and both test counts.
+Commit only those two files, in one sanitized commit recording the RED
+evidence, all four mutation proofs, the Step 21 result, and both counts.
 
-- [ ] **Step 24: Obtain an independent scoped review**
+- [ ] **Step 26: Obtain an independent scoped review**
 
 Invoke `superpowers:requesting-code-review` over
-`acc3f309f04a285fbec46acf0a0cc99d0175e101`..HEAD. The prompt carries only
-public requirements and synthetic evidence. Ask for Critical / Important /
-Minor findings covering: mapping provenance and the unchanged sanctioning
-decision; ambiguity and conflict handling; prefix composition including
-nested chains; the five pairing requirements; descendant precedence; the
-inode-reuse limitation being neither widened nor worked around; and test
-gaps.
+`acc3f309f04a285fbec46acf0a0cc99d0175e101`..HEAD, carrying only public
+requirements and synthetic evidence. Ask for Critical / Important / Minor
+findings covering: mapping provenance and the unchanged sanctioning
+decision; axis ambiguity and conflict handling; composition in **both**
+nesting orders; order-independent most-specific selection; the five pairing
+requirements; descendant precedence; the inode-reuse limitation being
+neither widened nor worked around; and test gaps.
 
 Verify every finding with `superpowers:receiving-code-review` before acting.
 Add a RED regression for each accepted behavioural defect, implement the
-smallest fix, re-run Steps 19–22, and request another scoped review. Return
+smallest fix, re-run Steps 21–24, and request another scoped review. Return
 disputed or scope-expanding findings to the owner.
 
-- [ ] **Step 25: Stop for the trusted-local private integration gate**
+- [ ] **Step 27: Stop for the trusted-local private integration gate**
 
-Report the final HEAD, changed files, RED/GREEN and mutation evidence,
-focused and full public counts, Gitleaks and both public audits, independent
-findings by severity, clean worktree, and confirmation that `ONEOS_VAULT`
-remained unset.
+Report the final HEAD, changed files, RED/GREEN and mutation evidence, the
+collector-confirmed counts, Gitleaks and both public audits, the Step 21
+result, independent findings by severity, clean worktree, and confirmation
+that `ONEOS_VAULT` remained unset.
 
 Then **stop**. Do not push, open a pull request, request CodeRabbit, run the
 live Gate 3 trial, begin Gate 1 timing, deploy, or start Phase 2. The owner
