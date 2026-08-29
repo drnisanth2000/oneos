@@ -1,6 +1,6 @@
 # Gate 3 Filesystem Evidence Boundary
 
-**Status:** REVISION 1 — AWAITING APPROVAL. Revision 1 adds the sanctioned
+**Status:** REVISION 2 — AWAITING APPROVAL. Revision 1 adds the sanctioned
 rename topology rule in "Directory ancestry disposition" and reconciles every
 statement that previously said a directory delta without a classified
 descendant always violates. The original design was approved conversationally
@@ -11,7 +11,13 @@ revision.
 
 - Revision 0 — approved 2026-08-29. Implementation of Tasks 1–8 proceeded
   against it.
-- Revision 1 — this document. Raised by an independent scoped review of the
+- Revision 2 — this document. Structural approval of Revision 1 was given
+  subject to one documentation correction: the evidence model's inode-reuse
+  limitation had to be stated explicitly, and the absolute detection claim
+  for an independently created or deleted directory had to be qualified to
+  objects with distinguishable endpoint evidence. No rule was relaxed. See
+  "Evidence-model limitation: identity is not proof of a move".
+- Revision 1 — raised by an independent scoped review of the
   implementation, which reproduced a false violation: a sanctioned entity
   rename that moves a directory with no tracked descendant reported both the
   removed and the added directory as unsanctioned direct writes. Revision 0's
@@ -204,11 +210,52 @@ closed shape:
 encoding of the entry kind, filesystem-device identity, inode identity, and,
 for device objects, special-device identity returned by no-follow metadata
 inspection. It never includes content, path text, or timestamps. This detects
-replacement by another object of the same apparent kind. `target_digest` is a
+replacement by another object of the same apparent kind whenever the
+replacement presents different endpoint evidence — see "Evidence-model
+limitation: identity is not proof of a move". `target_digest` is a
 separately domain-tagged SHA-256 of the raw link target and is populated only
 for symlinks; the target is never resolved. `mode` is the integer returned by
 the platform's permission-bit extraction, stored separately so a permission
 change is explicit.
+
+### Evidence-model limitation: identity is not proof of a move
+
+`identity_digest` is computed from object kind, filesystem-device identity,
+and inode identity, plus special-device identity for device objects. Nothing
+else is portable across the filesystems this audit must run on.
+
+Filesystems may reuse an inode number after the object holding it is
+deleted. When that happens, an object deleted at one path and a different
+object created at another can present the identical kind, mode, device, and
+inode as a genuine move of the first object. Endpoint-only portable metadata
+therefore **cannot** distinguish "this object moved" from "this object was
+deleted and an indistinguishable one was created" in that case.
+
+This is an accepted observational limitation of the filesystem fingerprint
+model, recorded here so it is not rediscovered as a defect. Three things
+follow, and no more:
+
+- Identity equality is a **necessary** condition for pairing, never a
+  sufficient one. Every other pairing requirement — a verified sanctioned
+  rename, an unambiguous mapping from that rename's own plan, the exact
+  roots, the identical tail, real directories at both endpoints, equal mode
+  — must still hold independently. The limitation narrows what identity
+  evidence proves; it does not remove a single requirement.
+- It is **not** permission for a broader rename whitelist, a name-similarity
+  heuristic, or any relaxation of the fail-closed rules. An unpaired
+  directory delta remains a violation exactly as before.
+- It is **not** an invitation to widen the evidence model to close it.
+  Modification and change timestamps are excluded for the reason given
+  below; platform-specific birth time is not portable; reading content would
+  make this a second regular-file scanner, which the design forbids. No new
+  dependency is introduced to work around it. If the owner ever wants a
+  stronger identity, that is a separate, separately approved design.
+
+The residual exposure is bounded by everything the limitation does not
+touch: an actor able to exploit it must also produce a commit that passes
+the full commit-relative rename verification, and must place both endpoints
+at exactly the roots and tail that verified plan names. Absent that, no
+inode coincidence sanctions anything.
 
 Directory modification and change timestamps are intentionally excluded from
 the persisted fingerprint: normal descendant activity changes them and would
@@ -387,9 +434,14 @@ or ambiguity fails closed and the delta is judged as if no pairing existed.
    `directory`. A symlink, FIFO, socket, device, regular file, or any other
    object at either endpoint is never paired.
 5. **Matching metadata and identity.** The two fingerprints must have equal
-   `mode` and equal `identity_digest`. A rename on one filesystem preserves
-   device and inode identity, so an unequal identity means the added
-   directory is a different object that merely occupies the expected name.
+   `mode` and equal `identity_digest`. A rename within one filesystem
+   preserves device and inode identity, so an **unequal** identity is
+   conclusive: the added directory is a different object merely occupying the
+   expected name, and the pair is refused. An **equal** identity is necessary
+   but not sufficient, because a reused inode can imitate it; see
+   "Evidence-model limitation: identity is not proof of a move". Pairing
+   therefore never rests on identity alone — requirements 1 through 4 must
+   hold independently.
 
 **Sequential renames** compose deterministically in audited commit order,
 oldest first. A later mapping `(o, n)` rewrites an earlier mapping's
@@ -415,8 +467,16 @@ rather than sanctioning it. Pairing never reaches an unrelated sibling
 addition or removal, a move to or from a root the verified plan does not
 name, a replacement of either endpoint, a special file or symlink at either
 endpoint, or a directory independently created or deleted at a path that
-merely resembles a rename destination. Each of those remains a violation on
-its own terms.
+merely resembles a rename destination.
+
+Each of those remains a violation on its own terms **wherever the endpoints
+present distinguishable evidence** — a different root, a different tail, a
+different kind, a different mode, or a different identity. The one case this
+design does not promise to detect is an independently created and deleted
+pair that a reused inode makes indistinguishable from the verified rename's
+own move, at exactly that rename's roots and tail. That is the accepted
+limitation recorded above, not a gap in these rules: no requirement is
+relaxed for it, and every other shape is still refused.
 
 ### Exact S7 quarantine-directory exception
 
