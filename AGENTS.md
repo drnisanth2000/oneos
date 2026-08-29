@@ -44,8 +44,13 @@ diff preserving pre-existing edits. Independent scoped review PASS found no
 Critical, Important, or Minor findings on the final rename-root correction.
 The macOS no-overwrite path was exercised;
 Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
-user/platform limitation. The separately sequenced inherited items 2–4 in
-`docs/STATUS.md` remain required before live Phase 1 gate trials.
+user/platform limitation. The separately sequenced inherited items 2, 4, and 3
+are also complete; `docs/STATUS.md` records their published public and
+trusted-local evidence. The substantive next phase is the live Phase 1 exit
+trials: Gate 2 approval plus revert proof, Gate 3 full-session
+unsanctioned-write audit, and Gate 1 timed triage of about 20 real inbox items.
+Gates 4 and 5 already pass. Phase 2 remains unauthorized, and deployment stays
+blocked until every Phase 1 gate passes and the owner separately approves it.
 A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
@@ -58,9 +63,9 @@ plan. It binds every reviewed action to exact proposal bytes; transactional
 actions retain committed receipts, while reject safely quarantines its record.
 Supported writers cooperate through OneOS interfaces and the shared action
 lock. Deliberate ancestor-directory relocation after the final check is outside
-that cooperative-writer boundary. Spent ids are refused. Its inherited items
-are recorded in `docs/STATUS.md`; do not silently claim those separately
-sequenced items done.
+that cooperative-writer boundary. Spent ids are refused. Its inherited
+follow-ups were completed later as separately sequenced work; their completion
+records in `docs/STATUS.md` do not rewrite S7's historical evidence.
 
 The satisfied historical sequence rule remains part of the audit record:
 **Do not begin S7 until S6 is merged into `origin/main` and a fresh

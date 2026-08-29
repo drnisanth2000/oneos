@@ -39,7 +39,7 @@ done-when to match what you built.
 | 8 | Approve / reject | One commit per approval; `git revert` undoes it with zero manual cleanup |
 | 9 | Registry CRUD — add/edit direct, **delete via outbox** with a reference count | Deleting a product shows what breaks before it runs |
 | 10 | Email adapter — IMAP poll into the step-5 envelope | Same envelope, same PII filter, no second code path |
-| 11 | Deploy — Compose + Caddy on the VPS beside Hermes | **Only after the Phase 1 gates in spec §11 pass.** Stop and ask |
+| 11 | Deploy — Compose + Caddy on the VPS beside Hermes | **Only after all Phase 1 gates in spec §11 pass and the owner separately approves deployment.** Stop and ask |
 
 ---
 
@@ -57,7 +57,7 @@ This is hardening of Phase 1, not a new feature phase. Complete in this order:
 | S4 | **COMPLETE** | **Fresh, collision-safe proposals.** Store source SHA-256 and use a collision-safe proposal id. | Changed or missing sources are visibly refused at approval; same-second proposals never overwrite each other. |
 | S5 | **COMPLETE** | **Isolated Git transaction and audit.** Commit exactly the reviewed paths, restore filesystem/index/proposal state on failure, and make Gate 3 validate both sanctioned message type and changed paths—including `ingest:` receipts. | Unrelated staged and unstaged changes remain untouched; injected commit failure leaves no partial move; a misleading commit prefix cannot sanction unrelated paths; one revert restores the full approved batch. |
 | S6 | **COMPLETE** | **Visible Console failures.** Return specific safe errors through the Command Center surface. | Stale, invalid, missing, cross-scope, and Git failures are visible and no route silently swallows them. |
-| S7 | **COMPLETE** | **Bound review tokens.** Bind approve, reject, and registry delete to the exact proposal bytes reviewed; quarantine transactional proposals only after commit; retain tracked action receipts so a committed id cannot act twice. | Same-id rewrites are visibly refused before mutation; spent ids project as non-actionable receipt cards; reject safely quarantines its reviewed record; the current public suite records 1,476 passed, all 48 campaign rows RED then GREEN, and a 1,476-pass restored closing suite in 107.32s; Gitleaks found no leaks; public current-tree/history audits are clean; and focused rename proofs refuse distinct same-HEAD vaults before lock while keeping execution on the reviewed canonical vault if a caller alias is retargeted. Final private gates record 37 tests, `check_v2` 0/0, a clean combined history audit, and byte-identical Grey Matter state. Independent scoped review PASS found no findings. Linux `renameat2` remains an explicitly accepted unexercised limitation. |
+| S7 | **COMPLETE** | **Bound review tokens.** Bind approve, reject, and registry delete to the exact proposal bytes reviewed; quarantine transactional proposals only after commit; retain tracked action receipts so a committed id cannot act twice. | Same-id rewrites are visibly refused before mutation; spent ids project as non-actionable receipt cards; reject safely quarantines its reviewed record. The published S7 suite recorded 1,476 passed, all 48 campaign rows RED then GREEN, and a 1,476-pass restored closing suite in 107.32s; Gitleaks found no leaks; public current-tree/history audits were clean; and focused rename proofs refused distinct same-HEAD vaults before lock while keeping execution on the reviewed canonical vault if a caller alias was retargeted. Final private gates recorded 37 tests, `check_v2` 0/0, a clean combined history audit, and byte-identical Grey Matter state. Independent scoped review PASS found no findings. Linux `renameat2` remains an explicitly accepted unexercised limitation. |
 
 S1-S5 are recorded as built, including review findings and intentional threat
 boundaries, in `docs/SAFETY-FOUNDATION-S1-S4.md` and its S5 addendum. Their old
@@ -71,8 +71,11 @@ lock; deliberate ancestor-directory relocation after the final identity check
 is outside that cooperative-writer boundary. Independent reviews and the
 mutation ledger record the correction rounds. The macOS no-overwrite path was
 exercised. Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
-user/platform limitation. Inherited items 2–4 remain separately sequenced
-before live trials.
+user/platform limitation. The separately sequenced inherited items 2, 4, and 3
+are complete; `docs/STATUS.md` records their published evidence. The next work
+is the live Phase 1 exit trials: Gate 2 approval plus revert proof, Gate 3
+full-session unsanctioned-write audit, and Gate 1 timed triage of about 20 real
+inbox items. Gates 4 and 5 already pass. Phase 2 remains unauthorized.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved
@@ -198,7 +201,8 @@ remove — the only irreversible mistake in this design. It ships *with* the
 first adapter, never "in a follow-up." Show the filter rules before wiring the
 watcher.
 
-**Step 11, deploy.** Gates first. Never deploy to prove a gate.
+**Step 11, deploy.** Gates first. Never deploy to prove a gate. Even after all
+Phase 1 gates pass, deployment requires separate owner approval.
 
 **Any change to `$ONEOS_VAULT/_system/conventions.md` or the registries.**
 Those are frozen. If the app needs a convention changed, that is a
