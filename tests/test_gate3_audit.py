@@ -6,6 +6,7 @@ than duplicating either implementation in mocks.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -3305,12 +3306,29 @@ def test_cli_sanctioned_rename_of_an_untracked_only_directory_passes(
 
 
 def test_unsanctioned_rename_commit_contributes_no_mapping(tmp_path: Path):
-    """Only a commit the existing verification accepted may map anything."""
+    """Only a commit the existing verification accepted may map anything.
+
+    Built from a *real* rename commit, then broken in a way only
+    `_sanctioned_rename` rejects. A fabricated parent OID would make the
+    envelope rebuild fail instead, and the provenance guard would never be
+    reached — the test would pass with the guard deleted.
+    """
     files, old, new = _rename_files("entity")
     vault = git_vault(tmp_path / "vault", files)
-    record = _rec("a" * 40, f"rename: {old} \u2192 {new}", (("M", "unrelated.md"),))
+    head = _git(vault, "rev-parse", "HEAD").strip()
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    (record,) = gate3.collect_commit_records(vault, head)
+    assert gate3._verified_rename_mappings(record, vault) != ()
 
-    assert gate3._verified_rename_mappings(record, vault) == ()
+    # `_matching_rename_axes` deliberately omits the duplicate-change guard
+    # that `_sanctioned_rename` applies, so this record still matches an axis
+    # while the sanctioning check refuses it.
+    duplicated = dataclasses.replace(
+        record, changes=record.changes + (record.changes[0],)
+    )
+
+    assert gate3._sanctioned_rename(duplicated, vault) is False
+    assert gate3._verified_rename_mappings(duplicated, vault) == ()
 
 
 def test_ambiguous_axis_match_contributes_no_mapping(
@@ -3319,17 +3337,30 @@ def test_ambiguous_axis_match_contributes_no_mapping(
     """Two axes reproducing one envelope is ambiguous, so nothing is mapped."""
     files, old, new = _rename_files("entity")
     vault = git_vault(tmp_path / "vault", files)
-    monkeypatch.setattr(gate3, "_sanctioned_rename", lambda *_a, **_k: True)
+    head = _git(vault, "rev-parse", "HEAD").strip()
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    (record,) = gate3.collect_commit_records(vault, head)
+
+    # Patch one level below the axis loop so the loop itself still runs. A
+    # loop that returned on its first match would report one axis here and
+    # the ambiguity would go undetected.
+    real_envelope = gate3._rename_envelope
     monkeypatch.setattr(
         gate3,
-        "_matching_rename_axes",
-        lambda *_a, **_k: (
-            ("entity", (gate3.RenameMapping(old, new),)),
-            ("product", (gate3.RenameMapping(old, new),)),
+        "_rename_envelope",
+        lambda tree, tracked, axis, o, n, *, parent_oid: real_envelope(
+            tree, tracked, "entity", o, n, parent_oid=parent_oid
         ),
     )
-    record = _rec("a" * 40, f"rename: {old} \u2192 {new}", (("M", "x.md"),))
+    monkeypatch.setattr(
+        gate3,
+        "_rename_move_pairs",
+        lambda _tree, axis, o, n, *, parent_oid: (
+            gate3.RenameMapping(o, f"{n}-{axis}"),
+        ),
+    )
 
+    assert len(gate3._matching_rename_axes(record, vault, old, new)) > 1
     assert gate3._verified_rename_mappings(record, vault) == ()
 
 
@@ -3410,8 +3441,13 @@ def test_source_preimage_fails_closed_on_equally_specific_disagreement():
     (
         ((_m("a", "b"), _m("a", "c")),),
         ((_m("a", "c"), _m("b", "c")),),
+        ((_m("a", "b"),), (_m("c", "b"),)),
     ),
-    ids=("one-source-two-destinations", "two-sources-one-destination"),
+    ids=(
+        "one-source-two-destinations",
+        "two-sources-one-destination",
+        "cross-commit-two-sources-one-destination",
+    ),
 )
 def test_conflicting_rename_mappings_contribute_nothing(ordered):
     assert gate3._compose_rename_mappings(ordered) == ()
@@ -3449,8 +3485,16 @@ def test_paired_rename_directories_are_sanctioned_at_both_endpoints(
         ("synthetic/d/empty", "renamed/d/empty", _pair_fp(),
          _pair_fp(mode=0o700), (_m("synthetic", "renamed"),)),
         ("synthetic/d/empty", "renamed/d/empty", _pair_fp(),
-         gate3.FilesystemFingerprint("symlink", 0o777, "1" * 64, "3" * 64),
+         gate3.FilesystemFingerprint("symlink", 0o755, "1" * 64, "3" * 64),
          (_m("synthetic", "renamed"),)),
+        ("synthetic/d/empty", "renamed/d/empty",
+         gate3.FilesystemFingerprint("symlink", 0o755, "1" * 64, "3" * 64),
+         _pair_fp(), (_m("synthetic", "renamed"),)),
+        # A sibling whose name merely *starts with* the mapped root. Under a
+        # prefix match that forgot the separator this would predict
+        # `renamed/x/empty` and wrongly pair.
+        ("synthetic-x/empty", "renamed/x/empty", _pair_fp(),
+         _pair_fp(), (_m("synthetic", "renamed"),)),
     ),
     ids=(
         "no-sanctioned-rename",
@@ -3459,7 +3503,9 @@ def test_paired_rename_directories_are_sanctioned_at_both_endpoints(
         "different-tail",
         "identity-mismatch",
         "mode-mismatch",
-        "non-directory-endpoint",
+        "non-directory-added-endpoint",
+        "non-directory-removed-endpoint",
+        "prefix-only-root-match",
     ),
 )
 def test_unpaired_rename_shapes_remain_violations(
@@ -3508,6 +3554,9 @@ def test_violating_descendant_beneath_a_paired_directory_still_fails(
     )
 
     assert "renamed/d/empty" not in audit.sanctioned_writes
+    # Suppressed as a duplicate, not re-reported: the descendant already
+    # fails the gate.
+    assert "renamed/d/empty" not in audit.violating_writes
 
 
 @pytest.mark.parametrize("order", ("general-first", "specific-first"))
