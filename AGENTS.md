@@ -301,7 +301,7 @@ coverage:
   resolves. Must also assert a `.sensitive/` read is still denied afterwards
 
 Existing suite: `cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover`
-— 37 tests, all passing. Keep them passing. `check_v2` is at 0 errors and
+— 39 tests, all passing. Keep them passing. `check_v2` is at 0 errors and
 0 warnings; keep it there.
 
 ## Do not

@@ -99,7 +99,7 @@ cd "$ONEOS_VAULT/_system/scripts" && python3 -m unittest discover -q; cd -
 python3 "$ONEOS_VAULT/_system/scripts/check_v2.py" "$ONEOS_VAULT" | tail -2
 ```
 
-Check 2 must show 37+ tests OK. Check 3 must show
+Check 2 must show 39+ tests OK. Check 3 must show
 `0 error(s), 0 warning(s)`. Before the first private command, capture opaque
 `git status --porcelain=v2 --untracked-files=all`, worktree binary diff, and
 cached binary diff outside both repositories. Compare each file byte-for-byte
