@@ -217,26 +217,51 @@ After each Task 2–8 GREEN step:
 - Test: none
 
 **Interfaces:**
-- Consumes: the fresh isolated worktree at the approved design commit and the
-  trusted-local gate commands prescribed by `BUILD.md`.
+- Consumes: the fresh isolated worktree descending from the canonical baseline,
+  the approved design and plan checkpoints, and the trusted-local gate commands
+  prescribed by `BUILD.md`.
 - Produces: an opaque mode-0700 proof directory outside both repositories,
   four byte-exact vault preimages, sanitized dirty-state counts, and passing
   public/private baselines retained for final comparison.
 
-- [ ] **Step 1: Verify the planning checkpoint and worktree**
+- [ ] **Step 1: Fetch and verify the canonical baseline and checkpoint chain**
 
-Run:
+Run before any public/private baseline or test/product-code edit. Do not query
+or print commit subjects:
 
 ```bash
-git rev-parse HEAD
-git status --short --branch
-git diff-tree --no-commit-id --name-status -r HEAD
+set -euo pipefail
+gate3_canonical=fecafea674cc254217d24950e716e42f71353fdc
+gate3_design=03be199cee333641700a0c347595d7d88125b194
+gate3_plan=e0a0e990679a7af6e01d2a63c06f71bd2a86b109
+git fetch --prune origin
+test "$(git rev-parse refs/remotes/origin/main)" = "$gate3_canonical"
+git merge-base --is-ancestor "$gate3_canonical" HEAD
+test "$(git rev-parse "$gate3_design^")" = "$gate3_canonical"
+test "$(git rev-parse "$gate3_plan^")" = "$gate3_design"
+test "$(git rev-parse HEAD^)" = "$gate3_plan"
+test "$(git rev-list --count "$gate3_canonical"..HEAD)" = 3
+test "$(git diff-tree --no-commit-id --name-only -r "$gate3_design")" = \
+  docs/superpowers/specs/2026-08-29-gate3-filesystem-evidence-design.md
+test "$(git diff-tree --no-commit-id --name-only -r "$gate3_plan")" = \
+  docs/superpowers/plans/2026-08-29-gate3-filesystem-evidence.md
+test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = \
+  docs/superpowers/plans/2026-08-29-gate3-filesystem-evidence.md
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
 ```
 
-Expected: HEAD is the approved planning checkpoint once this plan has been
-approved for execution, the branch has no worktree changes, and the latest
-checkpoint contains only this plan document. Do not use local `main` as an
-authority and do not fetch, rebase, or retarget during execution.
+Expected: fetched `origin/main` is exactly the canonical SHA; the task branch
+descends from it; the design checkpoint, original plan checkpoint, and this
+plan-revision checkpoint form the complete three-commit branch chain; both plan
+commits touch only this plan document; and the worktree is clean. Local `main`
+is never authority.
+
+If fetched `origin/main` differs, ancestry fails, a checkpoint parent or path
+set differs, the commit count differs, or the worktree is not clean, stop
+before baselines or edits and return a bounded decision memo containing only
+the expected/observed public OIDs and the failed generic check. Do not repair
+the condition. After this verification, do not rebase, retarget, reset, merge,
+amend, or otherwise rewrite the branch.
 
 - [ ] **Step 2: Run the fresh public baseline before any test/code edit**
 
@@ -1179,42 +1204,111 @@ implement the smallest fix, rerun its GREEN command, repeat Tasks 9.2–9.3, and
 request another scoped review. Return disputed or scope-expanding findings to
 the owner. Do not push with an unresolved finding.
 
-- [ ] **Step 5: Verify final branch shape and push**
+- [ ] **Step 5: Re-fetch the canonical baseline, verify branch relationships, and push**
 
 Run in one shell without printing subjects:
 
 ```bash
-plan_head=$(git rev-list -1 HEAD -- \
+set -euo pipefail
+gate3_canonical=fecafea674cc254217d24950e716e42f71353fdc
+gate3_branch=$(git branch --show-current)
+gate3_reviewed_head=$(git rev-parse HEAD)
+gate3_plan_head=$(git rev-list -1 HEAD -- \
   docs/superpowers/plans/2026-08-29-gate3-filesystem-evidence.md)
 git status --short --branch
-git diff --name-only "$plan_head"..HEAD
-git rev-list --reverse "$plan_head"..HEAD
+git diff --name-only "$gate3_plan_head"..HEAD
+git rev-list --reverse "$gate3_plan_head"..HEAD
+git fetch --prune origin
+test "$(git rev-parse refs/remotes/origin/main)" = "$gate3_canonical"
+git merge-base --is-ancestor "$gate3_canonical" "$gate3_reviewed_head"
+gate3_remote_ref="refs/remotes/origin/$gate3_branch"
+if git show-ref --verify --quiet "$gate3_remote_ref"; then
+  gate3_previous_remote=$(git rev-parse "$gate3_remote_ref")
+  git merge-base --is-ancestor "$gate3_canonical" "$gate3_previous_remote"
+  git merge-base --is-ancestor "$gate3_previous_remote" "$gate3_reviewed_head"
+fi
 ```
 
 Expected: clean worktree; only `tools/gate3_audit.py` and
 `tests/test_gate3_audit.py` differ after the planning checkpoint; every
-implementation checkpoint is present. Do not copy commit subjects into task,
-review, or pull-request output.
+implementation checkpoint is present; fetched `origin/main` remains exactly
+the canonical SHA; the reviewed local head descends from it; and any existing
+remote task branch is either equal to or an ancestor of the reviewed local
+head. Do not copy commit subjects into task, review, or pull-request output.
 
-Push the dedicated branch only after the evidence and independent review are
-clean.
+If `origin/main` moved, the task branch lost canonical ancestry, or an existing
+remote task branch is ahead or divergent, stop before pushing or opening a
+pull request and return a bounded decision memo. Do not automatically rebase,
+merge, reset, retarget, force-push, or rewrite any commit.
 
-- [ ] **Step 6: Open a sanitized pull request and obtain CodeRabbit review**
+Push the dedicated branch without force only after the evidence, canonical
+baseline check, branch-relationship check, and independent review are clean:
+
+```bash
+set -euo pipefail
+gate3_branch=$(git branch --show-current)
+gate3_reviewed_head=$(git rev-parse HEAD)
+git push --set-upstream origin "$gate3_branch"
+git fetch origin \
+  "refs/heads/$gate3_branch:refs/remotes/origin/$gate3_branch"
+test "$(git rev-parse "refs/remotes/origin/$gate3_branch")" = \
+  "$gate3_reviewed_head"
+test "$(git rev-parse HEAD)" = "$gate3_reviewed_head"
+```
+
+The exact fetched remote branch head must equal the locally reviewed head.
+Stop without opening a pull request if either equality fails.
+
+- [ ] **Step 6: Reverify the remote head, open a sanitized pull request, and obtain CodeRabbit review**
+
+Immediately before opening the pull request, fetch again and repeat both the
+canonical-main and reviewed-head equalities:
+
+```bash
+set -euo pipefail
+gate3_canonical=fecafea674cc254217d24950e716e42f71353fdc
+gate3_branch=$(git branch --show-current)
+gate3_reviewed_head=$(git rev-parse HEAD)
+git fetch --prune origin
+test "$(git rev-parse refs/remotes/origin/main)" = "$gate3_canonical"
+test "$(git rev-parse "refs/remotes/origin/$gate3_branch")" = \
+  "$gate3_reviewed_head"
+test "$(git rev-parse HEAD)" = "$gate3_reviewed_head"
+```
+
+Stop before pull-request creation if `origin/main` moved or either branch-head
+equality fails. Do not rebase or merge a moved baseline and do not force-push a
+mismatched task branch.
 
 Open one pull request whose title/body contain only the generic problem,
 approved design link, synthetic RED/GREEN proof, aggregate test counts, gate
 outcomes, and explicit non-goals. Include no local path, private filename,
 registry value, source content, preserved-state detail, or commit subject.
 
-Request CodeRabbit review of the exact final pushed head. Confirm the reviewed
-OID equals the remote branch head. For each finding:
+Immediately before requesting CodeRabbit, fetch the task branch again and
+require the exact remote branch head still equals both the locally reviewed
+head and local `HEAD`:
+
+```bash
+set -euo pipefail
+gate3_branch=$(git branch --show-current)
+gate3_reviewed_head=$(git rev-parse HEAD)
+git fetch origin \
+  "refs/heads/$gate3_branch:refs/remotes/origin/$gate3_branch"
+test "$(git rev-parse "refs/remotes/origin/$gate3_branch")" = \
+  "$gate3_reviewed_head"
+test "$(git rev-parse HEAD)" = "$gate3_reviewed_head"
+```
+
+Request CodeRabbit review only after both equalities pass. Confirm CodeRabbit
+reviewed that exact remote OID. For each finding:
 
 - verify it technically with `superpowers:receiving-code-review`;
 - add RED first for an accepted behavior correction;
 - implement minimal GREEN;
-- rerun all of Tasks 9.1–9.3;
-- push the corrected head; and
-- request CodeRabbit review again on that final head.
+- rerun all of Tasks 9.1–9.4;
+- repeat Steps 9.5–9.6 with the corrected reviewed head; and
+- request CodeRabbit review again only after the repeated remote-head checks.
 
 Resolve all findings or return them to the owner for a bounded decision. Never
 merge while a finding or head mismatch remains.
