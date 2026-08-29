@@ -926,7 +926,8 @@ def test_reject_consumed_record_requires_exact_shape_and_snapshot_correlation(
     scope = Scope(vault, "synthetic")
     proposal = _classification_proposal(vault)
     proposal_relative = proposal.relative_to(vault).as_posix()
-    before = gate3.collect_dirty_fingerprints(vault)
+    baseline = gate3.collect_gate3_evidence(vault)
+    before = baseline.dirty
     if mutation == "baseline-digest-mismatch":
         proposal.write_bytes(proposal.read_bytes() + b"\n")
     review = get_proposal_review(scope, proposal.stem)
@@ -966,17 +967,36 @@ def test_reject_consumed_record_requires_exact_shape_and_snapshot_correlation(
     elif mutation != "baseline-digest-mismatch":
         raise AssertionError(mutation)
 
-    result = gate3.audit_dirty(
-        before,
-        gate3.collect_dirty_fingerprints(vault),
-        gate3.AuditRules.load(vault),
-        vault,
-        records=(),
+    rules = gate3.AuditRules.load(vault)
+    current = gate3.collect_gate3_evidence(vault)
+    dirty_result = gate3.audit_dirty(
+        before, current.dirty, rules, vault, records=()
+    )
+    # A non-regular record is filesystem evidence, not dirty evidence, so the
+    # outcome is asserted over both channels exactly as the CLI composes them.
+    filesystem_result = gate3.audit_filesystem(
+        baseline.filesystem,
+        current.filesystem,
+        rules,
+        classified_paths=gate3._classify_dirty_path_changes(
+            before, current.dirty, dirty_result
+        ),
+    )
+    sanctioned = (
+        dirty_result.sanctioned_writes + filesystem_result.sanctioned_writes
+    )
+    violating = (
+        dirty_result.violating_writes + filesystem_result.violating_writes
     )
 
-    assert result.sanctioned_writes == []
-    assert proposal_relative in result.violating_writes
-    assert expected_candidate in result.violating_writes
+    # No *record* may be sanctioned. The canonical quarantine directory may
+    # appear when a mutation moves its record elsewhere and leaves it empty:
+    # that empty-directory addition is the design's one directory-only
+    # exception, and it never authorizes the record.
+    assert set(sanctioned) <= {"synthetic/outbox/.consumed"}
+    assert expected_candidate not in sanctioned
+    assert proposal_relative in violating
+    assert expected_candidate in violating
 
 
 @pytest.mark.parametrize(
@@ -1226,20 +1246,26 @@ def test_registry_delete_receipt_requires_the_final_consumed_record(
 def test_git_invisible_non_directory_consumed_store_is_a_violation(
     tmp_path: Path,
 ):
+    """A non-directory at the canonical store name is still a violation.
+
+    This used to depend on the canonical-store-only supplement, which the
+    boundary-wide walk now subsumes. The evidence moved from the dirty map
+    to the filesystem map; the outcome must not.
+    """
     vault = _audit_vault(tmp_path, initialize_git=True)
     consumed_store = vault / "synthetic/outbox/.consumed"
     consumed_store.parent.mkdir(exist_ok=True)
     os.mkfifo(consumed_store)
     relative = consumed_store.relative_to(vault).as_posix()
 
-    after = gate3.collect_dirty_fingerprints(vault)
-    result = gate3.audit_dirty(
-        {}, after, gate3.AuditRules.load(vault), vault
+    evidence = gate3.collect_filesystem_fingerprints(vault)
+    result = gate3.audit_filesystem(
+        {}, evidence, gate3.AuditRules.load(vault), classified_paths=()
     )
 
-    assert after[relative].kind == "other"
+    assert evidence[relative].kind == "fifo"
     assert result.sanctioned_writes == []
-    assert result.violating_writes == [relative]
+    assert relative in result.violating_writes
 
 
 def test_classification_proposal_created_must_match_id_timestamp(tmp_path: Path):
@@ -1883,6 +1909,196 @@ def test_gate3_evidence_rejects_changed_status_or_index_across_walk(
     assert str(raised.value) == (
         "Gate 3 Git evidence changed during filesystem traversal"
     )
+
+
+def _cli_vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    return vault, snapshot
+
+
+def test_cli_wrong_location_fifo_after_snapshot_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Finding A itself: a Git-invisible FIFO outside the canonical store.
+
+    Git omits it from porcelain entirely, so before this boundary-wide walk
+    an unsanctioned filesystem write passed a full-session Gate 3 audit.
+    """
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    assert gate3.main(["snapshot"]) == 0
+    (vault / "synthetic" / ".consumed").mkdir()
+    os.mkfifo(vault / "synthetic" / ".consumed" / "stray.yaml", 0o600)
+
+    assert gate3.main(["check"]) == 1
+
+
+def test_cli_unrelated_entity_local_specials_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    assert gate3.main(["snapshot"]) == 0
+    os.mkfifo(vault / "synthetic" / "11-library" / "pipe", 0o600)
+    _make_socket(vault / "synthetic" / "sock")
+
+    assert gate3.main(["check"]) == 1
+
+
+def test_cli_unchanged_preexisting_wrong_location_fifo_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Baseline preservation: unchanged pre-existing evidence is not a write."""
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    os.mkfifo(vault / "synthetic" / "stray", 0o600)
+
+    assert gate3.main(["snapshot"]) == 0
+    assert gate3.main(["check"]) == 0
+
+
+@pytest.mark.parametrize("direction", ("added", "removed"))
+def test_cli_empty_directory_change_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direction: str
+):
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    target = vault / "synthetic" / "empty"
+    if direction == "removed":
+        target.mkdir()
+    assert gate3.main(["snapshot"]) == 0
+    if direction == "added":
+        target.mkdir()
+    else:
+        target.rmdir()
+
+    assert gate3.main(["check"]) == 1
+
+
+def test_cli_canonical_empty_quarantine_directory_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    # A real vault already has its outbox; only `.consumed` is new. Creating
+    # the parent here too would test an unrelated directory addition.
+    (vault / "synthetic" / "outbox").mkdir()
+    assert gate3.main(["snapshot"]) == 0
+    (vault / "synthetic" / "outbox" / ".consumed").mkdir()
+
+    assert gate3.main(["check"]) == 0
+
+
+def test_cli_canonical_directory_with_unrelated_sibling_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    (vault / "synthetic" / "outbox").mkdir()
+    assert gate3.main(["snapshot"]) == 0
+    (vault / "synthetic" / "outbox" / ".consumed").mkdir()
+    os.mkfifo(vault / "synthetic" / "outbox" / "stray", 0o600)
+
+    # The sibling must fail on its own merits, not because the parent
+    # directory happened to be new as well.
+    assert gate3.main(["check"]) == 1
+
+
+def test_cli_directory_symlink_target_children_never_appear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+):
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    external = tmp_path / "outside"
+    external.mkdir()
+    os.mkfifo(external / "hidden", 0o600)
+    assert gate3.main(["snapshot"]) == 0
+    (vault / "synthetic" / "link").symlink_to(external)
+
+    assert gate3.main(["check"]) == 1
+    captured = capsys.readouterr().out
+    assert "synthetic/link" in captured
+    assert "hidden" not in captured
+
+
+def test_cli_sanctioned_commit_still_passes_with_filesystem_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Valid tracked evidence must not regress into a directory violation."""
+    vault, _snapshot = _cli_vault(tmp_path, monkeypatch)
+    assert gate3.main(["snapshot"]) == 0
+    receipt = "synthetic/00-inbox/active/new receipt.md"
+    (vault / receipt).write_text("redacted\n")
+    _git(vault, "add", receipt)
+    _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+
+    assert gate3.main(["check"]) == 0
+
+
+_CLI_ERROR_INJECTIONS = ("list", "open", "stat", "identity", "readlink", "relist")
+
+
+@pytest.mark.parametrize("command", ("snapshot", "check"))
+@pytest.mark.parametrize("injection", _CLI_ERROR_INJECTIONS)
+def test_cli_controlled_error_never_leaks_a_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    command: str,
+    injection: str,
+):
+    """A failed observation exits 2 with no path or cause in the message."""
+    vault, snapshot = _cli_vault(tmp_path, monkeypatch)
+    if command == "check":
+        assert gate3.main(["snapshot"]) == 0
+        capsys.readouterr()
+
+    outside_marker = os.fspath(tmp_path / "outside-marker")
+
+    def explode(*_args, **_kwargs):
+        raise OSError(f"boom {outside_marker}")
+
+    targets = {
+        "list": "_list_directory",
+        "open": "_open_directory",
+        "stat": "_stat_entry",
+        "identity": "_fstat_descriptor",
+        "readlink": "_stat_entry_absolute",
+        "relist": "_filesystem_fingerprint",
+    }
+    monkeypatch.setattr(gate3, targets[injection], explode)
+
+    assert gate3.main([command]) == 2
+    captured = capsys.readouterr()
+    assert "GATE 3 ERROR:" in captured.err
+    assert os.fspath(vault) not in captured.err
+    assert outside_marker not in captured.err
+    if command == "snapshot":
+        assert not snapshot.exists()
+    else:
+        assert "GATE 3: PASS" not in captured.out
+
+
+def test_cli_unequal_git_bracket_is_a_controlled_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+):
+    vault, snapshot = _cli_vault(tmp_path, monkeypatch)
+    real_inputs = gate3._collect_git_dirty_inputs
+    state = {"calls": 0}
+
+    def drifting(target):
+        state["calls"] += 1
+        inputs = real_inputs(target)
+        if state["calls"] == 2:
+            return gate3.GitDirtyInputs(
+                statuses={**inputs.statuses, "drift.md": "??"},
+                index_entries=inputs.index_entries,
+            )
+        return inputs
+
+    monkeypatch.setattr(gate3, "_collect_git_dirty_inputs", drifting)
+
+    assert gate3.main(["snapshot"]) == 2
+    captured = capsys.readouterr()
+    assert "GATE 3 ERROR:" in captured.err
+    assert os.fspath(vault) not in captured.err
+    assert not snapshot.exists()
 
 
 def _classified(
@@ -2769,23 +2985,26 @@ def test_cli_refuses_to_store_the_snapshot_inside_the_vault(
 def test_cli_snapshot_reports_a_missing_entity_manifest_as_a_controlled_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ):
-    """`snapshot` must fail through the command boundary, not a traceback.
+    """`check` must fail through the command boundary, not a traceback.
 
-    The store sweep loads the entity catalog, so `snapshot` now reaches
-    `EntityCatalog.load` where it never did before. `EntityManifestError` is a
-    `RuntimeError`, which the boundary's exception tuple does not name, so an
-    unreadable manifest escaped as an unhandled traceback and exit 1 instead
-    of the controlled outcome every other Gate 3 failure reports.
+    `EntityManifestError` is a `RuntimeError`, which the boundary's exception
+    tuple did not originally name, so an unreadable manifest escaped as an
+    unhandled traceback instead of the controlled outcome every other Gate 3
+    failure reports. `AuditRules.load` still reaches `EntityCatalog.load`
+    here; the retired store sweep no longer makes `snapshot` do so.
     """
     vault = _audit_vault(tmp_path / "vault", initialize_git=True)
-    (vault / "_system" / "entities.yaml").unlink()
     snapshot = tmp_path / "gate3.json"
     monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
     monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    capsys.readouterr()
+    (vault / "_system" / "entities.yaml").unlink()
 
-    assert gate3.main(["snapshot"]) == 2
-    assert "GATE 3 ERROR:" in capsys.readouterr().err
-    assert snapshot.exists() is False
+    assert gate3.main(["check"]) == 2
+    captured = capsys.readouterr()
+    assert "GATE 3 ERROR:" in captured.err
+    assert "GATE 3: PASS" not in captured.out
 
 
 def test_cli_check_accepts_a_sanctioned_commit_after_snapshot(

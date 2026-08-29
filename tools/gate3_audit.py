@@ -697,7 +697,19 @@ def collect_filesystem_fingerprints(
     text and no symlink is ever followed. Regular files are omitted: they
     remain governed by the existing Git-derived evidence.
     """
-    root = Path(vault).resolve()
+    try:
+        return _collect_filesystem_fingerprints(Path(vault).resolve())
+    except FilesystemEvidenceError:
+        raise
+    except OSError as exc:
+        # The boundary owns the wording. An operating-system message would
+        # carry a real path into public Gate 3 output.
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _collect_filesystem_fingerprints(
+    root: Path,
+) -> dict[str, FilesystemFingerprint]:
     exclusions = _filesystem_exclusions(root)
     evidence: dict[str, FilesystemFingerprint] = {}
     root_metadata = _stat_entry_absolute(root)
@@ -908,7 +920,6 @@ def _fingerprint_git_dirty_inputs(
     vault = Path(vault).resolve()
     statuses = inputs.statuses
     index_entries = inputs.index_entries
-    _supplement_untracked_consumed_entries(vault, statuses, index_entries)
     return {
         relative: _fingerprint_path(
             vault, relative, statuses[relative], index_entries.get(relative, ())
@@ -971,54 +982,6 @@ def collect_gate3_evidence(vault: Path) -> Gate3Evidence:
         )
     return Gate3Evidence(dirty=dirty, filesystem=filesystem)
 
-
-def _supplement_untracked_consumed_entries(
-    vault: Path,
-    statuses: dict[str, str],
-    index_entries: dict[str, tuple[str, ...]],
-) -> None:
-    """Make Git-invisible special leaves in exact S7 stores auditable."""
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        return
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
-    catalog = EntityCatalog.load(vault)
-
-    def record_untracked(relative: str) -> None:
-        if relative not in index_entries:
-            statuses.setdefault(relative, "??")
-
-    for entity in catalog.entities:
-        descriptors: list[int] = []
-        try:
-            descriptor = os.open(vault, directory_flags)
-            descriptors.append(descriptor)
-            traversed: list[str] = []
-            for component in (entity.slug, "outbox", ".consumed"):
-                traversed.append(component)
-                try:
-                    descriptor = os.open(
-                        component, directory_flags, dir_fd=descriptor
-                    )
-                except FileNotFoundError:
-                    break
-                except OSError:
-                    record_untracked("/".join(traversed))
-                    break
-                descriptors.append(descriptor)
-            else:
-                try:
-                    leaves = os.listdir(descriptors[-1])
-                except OSError:
-                    record_untracked(f"{entity.slug}/outbox/.consumed")
-                else:
-                    for leaf in leaves:
-                        record_untracked(
-                            f"{entity.slug}/outbox/.consumed/{leaf}"
-                        )
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
 
 
 def _path_parts(path: str) -> tuple[str, ...] | None:
@@ -2186,15 +2149,29 @@ def cmd_check() -> int:
     rules = AuditRules.load(vault)
     _validate_receipt_stores(vault, rules)
     records = collect_commit_records(vault, head, audit_head)
-    after = collect_dirty_fingerprints(vault)
+    current = collect_gate3_evidence(vault)
+    after = current.dirty
     commit_result = _audit_commit_history(records, vault, head, audit_head)
     commit_audit = commit_result.audit
     dirty_audit = audit_dirty(before, after, rules, vault, records=records)
+    dirty_paths = _classify_dirty_path_changes(before, after, dirty_audit)
+    filesystem_audit = audit_filesystem(
+        snapshot.evidence.filesystem,
+        current.filesystem,
+        rules,
+        classified_paths=commit_result.path_changes + dirty_paths,
+    )
+    sanctioned_writes = sorted(
+        set(dirty_audit.sanctioned_writes) | set(filesystem_audit.sanctioned_writes)
+    )
+    violating_writes = sorted(
+        set(dirty_audit.violating_writes) | set(filesystem_audit.violating_writes)
+    )
     result = Audit(
         sanctioned_commits=commit_audit.sanctioned_commits,
         violating_commits=commit_audit.violating_commits,
-        sanctioned_writes=dirty_audit.sanctioned_writes,
-        violating_writes=dirty_audit.violating_writes,
+        sanctioned_writes=sanctioned_writes,
+        violating_writes=violating_writes,
     )
     if _head_oid(vault) != audit_head:
         raise ValueError("Gate 3 HEAD changed during the audit")
@@ -2205,6 +2182,7 @@ def cmd_check() -> int:
     )
     print(f"  sanctioned commits: {len(result.sanctioned_commits)}")
     print(f"  sanctioned dirty writes: {len(result.sanctioned_writes)}")
+    print(f"  filesystem evidence: {len(current.filesystem)} path(s)")
     for message in result.violating_commits:
         print(f"  VIOLATION commit: {message}")
     for relative in result.violating_writes:
