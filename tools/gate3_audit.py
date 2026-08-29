@@ -529,22 +529,39 @@ def _supplement_untracked_consumed_entries(
         return
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
     catalog = EntityCatalog.load(vault)
+
+    def record_untracked(relative: str) -> None:
+        if relative not in index_entries:
+            statuses.setdefault(relative, "??")
+
     for entity in catalog.entities:
         descriptors: list[int] = []
         try:
             descriptor = os.open(vault, directory_flags)
             descriptors.append(descriptor)
+            traversed: list[str] = []
             for component in (entity.slug, "outbox", ".consumed"):
-                descriptor = os.open(
-                    component, directory_flags, dir_fd=descriptor
-                )
+                traversed.append(component)
+                try:
+                    descriptor = os.open(
+                        component, directory_flags, dir_fd=descriptor
+                    )
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    record_untracked("/".join(traversed))
+                    break
                 descriptors.append(descriptor)
-            for leaf in os.listdir(descriptors[-1]):
-                relative = f"{entity.slug}/outbox/.consumed/{leaf}"
-                if relative not in index_entries:
-                    statuses.setdefault(relative, "??")
-        except (FileNotFoundError, NotADirectoryError, OSError):
-            continue
+            else:
+                try:
+                    leaves = os.listdir(descriptors[-1])
+                except OSError:
+                    record_untracked(f"{entity.slug}/outbox/.consumed")
+                else:
+                    for leaf in leaves:
+                        record_untracked(
+                            f"{entity.slug}/outbox/.consumed/{leaf}"
+                        )
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
@@ -1223,7 +1240,7 @@ def _sanctioned_consumed_paths(
     rules: AuditRules,
     vault: Path,
     records: tuple[CommitRecord, ...],
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], set[str], set[str]]:
     authorizations = _receipt_authorizations(records, rules, vault)
     claimed_authorizations: set[tuple[str, str]] = set()
     sanctioned: set[str] = set()
@@ -1270,7 +1287,13 @@ def _sanctioned_consumed_paths(
             and not mentioned
         ):
             sanctioned.update({relative, consumed.pending_relative})
-    return sanctioned, blocked_pending
+    unclaimed = {
+        f"{authorization.entity}/outbox/.consumed/"
+        f"{authorization.proposal_id}.yaml"
+        for authorization in authorizations
+        if authorization.key not in claimed_authorizations
+    }
+    return sanctioned, blocked_pending, unclaimed
 
 
 def audit_dirty(
@@ -1283,7 +1306,7 @@ def audit_dirty(
 ) -> Audit:
     vault = Path(vault).resolve()
     result = Audit()
-    sanctioned, blocked_pending = _sanctioned_consumed_paths(
+    sanctioned, blocked_pending, unclaimed = _sanctioned_consumed_paths(
         before, after, rules, vault, records
     )
     for relative in sorted(set(before) | set(after)):
@@ -1304,6 +1327,8 @@ def audit_dirty(
             else result.violating_writes
         )
         destination.append(relative)
+    for relative in sorted(unclaimed - set(result.violating_writes)):
+        result.violating_writes.append(relative)
     return result
 
 

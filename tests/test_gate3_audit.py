@@ -1128,6 +1128,79 @@ def test_sanctioned_consumption_requires_the_pending_leaf_to_remain_absent(
     }
 
 
+def test_approval_receipt_requires_the_final_consumed_record(tmp_path: Path):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    proposal = _classification_proposal(vault)
+    review = get_proposal_review(scope, proposal.stem)
+    approve(scope, proposal.stem, review.sha256)
+    records = gate3.collect_commit_records(vault, before_head)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.stem}.yaml"
+    )
+    (vault / consumed_relative).unlink()
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [consumed_relative]
+
+
+def test_registry_delete_receipt_requires_the_final_consumed_record(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    proposal = propose_delete(scope, "product", "unused")
+    review = get_delete_review(scope, proposal.id)
+    execute_delete(scope, proposal.id, review.sha256)
+    records = gate3.collect_commit_records(vault, before_head)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.id}.yaml"
+    )
+    (vault / consumed_relative).unlink()
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [consumed_relative]
+
+
+def test_git_invisible_non_directory_consumed_store_is_a_violation(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    consumed_store = vault / "synthetic/outbox/.consumed"
+    consumed_store.parent.mkdir(exist_ok=True)
+    os.mkfifo(consumed_store)
+    relative = consumed_store.relative_to(vault).as_posix()
+
+    after = gate3.collect_dirty_fingerprints(vault)
+    result = gate3.audit_dirty(
+        {}, after, gate3.AuditRules.load(vault), vault
+    )
+
+    assert after[relative].kind == "other"
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [relative]
+
+
 def test_classification_proposal_created_must_match_id_timestamp(tmp_path: Path):
     vault = _audit_vault(tmp_path, initialize_git=True)
     proposal = _classification_proposal(vault)
