@@ -1,6 +1,6 @@
 # Gate 3 Filesystem Evidence Boundary
 
-**Status:** REVISION 3 — AWAITING APPROVAL. Revision 3 extends verified
+**Status:** REVISION 4 — AWAITING APPROVAL. Revision 3 extends verified
 rename-topology inheritance from directories to every included non-regular
 kind, replacing the blanket rule that made a sanctioned rename produce false
 violations, and consolidates rename evidence into one immutable per-record
@@ -11,7 +11,15 @@ to this revision.
 
 - Revision 0 — approved 2026-08-29. Implementation of Tasks 1–8 proceeded
   against it.
-- Revision 3 — this document. Two owner-approved changes, both raised by an
+- Revision 4 — this document. Documentation-only consistency corrections to
+  Revision 3, which was architecturally approved: the "exactly three end
+  sanctioned" count is scoped to the directory cases so it no longer reads as
+  contradicting the six sanctioned non-directory kinds; the directory case
+  holding "ignored or untracked regular content" is narrowed to content the
+  transaction can actually carry; a positive ignored-symlink regression is
+  added; and the stale literal "8 plan builds" is replaced by the measured
+  8–16 range with assertions bound to `len(AXES)`. No rule changed.
+- Revision 3 — two owner-approved changes, both raised by an
   independent review of the completed Task 10 implementation.
 
   **I5.** Verified rename-topology inheritance is extended from directories to
@@ -745,16 +753,24 @@ not require a live vault or privileged device creation.
 ### Sanctioned rename topology
 
 Every case below is adversarial. The directory cases were written RED before
-the directory pairing rule landed; the non-directory and call-count cases
-below must be written RED against the current implementation. Exactly three end sanctioned — the no-tracked-descendant case,
-the ignored/untracked-content case, and the sequential-composition case.
-Every other case must still report a violation.
+the directory pairing rule landed; the non-directory and call-count cases in
+the following sections must be written RED against the current
+implementation.
+
+**Within this directory section only**, exactly three cases end sanctioned —
+the no-tracked-descendant case, the Git-invisible-content case, and the
+sequential-composition case — and every other *directory* case must report a
+violation. This count says nothing about the non-directory section below,
+where every included kind has a sanctioned case of its own.
 
 - A sanctioned entity rename moving a directory that has **no tracked
   descendant** pairs, and both endpoints are reported as sanctioned writes.
-- The same rename where the directory holds only ignored or untracked
-  regular content pairs, because the contract deliberately leaves ignored
-  regular files to Git and the directory itself is the only evidence.
+- The same rename where the directory holds only **ignored, or otherwise
+  Git-invisible, regular content** pairs, because the contract deliberately
+  leaves regular files to Git and the directory itself is the only evidence.
+  The qualifier is load-bearing: a *Git-visible* untracked regular file makes
+  the working tree dirty and the rename transaction refuses to start, so that
+  shape never reaches pairing at all and is pinned separately below.
 - The same directory delta with **no sanctioned rename commit** in the
   window violates at both endpoints.
 - A removed or added path beneath a **wrong old or new root** — one the
@@ -820,10 +836,23 @@ One further regression pins the exclusion rather than assuming it:
   rename transaction **refuses to start**. The test asserts that refusal, so
   the reason these entries are outside inheritance stays executable.
 
+And one positive case pins the other half of that distinction, which the
+matrix would otherwise leave to inference — it covers a tracked symlink and
+the Git-visible refusal, but not the shape between them:
+
+- an **ignored untracked symlink** is absent from `git status`, so the tree
+  stays clean, the sanctioned rename proceeds, and the transaction carries
+  the symlink. Exact kind, mode, identity and target pairing sanctions both
+  endpoints and the gate passes. Tracked-ness is not a pairing condition;
+  Git *visibility* only decides whether the transaction can start.
+
 ### Rename analysis and call counts
 
 Instrumented call-count regressions, each RED against the current
-implementation's 4 checkouts, 8 plan builds and 2 sanction verifications:
+implementation's 4 checkouts and 2 sanction verifications, both
+axis-independent, and its 8–16 plan builds, which vary with the matching
+axis's position. The plan-build assertion compares against `len(AXES)`, never
+against a literal 8:
 
 - a rename-bearing record performs at most 2 parent-tree checkouts in total
   and exactly 1 inside rename analysis;
