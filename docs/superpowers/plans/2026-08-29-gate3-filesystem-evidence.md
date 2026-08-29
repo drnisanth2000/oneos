@@ -29,6 +29,11 @@ change.
   `acc3f309f04a285fbec46acf0a0cc99d0175e101`, specifically its
   "Sanctioned rename topology" rule and its "Evidence-model limitation:
   identity is not proof of a move".
+- Tasks 11 and 12 are written against **Design Revision 4**, approved at
+  `f8003a500881a9bb612a6c18999590b6be17ead4` and recorded approved at
+  `99a0ff522703d0ec281d2876b49d8ca7cc7d535a`. Task 11 implements its
+  non-directory rename-topology inheritance and three-phase disposition
+  order; Task 12 implements its one immutable per-record rename analysis.
 
 **Plan revision history:**
 
@@ -44,7 +49,13 @@ change.
   Its `_source_preimage()` also rejected every case with more than one
   matching accumulated destination, which is the normal shape after a nested
   rename.
-- Revision 4 — this document. Task 10 corrected again. Plan
+- Revision 4 — Task 10 corrected again. Executed to completion at
+  `69cbff7681c00a9347ec1be22cc40ef72788730e`.
+- Revision 5 — this document. Tasks 1–10 are historical and must not be
+  re-run. Adds **Task 11** (I5, non-directory rename inheritance — a
+  regression this branch introduces relative to canonical `origin/main`) and
+  **Task 12** (I4, one immutable per-record rename analysis), sequential and
+  in that order. Plan
   Revision 2's composition was wrong for the **ancestor-then-nested** order:
   it retained the general `a → b` mapping plus a mapping still rooted beneath
   `b`, so an original path under `a/.../oldproduct/...` predicted the
@@ -2567,6 +2578,1151 @@ Report the final HEAD, changed files, RED/GREEN and mutation evidence, the
 collector-confirmed counts, Gitleaks and both public audits, the Step 21
 result, independent findings by severity, clean worktree, and confirmation
 that `ONEOS_VAULT` remained unset.
+
+Then **stop**. Do not push, open a pull request, request CodeRabbit, run the
+live Gate 3 trial, begin Gate 1 timing, deploy, or start Phase 2. The owner
+runs the trusted-local private integration gate against that exact HEAD —
+fresh opaque preimages, 39+ private tests, `check_v2` 0 errors and 0
+warnings, policy pass, clean combined repository-plus-vault history audit,
+and four byte-identical preservation comparisons. Only after a sanitized
+PASS may publication resume, and any later CodeRabbit code change requires a
+further private gate on the resulting HEAD.
+
+---
+
+## Tasks 11–12 status and standing constraints
+
+Tasks 1–10 are historical. Their commands, counts and stop conditions record
+what was done and are **not** current instructions.
+
+**Baseline for Tasks 11–12:** product-code checkpoint
+`69cbff7681c00a9347ec1be22cc40ef72788730e` on branch
+`codex/gate3-finding-a-filesystem-evidence-20260829`, whose measured public
+state is **261 passed, 1 skipped** in the Gate 3 module (262 collected) and
+**1983 passed, 1 skipped** in the full suite. The one skip is the genuine
+APFS undecodable-filename case and must remain the only skip on hosts that
+support UNIX sockets.
+
+**Design authority:** Revision 4 at
+`f8003a500881a9bb612a6c18999590b6be17ead4`.
+
+**Standing constraints for both tasks:**
+
+- Modify only `tools/gate3_audit.py` and `tests/test_gate3_audit.py`.
+- `ONEOS_VAULT` stays unset **in the operator shell** and **no private
+  command runs**. Tests may monkeypatch it to a synthetic `tmp_path` vault —
+  the existing suite already does — so the confirmation to report is that the
+  shell variable is unset and no vault path was used outside pytest fixtures.
+- The trusted-local private integration gate is deferred to the exact new
+  final HEAD. **Push, pull-request creation and CodeRabbit stay blocked**
+  until the owner runs it and returns a sanitized PASS. Any later CodeRabbit
+  code change requires **another** private gate on the resulting HEAD; a
+  private gate result binds only to the HEAD it ran against.
+- Live Gate 3, Gate 1 timing, deployment and Phase 2 remain blocked.
+- Preserve every S7 record-sanctioning predicate and the classifier taxonomy.
+- Preserve the accepted inode-reuse limitation. Do not introduce timestamps,
+  platform birth time, content reads, a new dependency, or a general
+  move whitelist.
+- Before executing either task, and again before any later publication:
+  fetch origin and re-verify the branch descends from canonical
+  `origin/main` at `fecafea674cc254217d24950e716e42f71353fdc`. On any drift,
+  **stop with a bounded memo** — never automatically merge, rebase, reset or
+  force-push.
+- Append new tests; never rewrite a region by slicing between two anchors.
+  Run the repository's own shadowing guard after every test-file edit:
+  `uv run python -m pytest tests/test_console_invariants.py -k shadow -q`.
+
+---
+
+### Task 11: Extend rename inheritance to every included filesystem kind
+
+**Files:**
+- Modify: `tools/gate3_audit.py:1331-1449`
+- Test: `tests/test_gate3_audit.py` (append only)
+
+**Interfaces:**
+- Consumes: `FilesystemChange`, `FilesystemFingerprint`, `RenameMapping`,
+  `ClassifiedPathChange`, `Audit`, `AuditRules`,
+  `_predict_rename_destination()`, `compare_filesystem_evidence()`,
+  `_is_canonical_quarantine_directory()`.
+- Produces: a generalised `_paired_rename_entries()` replacing
+  `_paired_rename_directories()`, and a three-phase `audit_filesystem()`.
+
+```text
+_paired_rename_entries(
+    changes: tuple[FilesystemChange, ...],
+    mappings: tuple[RenameMapping, ...],
+) -> frozenset[str]
+```
+
+`audit_filesystem()` keeps its existing signature exactly. Only its body
+changes.
+
+**Normative disposition order (Design Revision 4).** Three phases, in this
+order:
+
+1. **Pair non-directory deltas.** Sanctioned pairs are recorded and become
+   **neutral** ancestry evidence — contributing *no* `ClassifiedPathChange`.
+   Refused ones are violating and become violating classified descendants.
+2. **Run directory ancestry** over classified descendants from commit
+   evidence, dirty evidence, and phase 1's violating entries.
+3. **Pair leftover directory presence deltas**, then apply the exact
+   quarantine-directory exception.
+
+Phase 1's neutrality is security-bearing: a sanctioned non-directory pair
+must never satisfy the sanctioned-descendant rule for an enclosing directory
+whose own `mode` or `identity_digest` check refused it.
+
+- [ ] **Step 1: Write the RED positive-kind tests**
+
+Append to `tests/test_gate3_audit.py`:
+
+```python
+def _kind_fp(kind: str, *, mode: int = 0o755, identity: str = "1" * 64,
+             target: str | None = None):
+    return gate3.FilesystemFingerprint(kind, mode, identity, target)
+
+
+_PAIRABLE_KINDS = (
+    ("symlink", "9" * 64),
+    ("fifo", None),
+    ("socket", None),
+    ("char-device", None),
+    ("block-device", None),
+    ("other", None),
+)
+
+
+@pytest.mark.parametrize(("kind", "target"), _PAIRABLE_KINDS,
+                         ids=[k for k, _ in _PAIRABLE_KINDS])
+def test_verified_rename_pairs_every_included_kind(
+    tmp_path: Path, kind: str, target: str | None
+):
+    """A sanctioned rename carries special entries; none may false-violate.
+
+    Device kinds are exercised through synthetic fingerprints only — this
+    never creates a device node.
+    """
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/x": _kind_fp(kind, target=target)},
+        {"renamed/d/x": _kind_fp(kind, target=target)},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.sanctioned_writes == ["renamed/d/x", "synthetic/d/x"]
+    assert audit.violating_writes == []
+
+
+def test_regular_files_are_never_pairable_supplemental_evidence(
+    tmp_path: Path,
+):
+    """Regular files stay under Git's rules and never enter the supplement."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/x": _kind_fp("regular")},
+        {"renamed/d/x": _kind_fp("regular")},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.sanctioned_writes == []
+```
+
+- [ ] **Step 2: Run them and observe RED**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'pairs_every_included_kind or never_pairable_supplemental' -q
+uv run python -m pytest tests/test_console_invariants.py -k shadow -q
+```
+
+Expected: the six kind cases FAIL — `audit_filesystem` reports both endpoints
+violating, because pairing is directory-only. The shadowing guard passes.
+
+- [ ] **Step 3: Write the RED negative and adversarial tests**
+
+```python
+_UNPAIRED_KIND_CASES = {
+    "no-sanctioned-rename": ("synthetic/d/x", "renamed/d/x",
+                             _kind_fp("fifo"), _kind_fp("fifo"), ()),
+    "wrong-old-root": ("stranger/d/x", "renamed/d/x",
+                       _kind_fp("fifo"), _kind_fp("fifo"),
+                       (("synthetic", "renamed"),)),
+    "wrong-new-root": ("synthetic/d/x", "stranger/d/x",
+                       _kind_fp("fifo"), _kind_fp("fifo"),
+                       (("synthetic", "renamed"),)),
+    "different-tail": ("synthetic/d/x", "renamed/d/y",
+                       _kind_fp("fifo"), _kind_fp("fifo"),
+                       (("synthetic", "renamed"),)),
+    "prefix-only-root": ("synthetic-x/d/x", "renamed/d/x",
+                         _kind_fp("fifo"), _kind_fp("fifo"),
+                         (("synthetic", "renamed"),)),
+    "kind-change": ("synthetic/d/x", "renamed/d/x",
+                    _kind_fp("fifo"), _kind_fp("socket"),
+                    (("synthetic", "renamed"),)),
+    "mode-change": ("synthetic/d/x", "renamed/d/x",
+                    _kind_fp("fifo"), _kind_fp("fifo", mode=0o700),
+                    (("synthetic", "renamed"),)),
+    "identity-change": ("synthetic/d/x", "renamed/d/x",
+                        _kind_fp("fifo"), _kind_fp("fifo", identity="2" * 64),
+                        (("synthetic", "renamed"),)),
+    "symlink-target-change": ("synthetic/d/x", "renamed/d/x",
+                              _kind_fp("symlink", target="9" * 64),
+                              _kind_fp("symlink", target="8" * 64),
+                              (("synthetic", "renamed"),)),
+    # A non-symlink must never carry a target; the same unconditional
+    # comparison enforces both halves of that invariant.
+    "non-symlink-carries-target": ("synthetic/d/x", "renamed/d/x",
+                                   _kind_fp("fifo"),
+                                   _kind_fp("fifo", target="9" * 64),
+                                   (("synthetic", "renamed"),)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_UNPAIRED_KIND_CASES))
+def test_unpaired_kind_shapes_remain_violations(tmp_path: Path, case: str):
+    """Every shape outside the verified mapping stays a direct write."""
+    before_path, after_path, before_fp, after_fp, raw = _UNPAIRED_KIND_CASES[case]
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {before_path: before_fp}, {after_path: after_fp}, rules,
+        tuple(_m(o, n) for o, n in raw),
+    )
+
+    assert audit.sanctioned_writes == []
+    assert sorted(audit.violating_writes) == sorted({before_path, after_path})
+
+
+def test_standalone_new_special_entry_is_never_sanctioned(tmp_path: Path):
+    """Both endpoints must exist in the delta; a creation has no removal."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {}, {"renamed/d/x": _kind_fp("fifo")}, rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.violating_writes == ["renamed/d/x"]
+    assert audit.sanctioned_writes == []
+
+
+@pytest.mark.parametrize("side", ("added", "removed"))
+def test_unrelated_special_sibling_is_not_sanctioned(tmp_path: Path, side: str):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    before = {"synthetic/d/x": _kind_fp("fifo")}
+    after = {"renamed/d/x": _kind_fp("fifo")}
+    if side == "added":
+        after["renamed/d/extra"] = _kind_fp("fifo")
+        expected = "renamed/d/extra"
+    else:
+        before["synthetic/d/extra"] = _kind_fp("fifo")
+        expected = "synthetic/d/extra"
+
+    audit = _pair_audit(before, after, rules, (_m("synthetic", "renamed"),))
+
+    assert audit.violating_writes == [expected]
+    assert audit.sanctioned_writes == ["renamed/d/x", "synthetic/d/x"]
+
+
+@pytest.mark.parametrize("shape", ("one-to-two", "two-to-one"))
+def test_ambiguous_special_pairing_fails_closed(tmp_path: Path, shape: str):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    if shape == "one-to-two":
+        before = {"synthetic/d/x": _kind_fp("fifo")}
+        after = {"renamed/d/x": _kind_fp("fifo"), "other/d/x": _kind_fp("fifo")}
+        mappings = (_m("synthetic", "renamed"),)
+        expected_sanctioned = ["renamed/d/x", "synthetic/d/x"]
+    else:
+        before = {"synthetic/d/x": _kind_fp("fifo"),
+                  "second/d/x": _kind_fp("fifo")}
+        after = {"renamed/d/x": _kind_fp("fifo")}
+        mappings = (_m("synthetic", "renamed"), _m("second", "renamed"))
+        expected_sanctioned = []
+
+    audit = _pair_audit(before, after, rules, mappings)
+
+    assert audit.sanctioned_writes == expected_sanctioned
+
+
+def test_conflicting_mapping_never_sanctions_a_special_entry(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/x": _kind_fp("fifo")},
+        {"renamed/d/x": _kind_fp("fifo")},
+        rules,
+        (_m("synthetic", "renamed"), _m("synthetic", "other")),
+    )
+
+    assert audit.sanctioned_writes == []
+```
+
+- [ ] **Step 4: Write the RED neutral-ancestry regression**
+
+This is the Critical case an independent review found in the design. It must
+exist before the generalisation lands.
+
+```python
+@pytest.mark.parametrize("refusal", ("mode", "identity"))
+def test_paired_special_entry_never_sanctions_its_enclosing_directory(
+    tmp_path: Path, refusal: str
+):
+    """A paired symlink is neutral for ancestry, never a sanctioning descendant.
+
+    The enclosing directory moved in the same rename but its `mode` changed,
+    so its own pairing is refused. If the symlink counted as a sanctioned
+    descendant it would satisfy the ancestry rule and the mode change would
+    never be reported — a requirement bypass reached through inheritance.
+    """
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    refused = (
+        _kind_fp("directory", mode=0o777)
+        if refusal == "mode"
+        else _kind_fp("directory", identity="2" * 64)
+    )
+    audit = _pair_audit(
+        {
+            "synthetic/d": _kind_fp("directory"),
+            "synthetic/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        {
+            "renamed/d": refused,
+            "renamed/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert sorted(audit.violating_writes) == ["renamed/d", "synthetic/d"]
+    assert audit.sanctioned_writes == ["renamed/d/link", "synthetic/d/link"]
+
+
+def test_refused_special_pair_still_suppresses_its_ancestor(tmp_path: Path):
+    """A violating descendant suppresses, exactly as before.
+
+    This one is GREEN against the current implementation: it is a
+    preservation guard proving the three-phase restructure did not change
+    existing behaviour, not a RED-first behaviour test.
+    """
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {},
+        {"renamed/d": _kind_fp("directory"),
+         "renamed/d/x": _kind_fp("fifo")},
+        rules,
+        (),
+    )
+
+    assert audit.violating_writes == ["renamed/d/x"]
+    assert audit.sanctioned_writes == []
+```
+
+- [ ] **Step 5: Write the RED end-to-end CLI kind tests**
+
+```python
+def _ignored_symlink_files():
+    """`.gitignore` pattern without a slash matches at any depth.
+
+    That matters: the ignored symlink must live *inside* the renamed root so
+    the transaction actually carries it, and it must stay ignored at its new
+    path too.
+    """
+    files, old, new = _rename_files("entity")
+    files[".gitignore"] = "ignored-link\n"
+    return files, old, new
+
+
+@pytest.mark.parametrize(
+    "entry", ("tracked-symlink", "ignored-symlink", "fifo", "socket")
+)
+def test_cli_sanctioned_rename_carries_special_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+):
+    """The gate must pass for every entry the transaction can carry."""
+    files, old, new = _ignored_symlink_files()
+    vault = git_vault(tmp_path / "vault", files)
+    holder = vault / old / "11-library" / "archive"
+    holder.mkdir(parents=True, exist_ok=True)
+    if entry == "tracked-symlink":
+        os.symlink("target", holder / "link")
+        _git(vault, "add", "-A")
+        _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+    elif entry == "ignored-symlink":
+        # Inside the moved root. At the vault root it would be untouched by
+        # the rename, produce no delta, and prove nothing about pairing.
+        os.symlink("target", holder / "ignored-link")
+    elif entry == "fifo":
+        os.mkfifo(holder / "pipe", 0o600)
+    else:
+        if not _make_socket(holder / "sock"):
+            pytest.skip("host does not safely support UNIX sockets here")
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+
+    assert gate3.main(["check"]) == 0
+
+
+def test_cli_git_visible_untracked_symlink_refuses_the_transaction(
+    tmp_path: Path,
+):
+    """Pins *why* Git-visible untracked entries are outside inheritance.
+
+    They are excluded because the transaction cannot start, not by policy.
+    """
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    os.symlink("target", vault / old / "11-library" / "stray-link")
+
+    with pytest.raises(RenameError):
+        apply_rename(
+            vault, plan_rename(vault, "entity", old, new), validators=[]
+        )
+```
+
+Import `RenameError` from `app.rename` in the test module's existing import
+block.
+
+- [ ] **Step 6: Run every Task 11 test and observe RED**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'included_kind or never_pairable or unpaired_kind or standalone_new_special or unrelated_special or ambiguous_special or conflicting_mapping_never or paired_special_entry or refused_special_pair or carries_special_entries or git_visible_untracked_symlink' -q
+```
+
+Expected: FAIL. Record which cases fail and why — the socket CLI case may
+skip on an unsupported host, and that skip must be reported, not hidden.
+
+- [ ] **Step 7: Generalise pairing and install the three phases**
+
+Rename `_paired_rename_directories` to `_paired_rename_entries` and change
+its two kind filters so both endpoints must share the *same included* kind
+rather than both being directories:
+
+```python
+def _paired_rename_entries(
+    changes: tuple[FilesystemChange, ...],
+    mappings: tuple[RenameMapping, ...],
+) -> frozenset[str]:
+    """Paths a verified sanctioned rename explains, at both endpoints.
+
+    Covers every included kind, not directories alone: the transaction moves
+    the whole verified root topology, and a special entry it carried is not a
+    direct write. Identity equality stays necessary and never sufficient —
+    every other requirement is checked here independently.
+    """
+    removed = {
+        change.path: change.before
+        for change in changes
+        if change.kind == "removed"
+        and change.before is not None
+        and change.before.kind in _FILESYSTEM_KINDS
+    }
+    added = {
+        change.path: change.after
+        for change in changes
+        if change.kind == "added"
+        and change.after is not None
+        and change.after.kind in _FILESYSTEM_KINDS
+    }
+    proposed: dict[str, str] = {}
+    for old_path, old_fingerprint in sorted(removed.items()):
+        new_path = _predict_rename_destination(old_path, mappings)
+        if new_path is None:
+            continue
+        new_fingerprint = added.get(new_path)
+        if new_fingerprint is None:
+            continue
+        if (
+            new_fingerprint.kind != old_fingerprint.kind
+            or new_fingerprint.mode != old_fingerprint.mode
+            or new_fingerprint.identity_digest != old_fingerprint.identity_digest
+            or new_fingerprint.target_digest != old_fingerprint.target_digest
+        ):
+            continue
+        proposed[old_path] = new_path
+    claimed: dict[str, list[str]] = {}
+    for old_path, new_path in proposed.items():
+        claimed.setdefault(new_path, []).append(old_path)
+    paired: set[str] = set()
+    for new_path, sources in claimed.items():
+        if len(sources) != 1:
+            continue
+        paired.update({sources[0], new_path})
+    return frozenset(paired)
+```
+
+`target_digest` is compared unconditionally: it is `None` for every non-symlink
+kind, so one comparison covers both the symlink requirement and the
+"non-symlink must not carry a target" invariant.
+
+Then restructure `audit_filesystem`'s first loop into phase 1:
+
+```python
+    changes = compare_filesystem_evidence(before, after)
+    paired = _paired_rename_entries(changes, rename_mappings)
+    directory_changes: list[FilesystemChange] = []
+    candidates: list[ClassifiedPathChange] = list(classified_paths)
+    for change in changes:
+        directory_presence = (
+            change.kind in {"added", "removed"}
+            and (change.before or change.after).kind == "directory"
+            and (change.before is None or change.after is None)
+        )
+        if directory_presence:
+            directory_changes.append(change)
+            continue
+        if change.path in paired:
+            # Phase 1: sanctioned, and deliberately NOT appended to
+            # `candidates`. A paired special entry is neutral ancestry
+            # evidence; counting it as a sanctioned descendant would satisfy
+            # the ancestry rule for an enclosing directory whose own mode or
+            # identity check refused it.
+            result.sanctioned_writes.append(change.path)
+            continue
+        result.violating_writes.append(change.path)
+        candidates.append(
+            ClassifiedPathChange(change.path, change.kind, "violating")
+        )
+```
+
+Phases 2 and 3 are the existing directory loop, unchanged, still consulting
+`paired` for leftover directory presence deltas before the quarantine
+exception. Update the docstring, which currently asserts the superseded
+blanket rule.
+
+- [ ] **Step 8: Run Task 11 GREEN and the shadowing guard**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'included_kind or never_pairable or unpaired_kind or standalone_new_special or unrelated_special or ambiguous_special or conflicting_mapping_never or paired_special_entry or refused_special_pair or carries_special_entries or git_visible_untracked_symlink' -q
+uv run python -m pytest tests/test_gate3_audit.py -q
+uv run python -m pytest tests/test_console_invariants.py -k shadow -q
+```
+
+Expected: all selected pass; the full Gate 3 module passes; no shadowed
+definition.
+
+- [ ] **Step 9: Mutation-prove every security-bearing condition**
+
+Six mutations. For each: apply without committing, run the named command,
+restore from a preimage, verify with `cmp` **and** SHA-256 that the file is
+byte-identical, then re-run to GREEN.
+
+| # | Mutation | Command | Expected RED |
+|---|---|---|---|
+| 1 | drop the `kind` equality in `_paired_rename_entries` | `-k unpaired_kind` | `kind-change` |
+| 2 | drop the `mode` equality | `-k unpaired_kind` | `mode-change` |
+| 3 | drop the `identity_digest` equality | `-k unpaired_kind` | `identity-change` |
+| 4 | drop the `target_digest` equality | `-k unpaired_kind` | `symlink-target-change` |
+| 5 | append paired non-directories to `candidates` as `"sanctioned"` | `-k paired_special_entry` | the neutral-ancestry regression |
+| 6 | remove the `len(sources) != 1` claim check | `-k ambiguous_special` | `two-to-one` |
+| 7 | drop the `kind in _FILESYSTEM_KINDS` filters so regular files enter the supplement | `-k never_pairable` | the regular-file exclusion |
+
+- [ ] **Step 10: Prove the S7 predicates and taxonomy did not move**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'consumed or pending or receipt or unrelated or quarantine' -q
+```
+
+Then run the full-file AST comparison against
+`f8003a500881a9bb612a6c18999590b6be17ead4`, requiring that only
+`_paired_rename_directories` disappears, only `_paired_rename_entries`
+appears, and only `audit_filesystem` differs among retained definitions.
+
+- [ ] **Step 11: Checkpoint gate and commit**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py --collect-only -q | tail -1
+uv run python -m pytest tests/test_gate3_audit.py -q
+uv run python -m pytest -q
+git diff --check
+tools/run_gitleaks.sh .
+uv run python -m tools.public_repo_audit --repo .
+uv run python -m tools.public_repo_audit --repo . --history
+git status --short
+```
+
+Require the floors in "Collected-case forecast" below, both audits CLEAN,
+Gitleaks clean, only the two approved files modified, and `ONEOS_VAULT`
+still unset. Commit those two files in one sanitized checkpoint recording the
+RED evidence, all six mutation results, and both counts.
+
+---
+
+### Task 12: One immutable per-record rename analysis
+
+**Files:**
+- Modify: `tools/gate3_audit.py:1233-1290,1451-1600,1704-1770`
+- Test: `tests/test_gate3_audit.py` (append only)
+
+**Interfaces:**
+- Consumes: `CommitRecord`, `AuditRules`, `Audit`, `CommitAuditResult`,
+  `RenameMapping`, `_parent_tree()`, `_compose_rename_mappings()`,
+  `build_rename_plan()`, `AXES`, `RenameError`.
+- Produces:
+
+```text
+@dataclass(frozen=True)
+class RenameAnalysis:
+    sanctioned: bool
+    matched_axes: tuple[str, ...]
+    mappings: tuple[RenameMapping, ...]
+
+_axis_envelope_and_moves(
+    tree: Path, tracked: tuple[str, ...], axis: str, old: str, new: str,
+    *, parent_oid: str,
+) -> tuple[frozenset[tuple[str, str]], tuple[RenameMapping, ...]]
+_analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis
+```
+
+`_sanctioned_rename()` and `_commit_is_sanctioned()` gain a keyword-only
+`analysis: RenameAnalysis | None = None`. `audit_commits()` gains a
+keyword-only `analyses: dict[str, RenameAnalysis] | None = None` keyed by
+`record.oid`, populated by `_audit_commit_history()` for the single record it
+passes. That dictionary is built per record, consumed immediately, and
+discarded — it is **not** a cross-record cache.
+
+`_matching_rename_axes()` and `_verified_rename_mappings()` are removed;
+`_rename_move_pairs()` is absorbed into `_axis_envelope_and_moves()`.
+
+- [ ] **Step 1: Write the RED call-count tests**
+
+```python
+def _instrumented_check(vault, snapshot, monkeypatch):
+    counts = {"parent_tree": 0, "plan": 0, "analysis": 0, "sanctioned": 0}
+    for name, key in (
+        ("_parent_tree", "parent_tree"),
+        ("build_rename_plan", "plan"),
+        ("_analyze_rename", "analysis"),
+        ("_sanctioned_rename", "sanctioned"),
+    ):
+        real = getattr(gate3, name, None)
+        if real is None:
+            continue
+
+        def wrapper(*a, _real=real, _key=key, **k):
+            counts[_key] += 1
+            return _real(*a, **k)
+
+        monkeypatch.setattr(gate3, name, wrapper)
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["check"]) in (0, 1)
+    return counts
+
+
+def test_rename_record_performs_one_analysis_and_bounded_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """One analysis per record; no repeated sanction verification."""
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+
+    counts = _instrumented_check(vault, snapshot, monkeypatch)
+
+    assert counts["parent_tree"] <= 2
+    assert counts["plan"] <= len(gate3.AXES)
+    assert counts["analysis"] == 1
+    assert counts["sanctioned"] <= 1
+
+
+def test_non_rename_record_builds_no_rename_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    files, old, _new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    receipt = f"{old}/00-inbox/active/new receipt.md"
+    (vault / receipt).write_text("redacted\n")
+    _git(vault, "add", receipt)
+    _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+
+    counts = _instrumented_check(vault, snapshot, monkeypatch)
+
+    assert counts["plan"] == 0
+    assert counts["parent_tree"] <= 1
+
+
+def test_two_rename_records_each_get_their_own_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Per-record, not cached: two rename commits mean two analyses.
+
+    A cross-record cache would satisfy every other call-count assertion while
+    violating the design's no-shared-state rule, so it needs its own test.
+    """
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    apply_rename(
+        vault, plan_rename(vault, "entity", new, "thirdentity"), validators=[]
+    )
+
+    counts = _instrumented_check(vault, snapshot, monkeypatch)
+
+    assert counts["analysis"] == 2
+```
+
+The plan-build assertion compares against `len(gate3.AXES)`, never a literal.
+The current implementation measures **4 checkouts and 2 sanction
+verifications on every axis**, and **8 to 16 plan builds** depending on the
+matching axis's position in `sorted(AXES)`.
+
+The non-rename bound uses an `ingest:` commit deliberately. A
+**receipt-bearing** record — an outbox approval or a registry delete —
+incurs a second checkout of the same object id inside the dirty audit's
+commit-relative rules loader, which is out of scope for this task. An
+`ingest:` commit is not receipt-bearing, so it never reaches that loader and
+one checkout is the true total. The counter is global; the bound comes from
+the fixture's shape, not from scoping the count.
+
+- [ ] **Step 2: Run them and observe RED**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'one_analysis_and_bounded_work or builds_no_rename_plan' -q
+```
+
+Expected: `test_rename_record_performs_one_analysis_and_bounded_work` FAILS —
+`parent_tree` is 4, `plan` is 8–16, `analysis` is 0 (`_analyze_rename` does
+not exist), and `sanctioned` is 2.
+
+`test_non_rename_record_builds_no_rename_plan` **already passes** against the
+current implementation, measured `{parent_tree: 1, plan: 0, sanctioned: 0}`.
+It is a **preservation guard**, not a RED-first behaviour test: record that
+explicitly rather than reporting it as RED. Its bound holds because an
+`ingest:` commit is not receipt-bearing, so it never reaches the second
+same-object checkout inside the dirty audit's commit-relative rules loader —
+that, not any scoping of the counter, is the mechanism, and the counter is
+global.
+
+- [ ] **Step 3: Write the RED differential oracle**
+
+```python
+def _baseline_gate3(tmp_path: Path):
+    """Load the approved-checkpoint module under its own name."""
+    import importlib.util
+
+    source = subprocess.run(
+        ["git", "show", "acc3f309f04a285fbec46acf0a0cc99d0175e101:tools/gate3_audit.py"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    path = tmp_path / "baseline_gate3.py"
+    path.write_text(source, encoding="utf-8")
+    name = f"baseline_gate3_{path.stem}_{abs(hash(source)) % 10**8}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    # Registered under a unique name and removed afterwards, so repeated
+    # parametrized calls never share or clobber one module object.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(name, None)
+    return module
+
+
+@pytest.mark.parametrize("axis", sorted(("entity", "product", "member",
+                                         "project", "workspace")))
+def test_sanctioning_matches_the_approved_baseline(
+    tmp_path: Path, axis: str
+):
+    """Structural identity is lost, so behaviour is proven instead."""
+    baseline = _baseline_gate3(tmp_path)
+    files, old, new = _rename_files(axis)
+    vault = git_vault(tmp_path / f"vault-{axis}", files)
+    head = _git(vault, "rev-parse", "HEAD").strip()
+    apply_rename(vault, plan_rename(vault, axis, old, new), validators=[])
+    (record,) = gate3.collect_commit_records(vault, head)
+
+    variants = {
+        "sanctioned": record,
+        "duplicate-change": dataclasses.replace(
+            record, changes=record.changes + (record.changes[0],)
+        ),
+        "wrong-parent": dataclasses.replace(record, parents=("e" * 40,)),
+        "malformed-envelope": dataclasses.replace(
+            record, changes=record.changes[:1]
+        ),
+        "non-rename-message": dataclasses.replace(
+            record, message="ingest: add redacted receipt"
+        ),
+        # Pins the early-return deviation: a later axis's planner raising
+        # must not change the sanctioning result.
+        "later-axis-raises": record,
+    }
+    for name, candidate in variants.items():
+        assert gate3._sanctioned_rename(candidate, vault) == (
+            baseline._sanctioned_rename(candidate, vault)
+        ), name
+
+
+def test_multi_axis_ambiguity_matches_the_approved_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The one shape where sanctioning and the matching-axis set diverge.
+
+    `apply_rename` always commits `rename: <old> → <new>`, so no *message*
+    edit can produce an ambiguous record — a second axis must actually
+    reproduce the envelope. Patch one level below the axis loop, exactly as
+    the existing suite does, so the loop itself still runs.
+    """
+    baseline = _baseline_gate3(tmp_path)
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    head = _git(vault, "rev-parse", "HEAD").strip()
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    (record,) = gate3.collect_commit_records(vault, head)
+
+    real = gate3._axis_envelope_and_moves
+
+    def every_axis_matches(tree, tracked, axis, o, n, *, parent_oid):
+        envelope, _moves = real(
+            tree, tracked, "entity", o, n, parent_oid=parent_oid
+        )
+        return envelope, (gate3.RenameMapping(o, f"{n}-{axis}"),)
+
+    monkeypatch.setattr(gate3, "_axis_envelope_and_moves", every_axis_matches)
+    analysis = gate3._analyze_rename(record, vault)
+
+    assert len(analysis.matched_axes) > 1
+    assert analysis.mappings == (), "ambiguity yields no mappings"
+    assert analysis.sanctioned is True, "sanctioning is unchanged by ambiguity"
+    assert analysis.sanctioned == baseline._sanctioned_rename(record, vault)
+```
+
+Import `sys` and `dataclasses` in the test module if not already present.
+
+- [ ] **Step 4: Run the oracle and observe it GREEN before the change**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'matches_the_approved_baseline' -q
+```
+
+Expected: PASS — but record it as a **fixture smoke-test, not evidence**. At
+`acc3f309` the sanctioning helpers are byte-identical to HEAD, so before the
+change the oracle compares a function to a verbatim copy of itself. Its
+evidential value is entirely post-change, where it is the substitute for the
+AST identity the consolidation destroys.
+
+The baseline must also survive this branch being merged: `git show` on a
+branch-local commit fails once the branch is gone, and `check=True` would
+then error all five cases permanently. Resolve the baseline defensively —
+`pytest.skip` with an explicit reason when the object is unreachable — so a
+merged main-line suite degrades to a reported skip rather than a failure.
+
+- [ ] **Step 5: Implement the analysis**
+
+```python
+@dataclass(frozen=True)
+class RenameAnalysis:
+    """One record's rename evidence, derived once and never recomputed."""
+
+    sanctioned: bool
+    matched_axes: tuple[str, ...]
+    mappings: tuple[RenameMapping, ...]
+
+
+def _axis_envelope_and_moves(
+    tree: Path, tracked: tuple[str, ...], axis: str, old: str, new: str,
+    *, parent_oid: str,
+) -> tuple[frozenset[tuple[str, str]], tuple[RenameMapping, ...]]:
+    """Build one axis's plan once and derive both products from it."""
+    plan = build_rename_plan(tree, axis, old, new, planned_head=parent_oid)
+    planned_root = plan.vault
+    moves = tuple(
+        (source.relative_to(planned_root), destination.relative_to(planned_root))
+        for source, destination in plan.moves
+    )
+    envelope: set[tuple[str, str]] = set()
+    for tracked_path in tracked:
+        candidate = Path(tracked_path)
+        for source, destination in moves:
+            tail = _relative_to(candidate, source)
+            if tail is not None:
+                envelope.add(("D", candidate.as_posix()))
+                envelope.add(("A", (destination / tail).as_posix()))
+                break
+    for edited in plan.edits:
+        relative = edited.relative_to(planned_root)
+        # An entity rename rewrites every text file carrying the old slug,
+        # including files *inside* the moved directory. Those already appear
+        # as the D/A pair above; adding an ("M", <old path>) as well makes
+        # the envelope disagree with the commit and every legitimate rename
+        # stops being sanctioned. `.relative_to` is kept rather than
+        # `_relative_to` so an unexpected path fails closed.
+        if any(_relative_to(relative, source) is not None for source, _ in moves):
+            continue
+        envelope.add(("M", relative.as_posix()))
+    mappings = tuple(
+        RenameMapping(source.as_posix(), destination.as_posix())
+        for source, destination in moves
+    )
+    return frozenset(envelope), mappings
+```
+
+The envelope body must reproduce `_rename_envelope`'s exactly — including
+the edits filter and `.relative_to`, both of which are load-bearing. The
+differential oracle is what proves it did. Before writing it, diff the two
+bodies line by line and confirm no guard was dropped.
+
+```python
+def _analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis:
+    """Derive this record's rename evidence with one checkout, once.
+
+    The sanctioning decision keeps its exact previous *result*, including the
+    duplicate-change guard: `sanctioned` is true when any axis matches, which
+    is what first-match acceptance computed.
+
+    It does **not** keep the early return. The design requires every axis to
+    be evaluated so ambiguity is observable, and one pass cannot both stop at
+    the first match and see the second. The observable consequence is that
+    planners for later axes now run on records where they previously did not,
+    so an exception they raise outside the inner tuple could flip a
+    sanctioned record to unsanctioned. The differential oracle covers this
+    with a variant in which a non-matching axis raises. Report this deviation
+    to the owner as a design-text correction — the design says the
+    sanctioning decision "keeps its early return", which this consolidation
+    makes impossible.
+
+    Ambiguity applies only to the mappings: more than one matching axis
+    yields none.
+    """
+    empty = RenameAnalysis(sanctioned=False, matched_axes=(), mappings=())
+    match = _RENAME_MESSAGE.fullmatch(record.message)
+    if match is None or len(record.parents) != 1:
+        return empty
+    actual = frozenset((change.status, change.path) for change in record.changes)
+    if len(actual) != len(record.changes) or not actual:
+        return empty
+    old, new = match.groups()
+    matched: list[tuple[str, tuple[RenameMapping, ...]]] = []
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        for axis in sorted(AXES):
+            try:
+                envelope, mappings = _axis_envelope_and_moves(
+                    tree, tracked, axis, old, new, parent_oid=record.parents[0]
+                )
+            except (OSError, RenameError, UnicodeError, sqlite3.Error):
+                continue
+            if envelope and actual == envelope:
+                matched.append((axis, mappings))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return empty
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+    return RenameAnalysis(
+        sanctioned=bool(matched),
+        matched_axes=tuple(axis for axis, _ in matched),
+        mappings=matched[0][1] if len(matched) == 1 else (),
+    )
+```
+
+- [ ] **Step 6: Thread the analysis explicitly**
+
+`_sanctioned_rename(record, vault, *, analysis=None)` returns
+`(analysis if analysis is not None else _analyze_rename(record, vault)).sanctioned`.
+`_commit_is_sanctioned` forwards its `analysis`. `audit_commits` accepts
+`analyses` and forwards `analyses.get(record.oid)`. `_audit_commit_history`
+computes `analysis = _analyze_rename(record, vault)` once per record, passes
+`{record.oid: analysis}` to `audit_commits`, and appends
+`analysis.mappings` when `audited.sanctioned_commits` is non-empty. Delete `_rename_envelope`, `_matching_rename_axes`,
+`_verified_rename_mappings` and `_rename_move_pairs`. Four existing tests
+name them and must be rewritten, not deleted — each carries coverage the
+design still requires:
+
+1. `test_offline_rename_envelope_uses_explicit_parent_oid_without_git_repo`
+   (`tests/test_gate3_audit.py:685`) — retarget to
+   `_axis_envelope_and_moves`, asserting the returned envelope equals the
+   commit's change set. It is the only offline explicit-parent-OID
+   regression.
+2. `test_unsanctioned_rename_commit_contributes_no_mapping`
+   (`:3306`) — retarget to `_analyze_rename`, keeping its assertion that a
+   duplicated change entry yields `sanctioned is False` **and** now also
+   `mappings == ()`. The design requires this sanctioning regression be
+   retained unchanged in substance.
+3. `test_ambiguous_axis_match_contributes_no_mapping` (`:3335`) — retarget
+   to `_analyze_rename` by patching `_axis_envelope_and_moves` so two axes
+   match, asserting `len(matched_axes) > 1` and `mappings == ()`.
+4. `test_rename_mappings_compose_*` and the pairing tests are untouched —
+   they consume `RenameMapping`, not the deleted helpers.
+
+- [ ] **Step 7: Run GREEN**
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'one_analysis_and_bounded_work or builds_no_rename_plan or matches_the_approved_baseline' -q
+uv run python -m pytest tests/test_gate3_audit.py -q
+uv run python -m pytest tests/test_console_invariants.py -k shadow -q
+```
+
+- [ ] **Step 8: Record the permitted and frozen definitions**
+
+**May change:** `_rename_envelope` (**deleted** — absorbed into
+`_axis_envelope_and_moves`, which is its only remaining caller's
+replacement), `_rename_move_pairs` (deleted, absorbed),
+`_matching_rename_axes` (deleted), `_verified_rename_mappings` (deleted),
+`_sanctioned_rename`,
+`_commit_is_sanctioned`, `audit_commits`, `_audit_commit_history`,
+`cmd_check`.
+
+**Must remain AST-equivalent to the Task 11 checkpoint** recorded at Task 11
+Step 11 — not to `f8003a5`, which predates Task 11 and where
+`_paired_rename_entries` does not yet exist and `audit_filesystem` still
+carries the superseded body: `_sanctioned_outbox`,
+`_sanctioned_registry`, `_sanctioned_ingest`, `_load_consumed_record`,
+`_receipt_authorizations`, `_sanctioned_consumed_paths`,
+`_new_proposal_is_sanctioned`, `_authorization_matches`, `audit_dirty`,
+`_commit_relative_rules`, `_is_canonical_quarantine_directory`,
+`_filesystem_kind`, `_filesystem_identity_digest`,
+`_filesystem_fingerprint`, `collect_filesystem_fingerprints`,
+`_walk_directory`, `compare_filesystem_evidence`,
+`_compose_rename_mappings`, `_source_preimage`,
+`_predict_rename_destination`, `_paired_rename_entries`.
+
+Assert this with an untracked AST script outside the repository, as Task 10
+Step 21 did. Any definition changing outside the permitted list is a stop
+condition.
+
+- [ ] **Step 9: Mutation-prove the consolidation**
+
+| # | Mutation | Command | Expected RED |
+|---|---|---|---|
+| 1 | make `_audit_commit_history` call `_sanctioned_rename(record, vault)` again before appending `analysis.mappings` | `-k one_analysis_and_bounded_work` | `sanctioned <= 1` |
+| 1b | make `_sanctioned_rename` ignore its `analysis` argument and always recompute | `-k one_analysis_and_bounded_work` | `parent_tree <= 2` |
+| 2 | call `build_rename_plan` a second time for the move pairs | `-k one_analysis_and_bounded_work` | `plan <= len(AXES)` |
+| 3 | open a second `_parent_tree` inside `_analyze_rename` | `-k one_analysis_and_bounded_work` | `parent_tree <= 2` |
+| 4 | drop the duplicate-change guard from `_analyze_rename` | `-k matches_the_approved_baseline` | `duplicate-change` |
+| 5 | make `sanctioned` require exactly one matched axis | `-k matches_the_approved_baseline` | a multi-axis variant |
+| 6 | build a plan for a non-rename record | `-k builds_no_rename_plan` | `plan == 0` |
+
+Restore byte-identically after each, verified by `cmp` and SHA-256.
+
+- [ ] **Step 10: Checkpoint gate and commit**
+
+Same gate as Task 11 Step 11, against the floors below. Commit only the two
+approved files.
+
+---
+
+### Collected-case forecast and suite floors
+
+Baseline at `69cbff7`: Gate 3 module **262 collected, 261 passed, 1 skipped**;
+full suite **1983 passed, 1 skipped**.
+
+| Task | Group | Functions | Collected cases |
+|---|---|---|---|
+| 11 | positive kinds (Step 1) ×6 + regular-file exclusion | 2 | 7 |
+| 11 | unpaired kind shapes (Step 3) ×10 | 1 | 10 |
+| 11 | standalone, conflicting mapping | 2 | 2 |
+| 11 | unrelated special sibling ×2 | 1 | 2 |
+| 11 | ambiguous special pairing ×2 | 1 | 2 |
+| 11 | neutral ancestry ×2 + refused-pair suppression (Step 4) | 2 | 3 |
+| 11 | CLI carried entries ×4 + refusal (Step 5) | 2 | 5 |
+| **11 total** | | **11** | **31** |
+| 12 | call-count tests, incl. two-record analysis (Step 1) | 3 | 3 |
+| 12 | differential oracle ×5 axes (Step 3) | 1 | 5 |
+| 12 | multi-axis ambiguity oracle (Step 3) | 1 | 1 |
+| **12 new** | | **5** | **9** |
+| 12 | four retargeted tests (Step 6) — rewritten, not added | 0 | 0 |
+| **Both** | | **16** | **40** |
+
+Task 12 Step 6 **retargets** four existing tests rather than deleting them,
+so it adds no net retirement: the offline-envelope regression, the
+duplicate-change sanctioning regression, and the axis-ambiguity regression
+all survive under new names against `_analyze_rename` and
+`_axis_envelope_and_moves`. The forecast therefore assumes **no** net
+removals. **The collector is authoritative.** Run `pytest --collect-only -q`
+at each checkpoint and reconcile against this table; if they disagree, the
+plan is wrong and must be corrected before proceeding.
+
+Floors, from the measured baseline of 262 collected / 261 passed / 1 skipped
+and 1983 passed / 1 skipped:
+
+- after Task 11: Gate 3 module **at least 292 passed**, 1 skipped; full suite
+  **at least 2014 passed**, 1 skipped;
+- after Task 12: Gate 3 module **at least 301 passed**, 1 skipped; full suite
+  **at least 2023 passed**, 1 skipped.
+
+A socket case may skip where the host cannot safely bind one; any such skip
+is reported, not hidden, and the floor is reduced by exactly the number of
+reported socket skips.
+
+A count below a floor, or any new skip on a host that supports UNIX sockets,
+is a stop condition. Socket cases skip only where the host cannot safely bind
+one, and any such skip must be reported.
+
+---
+
+### Task 13: Final verification, review, and stop
+
+- [ ] **Step 1: Re-run the complete acceptance set**
+
+Both mutation matrices, the focused suites, the Gate 3 module, the full
+public suite, `git diff --check`, Gitleaks, both public audits, the AST
+comparison, and the shadowing guard.
+
+- [ ] **Step 2: Obtain an independent scoped review**
+
+Invoke `superpowers:requesting-code-review` over
+`99a0ff522703d0ec281d2876b49d8ca7cc7d535a`..HEAD with only public
+requirements and synthetic evidence. Ask for Critical / Important / Minor
+findings covering: kind generalisation without requirement relaxation;
+three-phase order and neutral ancestry; target-digest handling; unique
+order-independent pairing; analysis immutability and absence of caching;
+call-count correctness; differential-oracle adequacy; unchanged S7
+predicates; and test gaps.
+
+Verify each finding with `superpowers:receiving-code-review`. Add a RED
+regression for every accepted behavioural defect, implement the smallest fix,
+re-run Steps 1–2, and request another review. **Return any design-changing or
+scope-expanding finding to the owner rather than improvising.**
+
+- [ ] **Step 3: Stop for the trusted-local private gate**
+
+Report the final HEAD, ordered new commits, changed files, RED/GREEN
+evidence, collector-confirmed counts and the single expected skip, both
+mutation matrices, the AST result, Gitleaks and both public audits,
+independent findings by severity, clean worktree, and confirmation that
+`ONEOS_VAULT` remained unset.
 
 Then **stop**. Do not push, open a pull request, request CodeRabbit, run the
 live Gate 3 trial, begin Gate 1 timing, deploy, or start Phase 2. The owner
