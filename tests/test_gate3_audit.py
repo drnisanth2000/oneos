@@ -1885,6 +1885,87 @@ def test_gate3_evidence_rejects_changed_status_or_index_across_walk(
     )
 
 
+def _fs_fp(
+    kind: gate3.FilesystemKind = "fifo",
+    *,
+    mode: int = 0o600,
+    identity: str = "1" * 64,
+    target: str | None = None,
+) -> gate3.FilesystemFingerprint:
+    return gate3.FilesystemFingerprint(kind, mode, identity, target)
+
+
+def test_filesystem_comparison_preserves_identical_preexisting_evidence():
+    """Unchanged pre-existing evidence is baseline, not a session change.
+
+    Reporting it would make every vault with a pre-existing special entry
+    fail its first audit, which is exactly the endpoint semantics Gate 3
+    already promises for Git-derived evidence.
+    """
+    evidence = {"a": _fs_fp(), "b": _fs_fp("directory", mode=0o755)}
+
+    assert gate3.compare_filesystem_evidence(evidence, dict(evidence)) == ()
+
+
+def test_filesystem_comparison_reports_added_removed_and_changed_in_sorted_order():
+    before = {"b": _fs_fp(), "c": _fs_fp(identity="2" * 64)}
+    after = {"a": _fs_fp(), "c": _fs_fp(identity="3" * 64)}
+
+    assert gate3.compare_filesystem_evidence(before, after) == (
+        gate3.FilesystemChange("a", "added", None, _fs_fp()),
+        gate3.FilesystemChange("b", "removed", _fs_fp(), None),
+        gate3.FilesystemChange(
+            "c", "changed", _fs_fp(identity="2" * 64), _fs_fp(identity="3" * 64)
+        ),
+    )
+
+
+def test_filesystem_comparison_detects_same_kind_identity_replacement():
+    before = {"a": _fs_fp(identity="1" * 64)}
+    after = {"a": _fs_fp(identity="2" * 64)}
+
+    (change,) = gate3.compare_filesystem_evidence(before, after)
+    assert change.kind == "changed"
+
+
+def test_filesystem_comparison_detects_directory_mode_change():
+    before = {"a": _fs_fp("directory", mode=0o755)}
+    after = {"a": _fs_fp("directory", mode=0o700)}
+
+    (change,) = gate3.compare_filesystem_evidence(before, after)
+    assert change.kind == "changed"
+
+
+def test_filesystem_comparison_detects_symlink_target_change():
+    before = {"a": _fs_fp("symlink", mode=0o777, target="1" * 64)}
+    after = {"a": _fs_fp("symlink", mode=0o777, target="2" * 64)}
+
+    (change,) = gate3.compare_filesystem_evidence(before, after)
+    assert change.kind == "changed"
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    (
+        ("directory", "symlink"),
+        ("symlink", "fifo"),
+        ("fifo", "socket"),
+        ("socket", "directory"),
+    ),
+)
+def test_filesystem_comparison_never_confuses_directory_symlink_fifo_or_socket(
+    first: str, second: str
+):
+    """A type swap is a replacement, never an unchanged path."""
+    before = {"a": _fs_fp(first, target="1" * 64 if first == "symlink" else None)}
+    after = {"a": _fs_fp(second, target="1" * 64 if second == "symlink" else None)}
+
+    (change,) = gate3.compare_filesystem_evidence(before, after)
+    assert change.kind == "changed"
+    assert change.before.kind == first
+    assert change.after.kind == second
+
+
 def _race_vault(root: Path) -> Path:
     vault = _boundary(root)
     (vault / "d").mkdir()

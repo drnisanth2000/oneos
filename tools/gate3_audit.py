@@ -916,6 +916,36 @@ def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
     return _fingerprint_git_dirty_inputs(vault, _collect_git_dirty_inputs(vault))
 
 
+def compare_filesystem_evidence(
+    before: dict[str, FilesystemFingerprint],
+    after: dict[str, FilesystemFingerprint],
+) -> tuple[FilesystemChange, ...]:
+    """Endpoint comparison only: pure, deterministic, no I/O and no policy.
+
+    Identical evidence at both endpoints is preserved baseline, exactly as
+    Gate 3 already treats unchanged Git-derived evidence. Everything else is
+    a session change for a later stage to dispose of.
+    """
+    changes: list[FilesystemChange] = []
+    for path in sorted(set(before) | set(after)):
+        previous = before.get(path)
+        current = after.get(path)
+        if previous == current:
+            continue
+        if previous is None:
+            kind: ChangeKind = "added"
+        elif current is None:
+            kind = "removed"
+        else:
+            kind = "changed"
+        changes.append(
+            FilesystemChange(
+                path=path, kind=kind, before=previous, after=current
+            )
+        )
+    return tuple(changes)
+
+
 def collect_gate3_evidence(vault: Path) -> Gate3Evidence:
     """One coherent observation of Git and filesystem evidence.
 
