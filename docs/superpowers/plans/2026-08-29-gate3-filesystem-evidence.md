@@ -37,7 +37,14 @@ change.
   directory with no tracked descendant reported both endpoints as
   unsanctioned direct writes.
 - Revision 2 — added Task 10 for I1. Superseded.
-- Revision 3 — this document. Task 10 corrected after owner review. Plan
+- Revision 3 — Task 10 corrected after owner review. Superseded: its
+  composition regressed the exact chain `a → b → c` to a fail-closed empty
+  result, because the forward rewrite already produced `a → c` and the
+  derivation step appended a duplicate that the conflict check then rejected.
+  Its `_source_preimage()` also rejected every case with more than one
+  matching accumulated destination, which is the normal shape after a nested
+  rename.
+- Revision 4 — this document. Task 10 corrected again. Plan
   Revision 2's composition was wrong for the **ancestor-then-nested** order:
   it retained the general `a → b` mapping plus a mapping still rooted beneath
   `b`, so an original path under `a/.../oldproduct/...` predicted the
@@ -1455,24 +1462,35 @@ audit_filesystem(
 ) -> Audit
 ```
 
-**Composition semantics.** Mappings fold oldest-first. Each new group does two
-things to the accumulated set:
+**Composition semantics.** Mappings fold oldest-first. A later mapping stands
+in exactly one of three relations to the accumulated set, and each is handled
+differently. Collapsing any two of them breaks one of the others.
 
-1. **Rewrite forward.** Every accumulated destination that the new mapping
-   names exactly, or is a proper path-prefix of, is rewritten through it.
-   This handles *nested rename then ancestor rename*.
-2. **Derive the original source.** A new mapping whose `old_root` sits at or
-   beneath an accumulated destination is recorded under that accumulated
-   mapping's **source** pre-image, not under its own `old_root`. This handles
-   *ancestor rename then nested rename*, which Plan Revision 2 got wrong: it
-   left `a → b` beside `b/M/oldproduct → b/M/newproduct`, so an original path
-   `a/M/oldproduct/x` matched only the general mapping and predicted the
-   intermediate `b/M/oldproduct/x`.
+1. **Later root *equals* an accumulated destination** (`a → b`, then
+   `b → c`). The forward rewrite already carries `a` through to `c`, so the
+   later mapping is **consumed** and nothing is appended. Appending a derived
+   `a → c` here would duplicate the source and trip the conflict check,
+   turning an ordinary sequential rename into a fail-closed empty result.
+2. **Later root is *strictly beneath* an accumulated destination** (`a → b`,
+   then `b/M/op → b/M/np`). The forward rewrite does not apply. The later
+   mapping is appended under its **original source pre-image**, derived
+   through the unique most-specific accumulated mapping. Without this an
+   original path `a/M/op/x` matches only the general mapping and predicts the
+   intermediate `b/M/op/x`, which never exists on disk.
+3. **Later root is an *ancestor* of an accumulated destination**
+   (`a/M/op → a/M/np`, then `a → b`). The accumulated destination is
+   rewritten forward, **and** the later general mapping is also retained so
+   original tails the nested rename never touched still map.
 
-The general mapping is retained alongside the derived specific one, so tails
-the nested rename does not touch still map. Two accumulated destinations
-matching one new `old_root`, two rewrites applying to one destination, a
-duplicated source, or a duplicated destination all return the empty tuple.
+Pre-image derivation selects the unique **longest** matching accumulated
+destination. General and specific mappings legitimately coexist after a
+nested rename, so more than one match is normal and must not fail closed; a
+third rename beneath the second would otherwise be rejected. Only equally
+specific candidates predicting *different* sources are ambiguous.
+
+The empty tuple is returned for: equally specific disagreeing pre-images, two
+rewrites applying to one accumulated destination, a duplicated source, or a
+duplicated destination.
 
 **Pairing semantics.** Pairing never depends on tuple order. For a removed
 path, every mapping whose `old_root` matches is a candidate; the unique
@@ -1486,6 +1504,32 @@ each record whose commit its existing per-commit audit sanctioned, appends
 `_compose_rename_mappings()` onto `CommitAuditResult.rename_mappings`.
 `cmd_check()` passes that to `audit_filesystem()`, which consults it only
 after the violating-descendant rule and only for directory presence deltas.
+
+**Composition probe (executed before this plan was committed).** Every
+composition case below was run against the exact algorithm in Step 10, in a
+standalone synthetic probe outside the repository. These are the literal
+resulting tuples:
+
+```text
+exact chain a->b->c          -> (('a', 'c'),)
+nested-then-ancestor         -> (('a/M/op', 'b/M/np'), ('a', 'b'))
+                                predict(a/M/op/x) = b/M/np/x
+ancestor-then-nested         -> (('a', 'b'), ('a/M/op', 'b/M/np'))
+                                predict(a/M/op/x) = b/M/np/x
+ancestor->nested->deeper     -> (('a', 'b'), ('a/M/op', 'b/M/np'),
+                                 ('a/M/op/dp', 'b/M/np/dpr'))
+                                predict(a/M/op/dp/x) = b/M/np/dpr/x
+general tail retained        -> (('a', 'b'), ('a/M/op', 'b/M/np'))
+                                predict(a/other/x) = b/other/x
+conflict one-src-two-dst     -> ()
+conflict two-src-one-dst     -> ()
+equally-specific preimage    -> None (ambiguous, hand-built)
+overlap general-first        -> predict(a/M/op/x) = b/M/np/x
+overlap specific-first       -> predict(a/M/op/x) = b/M/np/x
+```
+
+The implementer should reproduce these exact tuples; a difference means the
+transcribed algorithm diverged from the probed one.
 
 - [ ] **Step 1: Write the RED reproduction of I1**
 
@@ -1686,9 +1730,61 @@ def _m(old_root: str, new_root: str) -> gate3.RenameMapping:
 
 
 def test_rename_mappings_compose_oldest_first_over_exact_roots():
+    """An exact chain is consumed by the forward rewrite, not duplicated.
+
+    Appending a derived `a → c` beside the rewritten one duplicates the
+    source, which the conflict check then rejects — turning an ordinary
+    sequential rename into a fail-closed empty result.
+    """
     composed = gate3._compose_rename_mappings(((_m("a", "b"),), (_m("b", "c"),)))
 
     assert composed == (_m("a", "c"),)
+
+
+def test_rename_mappings_compose_through_a_deeper_nested_chain():
+    """A third rename beneath the second must find the most-specific source.
+
+    Two accumulated mappings match `b/M/np/dp` — the general `a → b` and the
+    specific `a/M/op → b/M/np`. Rejecting multiple matches would fail this
+    ordinary three-rename sequence closed.
+    """
+    composed = gate3._compose_rename_mappings(
+        (
+            (_m("a", "b"),),
+            (_m("b/M/op", "b/M/np"),),
+            (_m("b/M/np/dp", "b/M/np/dpr"),),
+        )
+    )
+
+    assert composed == (
+        _m("a", "b"),
+        _m("a/M/op", "b/M/np"),
+        _m("a/M/op/dp", "b/M/np/dpr"),
+    )
+    assert (
+        gate3._predict_rename_destination("a/M/op/dp/x", composed)
+        == "b/M/np/dpr/x"
+    )
+
+
+@pytest.mark.parametrize("order", ("general-first", "specific-first"))
+def test_source_preimage_selects_the_unique_most_specific_mapping(order: str):
+    """Accumulated tuple order must not decide the derived source."""
+    composed = (_m("a", "b"), _m("a/M/op", "b/M/np"))
+    if order == "specific-first":
+        composed = tuple(reversed(composed))
+
+    assert gate3._source_preimage("b/M/np/dp", composed) == "a/M/op/dp"
+
+
+def test_source_preimage_fails_closed_on_equally_specific_disagreement():
+    """Two same-length destinations predicting different sources is ambiguous.
+
+    Destination uniqueness makes this unreachable through composition today,
+    so the guard is defensive and is asserted directly rather than through a
+    scenario that cannot occur.
+    """
+    assert gate3._source_preimage("p/q/z", (_m("x", "p/q"), _m("y", "p/q"))) is None
 
 
 @pytest.mark.parametrize(
@@ -1727,13 +1823,6 @@ def test_composed_mappings_retain_the_general_tail():
     )
 
 
-def test_ambiguous_source_preimage_contributes_nothing():
-    """Two accumulated destinations matching one new source is ambiguous."""
-    ordered = ((_m("a", "shared"), _m("b", "shared/nested")), (_m("shared/nested", "c"),))
-
-    assert gate3._compose_rename_mappings(ordered) == ()
-
-
 @pytest.mark.parametrize(
     "ordered",
     (
@@ -1750,10 +1839,11 @@ def test_conflicting_rename_mappings_contribute_nothing(ordered):
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'rename_mappings_compose or composed_mappings_retain or ambiguous_source_preimage or conflicting_rename_mappings' -q
+  -k 'rename_mappings_compose or composed_mappings_retain or source_preimage or conflicting_rename_mappings' -q
 ```
 
-Expected: FAIL, `AttributeError` on `_compose_rename_mappings`.
+Expected: FAIL, `AttributeError` on `_compose_rename_mappings` and
+`_source_preimage`.
 
 - [ ] **Step 10: Implement bidirectional prefix composition**
 
@@ -1774,8 +1864,14 @@ def _source_preimage(
     """The original source a later mapping's root sits under, if any.
 
     Returns the sentinel `""` when nothing matches, so the caller can
-    distinguish "no earlier mapping applies" from an ambiguous match, which
-    returns None.
+    distinguish "no earlier mapping applies" from ambiguity, which returns
+    None.
+
+    Selection is by longest matching destination. A general and a specific
+    mapping legitimately coexist after a nested rename, so several matches is
+    the normal shape, not an error: rejecting it would fail an ordinary
+    three-rename sequence closed. Only equally specific candidates predicting
+    different sources are ambiguous.
     """
     matches = [
         mapping
@@ -1783,15 +1879,21 @@ def _source_preimage(
         if old_root == mapping.new_root
         or old_root.startswith(mapping.new_root + "/")
     ]
-    if len(matches) > 1:
-        return None
     if not matches:
         return ""
-    mapping = matches[0]
-    if old_root == mapping.new_root:
-        return mapping.old_root
-    tail = old_root[len(mapping.new_root) + 1:]
-    return mapping.old_root + "/" + tail
+    best = max(len(mapping.new_root) for mapping in matches)
+    predicted = set()
+    for mapping in matches:
+        if len(mapping.new_root) != best:
+            continue
+        if old_root == mapping.new_root:
+            predicted.add(mapping.old_root)
+        else:
+            tail = old_root[len(mapping.new_root) + 1:]
+            predicted.add(mapping.old_root + "/" + tail)
+    if len(predicted) != 1:
+        return None
+    return predicted.pop()
 
 
 def _compose_rename_mappings(
@@ -1799,11 +1901,14 @@ def _compose_rename_mappings(
 ) -> tuple[RenameMapping, ...]:
     """Fold per-commit mappings oldest-first, failing closed on ambiguity.
 
-    Two directions matter and both occur. A later ancestor rename rewrites an
-    earlier nested destination forward; a later nested rename is recorded
-    under the earlier ancestor's original source. Recording only the first
-    leaves an original path matching the general mapping alone and predicting
-    an intermediate destination that never exists on disk.
+    Three relations matter and each is handled differently. A later root that
+    equals an accumulated destination is consumed by the forward rewrite; one
+    strictly beneath it is appended under its original source pre-image; one
+    that is an ancestor rewrites the accumulated destination forward and is
+    also retained for untouched tails. Collapsing any two of these breaks one
+    of the others: appending on the exact match duplicates a source, and
+    skipping the pre-image leaves an original path predicting an intermediate
+    destination that never exists on disk.
     """
     composed: tuple[RenameMapping, ...] = ()
     for group in ordered:
@@ -1824,6 +1929,14 @@ def _compose_rename_mappings(
             )
         added: list[RenameMapping] = []
         for mapping in group:
+            # Exact-chain consumption. The forward rewrite above already
+            # carried an accumulated mapping through to this destination;
+            # appending a derived duplicate would trip the conflict check and
+            # fail an ordinary sequential rename closed.
+            if any(
+                existing.new_root == mapping.old_root for existing in composed
+            ):
+                continue
             preimage = _source_preimage(mapping.old_root, composed)
             if preimage is None:
                 return ()
@@ -1872,10 +1985,10 @@ def _predict_rename_destination(
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'rename_mappings_compose or composed_mappings_retain or ambiguous_source_preimage or conflicting_rename_mappings' -q
+  -k 'rename_mappings_compose or composed_mappings_retain or source_preimage or conflicting_rename_mappings' -q
 ```
 
-Expected: 7 passed.
+Expected: 10 passed.
 
 - [ ] **Step 12: Write RED pairing tests, including the wrong-old-root case**
 
@@ -2305,12 +2418,16 @@ Expected: 2 passed. If `ancestor-then-nested` fails, composition is not
 deriving the source pre-image; fix `_source_preimage()` rather than relaxing
 any pairing requirement.
 
-- [ ] **Step 21: Prove the sanctioning helpers are byte-identical**
+- [ ] **Step 21: Prove the sanctioning definitions are AST-equivalent**
 
-A name grep proves nothing about a function body. Compare the parsed source
-of each named definition against the approved design checkpoint. Write this
-as an **untracked** script outside the repository — do not add a tracked
-utility:
+A name grep proves nothing about a function body. Compare the **normalised
+structure** of each named definition against the approved design checkpoint.
+`ast.unparse()` round-trips through the parser, so this proves AST
+equivalence — identical structure after normalisation — not byte identity:
+reformatting, comment edits, and string-quote changes pass. That is the
+right strength here, because the claim being defended is that no
+sanctioning *behaviour* moved. Write it as an **untracked** script outside
+the repository — do not add a tracked utility:
 
 ```bash
 cat > /tmp/gate3_unchanged.py <<'PY'
@@ -2341,29 +2458,29 @@ changed = sorted(n for n in old if old[n] != new.get(n))
 absent = sorted(n for n in old if n not in new)
 if changed or absent:
     sys.exit(f"FAIL changed={changed} absent={absent}")
-print(f"OK: {len(old)} sanctioning definitions byte-identical to {BASE[:8]}")
+print(f"OK: {len(old)} sanctioning definitions AST-equivalent to {BASE[:8]}")
 PY
 uv run python /tmp/gate3_unchanged.py
 ```
 
-Expected: `OK: 12 sanctioning definitions byte-identical to acc3f309`. Any
+Expected: `OK: 12 sanctioning definitions AST-equivalent to acc3f309`. Any
 `FAIL` is a stop condition: the sanctioning decision or the classifier
 taxonomy moved, which this task forbids.
 
 - [ ] **Step 22: Count the suites and compare against the enumerated total**
 
-Task 10 adds exactly **27** pytest cases. Every parameterization is expanded,
+Task 10 adds exactly **30** pytest cases. Every parameterization is expanded,
 because a parameterized function is one `def` but many collected cases:
 
 | Group | Functions | Collected cases |
 |---|---|---|
 | I1 CLI reproduction (Step 1) | 1 | 1 |
 | mapping authorization and axis ambiguity (Step 4) | 2 | 2 |
-| composition (Step 8): exact roots 1, nesting orders ×2, general tail 1, source-preimage ambiguity 1, conflicts ×2 | 5 | 7 |
+| composition (Step 8): exact chain 1, nesting orders ×2, deeper nested chain 1, general tail 1, pre-image most-specific ×2, pre-image ambiguity 1, conflicts ×2 | 7 | 10 |
 | pairing (Step 12): both endpoints 1, unpaired shapes ×7, unrelated sibling 1, violating descendant 1 | 4 | 10 |
 | order independence (Step 14): most-specific ×2, equally specific 1, two destinations 1, two sources 1 | 4 | 5 |
 | nested CLI regressions (Step 20) ×2 | 1 | 2 |
-| **Total** | **17** | **27** |
+| **Total** | **19** | **30** |
 
 Treat the collector, not this table, as authoritative. If they disagree the
 plan is wrong and must be corrected before proceeding:
@@ -2377,8 +2494,8 @@ uv run python -m pytest -q
 The Gate 3 module stands at **228 passed, 1 skipped** and the full public
 suite at **1950 passed, 1 skipped** before this task. Require afterwards:
 
-- Gate 3 module: **at least 255 passed**, 1 skipped;
-- full public suite: **at least 1977 passed**, 1 skipped.
+- Gate 3 module: **at least 258 passed**, 1 skipped;
+- full public suite: **at least 1980 passed**, 1 skipped.
 
 These are floors, not equalities, because a review correction may add a
 regression. A count *below* a floor, or any new skip, is a stop condition.
@@ -2399,6 +2516,15 @@ verify byte-identity with `cmp` and SHA-256, and re-run to GREEN.
 4. Make `_predict_rename_destination()` return the first candidate instead of
    the longest. Run the Step 14 command. Expected RED on
    `most_specific_mapping[general-first]`.
+5. Remove the exact-chain consumption guard so a derived mapping is always
+   appended. Run the Step 9 command. Expected RED on
+   `compose_oldest_first_over_exact_roots`, which returns `()` instead of
+   `(a → c)` — the Plan Revision 3 regression this revision fixes.
+6. Make `_source_preimage()` return `None` whenever more than one accumulated
+   mapping matches. Run the Step 9 command. Expected RED on
+   `compose_through_a_deeper_nested_chain` and on
+   `source_preimage_selects_the_unique_most_specific_mapping` — the other
+   Plan Revision 3 regression.
 
 - [ ] **Step 24: Run the public acceptance gates**
 
