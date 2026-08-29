@@ -8,15 +8,16 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-08-25, after Safety Foundation S7 final gates.
+Last reconciled: 2026-08-29, after the published completion evidence for
+inherited items 2, 4, and 3.
 
 ---
 
 ## Phase 1 triage
 
-Original steps 1-10 and Safety Foundation S1-S7 are complete. The separately
-sequenced inherited items 2–4 below remain required before live Phase 1 gate
-trials. Phase 2 is not authorized.
+Original steps 1-10, Safety Foundation S1-S7, and the separately sequenced
+inherited items 2, 4, and 3 below are complete. The substantive next phase is
+the live Phase 1 exit trials. Phase 2 is not authorized.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -26,13 +27,13 @@ trials. Phase 2 is not authorized.
 | S4 — proposal identity and freshness | **COMPLETE** | Collision-safe proposal IDs, exact-byte source SHA-256, no-follow snapshots, and visible stale/missing refusals are merged. |
 | S5 — Git transaction and audit | **COMPLETE** | Classification approval and registry deletion use exact-path alternate-index transactions with ownership-aware rollback; Gate 3 validates action-specific messages, paths, and dirty-state fingerprints. |
 | S6 — Console failures | **COMPLETE** | Every typed Command Center refusal reaches the operator as a specific, safe, actionable message; no route swallows a failure or returns a raw server fault. Public suite 603 → 832. All public and private gates pass, including the combined repo+vault history audit; Grey Matter fingerprints identical before and after. Per-task review record: `docs/superpowers/plans/2026-08-16-s6-sdd-ledger.md`. |
-| S7 — bound review tokens | **COMPLETE** | Exact-byte review fingerprints bind approve, reject, and registry delete; quarantine-last and tracked HEAD receipts protect transactional actions from destructive rollback and repeated ids; reject safely quarantines its reviewed record; receipt-backed cards remain non-actionable. Current public evidence: 1,476 public tests, all 48 campaign rows RED then GREEN, and a 1,476-pass restored closing suite in 107.32s; Gitleaks found no leaks; and public current-tree/history audits are clean. Focused rename proofs refuse distinct same-HEAD vaults before lock and keep execution on the reviewed canonical vault if a caller alias is retargeted. Final private gates record 37 tests, `check_v2` 0/0, a clean combined history audit, and byte-identical Grey Matter state. Independent scoped review PASS found no findings. The macOS no-overwrite path was exercised; Linux `renameat2` is an accepted unexercised user/platform limitation. |
+| S7 — bound review tokens | **COMPLETE** | Exact-byte review fingerprints bind approve, reject, and registry delete; quarantine-last and tracked HEAD receipts protect transactional actions from destructive rollback and repeated ids; reject safely quarantines its reviewed record; receipt-backed cards remain non-actionable. Published S7 evidence: 1,476 public tests, all 48 campaign rows RED then GREEN, and a 1,476-pass restored closing suite in 107.32s; Gitleaks found no leaks; and public current-tree/history audits were clean. Focused rename proofs refused distinct same-HEAD vaults before lock and kept execution on the reviewed canonical vault if a caller alias was retargeted. Final private gates recorded 37 tests, `check_v2` 0/0, a clean combined history audit, and byte-identical Grey Matter state. Independent scoped review PASS found no findings. The macOS no-overwrite path was exercised; Linux `renameat2` is an accepted unexercised user/platform limitation. |
 
 Merged S5 baseline: `0f71cd3`. S6 is complete. S7 began from the fresh
 merged-S6 baseline `d7ad86b` with 926 public tests.
-Current public verification records 1,476 public tests, all 48 campaign rows
+The published S7 verification recorded 1,476 public tests, all 48 campaign rows
 RED then GREEN, and a 1,476-pass restored closing suite in 107.32s. Gitleaks
-found no leaks and public current-tree/history audits are clean. A separate
+found no leaks and public current-tree/history audits were clean. A separate
 focused cross-vault rename-plan mutation went RED then GREEN: two distinct
 repositories at the same HEAD refuse before lock, Git, or mutation, while
 same-root relative/absolute aliases remain valid. A caller-alias retarget
@@ -43,6 +44,16 @@ Matter HEAD/status/worktree/cached proof preserving pre-existing edits.
 Independent scoped review PASS found no findings. Supported
 writers cooperate through OneOS interfaces and the shared action lock;
 deliberate post-final-check ancestor relocation is outside that boundary.
+
+### Inherited follow-up completion evidence
+
+These are published completion records, not results from this reconciliation:
+
+| Item | Public implementation | Trusted-local completion evidence |
+|---|---|---|
+| 2 — prose-leakage enforcement | **COMPLETE** | 39 tests; `check_v2` 0 errors/0 warnings; combined audit CLEAN; byte-identical vault preservation. |
+| 4 — remaining filesystem failure shapes | **COMPLETE** | 39 tests; `check_v2` 0 errors/0 warnings; combined audit CLEAN; byte-identical vault preservation. |
+| 3 — declaration completeness | **COMPLETE** — final public suite recorded 1,826 passing tests. | 39 tests; `check_v2` 0 errors/0 warnings; Gitleaks clean; combined audit CLEAN; byte-identical vault preservation. CI and CodeRabbit passed. |
 
 ### Exit gates (spec §11)
 
@@ -171,12 +182,11 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-S7 is complete at its gate-certified branch tip. Its merge/PR state is never
-recorded here as a point-in-time fact; check it live with `git log
-origin/main..<branch>` and the hosting UI. Before live Phase 1 gate trials,
-sequence inherited items 2–4 below as their own reviewed tasks. Do not start
-Phase 2, deploy, or add deferred UI while those items or the live exit gates
-remain open.
+Run the trusted-local live Phase 1 exit trials: Gate 2 approval plus revert
+proof, Gate 3 full-session unsanctioned-write audit, and Gate 1 timed triage of
+about 20 real inbox items. Gates 4 and 5 already pass. Phase 2 remains
+unauthorized. Deployment remains blocked until all Phase 1 gates pass and the
+owner separately approves deployment; deferred UI remains out of scope.
 
 ---
 
@@ -190,39 +200,44 @@ service remains gated through an outbox proposal and explicit approval.
 Specific parsers and integration targets are instance data and remain in the
 vault's `decisions.md`, not this repository.
 
-## S7 inherits these from S6
+## Inherited follow-ups from S6 — completion record
 
-S6 is complete and its branch is frozen at a gate-certified tip. Five items pass
-to S7 explicitly, so none is rediscovered by accident. Each is stated as a rule
-or a measured condition; no instance values appear here or anywhere in this
-repository.
+S6 passed five items forward explicitly so none would be rediscovered by
+accident. Item 1 completed in S7; items 2, 4, and 3 completed later as separately
+sequenced work; item 5 remains the required verification method. The original
+problem descriptions are retained below as historical context, followed by the
+published completion evidence. No instance values appear here or anywhere in
+this repository.
 
-**1. Approval bound to reviewed bytes.** A proposal id names a *mutable file*,
-not the bytes an operator reviewed. `approve`, `reject` and `execute_delete`
-each take an id and re-read the record, comparing it only against another read
-made in the same request, so between preview and approval another process may
-rewrite a proposal while preserving its id and filename. Every existing check
-validates the current record's internal consistency, never its correspondence to
-what was reviewed. The fix — hash the validated snapshot, submit
+**1. Approval bound to reviewed bytes — COMPLETED IN S7.** A proposal id named a
+*mutable file*, not the bytes an operator reviewed. `approve`, `reject` and
+`execute_delete` each took an id and re-read the record, comparing it only
+against another read made in the same request, so between preview and approval
+another process could rewrite a proposal while preserving its id and filename.
+Every existing check validated the current record's internal consistency, never
+its correspondence to what was reviewed. The fix — hash the validated snapshot,
+submit
 `id + review_sha256`, compare before the first mutation, refuse visibly on
 mismatch — **adds a refusal condition**, which is precisely why S6 could not
 absorb it. The precedent is exact: S4 bound the source receipt's bytes and
 refused stale approvals; this binds the proposal record's bytes one artifact
 further out. S6 neither introduced nor widened the exposure.
 
-**2. Prose-leakage enforcement — PUBLIC IMPLEMENTATION COMPLETE.** This repository has structural invariants for
-catch-alls, `hx-vals`, reader categories and route declarations — and **none for
-its own documentation**. AGENTS.md's one rule is enforced solely by the combined
-repo+vault audit, which needs the private vault and therefore cannot run in CI
-or in a cloud task. A private value consequently survived fifty commits and
-several careful readings of the exact line that carried it, and was caught only
-at the final gate. A check over tracked documentation, seeded from the manifest
-at gate time, would have caught it at the first commit.
+**2. Prose-leakage enforcement — COMPLETE.** At inheritance, this repository had
+structural invariants for catch-alls, `hx-vals`, reader categories and route
+declarations — and **none for its own documentation**. AGENTS.md's one rule was
+enforced solely by the combined repo+vault audit, which needs the private vault
+and therefore cannot run in CI or in a cloud task. A private value consequently
+survived fifty commits and several careful readings of the exact line that
+carried it, and was caught only at the final gate. A check over tracked
+documentation, seeded from the manifest at gate time, would have caught it at
+the first commit.
 Exact short registry-derived tokens in tracked Markdown now fail both
-current-tree and history audit modes; the final live-vault audit and
-preservation proof remain trusted-local gates.
+current-tree and history audit modes. The published trusted-local completion
+record is 39 tests, `check_v2` 0 errors/0 warnings, combined audit CLEAN, and
+byte-identical vault preservation.
 
-**3. Declaration completeness — PUBLIC IMPLEMENTATION COMPLETE.** Immutable
+**3. Declaration completeness — COMPLETE.** Immutable
 failure metadata now closes the reviewed inventory of 20 route-facing service
 and dependency boundaries. Thirteen registered Console routes declare 35
 executable body-service edges; structural traversal proves every known domain
@@ -242,17 +257,20 @@ succeed before a service reload observes that the entity disappeared. Triage,
 proposal, and outbox contracts now keep that outcome visible as `E-ENTITY`.
 `Vault._entity_flags` instead converts the same root cause to `E-CONFIG`; that
 pre-existing taxonomy inconsistency is recorded for later work and is not
-changed here. The 37 private tests, `check_v2`, combined vault-seeded history
-audit, and opaque live-vault preservation comparison remain trusted-local gates.
+changed here. The final public suite recorded 1,826 passing tests. The published
+trusted-local completion record is 39 tests, `check_v2` 0 errors/0 warnings,
+Gitleaks clean, combined audit CLEAN, and byte-identical vault preservation; CI
+and CodeRabbit passed.
 
-**4. Remaining filesystem failure shapes — PUBLIC IMPLEMENTATION COMPLETE.**
+**4. Remaining filesystem failure shapes — COMPLETE.**
 A configured vault root that becomes unavailable now renders `E-TAMPER`, while
 an unreadable entity manifest renders `E-CONFIG`, across every entity-scoped
 Console endpoint derived from FastAPI's dependency metadata. Neither condition
 reaches the global fallback, reflects raw exception or submitted data, exposes
 an action control, or mutates the synthetic vault; lower route catches remain
-independently pinned. Trusted-local private gates and preservation proof remain
-outstanding.
+independently pinned. The published trusted-local completion record is 39 tests,
+`check_v2` 0 errors/0 warnings, combined audit CLEAN, and byte-identical vault
+preservation.
 
 **5. Independent reviewer and mutation-tested verification — retained as
 method, not as an option.** Across roughly twenty review rounds on S6, nearly
