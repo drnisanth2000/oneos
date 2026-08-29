@@ -488,6 +488,90 @@ def _read_relative_regular_no_follow(
         os.close(parent_descriptor)
 
 
+_IDENTITY_DOMAIN = b"oneos-gate3-identity-v1\0"
+_TARGET_DOMAIN = b"oneos-gate3-target-v1\0"
+_UNCLASSIFIABLE = "Gate 3 filesystem entry is unclassifiable"
+_TRAVERSAL_FAILED = "Gate 3 filesystem traversal failed"
+
+
+def _filesystem_kind(mode: int) -> FilesystemKind:
+    """Map one no-follow mode to exactly one supplemental kind.
+
+    Regular files are deliberately not supplemental evidence — they stay
+    under Git's status, index, content and mode rules — so a regular mode
+    reaching here is internal misuse, not an unknown type.
+    """
+    if stat.S_ISREG(mode):
+        raise FilesystemEvidenceError(_UNCLASSIFIABLE)
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "char-device"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    return "other"
+
+
+def _length_delimited(*fields: bytes) -> bytes:
+    """Join fields so no concatenation can imitate a different tuple."""
+    joined = b""
+    for value in fields:
+        joined += str(len(value)).encode("ascii") + b":" + value
+    return joined
+
+
+def _filesystem_identity_digest(
+    kind: FilesystemKind, metadata: os.stat_result
+) -> str:
+    """Stable identity over device and inode, never content or path text.
+
+    This is what distinguishes a directory that was removed and recreated
+    from one that never changed; both present the same kind and mode.
+    """
+    fields = [
+        kind.encode("ascii"),
+        str(metadata.st_dev).encode("ascii"),
+        str(metadata.st_ino).encode("ascii"),
+    ]
+    if kind in {"char-device", "block-device"}:
+        fields.append(str(metadata.st_rdev).encode("ascii"))
+    return hashlib.sha256(
+        _IDENTITY_DOMAIN + _length_delimited(*fields)
+    ).hexdigest()
+
+
+def _filesystem_fingerprint(
+    parent_descriptor: int,
+    name: str,
+    metadata: os.stat_result,
+) -> FilesystemFingerprint:
+    """Fingerprint one entry from metadata already captured no-follow."""
+    kind = _filesystem_kind(metadata.st_mode)
+    target_digest: str | None = None
+    if kind == "symlink":
+        try:
+            raw_target = os.readlink(name, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+        # The link text is the evidence. Resolving or opening the target
+        # would leave the boundary and could read outside the vault.
+        target_digest = hashlib.sha256(
+            _TARGET_DOMAIN + os.fsencode(raw_target)
+        ).hexdigest()
+    return FilesystemFingerprint(
+        kind=kind,
+        mode=stat.S_IMODE(metadata.st_mode),
+        identity_digest=_filesystem_identity_digest(kind, metadata),
+        target_digest=target_digest,
+    )
+
+
 def _fingerprint_path(
     vault: Path,
     relative: str,

@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
+import stat
 import subprocess
 import textwrap
 
@@ -1638,6 +1640,122 @@ def test_commit_collection_uses_no_renames_and_preserves_spaces(tmp_path: Path):
         ("D", old),
         ("A", new),
     }
+
+
+def _open_dir(path: Path) -> int:
+    return os.open(
+        path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+
+
+def _make_socket(path: Path) -> bool:
+    """Bind a UNIX socket where the host safely supports it."""
+    try:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except (AttributeError, OSError):
+        return False
+    try:
+        server.bind(os.fspath(path))
+    except OSError:
+        server.close()
+        return False
+    server.close()
+    return True
+
+
+def test_filesystem_kind_is_closed_without_type_confusion():
+    """One mode maps to exactly one kind, and regular is not evidence.
+
+    A regular file reaching the supplemental map would let a lookalike enter
+    a path Git already governs, so the classifier refuses it outright rather
+    than inventing a kind for it.
+    """
+    assert gate3._filesystem_kind(stat.S_IFDIR | 0o755) == "directory"
+    assert gate3._filesystem_kind(stat.S_IFLNK | 0o777) == "symlink"
+    assert gate3._filesystem_kind(stat.S_IFIFO | 0o600) == "fifo"
+    assert gate3._filesystem_kind(stat.S_IFSOCK | 0o600) == "socket"
+    assert gate3._filesystem_kind(stat.S_IFCHR | 0o600) == "char-device"
+    assert gate3._filesystem_kind(stat.S_IFBLK | 0o600) == "block-device"
+    assert gate3._filesystem_kind(0o600) == "other"
+
+    with pytest.raises(gate3.FilesystemEvidenceError):
+        gate3._filesystem_kind(stat.S_IFREG | 0o644)
+
+
+def test_filesystem_identity_digest_changes_on_same_kind_replacement(
+    tmp_path: Path,
+):
+    """A replaced directory of the same kind must not look unchanged."""
+    target = tmp_path / "d"
+    target.mkdir()
+    first = os.stat(target, follow_symlinks=False)
+    first_digest = gate3._filesystem_identity_digest("directory", first)
+    target.rmdir()
+    target.mkdir()
+    second = os.stat(target, follow_symlinks=False)
+    second_digest = gate3._filesystem_identity_digest("directory", second)
+
+    assert gate3._filesystem_kind(first.st_mode) == gate3._filesystem_kind(
+        second.st_mode
+    )
+    assert first_digest != second_digest
+
+
+def test_filesystem_symlink_hashes_raw_target_without_following(tmp_path: Path):
+    """The link's own text is the evidence; its target is never opened."""
+    external = tmp_path / "outside.txt"
+    external.write_bytes(b"external content\n")
+    boundary = tmp_path / "vault"
+    boundary.mkdir()
+    link = boundary / "link"
+    link.symlink_to(external)
+    descriptor = _open_dir(boundary)
+    try:
+        metadata = os.stat("link", dir_fd=descriptor, follow_symlinks=False)
+        fingerprint = gate3._filesystem_fingerprint(descriptor, "link", metadata)
+    finally:
+        os.close(descriptor)
+
+    assert fingerprint.kind == "symlink"
+    assert fingerprint.target_digest == hashlib.sha256(
+        b"oneos-gate3-target-v1\0" + os.fsencode(os.readlink(link))
+    ).hexdigest()
+    assert fingerprint.target_digest != hashlib.sha256(
+        external.read_bytes()
+    ).hexdigest()
+
+
+def test_filesystem_fingerprint_records_a_socket_where_supported(tmp_path: Path):
+    boundary = tmp_path / "vault"
+    boundary.mkdir()
+    if not _make_socket(boundary / "sock"):
+        pytest.skip("host does not safely support UNIX sockets here")
+    descriptor = _open_dir(boundary)
+    try:
+        metadata = os.stat("sock", dir_fd=descriptor, follow_symlinks=False)
+        fingerprint = gate3._filesystem_fingerprint(descriptor, "sock", metadata)
+    finally:
+        os.close(descriptor)
+
+    assert fingerprint.kind == "socket"
+    assert fingerprint.target_digest is None
+    assert gate3._SHA256_HEX.fullmatch(fingerprint.identity_digest)
+
+
+def test_filesystem_fingerprint_records_a_fifo_mode(tmp_path: Path):
+    boundary = tmp_path / "vault"
+    boundary.mkdir()
+    os.mkfifo(boundary / "pipe", 0o600)
+    descriptor = _open_dir(boundary)
+    try:
+        metadata = os.stat("pipe", dir_fd=descriptor, follow_symlinks=False)
+        fingerprint = gate3._filesystem_fingerprint(descriptor, "pipe", metadata)
+    finally:
+        os.close(descriptor)
+
+    assert fingerprint.kind == "fifo"
+    assert fingerprint.mode == 0o600
+    assert fingerprint.target_digest is None
 
 
 def test_cli_snapshot_writes_version_four_evidence_outside_vault(
