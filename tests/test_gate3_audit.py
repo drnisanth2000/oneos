@@ -1154,6 +1154,45 @@ def test_approval_receipt_requires_the_final_consumed_record(tmp_path: Path):
     assert result.violating_writes == [consumed_relative]
 
 
+def test_receipt_authorization_survives_a_later_entity_rename(tmp_path: Path):
+    """Authorization must be read with the rules of its own commit.
+
+    `_audit_commit_history` already loads `AuditRules` from each commit's
+    tree, so an approval made before a rename stays sanctioned. Receipt
+    authorization read the *final* vault rules instead, where the original
+    slug no longer exists — so every path helper refused, no authorization
+    was emitted, and the missing quarantine record was never added to
+    `unclaimed`. A session that approved and then renamed reported PASS with
+    its consumed evidence gone.
+    """
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    proposal = _classification_proposal(vault)
+    review = get_proposal_review(scope, proposal.stem)
+    approve(scope, proposal.stem, review.sha256)
+    consumed_relative = f"synthetic/outbox/.consumed/{proposal.stem}.yaml"
+    (vault / consumed_relative).unlink()
+    apply_rename(
+        vault, plan_rename(vault, "entity", "synthetic", "renamed"), validators=[]
+    )
+    rules = gate3.AuditRules.load(vault)
+    assert "synthetic" not in rules.entities, "fixture must retire the old slug"
+    records = gate3.collect_commit_records(vault, before_head)
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        rules,
+        vault,
+        records=records,
+    )
+
+    assert consumed_relative in result.violating_writes
+    assert result.ok is False
+
+
 def test_registry_delete_receipt_requires_the_final_consumed_record(
     tmp_path: Path,
 ):

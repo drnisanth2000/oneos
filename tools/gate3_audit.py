@@ -1124,31 +1124,74 @@ def _load_consumed_record(
     return None
 
 
+def _receipt_bearing(record: CommitRecord) -> bool:
+    """Whether this commit's envelope can carry a receipt authorization."""
+    if _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message) is not None:
+        return True
+    registry = _REGISTRY_MESSAGE.fullmatch(record.message)
+    return registry is not None and registry.group(1) == "delete"
+
+
+def _commit_relative_rules(
+    vault: Path, records: tuple[CommitRecord, ...]
+) -> dict[str, AuditRules]:
+    """Registry rules as of each receipt-bearing commit.
+
+    `_audit_commit_history` already judges every commit against its own
+    tree, so an approval made before a rename stays sanctioned. Reading
+    authorization from the *final* rules instead left the two auditors
+    disagreeing: the old slug is gone from the final manifest, so every path
+    helper refused, no authorization was emitted, and a missing quarantine
+    record never reached `unclaimed`. A failure to build a commit's rules
+    propagates rather than dropping its authorization — a dropped
+    authorization is a silent PASS.
+    """
+    resolved: dict[str, AuditRules] = {}
+    for record in records:
+        if not _receipt_bearing(record) or record.oid in resolved:
+            continue
+        temporary: tempfile.TemporaryDirectory[str] | None = None
+        try:
+            temporary, commit_tree, _ = _parent_tree(vault, record.oid)
+            resolved[record.oid] = AuditRules.load(commit_tree)
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+    return resolved
+
+
 def _receipt_authorizations(
-    records: tuple[CommitRecord, ...], rules: AuditRules, vault: Path
+    records: tuple[CommitRecord, ...],
+    rules: AuditRules,
+    vault: Path,
+    commit_rules: dict[str, AuditRules],
 ) -> tuple[_ReceiptAuthorization, ...]:
     """Extract exact-byte authorities only from sanctioned session commits."""
     authorizations: list[_ReceiptAuthorization] = []
     for record in records:
+        # The commit's own rules, never the final vault's, and never carried
+        # into the next iteration: a later rename must not erase an
+        # authorization this session actually issued.
+        record_rules = commit_rules.get(record.oid, rules)
         approval = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
-        if approval is not None and _sanctioned_outbox(record, rules, vault):
+        if approval is not None and _sanctioned_outbox(record, record_rules, vault):
             deleted = [change.path for change in record.changes if change.status == "D"]
             destinations = [
                 change.path
                 for change in record.changes
                 if change.status == "A"
-                and _active_destination(change.path, rules) is not None
+                and _active_destination(change.path, record_rules) is not None
             ]
             receipt_changes = [
                 change.path
                 for change in record.changes
                 if change.status == "A"
-                and _receipt_path(change.path, rules) is not None
+                and _receipt_path(change.path, record_rules) is not None
             ]
             if len(deleted) != 1 or len(destinations) != 1 or len(receipt_changes) != 1:
                 continue
             receipt_path = receipt_changes[0]
-            receipt_identity = _receipt_path(receipt_path, rules)
+            receipt_identity = _receipt_path(receipt_path, record_rules)
             receipt = _receipt_from_commit(vault, record, receipt_path)
             if receipt_identity is None or receipt is None:
                 continue
@@ -1169,19 +1212,19 @@ def _receipt_authorizations(
         if (
             registry is None
             or registry.group(1) != "delete"
-            or not _sanctioned_registry(record, rules, vault)
+            or not _sanctioned_registry(record, record_rules, vault)
         ):
             continue
         receipt_changes = [
             change.path
             for change in record.changes
             if change.status == "A"
-            and _receipt_path(change.path, rules) is not None
+            and _receipt_path(change.path, record_rules) is not None
         ]
         if len(receipt_changes) != 1:
             continue
         receipt_path = receipt_changes[0]
-        receipt_identity = _receipt_path(receipt_path, rules)
+        receipt_identity = _receipt_path(receipt_path, record_rules)
         receipt = _receipt_from_commit(vault, record, receipt_path)
         if receipt_identity is None or receipt is None:
             continue
@@ -1222,14 +1265,24 @@ def _authorization_matches(
 
 
 def _record_mentions_proposal(
-    record: CommitRecord, entity: str, proposal_id: str, rules: AuditRules
+    record: CommitRecord,
+    entity: str,
+    proposal_id: str,
+    rules: AuditRules,
+    commit_rules: dict[str, AuditRules],
 ) -> bool:
-    """Conservatively keep a failed transaction from masquerading as reject."""
+    """Conservatively keep a failed transaction from masquerading as reject.
+
+    Read with the commit's own rules for the same reason authorization is:
+    a receipt written under a slug a later rename retired still mentions its
+    proposal, and missing that would let the reject branch adopt it.
+    """
     approval = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
     if approval is not None and approval.group(1) == proposal_id:
         return True
+    record_rules = commit_rules.get(record.oid, rules)
     return any(
-        _receipt_path(change.path, rules) == (entity, proposal_id)
+        _receipt_path(change.path, record_rules) == (entity, proposal_id)
         for change in record.changes
     )
 
@@ -1240,8 +1293,9 @@ def _sanctioned_consumed_paths(
     rules: AuditRules,
     vault: Path,
     records: tuple[CommitRecord, ...],
+    commit_rules: dict[str, AuditRules],
 ) -> tuple[set[str], set[str], set[str]]:
-    authorizations = _receipt_authorizations(records, rules, vault)
+    authorizations = _receipt_authorizations(records, rules, vault, commit_rules)
     claimed_authorizations: set[tuple[str, str]] = set()
     sanctioned: set[str] = set()
     blocked_pending: set[str] = set()
@@ -1276,7 +1330,7 @@ def _sanctioned_consumed_paths(
             continue
         mentioned = any(
             _record_mentions_proposal(
-                record, consumed.entity, consumed.proposal_id, rules
+                record, consumed.entity, consumed.proposal_id, rules, commit_rules
             )
             for record in records
         )
@@ -1306,8 +1360,9 @@ def audit_dirty(
 ) -> Audit:
     vault = Path(vault).resolve()
     result = Audit()
+    commit_rules = _commit_relative_rules(vault, records)
     sanctioned, blocked_pending, unclaimed = _sanctioned_consumed_paths(
-        before, after, rules, vault, records
+        before, after, rules, vault, records, commit_rules
     )
     for relative in sorted(set(before) | set(after)):
         if relative in sanctioned:
