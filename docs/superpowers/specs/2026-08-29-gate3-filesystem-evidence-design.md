@@ -1,6 +1,8 @@
 # Gate 3 Filesystem Evidence Boundary
 
-**Status:** REVISION 4 — AWAITING APPROVAL. Revision 3 extends verified
+**Status:** REVISION 4 — APPROVED by the product owner on 2026-08-29 at
+design commit `f8003a500881a9bb612a6c18999590b6be17ead4`. Implementation of
+its two changes is planned as Tasks 11 and 12. Revision 3 extends verified
 rename-topology inheritance from directories to every included non-regular
 kind, replacing the blanket rule that made a sanctioned rename produce false
 violations, and consolidates rename evidence into one immutable per-record
