@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from typing import Literal, TypeAlias
 
 import yaml
 
@@ -48,8 +49,32 @@ from app.scope import CrossScopeError, Scope
 from app.vault import DestinationRegistryError, Vault
 
 
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 4
 _OID = re.compile(r"^[0-9a-f]{40,64}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_FILESYSTEM_KINDS = frozenset(
+    {
+        "directory",
+        "symlink",
+        "fifo",
+        "socket",
+        "char-device",
+        "block-device",
+        "other",
+    }
+)
+
+FilesystemKind: TypeAlias = Literal[
+    "directory",
+    "symlink",
+    "fifo",
+    "socket",
+    "char-device",
+    "block-device",
+    "other",
+]
+ChangeKind: TypeAlias = Literal["added", "removed", "changed"]
+Disposition: TypeAlias = Literal["sanctioned", "violating"]
 _REGISTRY_MESSAGE = re.compile(
     r"^registry: (add|edit|delete) (workspace|product|member)(?: .*)?$"
 )
@@ -118,6 +143,68 @@ class DirtyFingerprint:
     kind: str
     mode: int | None
     digest: str | None
+
+
+@dataclass(frozen=True)
+class GitDirtyInputs:
+    """The two raw Git reads every dirty fingerprint derives from."""
+
+    statuses: dict[str, str]
+    index_entries: dict[str, tuple[str, ...]]
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, GitDirtyInputs):
+            return NotImplemented
+        return (
+            self.statuses == other.statuses
+            and self.index_entries == other.index_entries
+        )
+
+
+@dataclass(frozen=True)
+class FilesystemFingerprint:
+    """Metadata-only evidence for one non-regular entry or real directory.
+
+    Content never appears here. `identity_digest` detects replacement by a
+    different object of the same apparent kind, and `target_digest` records a
+    symlink's raw text without ever resolving it.
+    """
+
+    kind: FilesystemKind
+    mode: int
+    identity_digest: str
+    target_digest: str | None
+
+
+@dataclass(frozen=True)
+class Gate3Evidence:
+    dirty: dict[str, DirtyFingerprint]
+    filesystem: dict[str, FilesystemFingerprint]
+
+
+@dataclass(frozen=True)
+class Gate3Snapshot:
+    head: str
+    evidence: Gate3Evidence
+
+
+@dataclass(frozen=True)
+class FilesystemChange:
+    path: str
+    kind: ChangeKind
+    before: FilesystemFingerprint | None
+    after: FilesystemFingerprint | None
+
+
+@dataclass(frozen=True)
+class ClassifiedPathChange:
+    path: str
+    kind: ChangeKind
+    disposition: Disposition
+
+
+class FilesystemEvidenceError(ValueError):
+    """Gate 3 could not obtain one coherent filesystem observation."""
 
 
 @dataclass(frozen=True)
@@ -1406,19 +1493,98 @@ def _snapshot_path(vault: Path) -> Path:
     return path
 
 
-def _snapshot_payload(vault: Path) -> dict:
+def _snapshot_payload(vault: Path) -> dict[str, object]:
     dirty = collect_dirty_fingerprints(vault)
     return {
         "version": SNAPSHOT_VERSION,
         "head": _git_text(vault, "rev-parse", "HEAD").strip(),
-        "dirty": {path: asdict(fingerprint) for path, fingerprint in dirty.items()},
+        "dirty": {
+            path: asdict(fingerprint)
+            for path, fingerprint in sorted(dirty.items())
+        },
+        "filesystem": {},
     }
 
 
-def _load_snapshot(path: Path) -> tuple[str, dict[str, DirtyFingerprint]]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("version") != SNAPSHOT_VERSION:
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """`json.loads` keeps the last repeated key and drops the rest silently.
+
+    A second value for one snapshot path would overwrite the evidence the
+    snapshot recorded, so the repetition is refused before it can collapse.
+    """
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError("Gate 3 snapshot has a duplicate key")
+        seen[key] = value
+    return seen
+
+
+def _load_filesystem_fingerprint(value: object) -> FilesystemFingerprint:
+    """Parse one closed supplemental entry, rejecting every other shape."""
+    expected = {"kind", "mode", "identity_digest", "target_digest"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("Gate 3 snapshot filesystem fingerprint is malformed")
+    kind = value["kind"]
+    mode = value["mode"]
+    identity_digest = value["identity_digest"]
+    target_digest = value["target_digest"]
+    if kind not in _FILESYSTEM_KINDS:
+        raise ValueError("Gate 3 snapshot filesystem kind is malformed")
+    # `bool` is an `int` subclass, so `mode: true` would otherwise pass.
+    if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0:
+        raise ValueError("Gate 3 snapshot filesystem mode is malformed")
+    if (
+        not isinstance(identity_digest, str)
+        or _SHA256_HEX.fullmatch(identity_digest) is None
+    ):
+        raise ValueError("Gate 3 snapshot filesystem digest is malformed")
+    if kind == "symlink":
+        if (
+            not isinstance(target_digest, str)
+            or _SHA256_HEX.fullmatch(target_digest) is None
+        ):
+            raise ValueError("Gate 3 snapshot filesystem digest is malformed")
+    elif target_digest is not None:
+        raise ValueError("Gate 3 snapshot filesystem digest is malformed")
+    return FilesystemFingerprint(
+        kind=kind,
+        mode=mode,
+        identity_digest=identity_digest,
+        target_digest=target_digest,
+    )
+
+
+def _load_filesystem_map(raw: object) -> dict[str, FilesystemFingerprint]:
+    if not isinstance(raw, dict):
+        raise ValueError("Gate 3 snapshot filesystem map is malformed")
+    fingerprints: dict[str, FilesystemFingerprint] = {}
+    for relative, value in raw.items():
+        if not isinstance(relative, str) or _path_parts(relative) is None:
+            raise ValueError("Gate 3 snapshot filesystem path is malformed")
+        try:
+            relative.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "Gate 3 snapshot filesystem path is malformed"
+            ) from exc
+        fingerprints[relative] = _load_filesystem_fingerprint(value)
+    return fingerprints
+
+
+def _load_snapshot(path: Path) -> Gate3Snapshot:
+    raw = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(raw, dict):
+        raise ValueError("Gate 3 snapshot is malformed")
+    # Version first: an operator holding an older snapshot needs the
+    # actionable reason, not a generic shape complaint about the map that
+    # version never had.
+    if raw.get("version") != SNAPSHOT_VERSION:
         raise ValueError("Gate 3 snapshot version is unsupported")
+    if set(raw) != {"version", "head", "dirty", "filesystem"}:
+        raise ValueError("Gate 3 snapshot is malformed")
     head = raw.get("head")
     dirty = raw.get("dirty")
     if not isinstance(head, str) or _OID.fullmatch(head) is None:
@@ -1457,7 +1623,13 @@ def _load_snapshot(path: Path) -> tuple[str, dict[str, DirtyFingerprint]]:
         ):
             raise ValueError("Gate 3 snapshot fingerprint types are malformed")
         fingerprints[relative] = fingerprint
-    return head, fingerprints
+    return Gate3Snapshot(
+        head=head,
+        evidence=Gate3Evidence(
+            dirty=fingerprints,
+            filesystem=_load_filesystem_map(raw.get("filesystem")),
+        ),
+    )
 
 
 def cmd_snapshot() -> int:
@@ -1477,7 +1649,9 @@ def cmd_snapshot() -> int:
 def cmd_check() -> int:
     vault = _vault()
     snapshot_path = _snapshot_path(vault)
-    head, before = _load_snapshot(snapshot_path)
+    snapshot = _load_snapshot(snapshot_path)
+    head = snapshot.head
+    before = snapshot.evidence.dirty
     audit_head = _head_oid(vault)
     rules = AuditRules.load(vault)
     _validate_receipt_stores(vault, rules)

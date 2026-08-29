@@ -1640,7 +1640,7 @@ def test_commit_collection_uses_no_renames_and_preserves_spaces(tmp_path: Path):
     }
 
 
-def test_cli_snapshot_writes_version_three_fingerprints_outside_vault(
+def test_cli_snapshot_writes_version_four_evidence_outside_vault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     vault = _audit_vault(tmp_path / "vault", initialize_git=True)
@@ -1654,13 +1654,156 @@ def test_cli_snapshot_writes_version_three_fingerprints_outside_vault(
 
     data = json.loads(snapshot.read_text(encoding="utf-8"))
     fingerprint = data["dirty"][relative]
-    assert data["version"] == 3
+    assert set(data) == {"version", "head", "dirty", "filesystem"}
+    assert data["version"] == 4
+    assert data["filesystem"] == {}
     assert data["head"] == _git(vault, "rev-parse", "HEAD").strip()
     assert fingerprint["status"] == "??"
     assert fingerprint["index_entries"] == []
     assert fingerprint["kind"] == "file"
     assert fingerprint["mode"] == 0o644
     assert fingerprint["digest"] == hashlib.sha256(b"baseline bytes\n").hexdigest()
+
+
+def _version_three_snapshot(head: str) -> dict:
+    return {
+        "version": 3,
+        "head": head,
+        "dirty": {
+            "synthetic/11-library/active/note.md": {
+                "status": "??",
+                "index_entries": [],
+                "kind": "file",
+                "mode": 0o644,
+                "digest": "0" * 64,
+            }
+        },
+    }
+
+
+def test_load_snapshot_rejects_version_three_without_upgrade(tmp_path: Path):
+    """A version 3 snapshot has no initial filesystem evidence.
+
+    Silently upgrading it would read a missing supplemental map as a clean
+    baseline, so every pre-existing special entry would look like a session
+    addition and every genuine one would be invisible. The operator must take
+    a fresh snapshot instead.
+    """
+    snapshot = tmp_path / "gate3.json"
+    snapshot.write_text(
+        json.dumps(_version_three_snapshot("a" * 40)), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="Gate 3 snapshot version is unsupported"):
+        gate3._load_snapshot(snapshot)
+
+
+def _version_four_snapshot(**filesystem: dict) -> dict:
+    return {
+        "version": 4,
+        "head": "a" * 40,
+        "dirty": {},
+        "filesystem": dict(filesystem),
+    }
+
+
+_VALID_FS_ENTRY = {
+    "kind": "fifo",
+    "mode": 0o600,
+    "identity_digest": "1" * 64,
+    "target_digest": None,
+}
+
+
+def _fs_entry(**overrides) -> dict:
+    entry = dict(_VALID_FS_ENTRY)
+    entry.update(overrides)
+    return entry
+
+
+_MALFORMED_FILESYSTEM_CASES = {
+    "missing-kind": lambda: _version_four_snapshot(
+        **{"a/b": {k: v for k, v in _VALID_FS_ENTRY.items() if k != "kind"}}
+    ),
+    "extra-field": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(unexpected=1)}
+    ),
+    "unknown-kind": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(kind="regular")}
+    ),
+    "negative-mode": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(mode=-1)}
+    ),
+    "boolean-mode": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(mode=True)}
+    ),
+    "uppercase-digest": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(identity_digest="A" * 64)}
+    ),
+    "short-digest": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(identity_digest="1" * 63)}
+    ),
+    "target-on-non-symlink": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(target_digest="2" * 64)}
+    ),
+    "no-target-on-symlink": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(kind="symlink", target_digest=None)}
+    ),
+    "absolute-path": lambda: _version_four_snapshot(**{"/a/b": _fs_entry()}),
+    "empty-component": lambda: _version_four_snapshot(**{"a//b": _fs_entry()}),
+    "dot-component": lambda: _version_four_snapshot(**{"a/./b": _fs_entry()}),
+    "parent-component": lambda: _version_four_snapshot(**{"a/../b": _fs_entry()}),
+    "nul-path": lambda: _version_four_snapshot(**{"a\x00b": _fs_entry()}),
+    "surrogate-path": lambda: _version_four_snapshot(**{"a\udcffb": _fs_entry()}),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_MALFORMED_FILESYSTEM_CASES))
+def test_load_snapshot_rejects_malformed_filesystem_fingerprint(
+    tmp_path: Path, case: str
+):
+    """Every closed-shape violation is a controlled, value-free refusal."""
+    snapshot = tmp_path / "gate3.json"
+    snapshot.write_text(
+        json.dumps(_MALFORMED_FILESYSTEM_CASES[case]()), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError) as raised:
+        gate3._load_snapshot(snapshot)
+    message = str(raised.value)
+    assert message.startswith("Gate 3 snapshot")
+    # The refusal must come from the closed shape, never from the version
+    # check: a loader that rejected every version 4 payload would pass this
+    # test while validating nothing.
+    assert "version is unsupported" not in message
+    assert "a/b" not in message
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        '{"version": 4, "version": 4, "head": "%s", "dirty": {}, '
+        '"filesystem": {}}' % ("a" * 40),
+        '{"version": 4, "head": "%s", "dirty": {}, "filesystem": '
+        '{"a/b": {"kind": "fifo", "mode": 384, "identity_digest": "%s", '
+        '"target_digest": null}, "a/b": {"kind": "fifo", "mode": 384, '
+        '"identity_digest": "%s", "target_digest": null}}}'
+        % ("a" * 40, "1" * 64, "1" * 64),
+    ),
+    ids=("duplicate-top-level-key", "duplicate-filesystem-path"),
+)
+def test_load_snapshot_rejects_duplicate_object_keys(tmp_path: Path, raw: str):
+    """A repeated key must be refused before Python collapses it.
+
+    `json.loads` keeps the last value silently, so a second `filesystem`
+    entry for one path could overwrite the evidence the snapshot recorded.
+    """
+    snapshot = tmp_path / "gate3.json"
+    snapshot.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        gate3._load_snapshot(snapshot)
+    assert "version is unsupported" not in str(raised.value)
 
 
 def test_cli_refuses_to_store_the_snapshot_inside_the_vault(
