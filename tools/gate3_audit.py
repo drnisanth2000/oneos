@@ -1215,6 +1215,10 @@ def _net_commit_path_changes(
         audit_head,
     )
     fields = [field for field in raw.split(b"\0") if field]
+    if len(fields) % 2:
+        # `_parse_name_status` raises on the same condition; silently
+        # dropping the tail would drop a path that could carry a sanction.
+        raise ValueError("Gate 3 name-status output is malformed")
     pairs: list[tuple[str, str]] = []
     index = 0
     while index + 1 < len(fields):
@@ -1329,18 +1333,30 @@ def audit_filesystem(
     for one, and a non-regular lookalike can never reach the S7 record path.
     """
     result = Audit()
-    for change in compare_filesystem_evidence(before, after):
+    changes = compare_filesystem_evidence(before, after)
+    directory_changes: list[FilesystemChange] = []
+    # Two passes. A non-directory delta is itself a classified descendant, so
+    # it must be known before any ancestor is judged: creating `x/p`
+    # necessarily creates `x`, and reporting both would turn one event into
+    # two findings.
+    candidates: list[ClassifiedPathChange] = list(classified_paths)
+    for change in changes:
         directory_presence = (
             change.kind in {"added", "removed"}
             and (change.before or change.after).kind == "directory"
             and (change.before is None or change.after is None)
         )
-        if not directory_presence:
-            result.violating_writes.append(change.path)
+        if directory_presence:
+            directory_changes.append(change)
             continue
+        result.violating_writes.append(change.path)
+        candidates.append(
+            ClassifiedPathChange(change.path, change.kind, "violating")
+        )
+    for change in directory_changes:
         relevant = [
             candidate
-            for candidate in classified_paths
+            for candidate in candidates
             if candidate.path.startswith(change.path + "/")
             and candidate.kind == change.kind
         ]
@@ -2024,7 +2040,14 @@ def _load_filesystem_fingerprint(value: object) -> FilesystemFingerprint:
     if kind not in _FILESYSTEM_KINDS:
         raise ValueError("Gate 3 snapshot filesystem kind is malformed")
     # `bool` is an `int` subclass, so `mode: true` would otherwise pass.
-    if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0:
+    # The upper bound keeps the shape genuinely closed: these are permission
+    # bits, never a whole st_mode.
+    if (
+        isinstance(mode, bool)
+        or not isinstance(mode, int)
+        or mode < 0
+        or mode > 0o7777
+    ):
         raise ValueError("Gate 3 snapshot filesystem mode is malformed")
     if (
         not isinstance(identity_digest, str)
@@ -2203,8 +2226,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except (
         # An unreadable entity manifest is a `RuntimeError`, so naming it is
-        # the only way this boundary reports it. The store sweep reaches
-        # `EntityCatalog.load` from `snapshot` as well as `check`.
+        # the only way this boundary reports it. `check` reaches
+        # `EntityCatalog.load` through `AuditRules.load`.
         EntityManifestError,
         json.JSONDecodeError,
         KeyError,

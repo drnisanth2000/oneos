@@ -1675,17 +1675,25 @@ def _open_dir(path: Path) -> int:
 
 
 def _make_socket(path: Path) -> bool:
-    """Bind a UNIX socket where the host safely supports it."""
+    """Bind a UNIX socket where the host safely supports it.
+
+    Binds relative to the parent directory: `sun_path` is 104 bytes on
+    macOS, and a pytest `tmp_path` alone exceeds that. Passing the absolute
+    path made every socket case skip on a host that supports sockets fine.
+    """
     try:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     except (AttributeError, OSError):
         return False
+    previous = os.getcwd()
     try:
-        server.bind(os.fspath(path))
+        os.chdir(path.parent)
+        server.bind(path.name)
     except OSError:
-        server.close()
         return False
-    server.close()
+    finally:
+        os.chdir(previous)
+        server.close()
     return True
 
 
@@ -1784,6 +1792,30 @@ def test_git_administrative_directory_is_derived_and_not_traversed(
     evidence = gate3.collect_filesystem_fingerprints(vault)
 
     assert not any(path.startswith(".git/") for path in evidence)
+
+
+def test_separate_git_directory_is_excluded_by_derivation_not_by_name(
+    tmp_path: Path,
+):
+    """A hardcoded `.git` would walk a separate administrative directory.
+
+    Asserting only that `.git/` is skipped cannot distinguish derivation
+    from a guessed literal, so the store is placed under a different name.
+    """
+    root = tmp_path / "vault"
+    root.mkdir()
+    store = root / "gitstore"
+    subprocess.run(
+        ["git", "init", "-q", f"--separate-git-dir={store}"],
+        cwd=root,
+        check=True,
+    )
+    os.mkfifo(store / "pipe", 0o600)
+
+    evidence = gate3.collect_filesystem_fingerprints(root)
+
+    assert evidence["gitstore"].kind == "directory"
+    assert not any(path.startswith("gitstore/") for path in evidence)
 
 
 def test_undecodable_entry_name_fails_closed(tmp_path: Path):
@@ -2031,7 +2063,18 @@ def test_cli_sanctioned_commit_still_passes_with_filesystem_evidence(
     assert gate3.main(["check"]) == 0
 
 
-_CLI_ERROR_INJECTIONS = ("list", "open", "stat", "identity", "readlink", "relist")
+_CLI_ERROR_INJECTIONS = (
+    "list",
+    "open",
+    "stat",
+    "identity",
+    "root-stat",
+    "fingerprint",
+    # Minor review finding: the design names "failure to close or otherwise
+    # complete a descriptor-owned operation" as a controlled failure, and
+    # nothing exercised it.
+    "close",
+)
 
 
 @pytest.mark.parametrize("command", ("snapshot", "check"))
@@ -2059,8 +2102,9 @@ def test_cli_controlled_error_never_leaks_a_path(
         "open": "_open_directory",
         "stat": "_stat_entry",
         "identity": "_fstat_descriptor",
-        "readlink": "_stat_entry_absolute",
-        "relist": "_filesystem_fingerprint",
+        "root-stat": "_stat_entry_absolute",
+        "fingerprint": "_filesystem_fingerprint",
+        "close": "_close_directory",
     }
     monkeypatch.setattr(gate3, targets[injection], explode)
 
@@ -2350,6 +2394,34 @@ def test_directory_to_symlink_replacement_violates_as_a_changed_path(
     )
 
     assert audit.violating_writes == ["synthetic/d"]
+
+
+def test_directory_is_not_reported_beside_its_own_nonregular_descendant(
+    tmp_path: Path,
+):
+    """One unsanctioned event must produce one finding, not two.
+
+    Creating `x/p` necessarily creates `x`. Reporting both inflates the
+    violation count and obscures which write actually happened, so the
+    ancestor is suppressed as a duplicate exactly as it is for a violating
+    descendant from commit or dirty evidence.
+    """
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _audit_fs(
+        {},
+        {
+            "synthetic/x": _dir_fp(),
+            "synthetic/x/p": gate3.FilesystemFingerprint(
+                "fifo", 0o600, "9" * 64, None
+            ),
+        },
+        rules,
+    )
+
+    assert audit.violating_writes == ["synthetic/x/p"]
+    assert audit.sanctioned_writes == []
 
 
 def test_exact_canonical_quarantine_directory_addition_is_sanctioned(
@@ -2901,6 +2973,9 @@ _MALFORMED_FILESYSTEM_CASES = {
     "boolean-mode": lambda: _version_four_snapshot(
         **{"a/b": _fs_entry(mode=True)}
     ),
+    "out-of-range-mode": lambda: _version_four_snapshot(
+        **{"a/b": _fs_entry(mode=0o10000)}
+    ),
     "uppercase-digest": lambda: _version_four_snapshot(
         **{"a/b": _fs_entry(identity_digest="A" * 64)}
     ),
@@ -2982,7 +3057,7 @@ def test_cli_refuses_to_store_the_snapshot_inside_the_vault(
     assert snapshot.exists() is False
 
 
-def test_cli_snapshot_reports_a_missing_entity_manifest_as_a_controlled_error(
+def test_cli_check_reports_a_missing_entity_manifest_as_a_controlled_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ):
     """`check` must fail through the command boundary, not a traceback.
