@@ -494,6 +494,92 @@ _UNCLASSIFIABLE = "Gate 3 filesystem entry is unclassifiable"
 _TRAVERSAL_FAILED = "Gate 3 filesystem traversal failed"
 
 
+#: Generic convention names. None of these is an instance value: they are
+#: the same public constants the conventions and the S7 design already name.
+_SENSITIVE_DIRECTORY_NAME = ".sensitive"
+_ROOT_SCRATCH_DIRECTORY_NAME = "_scratch"
+_ROOT_CACHE_DIRECTORY_NAME = ".obsidian"
+_OUTBOX_DIRECTORY_NAME = "outbox"
+_QUARANTINE_DIRECTORY_NAME = ".consumed"
+
+
+@dataclass(frozen=True)
+class FilesystemExclusions:
+    exact_directories: frozenset[tuple[str, ...]]
+    directory_names: frozenset[str]
+
+
+def _filesystem_exclusions(vault: Path) -> FilesystemExclusions:
+    """The authoritative traversal exclusions, none from a registry value.
+
+    The administrative directory is resolved from Git rather than assumed to
+    be a literal name, because a worktree or a redirected `.git` file would
+    otherwise be walked as ordinary content.
+    """
+    exact: set[tuple[str, ...]] = {
+        (_ROOT_SCRATCH_DIRECTORY_NAME,),
+        (_ROOT_CACHE_DIRECTORY_NAME,),
+    }
+    try:
+        git_dir = Path(
+            _git_text(vault, "rev-parse", "--absolute-git-dir").strip()
+        ).resolve()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+    relative = _relative_to(git_dir, Path(vault).resolve())
+    if relative is not None and relative.parts:
+        exact.add(relative.parts)
+    return FilesystemExclusions(
+        exact_directories=frozenset(exact),
+        directory_names=frozenset({_SENSITIVE_DIRECTORY_NAME}),
+    )
+
+
+def _open_directory(
+    path: str | Path, *, parent_descriptor: int | None = None
+) -> int:
+    """Open a directory without ever following a symlink into it."""
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if directory_flag is None or no_follow is None:
+        # Weakening the walk would silently reintroduce the blind spot this
+        # traversal exists to close.
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+    flags = os.O_RDONLY | directory_flag | no_follow
+    try:
+        if parent_descriptor is None:
+            return os.open(path, flags)
+        return os.open(path, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _close_directory(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _list_directory(descriptor: int) -> tuple[str, ...]:
+    """List one directory in raw-byte order, refusing unusable names."""
+    try:
+        names = os.listdir(descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+    for name in names:
+        # A surrogate escape means the name did not decode. Recording it
+        # would put an unrepresentable key into the snapshot; skipping it
+        # would drop real evidence. Both are wrong, so the walk fails.
+        if _is_surrogate(name) or name in {"", ".", ".."} or "/" in name:
+            raise FilesystemEvidenceError(_UNCLASSIFIABLE)
+    return tuple(sorted(names, key=os.fsencode))
+
+
+def _is_surrogate(name: str) -> bool:
+    return any("\ud800" <= character <= "\udfff" for character in name)
+
+
 def _filesystem_kind(mode: int) -> FilesystemKind:
     """Map one no-follow mode to exactly one supplemental kind.
 
@@ -570,6 +656,133 @@ def _filesystem_fingerprint(
         identity_digest=_filesystem_identity_digest(kind, metadata),
         target_digest=target_digest,
     )
+
+
+def _identity_fields(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    """The fields every consistency comparison uses, and nothing else."""
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+    )
+
+
+def _stat_entry(parent_descriptor: int, name: str) -> os.stat_result:
+    try:
+        return os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _fstat_descriptor(descriptor: int) -> os.stat_result:
+    try:
+        return os.fstat(descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def collect_filesystem_fingerprints(
+    vault: Path,
+) -> dict[str, FilesystemFingerprint]:
+    """Every real directory and non-regular entry inside the boundary.
+
+    Depth-first and descriptor-relative, so no path is ever re-resolved from
+    text and no symlink is ever followed. Regular files are omitted: they
+    remain governed by the existing Git-derived evidence.
+    """
+    root = Path(vault).resolve()
+    exclusions = _filesystem_exclusions(root)
+    evidence: dict[str, FilesystemFingerprint] = {}
+    root_metadata = _stat_entry_absolute(root)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+    descriptor = _open_directory(root)
+    try:
+        if _identity_fields(_fstat_descriptor(descriptor)) != _identity_fields(
+            root_metadata
+        ):
+            raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+        _walk_directory(descriptor, (), evidence, exclusions, root_metadata)
+    finally:
+        _close_directory(descriptor)
+    return {path: evidence[path] for path in sorted(evidence, key=os.fsencode)}
+
+
+def _stat_entry_absolute(path: Path) -> os.stat_result:
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _walk_directory(
+    descriptor: int,
+    prefix: tuple[str, ...],
+    evidence: dict[str, FilesystemFingerprint],
+    exclusions: FilesystemExclusions,
+    own_metadata: os.stat_result,
+) -> None:
+    names = _list_directory(descriptor)
+    for name in names:
+        parts = prefix + (name,)
+        relative = "/".join(parts)
+        if _path_parts(relative) is None:
+            raise FilesystemEvidenceError(_UNCLASSIFIABLE)
+        metadata = _stat_entry(descriptor, name)
+        if stat.S_ISREG(metadata.st_mode):
+            # Regular files stay under Git's rules; recording one here would
+            # create a second, partly-overlapping regular-file scanner.
+            continue
+        fingerprint = _filesystem_fingerprint(descriptor, name, metadata)
+        evidence[relative] = fingerprint
+        if fingerprint.kind != "directory":
+            # Re-observe after recording. Without this, an object swapped
+            # between the stat and the fingerprint would be serialised under
+            # the identity of the one that is already gone.
+            if _identity_fields(
+                _stat_entry(descriptor, name)
+            ) != _identity_fields(metadata):
+                raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+            continue
+        # An exclusion applies only to a real directory: a symlink or
+        # special object wearing the name is recorded above and never
+        # descended into.
+        if (
+            parts in exclusions.exact_directories
+            or name in exclusions.directory_names
+        ):
+            continue
+        child = _open_directory(name, parent_descriptor=descriptor)
+        try:
+            if _identity_fields(_fstat_descriptor(child)) != _identity_fields(
+                metadata
+            ):
+                raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+            _walk_directory(child, parts, evidence, exclusions, metadata)
+        finally:
+            # Closed on the way out of this child, before the next sibling
+            # opens, so peak descriptor use is bounded by depth.
+            _close_directory(child)
+        if _identity_fields(_stat_entry(descriptor, name)) != _identity_fields(
+            metadata
+        ):
+            raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+
+    # The directory must still be the one whose children were just recorded,
+    # and must still hold exactly those children. Timestamps are compared
+    # here only: they are deliberately absent from the persisted fingerprint,
+    # where ordinary descendant activity would turn every valid tracked write
+    # into a parent-directory violation.
+    if _list_directory(descriptor) != names:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+    final = _fstat_descriptor(descriptor)
+    if (
+        _identity_fields(final) != _identity_fields(own_metadata)
+        or final.st_mtime_ns != own_metadata.st_mtime_ns
+        or final.st_ctime_ns != own_metadata.st_ctime_ns
+    ):
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
 
 
 def _fingerprint_path(

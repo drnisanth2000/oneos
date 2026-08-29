@@ -1663,6 +1663,324 @@ def _make_socket(path: Path) -> bool:
     return True
 
 
+def _boundary(root: Path) -> Path:
+    """A minimal real Git working tree to walk."""
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    return root
+
+
+def test_filesystem_walk_records_real_directories_and_special_entries_in_byte_order(
+    tmp_path: Path,
+):
+    """Every real directory and non-regular entry, sorted by raw bytes."""
+    vault = _boundary(tmp_path / "vault")
+    (vault / "b").mkdir()
+    (vault / "b" / "deep").mkdir()
+    (vault / "a-empty").mkdir()
+    (vault / "regular.md").write_text("content\n")
+    (vault / "b" / "regular.md").write_text("content\n")
+    os.mkfifo(vault / "b" / "pipe", 0o600)
+    (vault / "link").symlink_to("b")
+    has_socket = _make_socket(vault / "sock")
+
+    evidence = gate3.collect_filesystem_fingerprints(vault)
+
+    assert list(evidence) == sorted(evidence, key=os.fsencode)
+    assert evidence["a-empty"].kind == "directory"
+    assert evidence["b"].kind == "directory"
+    assert evidence["b/deep"].kind == "directory"
+    assert evidence["b/pipe"].kind == "fifo"
+    assert evidence["link"].kind == "symlink"
+    assert "regular.md" not in evidence
+    assert "b/regular.md" not in evidence
+    if has_socket:
+        assert evidence["sock"].kind == "socket"
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    (".sensitive", "_scratch", ".obsidian"),
+)
+def test_filesystem_walk_excludes_only_authoritative_real_directories(
+    tmp_path: Path, excluded: str
+):
+    """The exclusion entry is evidence; its contents are not walked."""
+    vault = _boundary(tmp_path / "vault")
+    directory = vault / excluded
+    directory.mkdir()
+    os.mkfifo(directory / "pipe", 0o600)
+
+    evidence = gate3.collect_filesystem_fingerprints(vault)
+
+    assert evidence[excluded].kind == "directory"
+    assert f"{excluded}/pipe" not in evidence
+
+
+def test_exclusion_name_symlink_is_evidence_and_is_not_followed(tmp_path: Path):
+    """An exclusion name only excludes when it is a real directory.
+
+    A symlink wearing the name would otherwise skip a whole subtree from the
+    audit while pointing anywhere it liked.
+    """
+    external = tmp_path / "outside"
+    external.mkdir()
+    os.mkfifo(external / "pipe", 0o600)
+    vault = _boundary(tmp_path / "vault")
+    (vault / ".sensitive").symlink_to(external)
+
+    evidence = gate3.collect_filesystem_fingerprints(vault)
+
+    assert evidence[".sensitive"].kind == "symlink"
+    assert ".sensitive/pipe" not in evidence
+
+
+def test_directory_symlink_is_not_followed(tmp_path: Path):
+    external = tmp_path / "outside"
+    external.mkdir()
+    os.mkfifo(external / "pipe", 0o600)
+    vault = _boundary(tmp_path / "vault")
+    (vault / "link").symlink_to(external)
+
+    evidence = gate3.collect_filesystem_fingerprints(vault)
+
+    assert evidence["link"].kind == "symlink"
+    assert not any(path.startswith("link/") for path in evidence)
+
+
+def test_git_administrative_directory_is_derived_and_not_traversed(
+    tmp_path: Path,
+):
+    """The administrative directory comes from Git, not a guessed name."""
+    vault = _boundary(tmp_path / "vault")
+    os.mkfifo(vault / ".git" / "pipe", 0o600)
+
+    evidence = gate3.collect_filesystem_fingerprints(vault)
+
+    assert not any(path.startswith(".git/") for path in evidence)
+
+
+def test_undecodable_entry_name_fails_closed(tmp_path: Path):
+    """An unrepresentable name cannot be silently dropped from evidence."""
+    vault = _boundary(tmp_path / "vault")
+    raw = os.path.join(os.fsencode(vault), b"bad\xff\xfename")
+    try:
+        os.mkdir(raw)
+    except OSError:
+        pytest.skip("filesystem rejects undecodable names")
+
+    with pytest.raises(gate3.FilesystemEvidenceError):
+        gate3.collect_filesystem_fingerprints(vault)
+
+
+def test_filesystem_walk_closes_siblings_during_depth_first_unwind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Descriptor lifetime is bounded by depth, not by directories visited.
+
+    Holding one descriptor per visited directory would exhaust the process
+    limit on a real vault, so the first sibling subtree must be fully closed
+    before the second one opens.
+    """
+    vault = _boundary(tmp_path / "vault")
+    for sibling in ("one", "two"):
+        (vault / sibling / "mid" / "leaf").mkdir(parents=True)
+
+    events: list[tuple[str, int]] = []
+    active: set[int] = set()
+    peak = 0
+    real_open = gate3._open_directory
+    real_close = gate3._close_directory
+
+    def spy_open(path, *, parent_descriptor=None):
+        nonlocal peak
+        descriptor = real_open(path, parent_descriptor=parent_descriptor)
+        events.append(("open", descriptor))
+        active.add(descriptor)
+        peak = max(peak, len(active))
+        return descriptor
+
+    def spy_close(descriptor):
+        events.append(("close", descriptor))
+        active.discard(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(gate3, "_open_directory", spy_open)
+    monkeypatch.setattr(gate3, "_close_directory", spy_close)
+
+    evidence = gate3.collect_filesystem_fingerprints(vault)
+
+    assert evidence["one/mid/leaf"].kind == "directory"
+    assert active == set(), "every descriptor must be closed"
+    opens = [index for index, (event, _) in enumerate(events) if event == "open"]
+    assert len(opens) == 7, "root plus six directories"
+    # root + maximum depth (sibling, mid, leaf)
+    assert peak <= 4
+
+
+def _race_vault(root: Path) -> Path:
+    vault = _boundary(root)
+    (vault / "d").mkdir()
+    os.mkfifo(vault / "d" / "p", 0o600)
+    (vault / "d" / "l").symlink_to("p")
+    return vault
+
+
+def _replace_fifo(path: Path) -> None:
+    path.unlink()
+    os.mkfifo(path, 0o600)
+
+
+@pytest.mark.parametrize(
+    "injection",
+    (
+        "after-initial-list",
+        "pre-stat",
+        "child-open",
+        "child-fstat",
+        "readlink",
+        "post-stat",
+        "relist",
+    ),
+)
+def test_filesystem_walk_fails_closed_on_observed_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, injection: str
+):
+    """Any observed change during the walk voids the whole observation.
+
+    A partially-consistent walk is worse than none: it would serialise
+    evidence that never existed at one instant, and the endpoint comparison
+    would then blame or excuse the wrong path.
+    """
+    vault = _race_vault(tmp_path / "vault")
+    directory = vault / "d"
+
+    if injection == "after-initial-list":
+        real_list = gate3._list_directory
+        state = {"done": False}
+
+        def listing(descriptor):
+            names = real_list(descriptor)
+            if not state["done"] and "d" in names:
+                state["done"] = True
+                (directory / "p").unlink()
+                (directory / "l").unlink()
+                directory.rmdir()
+            return names
+
+        monkeypatch.setattr(gate3, "_list_directory", listing)
+    elif injection == "pre-stat":
+        real_stat = gate3._stat_entry
+
+        def stat_entry(descriptor, name):
+            if name == "p" and (directory / "p").exists():
+                (directory / "p").unlink()
+            return real_stat(descriptor, name)
+
+        monkeypatch.setattr(gate3, "_stat_entry", stat_entry)
+    elif injection == "child-open":
+        real_open = gate3._open_directory
+
+        def opener(path, *, parent_descriptor=None):
+            if path == "d":
+                (directory / "p").unlink()
+                (directory / "l").unlink()
+                directory.rmdir()
+                os.mkfifo(vault / "d", 0o600)
+            return real_open(path, parent_descriptor=parent_descriptor)
+
+        monkeypatch.setattr(gate3, "_open_directory", opener)
+    elif injection == "child-fstat":
+        real_fstat = gate3._fstat_descriptor
+        state = {"calls": 0}
+
+        def fstat(descriptor):
+            state["calls"] += 1
+            result = real_fstat(descriptor)
+            if state["calls"] == 2:
+                return os.stat(tmp_path, follow_symlinks=False)
+            return result
+
+        monkeypatch.setattr(gate3, "_fstat_descriptor", fstat)
+    elif injection == "readlink":
+        def readlink(name, *, dir_fd=None):
+            raise OSError("link vanished")
+
+        monkeypatch.setattr(gate3.os, "readlink", readlink)
+    elif injection == "post-stat":
+        real_fingerprint = gate3._filesystem_fingerprint
+
+        def fingerprint(parent_descriptor, name, metadata):
+            result = real_fingerprint(parent_descriptor, name, metadata)
+            if name == "p":
+                _replace_fifo(directory / "p")
+            return result
+
+        monkeypatch.setattr(gate3, "_filesystem_fingerprint", fingerprint)
+    else:
+        real_list = gate3._list_directory
+        state = {"seen": 0}
+
+        def listing(descriptor):
+            names = real_list(descriptor)
+            if "p" in names:
+                state["seen"] += 1
+                if state["seen"] == 1:
+                    os.mkfifo(directory / "late", 0o600)
+            return names
+
+        monkeypatch.setattr(gate3, "_list_directory", listing)
+
+    with pytest.raises(gate3.FilesystemEvidenceError) as raised:
+        gate3.collect_filesystem_fingerprints(vault)
+    assert os.fspath(vault) not in str(raised.value)
+    assert str(raised.value) in {
+        "Gate 3 filesystem traversal failed",
+        "Gate 3 filesystem entry is unclassifiable",
+    }
+
+
+def test_filesystem_walk_closes_all_descriptors_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failure mid-walk must not leak the ancestor descriptors it holds."""
+    vault = _boundary(tmp_path / "vault")
+    (vault / "a" / "b" / "c").mkdir(parents=True)
+
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open = gate3._open_directory
+    real_close = gate3._close_directory
+    real_list = gate3._list_directory
+
+    def spy_open(path, *, parent_descriptor=None):
+        descriptor = real_open(path, parent_descriptor=parent_descriptor)
+        opened.append(descriptor)
+        return descriptor
+
+    def spy_close(descriptor):
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    def failing_list(descriptor):
+        names = real_list(descriptor)
+        if "c" in names:
+            raise gate3.FilesystemEvidenceError(
+                "Gate 3 filesystem traversal failed"
+            )
+        return names
+
+    monkeypatch.setattr(gate3, "_open_directory", spy_open)
+    monkeypatch.setattr(gate3, "_close_directory", spy_close)
+    monkeypatch.setattr(gate3, "_list_directory", failing_list)
+
+    with pytest.raises(gate3.FilesystemEvidenceError):
+        gate3.collect_filesystem_fingerprints(vault)
+
+    assert sorted(closed) == sorted(opened)
+    assert len(closed) == len(set(closed)), "each descriptor closes exactly once"
+
+
 def test_filesystem_kind_is_closed_without_type_confusion():
     """One mode maps to exactly one kind, and regular is not evidence.
 
