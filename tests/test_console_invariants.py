@@ -1640,11 +1640,11 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         "app.outbox.preview_diff": (outbox_projection[:6], ()),
         "app.outbox.project_outbox": (outbox_projection, ()),
         "app.outbox.approve": (
-            outbox_projection[:6] + (ReviewTokenError,) + receipt_failures,
+            (*outbox_projection[:6], ReviewTokenError, *receipt_failures),
             (),
         ),
         "app.outbox.reject": (
-            outbox_projection[:6] + (ReviewTokenError,) + receipt_failures,
+            (*outbox_projection[:6], ReviewTokenError, *receipt_failures),
             (),
         ),
         "app.outbox.pending_proposal_entry_exists": (
