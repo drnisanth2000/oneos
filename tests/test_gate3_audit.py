@@ -21,8 +21,13 @@ from app.action_receipts import (
     render_action_receipt,
     validate_head_receipt_store,
 )
-from app.outbox import propose_classification
-from app.registry import propose_delete
+from app.outbox import (
+    approve,
+    get_proposal_review,
+    propose_classification,
+    reject,
+)
+from app.registry import execute_delete, get_delete_review, propose_delete
 from app.rename import AXES, apply_rename, plan_rename
 from app.scope import Scope
 from tests.conftest import git_vault, write_tree
@@ -779,6 +784,348 @@ def test_new_canonical_pending_registry_delete_proposal_is_sanctioned(tmp_path: 
 
     assert result.ok is True
     assert result.sanctioned_writes == [proposal.path.relative_to(vault).as_posix()]
+
+
+def test_sanctioned_approval_consumed_record_is_not_a_direct_write(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    proposal = _classification_proposal(vault)
+    proposal_id = proposal.stem
+    review = get_proposal_review(scope, proposal_id)
+
+    approve(scope, proposal_id, review.sha256)
+
+    records = gate3.collect_commit_records(vault, before_head)
+    after = gate3.collect_dirty_fingerprints(vault)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal_id}.yaml"
+    )
+    result = gate3.audit_dirty(
+        before,
+        after,
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert result.ok is True
+    assert result.sanctioned_writes == [consumed_relative]
+    assert result.violating_writes == []
+
+
+def test_sanctioned_reject_consumed_record_is_not_a_direct_write(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = _classification_proposal(vault)
+    proposal_id = proposal.stem
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    before = gate3.collect_dirty_fingerprints(vault)
+    review = get_proposal_review(scope, proposal_id)
+
+    reject(scope, proposal_id, review.sha256)
+
+    after = gate3.collect_dirty_fingerprints(vault)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal_id}.yaml"
+    )
+    result = gate3.audit_dirty(
+        before,
+        after,
+        gate3.AuditRules.load(vault),
+        vault,
+        records=(),
+    )
+
+    assert result.ok is True
+    assert set(result.sanctioned_writes) == {
+        proposal_relative,
+        consumed_relative,
+    }
+    assert result.violating_writes == []
+
+
+def test_sanctioned_registry_delete_consumed_record_is_not_a_direct_write(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    proposal = propose_delete(scope, "product", "unused")
+    review = get_delete_review(scope, proposal.id)
+
+    execute_delete(scope, proposal.id, review.sha256)
+
+    records = gate3.collect_commit_records(vault, before_head)
+    after = gate3.collect_dirty_fingerprints(vault)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.id}.yaml"
+    )
+    result = gate3.audit_dirty(
+        before,
+        after,
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert result.ok is True
+    assert result.sanctioned_writes == [consumed_relative]
+    assert result.violating_writes == []
+
+
+def test_reject_created_entirely_after_snapshot_remains_a_violation(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = _classification_proposal(vault)
+    review = get_proposal_review(scope, proposal.stem)
+
+    reject(scope, proposal.stem, review.sha256)
+
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.stem}.yaml"
+    )
+    result = gate3.audit_dirty(
+        {},
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=(),
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [consumed_relative]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "malformed-content",
+        "mismatched-id",
+        "symlink",
+        "non-regular",
+        "wrong-location",
+        "wrong-entity",
+        "baseline-digest-mismatch",
+    ],
+)
+def test_reject_consumed_record_requires_exact_shape_and_snapshot_correlation(
+    tmp_path: Path, mutation: str
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = _classification_proposal(vault)
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    before = gate3.collect_dirty_fingerprints(vault)
+    if mutation == "baseline-digest-mismatch":
+        proposal.write_bytes(proposal.read_bytes() + b"\n")
+    review = get_proposal_review(scope, proposal.stem)
+    reject(scope, proposal.stem, review.sha256)
+    consumed = (
+        vault
+        / "synthetic"
+        / "outbox"
+        / ".consumed"
+        / f"{proposal.stem}.yaml"
+    )
+    expected_candidate = consumed.relative_to(vault).as_posix()
+    if mutation == "malformed-content":
+        consumed.write_bytes(b"action: classify\nmodule: [unterminated\n")
+    elif mutation == "mismatched-id":
+        record = yaml.safe_load(consumed.read_bytes())
+        record["id"] = "20260824T120001-" + "cd" * 16
+        consumed.write_text(yaml.safe_dump(record, sort_keys=False))
+    elif mutation == "symlink":
+        consumed.unlink()
+        outside = tmp_path / "outside.yaml"
+        outside.write_bytes(b"outside\n")
+        os.symlink(outside, consumed)
+    elif mutation == "non-regular":
+        consumed.unlink()
+        os.mkfifo(consumed)
+    elif mutation == "wrong-location":
+        wrong = vault / "synthetic/outbox/quarantine" / consumed.name
+        wrong.parent.mkdir()
+        consumed.rename(wrong)
+        expected_candidate = wrong.relative_to(vault).as_posix()
+    elif mutation == "wrong-entity":
+        wrong = vault / "secondary/outbox/.consumed" / consumed.name
+        wrong.parent.mkdir(parents=True)
+        consumed.rename(wrong)
+        expected_candidate = wrong.relative_to(vault).as_posix()
+    elif mutation != "baseline-digest-mismatch":
+        raise AssertionError(mutation)
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=(),
+    )
+
+    assert result.sanctioned_writes == []
+    assert proposal_relative in result.violating_writes
+    assert expected_candidate in result.violating_writes
+
+
+@pytest.mark.parametrize(
+    ("action_kind", "review_sha256"),
+    [
+        ("registry deletion", None),
+        ("approval", "0" * 64),
+    ],
+)
+def test_approval_consumed_record_requires_matching_session_receipt(
+    tmp_path: Path,
+    action_kind: str,
+    review_sha256: str | None,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = _classification_proposal(vault)
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    review = get_proposal_review(scope, proposal.stem)
+    approve(scope, proposal.stem, review.sha256)
+    receipt_relative = (
+        f"synthetic/outbox/.receipts/{proposal.stem}.yaml"
+    )
+    replacement = make_action_receipt(
+        proposal.stem,
+        review.sha256 if review_sha256 is None else review_sha256,
+        action_kind,
+    )
+    (vault / receipt_relative).write_bytes(render_action_receipt(replacement))
+    _git(vault, "add", receipt_relative)
+    _git(vault, "commit", "-q", "--amend", "--no-edit")
+    records = gate3.collect_commit_records(vault, before_head)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.stem}.yaml"
+    )
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert result.sanctioned_writes == []
+    assert set(result.violating_writes) == {
+        proposal_relative,
+        consumed_relative,
+    }
+
+
+def test_approval_consumed_record_requires_session_receipt_to_exist(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = _classification_proposal(vault)
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    review = get_proposal_review(scope, proposal.stem)
+    approve(scope, proposal.stem, review.sha256)
+    receipt_relative = f"synthetic/outbox/.receipts/{proposal.stem}.yaml"
+    (vault / receipt_relative).unlink()
+    _git(vault, "add", "-u", receipt_relative)
+    _git(vault, "commit", "-q", "--amend", "--no-edit")
+    records = gate3.collect_commit_records(vault, before_head)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.stem}.yaml"
+    )
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert result.sanctioned_writes == []
+    assert set(result.violating_writes) == {
+        proposal_relative,
+        consumed_relative,
+    }
+
+
+def test_sanctioned_consumption_does_not_hide_an_unrelated_sibling_write(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    proposal = _classification_proposal(vault)
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    review = get_proposal_review(scope, proposal.stem)
+    approve(scope, proposal.stem, review.sha256)
+    records = gate3.collect_commit_records(vault, before_head)
+    unrelated = "synthetic/outbox/.consumed/unrelated.txt"
+    (vault / unrelated).write_text("unrelated\n")
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.stem}.yaml"
+    )
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert set(result.sanctioned_writes) == {
+        proposal_relative,
+        consumed_relative,
+    }
+    assert result.violating_writes == [unrelated]
+
+
+def test_sanctioned_consumption_requires_the_pending_leaf_to_remain_absent(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    scope = Scope(vault, "synthetic")
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    proposal = _classification_proposal(vault)
+    review = get_proposal_review(scope, proposal.stem)
+    approve(scope, proposal.stem, review.sha256)
+    records = gate3.collect_commit_records(vault, before_head)
+    consumed_relative = (
+        f"synthetic/outbox/.consumed/{proposal.stem}.yaml"
+    )
+    proposal.write_bytes((vault / consumed_relative).read_bytes())
+    proposal_relative = proposal.relative_to(vault).as_posix()
+
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=records,
+    )
+
+    assert result.sanctioned_writes == []
+    assert set(result.violating_writes) == {
+        proposal_relative,
+        consumed_relative,
+    }
 
 
 def test_classification_proposal_created_must_match_id_timestamp(tmp_path: Path):
