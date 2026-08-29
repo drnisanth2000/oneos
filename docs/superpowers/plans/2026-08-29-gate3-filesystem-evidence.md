@@ -2543,7 +2543,7 @@ Expected: whitespace clean; Gitleaks clean; both audits CLEAN; only
 - [ ] **Step 25: Commit the implementation checkpoint**
 
 Commit only those two files, in one sanitized commit recording the RED
-evidence, all four mutation proofs, the Step 21 result, and both counts.
+evidence, all six mutation proofs, the Step 21 result, and both counts.
 
 - [ ] **Step 26: Obtain an independent scoped review**
 
