@@ -1818,6 +1818,73 @@ def test_filesystem_walk_closes_siblings_during_depth_first_unwind(
     assert peak <= 4
 
 
+def test_gate3_evidence_brackets_the_filesystem_walk_with_equal_git_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Git is read before and after the walk, and the walk sits between.
+
+    One observation must describe one instant. Reading Git only once would
+    let the working tree change under the walk with nothing to detect it.
+    """
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    (vault / "d").mkdir()
+    calls: list[str] = []
+    inputs = gate3.GitDirtyInputs(statuses={}, index_entries={})
+    real_filesystem = gate3.collect_filesystem_fingerprints
+    real_fingerprint = gate3._fingerprint_git_dirty_inputs
+
+    def git_inputs(_vault):
+        calls.append("git-before" if not calls else "git-after")
+        return inputs
+
+    def filesystem(target):
+        calls.append("filesystem")
+        return real_filesystem(target)
+
+    def fingerprint(target, given):
+        calls.append("fingerprint")
+        return real_fingerprint(target, given)
+
+    monkeypatch.setattr(gate3, "_collect_git_dirty_inputs", git_inputs)
+    monkeypatch.setattr(gate3, "collect_filesystem_fingerprints", filesystem)
+    monkeypatch.setattr(gate3, "_fingerprint_git_dirty_inputs", fingerprint)
+
+    evidence = gate3.collect_gate3_evidence(vault)
+
+    assert calls == ["git-before", "filesystem", "fingerprint", "git-after"]
+    assert evidence.filesystem["d"].kind == "directory"
+
+
+@pytest.mark.parametrize("field", ("statuses", "index_entries"))
+def test_gate3_evidence_rejects_changed_status_or_index_across_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+):
+    """A Git change across the bracket voids the observation."""
+    vault = _boundary(tmp_path / "vault")
+    first = gate3.GitDirtyInputs(statuses={}, index_entries={})
+    if field == "statuses":
+        second = gate3.GitDirtyInputs(
+            statuses={"a.md": "??"}, index_entries={}
+        )
+    else:
+        second = gate3.GitDirtyInputs(
+            statuses={}, index_entries={"a.md": ("x",)}
+        )
+    responses = iter((first, second))
+    monkeypatch.setattr(
+        gate3, "_collect_git_dirty_inputs", lambda _vault: next(responses)
+    )
+    monkeypatch.setattr(
+        gate3, "_fingerprint_git_dirty_inputs", lambda _vault, _given: {}
+    )
+
+    with pytest.raises(gate3.FilesystemEvidenceError) as raised:
+        gate3.collect_gate3_evidence(vault)
+    assert str(raised.value) == (
+        "Gate 3 Git evidence changed during filesystem traversal"
+    )
+
+
 def _race_vault(root: Path) -> Path:
     vault = _boundary(root)
     (vault / "d").mkdir()
@@ -2082,6 +2149,8 @@ def test_cli_snapshot_writes_version_four_evidence_outside_vault(
     vault = _audit_vault(tmp_path / "vault", initialize_git=True)
     relative = "synthetic/11-library/active/path with spaces.md"
     (vault / relative).write_text("baseline bytes\n")
+    (vault / "synthetic" / "empty-dir").mkdir()
+    os.mkfifo(vault / "synthetic" / "pipe", 0o600)
     snapshot = tmp_path / "gate3.json"
     monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
     monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
@@ -2092,7 +2161,12 @@ def test_cli_snapshot_writes_version_four_evidence_outside_vault(
     fingerprint = data["dirty"][relative]
     assert set(data) == {"version", "head", "dirty", "filesystem"}
     assert data["version"] == 4
-    assert data["filesystem"] == {}
+    # A regular file is Git's business; the directory and the FIFO are the
+    # supplement's, and neither map may claim the other's evidence.
+    assert data["filesystem"]["synthetic/empty-dir"]["kind"] == "directory"
+    assert data["filesystem"]["synthetic/pipe"]["kind"] == "fifo"
+    assert relative not in data["filesystem"]
+    assert "synthetic/pipe" not in data["dirty"]
     assert data["head"] == _git(vault, "rev-parse", "HEAD").strip()
     assert fingerprint["status"] == "??"
     assert fingerprint["index_entries"] == []

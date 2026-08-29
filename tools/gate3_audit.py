@@ -877,8 +877,8 @@ def _fingerprint_path(
         os.close(parent_descriptor)
 
 
-def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
-    """Fingerprint every Git-dirty path without rename pairing or path quoting."""
+def _collect_git_dirty_inputs(vault: Path) -> GitDirtyInputs:
+    """The two raw Git reads, taken together and never mutated afterwards."""
     vault = Path(vault).resolve()
     statuses = _parse_porcelain(
         _git_bytes(
@@ -893,6 +893,15 @@ def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
     index_entries = _parse_index_entries(
         _git_bytes(vault, "ls-files", "--stage", "-z")
     )
+    return GitDirtyInputs(statuses=statuses, index_entries=index_entries)
+
+
+def _fingerprint_git_dirty_inputs(
+    vault: Path, inputs: GitDirtyInputs
+) -> dict[str, DirtyFingerprint]:
+    vault = Path(vault).resolve()
+    statuses = inputs.statuses
+    index_entries = inputs.index_entries
     _supplement_untracked_consumed_entries(vault, statuses, index_entries)
     return {
         relative: _fingerprint_path(
@@ -900,6 +909,31 @@ def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
         )
         for relative in sorted(statuses)
     }
+
+
+def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
+    """Fingerprint every Git-dirty path without rename pairing or path quoting."""
+    return _fingerprint_git_dirty_inputs(vault, _collect_git_dirty_inputs(vault))
+
+
+def collect_gate3_evidence(vault: Path) -> Gate3Evidence:
+    """One coherent observation of Git and filesystem evidence.
+
+    The filesystem walk is bracketed by two identical Git reads. One
+    observation must describe one instant: reading Git only once would let
+    the working tree change under the walk with nothing able to detect it.
+    A mismatch is never retried — a retry would just widen the window.
+    """
+    vault = Path(vault).resolve()
+    before = _collect_git_dirty_inputs(vault)
+    filesystem = collect_filesystem_fingerprints(vault)
+    dirty = _fingerprint_git_dirty_inputs(vault, before)
+    after = _collect_git_dirty_inputs(vault)
+    if after != before:
+        raise FilesystemEvidenceError(
+            "Gate 3 Git evidence changed during filesystem traversal"
+        )
+    return Gate3Evidence(dirty=dirty, filesystem=filesystem)
 
 
 def _supplement_untracked_consumed_entries(
@@ -1791,15 +1825,18 @@ def _snapshot_path(vault: Path) -> Path:
 
 
 def _snapshot_payload(vault: Path) -> dict[str, object]:
-    dirty = collect_dirty_fingerprints(vault)
+    evidence = collect_gate3_evidence(vault)
     return {
         "version": SNAPSHOT_VERSION,
         "head": _git_text(vault, "rev-parse", "HEAD").strip(),
         "dirty": {
             path: asdict(fingerprint)
-            for path, fingerprint in sorted(dirty.items())
+            for path, fingerprint in sorted(evidence.dirty.items())
         },
-        "filesystem": {},
+        "filesystem": {
+            path: asdict(fingerprint)
+            for path, fingerprint in sorted(evidence.filesystem.items())
+        },
     }
 
 
@@ -1938,7 +1975,8 @@ def cmd_snapshot() -> int:
     )
     print(
         f"snapshot: HEAD={snapshot['head'][:8]} "
-        f"dirty={len(snapshot['dirty'])} -> {snapshot_path}"
+        f"dirty={len(snapshot['dirty'])} "
+        f"filesystem={len(snapshot['filesystem'])} -> {snapshot_path}"
     )
     return 0
 
