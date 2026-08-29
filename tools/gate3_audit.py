@@ -7,8 +7,9 @@
 
 The snapshot is external to the vault.  A check accepts only the commit
 envelopes produced by the existing ingest, outbox, registry, and rename flows,
-plus genuinely new canonical pending proposal YAML.  Every initially dirty
-path must retain its exact index/worktree fingerprint for the whole session.
+genuinely new canonical pending proposal YAML, and the exact S7 quarantine
+outcome for a reviewed proposal.  Every other initially dirty path must retain
+its exact index/worktree fingerprint for the whole session.
 """
 from __future__ import annotations
 
@@ -33,14 +34,15 @@ from app.action_receipts import (
     parse_action_receipt,
     validate_all_head_receipt_stores,
 )
-from app.entities import EntityCatalog
+from app.destinations import DestinationError, resolve_classification_destination
+from app.entities import EntityCatalog, EntityManifestError
 from app.outbox import OutboxError, _require_destination, _to_proposal
 from app.proposal_identity import (
     ProposalIdentityError,
     require_proposal_id,
     require_proposal_identity,
 )
-from app.registry import RegistryError, get_delete_proposal
+from app.registry import RegistryError, _validate_delete_record, get_delete_proposal
 from app.rename import AXES, RenameError, build_rename_plan
 from app.scope import CrossScopeError, Scope
 from app.vault import DestinationRegistryError, Vault
@@ -116,6 +118,31 @@ class DirtyFingerprint:
     kind: str
     mode: int | None
     digest: str | None
+
+
+@dataclass(frozen=True)
+class _ConsumedRecord:
+    relative: str
+    pending_relative: str
+    entity: str
+    proposal_id: str
+    action: str
+    digest: str
+    source: str | None = None
+    destination: str | None = None
+    registry_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class _ReceiptAuthorization:
+    key: tuple[str, str]
+    entity: str
+    proposal_id: str
+    action_kind: str
+    review_sha256: str
+    source: str | None = None
+    destination: str | None = None
+    registry_kind: str | None = None
 
 
 @dataclass
@@ -339,6 +366,41 @@ def _read_regular_no_follow(path: Path) -> tuple[bytes, int]:
             os.close(descriptor)
 
 
+def _read_relative_regular_no_follow(
+    vault: Path, relative: str
+) -> tuple[bytes, int]:
+    """Read one vault-relative regular leaf without following any component."""
+    parts = _path_parts(relative)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if parts is None or no_follow is None:
+        raise OSError("safe no-follow reads are unavailable")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
+    parent_descriptor = os.open(vault, directory_flags)
+    try:
+        for component in parts[:-1]:
+            next_descriptor = os.open(
+                component, directory_flags, dir_fd=parent_descriptor
+            )
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        descriptor = os.open(
+            parts[-1], os.O_RDONLY | no_follow, dir_fd=parent_descriptor
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("path changed type while Gate 3 read it")
+            with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                descriptor = -1
+                contents = stream.read()
+            return contents, stat.S_IMODE(opened.st_mode)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
 def _fingerprint_path(
     vault: Path,
     relative: str,
@@ -447,12 +509,62 @@ def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
     index_entries = _parse_index_entries(
         _git_bytes(vault, "ls-files", "--stage", "-z")
     )
+    _supplement_untracked_consumed_entries(vault, statuses, index_entries)
     return {
         relative: _fingerprint_path(
             vault, relative, statuses[relative], index_entries.get(relative, ())
         )
         for relative in sorted(statuses)
     }
+
+
+def _supplement_untracked_consumed_entries(
+    vault: Path,
+    statuses: dict[str, str],
+    index_entries: dict[str, tuple[str, ...]],
+) -> None:
+    """Make Git-invisible special leaves in exact S7 stores auditable."""
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        return
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
+    catalog = EntityCatalog.load(vault)
+
+    def record_untracked(relative: str) -> None:
+        if relative not in index_entries:
+            statuses.setdefault(relative, "??")
+
+    for entity in catalog.entities:
+        descriptors: list[int] = []
+        try:
+            descriptor = os.open(vault, directory_flags)
+            descriptors.append(descriptor)
+            traversed: list[str] = []
+            for component in (entity.slug, "outbox", ".consumed"):
+                traversed.append(component)
+                try:
+                    descriptor = os.open(
+                        component, directory_flags, dir_fd=descriptor
+                    )
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    record_untracked("/".join(traversed))
+                    break
+                descriptors.append(descriptor)
+            else:
+                try:
+                    leaves = os.listdir(descriptors[-1])
+                except OSError:
+                    record_untracked(f"{entity.slug}/outbox/.consumed")
+                else:
+                    for leaf in leaves:
+                        record_untracked(
+                            f"{entity.slug}/outbox/.consumed/{leaf}"
+                        )
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
 
 def _path_parts(path: str) -> tuple[str, ...] | None:
@@ -911,14 +1023,351 @@ def _new_proposal_is_sanctioned(
         return False
 
 
+def _load_consumed_record(
+    relative: str,
+    fingerprint: DirtyFingerprint,
+    rules: AuditRules,
+    vault: Path,
+) -> _ConsumedRecord | None:
+    """Validate the exact S7 entity-local quarantine leaf and its bytes."""
+    parts = _path_parts(relative)
+    if (
+        fingerprint.status != "??"
+        or fingerprint.index_entries
+        or fingerprint.kind != "file"
+        or fingerprint.mode is None
+        or fingerprint.digest is None
+        or parts is None
+        or len(parts) != 4
+        or parts[0] not in rules.entities
+        or parts[1:3] != ("outbox", ".consumed")
+        or not parts[3].endswith(".yaml")
+        or rules.root != vault
+    ):
+        return None
+    entity, _, _, leaf = parts
+    proposal_id = leaf[:-5]
+    pending_relative = f"{entity}/outbox/{leaf}"
+    pending_path = vault / pending_relative
+    try:
+        canonical_id = require_proposal_id(proposal_id)
+        contents, mode = _read_relative_regular_no_follow(vault, relative)
+        digest = hashlib.sha256(contents).hexdigest()
+        if mode != fingerprint.mode or digest != fingerprint.digest:
+            return None
+        loaded = yaml.safe_load(contents.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            return None
+        require_proposal_identity(pending_path, loaded.get("id"))
+        if (
+            loaded.get("id") != canonical_id
+            or loaded.get("entity") != entity
+            or loaded.get("status") != "pending"
+        ):
+            return None
+        action = loaded.get("action")
+        scope = Scope(vault, entity)
+        if action == "classify":
+            if not _canonical_classification_record(loaded):
+                return None
+            proposal = _to_proposal(pending_path, loaded)
+            canonical = resolve_classification_destination(
+                scope,
+                vault / proposal.src,
+                module=proposal.module,
+                sub=proposal.sub,
+                claimed_block=proposal.block,
+                require_source=False,
+            )
+            if (
+                proposal.entity != entity
+                or proposal.src != canonical.src
+                or proposal.dst != canonical.dst
+            ):
+                return None
+            return _ConsumedRecord(
+                relative=relative,
+                pending_relative=pending_relative,
+                entity=entity,
+                proposal_id=canonical_id,
+                action=action,
+                digest=digest,
+                source=proposal.src,
+                destination=proposal.dst,
+            )
+        if action == "delete" and _canonical_delete_record(loaded):
+            proposal = _validate_delete_record(scope, pending_path, loaded)
+            return _ConsumedRecord(
+                relative=relative,
+                pending_relative=pending_relative,
+                entity=entity,
+                proposal_id=canonical_id,
+                action=action,
+                digest=digest,
+                registry_kind=proposal.kind,
+            )
+    except (
+        CrossScopeError,
+        DestinationRegistryError,
+        DestinationError,
+        OSError,
+        OutboxError,
+        ProposalIdentityError,
+        RegistryError,
+        UnicodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        yaml.YAMLError,
+    ):
+        return None
+    return None
+
+
+def _receipt_bearing(record: CommitRecord) -> bool:
+    """Whether this commit's envelope can carry a receipt authorization."""
+    if _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message) is not None:
+        return True
+    registry = _REGISTRY_MESSAGE.fullmatch(record.message)
+    return registry is not None and registry.group(1) == "delete"
+
+
+def _commit_relative_rules(
+    vault: Path, records: tuple[CommitRecord, ...]
+) -> dict[str, AuditRules]:
+    """Registry rules as of each receipt-bearing commit.
+
+    `_audit_commit_history` already judges every commit against its own
+    tree, so an approval made before a rename stays sanctioned. Reading
+    authorization from the *final* rules instead left the two auditors
+    disagreeing: the old slug is gone from the final manifest, so every path
+    helper refused, no authorization was emitted, and a missing quarantine
+    record never reached `unclaimed`. A failure to build a commit's rules
+    propagates rather than dropping its authorization — a dropped
+    authorization is a silent PASS.
+    """
+    resolved: dict[str, AuditRules] = {}
+    for record in records:
+        if not _receipt_bearing(record) or record.oid in resolved:
+            continue
+        temporary: tempfile.TemporaryDirectory[str] | None = None
+        try:
+            temporary, commit_tree, _ = _parent_tree(vault, record.oid)
+            resolved[record.oid] = AuditRules.load(commit_tree)
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+    return resolved
+
+
+def _receipt_authorizations(
+    records: tuple[CommitRecord, ...],
+    rules: AuditRules,
+    vault: Path,
+    commit_rules: dict[str, AuditRules],
+) -> tuple[_ReceiptAuthorization, ...]:
+    """Extract exact-byte authorities only from sanctioned session commits."""
+    authorizations: list[_ReceiptAuthorization] = []
+    for record in records:
+        # The commit's own rules, never the final vault's, and never carried
+        # into the next iteration: a later rename must not erase an
+        # authorization this session actually issued.
+        record_rules = commit_rules.get(record.oid, rules)
+        approval = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
+        if approval is not None and _sanctioned_outbox(record, record_rules, vault):
+            deleted = [change.path for change in record.changes if change.status == "D"]
+            destinations = [
+                change.path
+                for change in record.changes
+                if change.status == "A"
+                and _active_destination(change.path, record_rules) is not None
+            ]
+            receipt_changes = [
+                change.path
+                for change in record.changes
+                if change.status == "A"
+                and _receipt_path(change.path, record_rules) is not None
+            ]
+            if len(deleted) != 1 or len(destinations) != 1 or len(receipt_changes) != 1:
+                continue
+            receipt_path = receipt_changes[0]
+            receipt_identity = _receipt_path(receipt_path, record_rules)
+            receipt = _receipt_from_commit(vault, record, receipt_path)
+            if receipt_identity is None or receipt is None:
+                continue
+            authorizations.append(
+                _ReceiptAuthorization(
+                    key=(record.oid, receipt_path),
+                    entity=receipt_identity[0],
+                    proposal_id=receipt.proposal_id,
+                    action_kind=receipt.action_kind,
+                    review_sha256=receipt.review_sha256,
+                    source=deleted[0],
+                    destination=destinations[0],
+                )
+            )
+            continue
+
+        registry = _REGISTRY_MESSAGE.fullmatch(record.message)
+        if (
+            registry is None
+            or registry.group(1) != "delete"
+            or not _sanctioned_registry(record, record_rules, vault)
+        ):
+            continue
+        receipt_changes = [
+            change.path
+            for change in record.changes
+            if change.status == "A"
+            and _receipt_path(change.path, record_rules) is not None
+        ]
+        if len(receipt_changes) != 1:
+            continue
+        receipt_path = receipt_changes[0]
+        receipt_identity = _receipt_path(receipt_path, record_rules)
+        receipt = _receipt_from_commit(vault, record, receipt_path)
+        if receipt_identity is None or receipt is None:
+            continue
+        authorizations.append(
+            _ReceiptAuthorization(
+                key=(record.oid, receipt_path),
+                entity=receipt_identity[0],
+                proposal_id=receipt.proposal_id,
+                action_kind=receipt.action_kind,
+                review_sha256=receipt.review_sha256,
+                registry_kind=registry.group(2),
+            )
+        )
+    return tuple(authorizations)
+
+
+def _authorization_matches(
+    consumed: _ConsumedRecord, authorization: _ReceiptAuthorization
+) -> bool:
+    common = (
+        consumed.entity == authorization.entity
+        and consumed.proposal_id == authorization.proposal_id
+        and consumed.digest == authorization.review_sha256
+    )
+    if consumed.action == "classify":
+        return (
+            common
+            and authorization.action_kind == "approval"
+            and consumed.source == authorization.source
+            and consumed.destination == authorization.destination
+        )
+    return (
+        common
+        and consumed.action == "delete"
+        and authorization.action_kind == "registry deletion"
+        and consumed.registry_kind == authorization.registry_kind
+    )
+
+
+def _record_mentions_proposal(
+    record: CommitRecord,
+    entity: str,
+    proposal_id: str,
+    rules: AuditRules,
+    commit_rules: dict[str, AuditRules],
+) -> bool:
+    """Conservatively keep a failed transaction from masquerading as reject.
+
+    Read with the commit's own rules for the same reason authorization is:
+    a receipt written under a slug a later rename retired still mentions its
+    proposal, and missing that would let the reject branch adopt it.
+    """
+    approval = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
+    if approval is not None and approval.group(1) == proposal_id:
+        return True
+    record_rules = commit_rules.get(record.oid, rules)
+    return any(
+        _receipt_path(change.path, record_rules) == (entity, proposal_id)
+        for change in record.changes
+    )
+
+
+def _sanctioned_consumed_paths(
+    before: dict[str, DirtyFingerprint],
+    after: dict[str, DirtyFingerprint],
+    rules: AuditRules,
+    vault: Path,
+    records: tuple[CommitRecord, ...],
+    commit_rules: dict[str, AuditRules],
+) -> tuple[set[str], set[str], set[str]]:
+    authorizations = _receipt_authorizations(records, rules, vault, commit_rules)
+    claimed_authorizations: set[tuple[str, str]] = set()
+    sanctioned: set[str] = set()
+    blocked_pending: set[str] = set()
+    for relative in sorted(set(after) - set(before)):
+        consumed = _load_consumed_record(relative, after[relative], rules, vault)
+        if consumed is None:
+            continue
+        pending_absent = consumed.pending_relative not in after
+        if not pending_absent:
+            blocked_pending.add(consumed.pending_relative)
+        pending_before = before.get(consumed.pending_relative)
+        snapshot_pair = (
+            pending_before is not None
+            and pending_absent
+            and pending_before == after[relative]
+        )
+        matching = [
+            authorization
+            for authorization in authorizations
+            if _authorization_matches(consumed, authorization)
+            and authorization.key not in claimed_authorizations
+        ]
+        if (
+            len(matching) == 1
+            and pending_absent
+            and (pending_before is None or snapshot_pair)
+        ):
+            claimed_authorizations.add(matching[0].key)
+            sanctioned.add(relative)
+            if pending_before is not None:
+                sanctioned.add(consumed.pending_relative)
+            continue
+        mentioned = any(
+            _record_mentions_proposal(
+                record, consumed.entity, consumed.proposal_id, rules, commit_rules
+            )
+            for record in records
+        )
+        if (
+            consumed.action == "classify"
+            and not matching
+            and snapshot_pair
+            and not mentioned
+        ):
+            sanctioned.update({relative, consumed.pending_relative})
+    unclaimed = {
+        f"{authorization.entity}/outbox/.consumed/"
+        f"{authorization.proposal_id}.yaml"
+        for authorization in authorizations
+        if authorization.key not in claimed_authorizations
+    }
+    return sanctioned, blocked_pending, unclaimed
+
+
 def audit_dirty(
     before: dict[str, DirtyFingerprint],
     after: dict[str, DirtyFingerprint],
     rules: AuditRules,
     vault: Path,
+    *,
+    records: tuple[CommitRecord, ...] = (),
 ) -> Audit:
+    vault = Path(vault).resolve()
     result = Audit()
+    commit_rules = _commit_relative_rules(vault, records)
+    sanctioned, blocked_pending, unclaimed = _sanctioned_consumed_paths(
+        before, after, rules, vault, records, commit_rules
+    )
     for relative in sorted(set(before) | set(after)):
+        if relative in sanctioned:
+            result.sanctioned_writes.append(relative)
+            continue
         if relative in before:
             if after.get(relative) != before[relative]:
                 result.violating_writes.append(relative)
@@ -926,12 +1375,15 @@ def audit_dirty(
         fingerprint = after[relative]
         destination = (
             result.sanctioned_writes
-            if _new_proposal_is_sanctioned(
-                relative, fingerprint, rules, Path(vault).resolve()
+            if relative not in blocked_pending
+            and _new_proposal_is_sanctioned(
+                relative, fingerprint, rules, vault
             )
             else result.violating_writes
         )
         destination.append(relative)
+    for relative in sorted(unclaimed - set(result.violating_writes)):
+        result.violating_writes.append(relative)
     return result
 
 
@@ -1032,7 +1484,7 @@ def cmd_check() -> int:
     records = collect_commit_records(vault, head, audit_head)
     after = collect_dirty_fingerprints(vault)
     commit_audit = _audit_commit_history(records, vault)
-    dirty_audit = audit_dirty(before, after, rules, vault)
+    dirty_audit = audit_dirty(before, after, rules, vault, records=records)
     result = Audit(
         sanctioned_commits=commit_audit.sanctioned_commits,
         violating_commits=commit_audit.violating_commits,
@@ -1047,7 +1499,7 @@ def cmd_check() -> int:
         f"{len(after)} current dirty path(s)"
     )
     print(f"  sanctioned commits: {len(result.sanctioned_commits)}")
-    print(f"  pending proposal writes: {len(result.sanctioned_writes)}")
+    print(f"  sanctioned dirty writes: {len(result.sanctioned_writes)}")
     for message in result.violating_commits:
         print(f"  VIOLATION commit: {message}")
     for relative in result.violating_writes:
@@ -1067,6 +1519,10 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         return 2
     except (
+        # An unreadable entity manifest is a `RuntimeError`, so naming it is
+        # the only way this boundary reports it. The store sweep reaches
+        # `EntityCatalog.load` from `snapshot` as well as `check`.
+        EntityManifestError,
         json.JSONDecodeError,
         KeyError,
         OSError,
