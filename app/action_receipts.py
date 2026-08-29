@@ -16,14 +16,27 @@ from typing import Literal, cast
 
 import yaml
 
-from .console_routing import structured_reader
+from .console_routing import failure_contract, structured_reader
 from .identifiers import meets_floor
 from .proposal_identity import (
     ProposalIdentityError,
     require_proposal_id,
     require_proposal_identity,
 )
-from .review_tokens import InvalidReviewToken, require_review_sha256
+from .review_tokens import (
+    InvalidReviewToken,
+    ReviewContractViolation,
+    require_review_sha256,
+)
+
+
+# Console failure metadata belongs at this route-facing adapter rather than in
+# review_tokens.py. That exact-byte domain primitive deliberately has no app
+# imports; decorating the shared function object here preserves that boundary
+# while exposing the same immutable contract to the Console composition graph.
+require_review_sha256 = failure_contract(
+    raises=(InvalidReviewToken, ReviewContractViolation)
+)(require_review_sha256)
 
 
 ActionKind = Literal["approval", "registry deletion"]
@@ -342,6 +355,14 @@ def resolve_head_receipts(
     return resolutions
 
 
+@failure_contract(
+    raises=(
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    ),
+    calls=(require_proposal_id,),
+)
 def resolve_head_receipt(
     vault: Path, entity: str, proposal_id: str
 ) -> ReceiptResolution:

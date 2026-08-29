@@ -222,17 +222,28 @@ Exact short registry-derived tokens in tracked Markdown now fail both
 current-tree and history audit modes; the final live-vault audit and
 preservation proof remain trusted-local gates.
 
-**3. Declaration-completeness gaps.** The declaration-driven totality sweep
-reads each endpoint's own declared catch tuple at test time, so decorator/body
-**drift** is caught — widening a decorator alone reds it. It cannot catch
-declaration **incompleteness**, because it injects only what a route already
-declares. Every gap found in Tasks 13 and 14 was invisible to exactly that shape
-and surfaced only by driving the real filesystem. The invariant that would close
-this — per route, every type reachable from its own call graph is either
-declared or deliberately routed to `E-UNKNOWN` — does not exist. Related: a
-broad typed handler can silently *retire* a narrower guard's coverage without
-changing behaviour, so whenever one is added above a layer declaring the same
-family, check the lower declaration is still pinned.
+**3. Declaration completeness — PUBLIC IMPLEMENTATION COMPLETE.** Immutable
+failure metadata now closes the reviewed inventory of 20 route-facing service
+and dependency boundaries. Thirteen registered Console routes declare 35
+executable body-service edges; structural traversal proves every known domain
+failure exported through those contracts has a route-owned catch, typed
+dependency handler, or exact deliberate-`E-UNKNOWN` disposition. Executable
+call-edge, FastAPI dependency, lower-ownership, and route/body binding checks
+fail independently under seven semantic mutations and every one of the 35
+route/service removals, with byte-identical restoration before each GREEN run.
+Representative real-filesystem root-loss, manifest-permission, whole-system
+redirect, missing-manifest, and leaf-redirect vehicles remain part of the
+proof. This is a closed known-domain inventory, not a claim to enumerate every
+possible Python exception; unforeseen programmer defects still belong to the
+global fallback.
+
+A concurrent entity-registry cutover remains narrow but real: scope binding can
+succeed before a service reload observes that the entity disappeared. Triage,
+proposal, and outbox contracts now keep that outcome visible as `E-ENTITY`.
+`Vault._entity_flags` instead converts the same root cause to `E-CONFIG`; that
+pre-existing taxonomy inconsistency is recorded for later work and is not
+changed here. The 37 private tests, `check_v2`, combined vault-seeded history
+audit, and opaque live-vault preservation comparison remain trusted-local gates.
 
 **4. Remaining filesystem failure shapes — PUBLIC IMPLEMENTATION COMPLETE.**
 A configured vault root that becomes unavailable now renders `E-TAMPER`, while

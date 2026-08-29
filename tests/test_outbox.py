@@ -1850,6 +1850,24 @@ def test_pending_presence_never_uses_a_swapped_outbox_target(
     assert swapped, "the probe never swapped the validated outbox"
 
 
+def test_pending_presence_exports_noncanonical_id_as_domain_failure(tmp_path):
+    scope, _prop = _propose(_vault(tmp_path))
+
+    with pytest.raises(proposal_identity.ProposalIdentityError):
+        outbox.pending_proposal_entry_exists(scope, "not-a-proposal-id")
+
+
+def test_pending_presence_contains_cross_scope_as_missing(tmp_path, monkeypatch):
+    scope, prop = _propose(_vault(tmp_path))
+
+    def _redirected(_scope):
+        raise CrossScopeError("synthetic pending-path redirect")
+
+    monkeypatch.setattr(outbox, "_require_outbox_path", _redirected)
+
+    assert not outbox.pending_proposal_entry_exists(scope, prop.id)
+
+
 def test_pending_presence_cleanup_failure_never_overrides_receipt_evidence(
     tmp_path, monkeypatch
 ):

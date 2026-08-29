@@ -1487,6 +1487,500 @@ def _load_console_app(tmp_path, monkeypatch):
     return importlib.reload(main)
 
 
+EXPECTED_CONTRACTED_BOUNDARIES = (
+    ("app.config", "vault_root"),
+    ("app.config", "build_scope"),
+    ("app.main", "entity_scope"),
+    ("app.entities", "EntityCatalog.load"),
+    ("app.vault", "Vault.bundles"),
+    ("app.inbox", "read_inbox"),
+    ("app.destinations", "resolve_classification_destination"),
+    ("app.outbox", "propose_classification"),
+    ("app.outbox", "preview_diff"),
+    ("app.outbox", "project_outbox"),
+    ("app.outbox", "approve"),
+    ("app.outbox", "reject"),
+    ("app.outbox", "pending_proposal_entry_exists"),
+    ("app.registry", "products_for"),
+    ("app.registry", "propose_delete"),
+    ("app.registry", "get_delete_receipt_or_review"),
+    ("app.registry", "execute_delete"),
+    ("app.action_receipts", "resolve_head_receipt"),
+    ("app.proposal_identity", "require_proposal_id"),
+    ("app.review_tokens", "require_review_sha256"),
+)
+
+
+def _resolve_qualified(module, qualified_name):
+    value = module
+    for part in qualified_name.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def _inventory_objects(main):
+    import importlib
+
+    return {
+        f"{module_name}.{name}": _resolve_qualified(
+            main if module_name == "app.main" else importlib.import_module(module_name),
+            name,
+        )
+        for module_name, name in EXPECTED_CONTRACTED_BOUNDARIES
+    }
+
+
+def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypatch):
+    from app.console_routing import FailureContract
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
+    assert len(qualified) == 20
+    assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
+
+    missing = []
+    for qualified_name, boundary in _inventory_objects(main).items():
+        if not isinstance(
+            getattr(boundary, "__failure_contract__", None), FailureContract
+        ):
+            missing.append(qualified_name)
+
+    assert missing == [], f"route-facing boundaries without contracts: {missing}"
+
+
+def test_route_facing_failure_contracts_match_the_approved_inventory(
+    tmp_path, monkeypatch
+):
+    from app.action_receipts import (
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+        resolve_head_receipt,
+    )
+    from app.config import VaultRootUnavailable, build_scope, vault_root
+    from app.destinations import DestinationError, resolve_classification_destination
+    from app.entities import (
+        EntityCatalog,
+        EntityManifestError,
+        EntitySelectionError,
+        RecipientConfigurationError,
+        SystemRegistryPathError,
+    )
+    from app.outbox import (
+        OutboxError,
+        UnreadableProposalRecord,
+        approve,
+        pending_proposal_entry_exists,
+        preview_diff,
+        project_outbox,
+        propose_classification,
+        reject,
+    )
+    from app.proposal_identity import ProposalIdentityError, require_proposal_id
+    from app.registry import RegistryError
+    from app.review_tokens import (
+        InvalidReviewToken,
+        ReviewContractViolation,
+        ReviewTokenError,
+    )
+    from app.scope import CrossScopeError, RedirectedPathError
+    from app.vault import DestinationRegistryError
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    amended_destination = (
+        DestinationError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+    )
+    receipt_failures = (
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+    outbox_projection = (
+        OutboxError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+        *receipt_failures,
+    )
+    expected = {
+        "app.config.vault_root": ((VaultRootUnavailable,), ()),
+        "app.config.build_scope": (
+            (EntityManifestError, SystemRegistryPathError, EntitySelectionError),
+            (vault_root,),
+        ),
+        "app.main.entity_scope": ((), (build_scope,)),
+        "app.entities.EntityCatalog.load": (
+            (
+                EntityManifestError,
+                SystemRegistryPathError,
+                RecipientConfigurationError,
+            ),
+            (),
+        ),
+        "app.vault.Vault.bundles": (
+            (DestinationRegistryError, EntityManifestError, SystemRegistryPathError),
+            (),
+        ),
+        "app.inbox.read_inbox": ((RedirectedPathError,), ()),
+        "app.destinations.resolve_classification_destination": (
+            amended_destination,
+            (EntityCatalog.load,),
+        ),
+        "app.outbox.propose_classification": (
+            (OutboxError,),
+            (resolve_classification_destination,),
+        ),
+        "app.outbox.preview_diff": (outbox_projection[:6], ()),
+        "app.outbox.project_outbox": (outbox_projection, ()),
+        "app.outbox.approve": (
+            (*outbox_projection[:6], ReviewTokenError, *receipt_failures),
+            (),
+        ),
+        "app.outbox.reject": (
+            (*outbox_projection[:6], ReviewTokenError, *receipt_failures),
+            (),
+        ),
+        "app.outbox.pending_proposal_entry_exists": (
+            (),
+            (require_proposal_id,),
+        ),
+        "app.registry.products_for": (
+            (RegistryError, CrossScopeError, DestinationRegistryError),
+            (),
+        ),
+        "app.registry.propose_delete": (
+            (RegistryError, CrossScopeError, DestinationRegistryError),
+            (),
+        ),
+        "app.registry.get_delete_receipt_or_review": (
+            (
+                RegistryError,
+                CrossScopeError,
+                DestinationRegistryError,
+                UnreadableProposalRecord,
+                *receipt_failures,
+            ),
+            (),
+        ),
+        "app.registry.execute_delete": (
+            (
+                RegistryError,
+                CrossScopeError,
+                DestinationRegistryError,
+                UnreadableProposalRecord,
+                ReviewTokenError,
+                *receipt_failures,
+            ),
+            (),
+        ),
+        "app.action_receipts.resolve_head_receipt": (
+            receipt_failures,
+            (require_proposal_id,),
+        ),
+        "app.proposal_identity.require_proposal_id": ((ProposalIdentityError,), ()),
+        "app.review_tokens.require_review_sha256": (
+            (InvalidReviewToken, ReviewContractViolation),
+            (),
+        ),
+    }
+
+    boundaries = _inventory_objects(main)
+    assert set(boundaries) == set(expected)
+    for qualified_name, boundary in boundaries.items():
+        raises, calls = expected[qualified_name]
+        contract = boundary.__failure_contract__
+        assert contract.raises == raises, qualified_name
+        assert contract.calls == calls, qualified_name
+        assert contract.deliberate_unknown == (), qualified_name
+
+
+def _contract_graph_is_acyclic(boundaries):
+    active = []
+    complete = set()
+
+    def visit(boundary):
+        if boundary in active:
+            cycle = " -> ".join(item.__qualname__ for item in (*active, boundary))
+            raise AssertionError(f"failure contract cycle: {cycle}")
+        if boundary in complete:
+            return
+        active.append(boundary)
+        for called in boundary.__failure_contract__.calls:
+            visit(called)
+        active.pop()
+        complete.add(boundary)
+
+    for boundary in boundaries:
+        visit(boundary)
+
+
+def test_failure_contract_graph_rejects_a_cycle():
+    from app.console_routing import FailureContract, failure_contract
+
+    @failure_contract()
+    def first():
+        pass
+
+    @failure_contract(calls=(first,))
+    def second():
+        pass
+
+    first.__failure_contract__ = FailureContract((), (second,), ())
+    with pytest.raises(AssertionError, match="failure contract cycle"):
+        _contract_graph_is_acyclic((first, second))
+
+
+def _normalized_callable(value):
+    return getattr(value, "__func__", value)
+
+
+def _executable_resolved_call_sites(boundary):
+    """Resolve direct calls through names, class attributes and bound locals.
+
+    This is deliberately a closed-inventory resolver. It does not claim to
+    infer arbitrary Python dispatch; it recognizes only the executable shapes
+    used by the approved boundaries and route bodies.
+    """
+    import inspect
+
+    function = _normalized_callable(boundary)
+    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+    definition = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    )
+    globals_map = function.__globals__
+    local_types = {}
+
+    def global_value(name):
+        return globals_map.get(name)
+
+    def resolve(expression):
+        if isinstance(expression, ast.Name):
+            return local_types.get(expression.id, global_value(expression.id))
+        if not isinstance(expression, ast.Attribute):
+            return None
+        if isinstance(expression.value, ast.Call):
+            owner = resolve(expression.value.func)
+        else:
+            owner = resolve(expression.value)
+        if owner is None:
+            return None
+        return getattr(owner, expression.attr, None)
+
+    for node in ast.walk(definition):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        constructor = resolve(value.func)
+        if not isinstance(constructor, type):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        for target in targets:
+            if isinstance(target, ast.Name):
+                local_types[target.id] = constructor
+
+    found = []
+    for statement in definition.body:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Call):
+                continue
+            called = resolve(node.func)
+            called = _normalized_callable(called)
+            if called is not None:
+                found.append((called, node))
+    parents = {
+        child: parent
+        for parent in ast.walk(definition)
+        for child in ast.iter_child_nodes(parent)
+    }
+    return function, found, parents
+
+
+def _executable_resolved_calls(boundary):
+    _function, sites, _parents = _executable_resolved_call_sites(boundary)
+    return {called for called, _node in sites}
+
+
+def _call_is_fully_caught(function, call, parents, outcomes):
+    """Whether one helper contains every contracted outcome at the call.
+
+    Route-level catches are dispositions and therefore remain service edges;
+    this helper is used only while traversing uncontracted helpers below an
+    endpoint. A service whose complete contract is caught inside such a helper
+    cannot export a failure to the route and is not a route-service root.
+    """
+
+    def resolve_handler(expression):
+        def resolve_value(value):
+            if isinstance(value, ast.Name):
+                return function.__globals__.get(value.id)
+            if isinstance(value, ast.Attribute):
+                owner = resolve_value(value.value)
+                return (
+                    getattr(owner, value.attr, None)
+                    if owner is not None
+                    else None
+                )
+            return None
+
+        if expression is None:
+            return (BaseException,)
+        if isinstance(expression, ast.Tuple):
+            return tuple(
+                item
+                for element in expression.elts
+                for item in resolve_handler(element)
+            )
+        value = resolve_value(expression)
+        if isinstance(value, tuple):
+            return tuple(value)
+        return (value,) if isinstance(value, type) else ()
+
+    child = call
+    parent = parents.get(child)
+    while parent is not None:
+        if isinstance(parent, ast.Try) and child in parent.body:
+            caught = tuple(
+                exception
+                for handler in parent.handlers
+                for exception in resolve_handler(handler.type)
+                if isinstance(exception, type)
+                and issubclass(exception, BaseException)
+            )
+            if caught and all(
+                any(issubclass(exported, exception) for exception in caught)
+                for exported in outcomes
+            ):
+                return True
+        child = parent
+        parent = parents.get(child)
+    return False
+
+
+def _executable_contracted_calls(boundary, contracted):
+    normalized = {_normalized_callable(item) for item in contracted}
+    return _executable_resolved_calls(boundary) & normalized
+
+
+def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeypatch):
+    main = _load_console_app(tmp_path, monkeypatch)
+    boundaries = _inventory_objects(main)
+    by_object = {
+        _normalized_callable(boundary): qualified_name
+        for qualified_name, boundary in boundaries.items()
+    }
+    expected_executable = {
+        "app.config.build_scope": {"app.config.vault_root"},
+        "app.main.entity_scope": {"app.config.build_scope"},
+        "app.destinations.resolve_classification_destination": {
+            "app.entities.EntityCatalog.load"
+        },
+        "app.outbox.propose_classification": {
+            "app.destinations.resolve_classification_destination"
+        },
+        "app.outbox.project_outbox": {
+            "app.outbox.pending_proposal_entry_exists",
+            "app.proposal_identity.require_proposal_id",
+        },
+        "app.outbox.pending_proposal_entry_exists": {
+            "app.proposal_identity.require_proposal_id"
+        },
+        "app.registry.get_delete_receipt_or_review": {
+            "app.action_receipts.resolve_head_receipt",
+            "app.proposal_identity.require_proposal_id",
+        },
+        "app.action_receipts.resolve_head_receipt": {
+            "app.proposal_identity.require_proposal_id"
+        },
+    }
+
+    actual = {}
+    universe = tuple(boundaries.values())
+    for qualified_name, boundary in boundaries.items():
+        calls = _executable_contracted_calls(boundary, universe)
+        if calls:
+            actual[qualified_name] = {by_object[called] for called in calls}
+    assert actual == expected_executable
+
+    declared_edges = {
+        qualified_name: {
+            by_object[_normalized_callable(called)]
+            for called in boundary.__failure_contract__.calls
+        }
+        for qualified_name, boundary in boundaries.items()
+        if boundary.__failure_contract__.calls
+    }
+    assert declared_edges == {
+        "app.config.build_scope": {"app.config.vault_root"},
+        "app.main.entity_scope": {"app.config.build_scope"},
+        "app.outbox.propose_classification": {
+            "app.destinations.resolve_classification_destination"
+        },
+        "app.destinations.resolve_classification_destination": {
+            "app.entities.EntityCatalog.load"
+        },
+        "app.outbox.pending_proposal_entry_exists": {
+            "app.proposal_identity.require_proposal_id"
+        },
+        "app.action_receipts.resolve_head_receipt": {
+            "app.proposal_identity.require_proposal_id"
+        },
+    }
+    summarized_or_contained_edges = {
+        "app.outbox.project_outbox": {
+            "app.outbox.pending_proposal_entry_exists",
+            "app.proposal_identity.require_proposal_id",
+        },
+        "app.registry.get_delete_receipt_or_review": {
+            "app.action_receipts.resolve_head_receipt",
+            "app.proposal_identity.require_proposal_id",
+        },
+    }
+    assert set(declared_edges) & set(summarized_or_contained_edges) == set()
+    classified_edges = {
+        caller: declared_edges.get(caller, set())
+        | summarized_or_contained_edges.get(caller, set())
+        for caller in set(declared_edges) | set(summarized_or_contained_edges)
+    }
+    assert classified_edges == actual, (
+        "every executable contracted call must be classified as a propagating "
+        "contract edge or a contained/prevalidated call"
+    )
+    for caller, callees in declared_edges.items():
+        assert callees <= actual[caller], caller
+    _contract_graph_is_acyclic(universe)
+
+
+def test_executable_contract_call_resolver_handles_bound_calls_not_prose(
+    tmp_path, monkeypatch
+):
+    from app.vault import Vault
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    contracted = tuple(_inventory_objects(main).values())
+    assert _normalized_callable(Vault.bundles) in _executable_contracted_calls(
+        main._triage_page, contracted
+    )
+
+    def prose_only():
+        """Vault.bundles() appears only in this docstring."""
+        # Vault(catalog).bundles() is not executable either.
+        return None
+
+    assert _executable_contracted_calls(prose_only, contracted) == set()
+
+
 def _registered_console_endpoints(app):
     """Every endpoint the router will actually dispatch to, minus the
     framework's own. A Mount (the StaticFiles application) exposes no
@@ -1500,6 +1994,268 @@ def _registered_console_endpoints(app):
         ):
             continue
         yield endpoint
+
+
+def _expected_route_services(main):
+    return {
+        main.shell: (main.Vault.bundles,),
+        main.pulse: (),
+        main.triage_default: (main.Vault.bundles,),
+        main.triage: (
+            main.read_inbox,
+            main.resolve_classification_destination,
+            main.Vault.bundles,
+        ),
+        main.propose: (main.propose_classification, main.preview_diff),
+        main.outbox_screen: (main.project_outbox, main.Vault.bundles),
+        main.outbox_approve: (
+            main.approve,
+            main.project_outbox,
+            main.resolve_head_receipt,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
+        ),
+        main.outbox_reject: (
+            main.reject,
+            main.project_outbox,
+            main.resolve_head_receipt,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
+        ),
+        main.outbox_review_fragment: (
+            main.project_outbox,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
+        ),
+        main.registry_products: (main.products_for, main.Vault.bundles),
+        main.registry_delete_preview: (
+            main.propose_delete,
+            main.get_delete_receipt_or_review,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
+        ),
+        main.registry_delete_execute: (
+            main.execute_delete,
+            main.get_delete_receipt_or_review,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
+        ),
+        main.registry_delete_review_fragment: (
+            main.get_delete_receipt_or_review,
+            main.pending_proposal_entry_exists,
+            main.require_proposal_id,
+        ),
+    }
+
+
+def test_registered_routes_declare_the_exact_body_service_inventory(
+    tmp_path, monkeypatch
+):
+    main = _load_console_app(tmp_path, monkeypatch)
+    expected = _expected_route_services(main)
+    assert sum(len(services) for services in expected.values()) == 35
+    endpoints = list(_registered_console_endpoints(main.app))
+    assert len(endpoints) == 13, endpoints
+    assert set(endpoints) == set(expected), (
+        "registered route/service inventory mismatch: "
+        f"missing={set(endpoints) - set(expected)}, "
+        f"extra={set(expected) - set(endpoints)}"
+    )
+    for endpoint in endpoints:
+        assert endpoint.__console_route__.services == expected[endpoint], (
+            f"{endpoint.__qualname__}: expected services "
+            f"{tuple(service.__qualname__ for service in expected[endpoint])}, "
+            f"got {tuple(service.__qualname__ for service in endpoint.__console_route__.services)}"
+        )
+
+
+def _recursive_fastapi_dependency_calls(route):
+    found = set()
+    pending = list(route.dependant.dependencies)
+    while pending:
+        dependant = pending.pop()
+        if dependant.call is not None:
+            found.add(_normalized_callable(dependant.call))
+        pending.extend(dependant.dependencies)
+    return found
+
+
+def test_actual_application_dependencies_carry_failure_contracts(
+    tmp_path, monkeypatch
+):
+    import typing
+
+    from fastapi.routing import APIRoute
+
+    from app.console_routing import FailureContract
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    entity_scope = _normalized_callable(main.entity_scope)
+    entity_scoped = []
+    discovered = []
+    missing = []
+    for route in main.app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        endpoint = route.endpoint
+        if endpoint not in set(_registered_console_endpoints(main.app)):
+            continue
+        dependency_calls = _recursive_fastapi_dependency_calls(route)
+        discovered.extend(dependency_calls)
+        hints = typing.get_type_hints(endpoint, include_extras=True)
+        if main.EntityScope in hints.values():
+            entity_scoped.append(endpoint.__qualname__)
+            assert entity_scope in dependency_calls, endpoint.__qualname__
+        for dependency in dependency_calls:
+            if not (getattr(dependency, "__module__", "") or "").startswith("app."):
+                continue
+            if not isinstance(
+                getattr(dependency, "__failure_contract__", None), FailureContract
+            ):
+                missing.append(
+                    f"{endpoint.__qualname__}: {dependency.__qualname__}"
+                )
+
+    assert len(entity_scoped) >= 8, entity_scoped
+    assert entity_scope in discovered
+    assert missing == []
+
+
+def _route_reachable_contracted_calls(endpoint, main, contracted, declared):
+    import inspect
+
+    normalized = {_normalized_callable(item) for item in contracted}
+    pending = [endpoint]
+    visited = set()
+    found = set()
+    while pending:
+        function = pending.pop()
+        function = _normalized_callable(function)
+        if function in visited or not inspect.isfunction(function):
+            continue
+        visited.add(function)
+        current, sites, parents = _executable_resolved_call_sites(function)
+        for called, call in sites:
+            if called in normalized:
+                outcomes = tuple(
+                    exported
+                    for _boundary, exported, _unknown in _contract_outcomes(called)
+                )
+                if (
+                    function is endpoint
+                    or called in declared
+                    or not _call_is_fully_caught(current, call, parents, outcomes)
+                ):
+                    found.add(called)
+            elif (
+                inspect.isfunction(called)
+                and called.__module__ == main.__name__
+                and not hasattr(called, "__failure_contract__")
+            ):
+                pending.append(called)
+    return found
+
+
+def test_route_service_declarations_bind_to_executable_bodies(
+    tmp_path, monkeypatch
+):
+    main = _load_console_app(tmp_path, monkeypatch)
+    contracted = tuple(_inventory_objects(main).values())
+    for endpoint in _registered_console_endpoints(main.app):
+        declared = {
+            _normalized_callable(service)
+            for service in endpoint.__console_route__.services
+        }
+        reachable = _route_reachable_contracted_calls(
+            endpoint, main, contracted, declared
+        )
+        assert declared == reachable, (
+            f"{endpoint.__qualname__}: route service mismatch: "
+            f"undeclared={sorted(item.__qualname__ for item in reachable - declared)}, "
+            f"not_executable={sorted(item.__qualname__ for item in declared - reachable)}"
+        )
+
+
+def _contract_outcomes(boundary):
+    pending = [boundary]
+    visited = set()
+    outcomes = []
+    while pending:
+        current = pending.pop()
+        current = _normalized_callable(current)
+        if current in visited:
+            continue
+        visited.add(current)
+        contract = current.__failure_contract__
+        outcomes.extend(
+            (current, exception, None) for exception in contract.raises
+        )
+        outcomes.extend(
+            (current, item.exception, item) for item in contract.deliberate_unknown
+        )
+        pending.extend(contract.calls)
+    return outcomes
+
+
+def test_registered_routes_cover_transitive_body_and_dependency_failures(
+    tmp_path, monkeypatch
+):
+    from fastapi.routing import APIRoute
+
+    main = _load_console_app(tmp_path, monkeypatch)
+    route_by_endpoint = {
+        route.endpoint: route
+        for route in main.app.routes
+        if isinstance(route, APIRoute)
+    }
+    typed_handlers = tuple(
+        exception
+        for exception in main.app.exception_handlers
+        if isinstance(exception, type)
+        and issubclass(exception, BaseException)
+        and exception not in (Exception, BaseException)
+    )
+    failures = []
+
+    for endpoint in _registered_console_endpoints(main.app):
+        declaration = endpoint.__console_route__
+        for service in declaration.services:
+            for boundary, exported, unknown in _contract_outcomes(service):
+                handled = any(
+                    issubclass(exported, caught) for caught in declaration.catches
+                )
+                if handled and unknown is not None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} is both handled and deliberate E-UNKNOWN"
+                    )
+                elif not handled and unknown is None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} has no route disposition"
+                    )
+
+        route = route_by_endpoint[endpoint]
+        for dependency in _recursive_fastapi_dependency_calls(route):
+            if not hasattr(dependency, "__failure_contract__"):
+                continue
+            for boundary, exported, unknown in _contract_outcomes(dependency):
+                handled = any(
+                    issubclass(exported, registered)
+                    for registered in typed_handlers
+                )
+                if handled and unknown is not None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} is both handled and deliberate E-UNKNOWN"
+                    )
+                elif not handled and unknown is None:
+                    failures.append(
+                        f"{endpoint.__qualname__}: {boundary.__qualname__}: "
+                        f"{exported.__name__} has no typed dependency handler"
+                    )
+
+    assert failures == [], "\n".join(failures)
 
 
 def test_every_registered_route_declares_its_catch_family(tmp_path, monkeypatch):

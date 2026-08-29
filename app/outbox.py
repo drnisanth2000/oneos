@@ -24,6 +24,9 @@ import yaml
 
 from .action_receipts import (
     ActionReceipt,
+    InvalidActionReceipt,
+    ReceiptStoreIntegrityError,
+    ReceiptStoreUnavailable,
     SpentAction,
     make_action_receipt,
     receipt_relative_path,
@@ -31,7 +34,12 @@ from .action_receipts import (
     resolve_head_receipt,
     resolve_head_receipts,
 )
-from .console_routing import structured_reader
+from .console_routing import failure_contract, structured_reader
+from .entities import (
+    EntityManifestError,
+    EntitySelectionError,
+    SystemRegistryPathError,
+)
 from .git_transaction import (
     GitTransactionError,
     InvalidTransactionPath,
@@ -56,6 +64,7 @@ from .proposal_identity import (
 )
 from .review_tokens import (
     ReviewSnapshot,
+    ReviewTokenError,
     make_review_snapshot,
     require_review_match,
 )
@@ -228,6 +237,9 @@ def _require_outbox_path(
     return candidate
 
 
+@failure_contract(
+    calls=(require_proposal_id,),
+)
 def pending_proposal_entry_exists(scope: Scope, proposal_id: str) -> bool:
     """Report whether a real pending-record leaf is present, without reading it.
 
@@ -320,6 +332,10 @@ def _capture_source_state(root: Path, relative: str) -> PathState:
         ) from exc
 
 
+@failure_contract(
+    raises=(OutboxError,),
+    calls=(resolve_classification_destination,),
+)
 def propose_classification(
     scope: Scope,
     item_path: Path,
@@ -589,6 +605,16 @@ def _render_diff(scope: Scope, proposal: Proposal) -> str:
     return _diff_text(proposal, old)
 
 
+@failure_contract(
+    raises=(
+        OutboxError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+    )
+)
 def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves.
@@ -623,6 +649,19 @@ def preview_diff(scope: Scope, proposal: Proposal) -> str:
     return _diff_text(proposal, old)
 
 
+@failure_contract(
+    raises=(
+        OutboxError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+)
 def project_outbox(scope: Scope) -> OutboxListing:
     """Read-only presentation projection over the outbox (design §3 Rule 3).
 
@@ -945,6 +984,20 @@ def _spent_action_from_refusal(
 
 
 @structured_reader(category="proposal")
+@failure_contract(
+    raises=(
+        OutboxError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+        ReviewTokenError,
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+)
 def approve(
     scope: Scope, proposal_id: str, review_sha256: object
 ) -> ClassificationActionResult:
@@ -1032,6 +1085,20 @@ def approve(
     return prop
 
 
+@failure_contract(
+    raises=(
+        OutboxError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+        ReviewTokenError,
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    )
+)
 def reject(
     scope: Scope, proposal_id: str, review_sha256: object
 ) -> ClassificationActionResult:

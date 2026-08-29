@@ -11,7 +11,13 @@ import stat
 from functools import cache
 from pathlib import Path
 
-from .entities import EntityCatalog
+from .console_routing import failure_contract
+from .entities import (
+    EntityCatalog,
+    EntityManifestError,
+    EntitySelectionError,
+    SystemRegistryPathError,
+)
 from .scope import Scope
 
 ENV_VAULT = "ONEOS_VAULT"
@@ -38,6 +44,7 @@ def _pinned_vault_root_identity(root: Path) -> tuple[Path, int, int]:
     return _vault_root_identity(root)
 
 
+@failure_contract(raises=(VaultRootUnavailable,))
 def vault_root() -> Path:
     raw = os.environ.get(ENV_VAULT)
     if not raw:
@@ -54,5 +61,9 @@ def build_catalog() -> EntityCatalog:
     return EntityCatalog.load(vault_root())
 
 
+@failure_contract(
+    raises=(EntityManifestError, SystemRegistryPathError, EntitySelectionError),
+    calls=(vault_root,),
+)
 def build_scope(entity: str) -> Scope:
     return Scope(vault_root(), entity)

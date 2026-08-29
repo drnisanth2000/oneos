@@ -35,12 +35,11 @@ from .classifier import Classifier
 from .config import VaultRootUnavailable, build_catalog, build_scope
 from .console_errors import ConsoleError, describe
 from .console_render import is_fragment, status_for
-from .console_routing import console_route
+from .console_routing import console_route, failure_contract
 from .destinations import DestinationError, resolve_classification_destination
 from .entities import (
     EntityManifestError,
     EntitySelectionError,
-    SystemRegistryPathError,
 )
 from .inbox import read_inbox
 from .outbox import (
@@ -121,6 +120,7 @@ app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 catalog = build_catalog()
 
 
+@failure_contract(calls=(build_scope,))
 def entity_scope(entity: str) -> Scope:
     # Rule 6: no application code raises HTTPException. EntitySelectionError
     # propagates to its own dedicated handler below.
@@ -154,8 +154,7 @@ def _endpoint_for(request: Request):
 #: `SystemRegistryPathError` — and it re-resolves `_system` on EVERY call, so
 #: a `_system` directory redirected AFTER startup reaches this on a live
 #: request. That subclasses `EntityManifestError`, so this tuple already
-#: catches it; the three route tuples below did not, and now name it
-#: explicitly.
+#: catches it; the route tuples below now cover it through the same base.
 #:
 #: Task 8 corrective: the two shapes named above (a module spec that is a
 #: list or a scalar; a non-iterable `flags:`) — plus two more the reviewer
@@ -315,8 +314,8 @@ async def _vault_root_unavailable_handler(
 #: `registry_products`, `registry_delete_preview`, `registry_delete_execute`
 #: — and this family reaches all of them **unguarded** only through the
 #: dependency. (It also reaches the three page routes inside their bodies via
-#: `Vault.bundles()`, which is why `SystemRegistryPathError` sits in their
-#: catch tuples; that path is guarded, this one was not.) The five
+#: `Vault.bundles()`, which is why `EntityManifestError` sits in their catch
+#: tuples; that path is guarded, this one was not.) The five
 #: `fragment-only` POSTs are covered by the same handler: `_endpoint_for` is
 #: populated during dependency resolution, so the fragment surface is
 #: selected correctly and no whole document is swapped into an HTMX target.
@@ -375,7 +374,11 @@ async def _console_fallback_handler(request: Request, exc: Exception) -> HTMLRes
 
 
 @app.get("/", response_class=HTMLResponse)
-@console_route(catches=_SIDEBAR_CATCHES, surface="page")
+@console_route(
+    catches=_SIDEBAR_CATCHES,
+    surface="page",
+    services=(Vault.bundles,),
+)
 def shell(request: Request) -> HTMLResponse:
     """`Vault(catalog).bundles()` raises every declared member, and it runs
     before any template exists — so the route answers them itself rather than
@@ -410,7 +413,7 @@ def shell(request: Request) -> HTMLResponse:
 # status is unaffected (the global fallback forces the code's page status
 # either way), and no refusal, validation, or commit decision changes. Pinned
 # by test_pulse_declaration_selects_the_fragment_surface.
-@console_route(catches=(), surface="fragment-only")
+@console_route(catches=(), surface="fragment-only", services=())
 def pulse(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request, "blocks/pulse.html", {"now": datetime.now().strftime("%H:%M:%S")}
@@ -418,7 +421,11 @@ def pulse(request: Request) -> HTMLResponse:
 
 
 @app.get("/triage", response_class=HTMLResponse)
-@console_route(catches=_SIDEBAR_CATCHES, surface="page")
+@console_route(
+    catches=_SIDEBAR_CATCHES,
+    surface="page",
+    services=(Vault.bundles,),
+)
 def triage_default(request: Request):
     """Same boundary as `shell`, and for the same reason."""
     try:
@@ -442,34 +449,27 @@ _PROPOSAL_PERSISTED_EVENT = "console:proposal-persisted"
 
 
 #: Declared once so the decorator and the route's own `except` cannot drift.
-#: `SystemRegistryPathError` is declared explicitly rather than via its
-#: `EntityManifestError` base because it is **narrower**: the base would also
-#: swallow `RecipientConfigurationError` and any future sibling, which these
-#: routes have no business answering.
+#: The transitive route contracts require the complete manifest family: a
+#: catalog reload can fail as `EntityManifestError`, while a narrow concurrent
+#: registry cutover can invalidate the scope-selected entity and raise
+#: `EntitySelectionError`. Both remain described, operator-visible failures.
 #:
-#: An earlier revision of this comment justified it as "so the `E-TAMPER`
-#: mapping is preserved rather than collapsed into `E-CONFIG`". That was
-#: false and review disproved it with one command: `describe()` resolves on
-#: the raised instance's own class, never on the route's declared tuple, so
-#: declaring the base would still render `E-TAMPER`. The decision stands; the
-#: reason did not. `bundles()`
-#: re-resolves `_system` on every request, so an operator who moves the
-#: directory and symlinks it back after startup reaches this on a live
-#: request — measured on three routes, each previously escaping to the global
-#: fallback with a logged traceback.
-#:
-#: Declared here rather than converted in `Vault.system_path`: converting
-#: would change a service exception contract to close a presentation-layer
-#: gap, and would break `tests/test_vault.py`'s standing E4 regression, which
-#: asserts the raw `EntityManifestError`. Human ruling, recorded in the ledger.
+#: The base declaration intentionally includes every manifest sibling a
+#: contracted catalog reload exports. `describe()` still resolves on the
+#: raised instance, so `SystemRegistryPathError` retains E-TAMPER while the
+#: manifest base remains E-CONFIG.
 _TRIAGE_CATCHES = (
     DestinationError, DestinationRegistryError, CrossScopeError,
-    SystemRegistryPathError,
+    EntityManifestError, EntitySelectionError,
 )
 
 
 @app.get("/triage/{entity}", response_class=HTMLResponse)
-@console_route(catches=_TRIAGE_CATCHES, surface="page")
+@console_route(
+    catches=_TRIAGE_CATCHES,
+    surface="page",
+    services=(read_inbox, resolve_classification_destination, Vault.bundles),
+)
 def triage(request: Request, scope: EntityScope) -> HTMLResponse:
     """Every member of the declared family is answered by the route itself.
 
@@ -528,12 +528,22 @@ def _triage_page(request: Request, scope: Scope) -> HTMLResponse:
 #: Declared once so the decorator and each of the route's two `except`
 #: clauses cannot drift (the Task 11 pattern; M5, review: this repeated the
 #: same literal tuple three times before).
-_PROPOSE_CATCHES = (OutboxError, DestinationError, CrossScopeError,
-                     DestinationRegistryError)
+_PROPOSE_CATCHES = (
+    OutboxError,
+    DestinationError,
+    CrossScopeError,
+    DestinationRegistryError,
+    EntityManifestError,
+    EntitySelectionError,
+)
 
 
 @app.post("/triage/{entity}/propose", response_class=HTMLResponse)
-@console_route(catches=_PROPOSE_CATCHES, surface="fragment-only")
+@console_route(
+    catches=_PROPOSE_CATCHES,
+    surface="fragment-only",
+    services=(propose_classification, preview_diff),
+)
 def propose(
     request: Request,
     scope: EntityScope,
@@ -594,7 +604,8 @@ def propose(
 #: approved refusal, and the operator is never offered the current review.
 _OUTBOX_CATCHES = (
     OutboxError, CrossScopeError, DestinationRegistryError,
-    SystemRegistryPathError,  # see _TRIAGE_CATCHES
+    EntityManifestError, EntitySelectionError,  # see _TRIAGE_CATCHES
+    ProposalIdentityError,
     ReviewTokenError,
     InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
@@ -748,7 +759,11 @@ def _outbox_list(
 
 
 @app.get("/outbox/{entity}", response_class=HTMLResponse)
-@console_route(catches=_OUTBOX_CATCHES, surface="page")
+@console_route(
+    catches=_OUTBOX_CATCHES,
+    surface="page",
+    services=(project_outbox, Vault.bundles),
+)
 def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
     """Every member of the declared family is answered by the route itself
     (the Task 11 `triage` pattern). `project_outbox`'s phase 2 (destination and
@@ -1231,7 +1246,11 @@ def _review_unavailable_response(
 
 
 @app.get("/outbox/{entity}/review/{proposal_id}", response_class=HTMLResponse)
-@console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
+@console_route(
+    catches=_OUTBOX_CATCHES,
+    surface="fragment-only",
+    services=(project_outbox, pending_proposal_entry_exists, require_proposal_id),
+)
 def outbox_review_fragment(
     request: Request, scope: EntityScope, proposal_id: str
 ) -> HTMLResponse:
@@ -1304,7 +1323,17 @@ def outbox_review_fragment(
 
 
 @app.post("/outbox/{entity}/approve", response_class=HTMLResponse)
-@console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
+@console_route(
+    catches=_OUTBOX_CATCHES,
+    surface="fragment-only",
+    services=(
+        approve,
+        project_outbox,
+        resolve_head_receipt,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
+)
 def outbox_approve(
     request: Request,
     scope: EntityScope,
@@ -1410,7 +1439,17 @@ def _outbox_approve_response(
 
 
 @app.post("/outbox/{entity}/reject", response_class=HTMLResponse)
-@console_route(catches=_OUTBOX_CATCHES, surface="fragment-only")
+@console_route(
+    catches=_OUTBOX_CATCHES,
+    surface="fragment-only",
+    services=(
+        reject,
+        project_outbox,
+        resolve_head_receipt,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
+)
 def outbox_reject(
     request: Request,
     scope: EntityScope,
@@ -1531,20 +1570,25 @@ def _outbox_reject_response(
 #: designed, not accidental, failure mode.
 _REGISTRY_PRODUCTS_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError,
-    SystemRegistryPathError,  # see _TRIAGE_CATCHES
+    EntityManifestError,  # see _TRIAGE_CATCHES
 )
 #: `ReviewTokenError` (S7): a stale or malformed review fingerprint is a
 #: declared outcome of delete-execute, not an escape — the same addition the
 #: outbox actions needed.
 _REGISTRY_DELETE_CATCHES = (
     RegistryError, CrossScopeError, DestinationRegistryError, UnreadableProposalRecord,
+    ProposalIdentityError,
     ReviewTokenError,
     InvalidActionReceipt, ReceiptStoreIntegrityError, ReceiptStoreUnavailable,
 )
 
 
 @app.get("/registry/{entity}/products", response_class=HTMLResponse)
-@console_route(catches=_REGISTRY_PRODUCTS_CATCHES, surface="page")
+@console_route(
+    catches=_REGISTRY_PRODUCTS_CATCHES,
+    surface="page",
+    services=(products_for, Vault.bundles),
+)
 def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
     # M7 (review): unlike the two delete routes below, the `TemplateResponse`
     # call sits inside this `try`. Intentional, not drift: `vault.bundles()`
@@ -1569,7 +1613,16 @@ def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
 
 
 @app.post("/registry/{entity}/product/delete-preview", response_class=HTMLResponse)
-@console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
+@console_route(
+    catches=_REGISTRY_DELETE_CATCHES,
+    surface="fragment-only",
+    services=(
+        propose_delete,
+        get_delete_receipt_or_review,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
+)
 def registry_delete_preview(
     request: Request, scope: EntityScope, slug: str = Form(...)
 ) -> HTMLResponse:
@@ -1676,7 +1729,15 @@ def _impact_signature(sources) -> str:
 @app.get(
     "/registry/{entity}/product/review/{proposal_id}", response_class=HTMLResponse
 )
-@console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
+@console_route(
+    catches=_REGISTRY_DELETE_CATCHES,
+    surface="fragment-only",
+    services=(
+        get_delete_receipt_or_review,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
+)
 def registry_delete_review_fragment(
     request: Request, scope: EntityScope, proposal_id: str
 ) -> HTMLResponse:
@@ -1723,7 +1784,16 @@ def registry_delete_review_fragment(
 
 
 @app.post("/registry/{entity}/product/delete-execute", response_class=HTMLResponse)
-@console_route(catches=_REGISTRY_DELETE_CATCHES, surface="fragment-only")
+@console_route(
+    catches=_REGISTRY_DELETE_CATCHES,
+    surface="fragment-only",
+    services=(
+        execute_delete,
+        get_delete_receipt_or_review,
+        pending_proposal_entry_exists,
+        require_proposal_id,
+    ),
+)
 def registry_delete_execute(
     request: Request,
     scope: EntityScope,

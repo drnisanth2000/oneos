@@ -5,9 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
-from .entities import EntityCatalog
-from .scope import Scope
-from .vault import Vault
+from .console_routing import failure_contract
+from .entities import (
+    EntityCatalog,
+    EntityManifestError,
+    EntitySelectionError,
+    SystemRegistryPathError,
+)
+from .scope import CrossScopeError, Scope
+from .vault import DestinationRegistryError, Vault
 
 
 class DestinationError(ValueError):
@@ -110,6 +116,17 @@ def _require_real_directory(scope: Scope, *parts: str) -> Path:
     return resolved
 
 
+@failure_contract(
+    raises=(
+        DestinationError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+    ),
+    calls=(EntityCatalog.load,),
+)
 def resolve_classification_destination(
     scope: Scope,
     item_path: Path | str,

@@ -4342,6 +4342,73 @@ def test_route_tuples_still_answer_the_leaf_redirect_without_the_dependency_hand
     assert reached == ["RuntimeError"]
 
 
+def test_propose_answers_entity_cutover_inside_route_as_e_entity_fragment(
+    tmp_path, monkeypatch
+):
+    """Pin the narrow scope-binding/catalog-reload TOCTOU vehicle.
+
+    The dependency validates ``alpha`` first. The synthetic cutover then
+    removes it before ``propose_classification`` reloads ``entities.yaml``.
+    The fragment route owns that second ``EntitySelectionError``: a 200 is
+    intentional for an HTMX swap, but the response must remain a classified,
+    visible refusal and must never reach either application fallback.
+    """
+    from app.entities import EntitySelectionError
+
+    main = _load_main(tmp_path, monkeypatch, ENTITIES)
+    active = tmp_path / "alpha/00-inbox/active"
+    active.mkdir(parents=True, exist_ok=True)
+    (active / "marker.md").write_text(
+        "---\ntitle: cutover marker\nsub: triage\n---\nbody\n",
+        encoding="utf-8",
+    )
+    scaffold_modules(tmp_path, "bravo", ["00-intake", "01-core", "02-work"])
+    original_scope = main.entity_scope
+
+    def _scope_then_cutover(entity: str):
+        scope = original_scope(entity)
+        (tmp_path / "_system/entities.yaml").write_text(
+            'version: "1.0"\nentities:\n'
+            "  bravo: { label: Bravo, flags: [] }\n",
+            encoding="utf-8",
+        )
+        return scope
+
+    main.app.dependency_overrides[main.entity_scope] = _scope_then_cutover
+    reached = []
+    described = []
+    original_describe = main.describe
+
+    def _record_description(exc):
+        described.append(type(exc).__name__)
+        return original_describe(exc)
+
+    monkeypatch.setattr(main, "describe", _record_description)
+    original = main.app.exception_handlers[Exception]
+
+    async def _spy(request, exc):
+        reached.append(type(exc).__name__)
+        return await original(request, exc)
+
+    monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
+    monkeypatch.delitem(main.app.exception_handlers, EntitySelectionError)
+    client = TestClient(main.app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/triage/alpha/propose",
+        headers={"HX-Request": "true"},
+        data={"filename": "marker.md", "module": "02-work", "sub": ""},
+    )
+
+    assert response.status_code == 200
+    assert 'role="alert"' in response.text
+    assert "E-ENTITY" in response.text
+    assert "E-UNKNOWN" not in response.text
+    assert described == ["EntitySelectionError"]
+    assert reached == []
+    assert not (tmp_path / "alpha/outbox").exists()
+
+
 def test_real_post_startup_system_redirect_never_reaches_the_global_fallback(
     tmp_path, monkeypatch
 ):
