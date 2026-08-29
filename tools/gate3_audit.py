@@ -248,6 +248,7 @@ class Audit:
 class CommitAuditResult:
     audit: Audit
     path_changes: tuple[ClassifiedPathChange, ...]
+    rename_mappings: tuple[RenameMapping, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1237,6 +1238,7 @@ def _audit_commit_history(
 ) -> CommitAuditResult:
     result = Audit()
     violating_paths: set[str] = set()
+    ordered_mappings: list[tuple[RenameMapping, ...]] = []
     for record in records:
         temporary: tempfile.TemporaryDirectory[str] | None = None
         try:
@@ -1248,6 +1250,10 @@ def _audit_commit_history(
             if audited.violating_commits:
                 violating_paths.update(
                     change.path for change in record.changes
+                )
+            if audited.sanctioned_commits:
+                ordered_mappings.append(
+                    _verified_rename_mappings(record, vault)
                 )
         finally:
             if temporary is not None:
@@ -1268,6 +1274,9 @@ def _audit_commit_history(
     return CommitAuditResult(
         audit=result,
         path_changes=tuple(changes[path] for path in sorted(changes)),
+        rename_mappings=_compose_rename_mappings(
+            tuple(group for group in ordered_mappings if group)
+        ),
     )
 
 
@@ -1319,12 +1328,64 @@ def _is_canonical_quarantine_directory(
     )
 
 
+def _paired_rename_directories(
+    changes: tuple[FilesystemChange, ...],
+    mappings: tuple[RenameMapping, ...],
+) -> frozenset[str]:
+    """Paths a verified sanctioned rename explains, at both endpoints.
+
+    Identity equality is necessary and never sufficient: every other
+    requirement is checked here independently, and a reused inode cannot
+    substitute for any of them (design "Evidence-model limitation").
+    """
+    removed = {
+        change.path: change.before
+        for change in changes
+        if change.kind == "removed"
+        and change.before is not None
+        and change.before.kind == "directory"
+    }
+    added = {
+        change.path: change.after
+        for change in changes
+        if change.kind == "added"
+        and change.after is not None
+        and change.after.kind == "directory"
+    }
+    proposed: dict[str, str] = {}
+    for old_path, old_fingerprint in sorted(removed.items()):
+        new_path = _predict_rename_destination(old_path, mappings)
+        if new_path is None:
+            continue
+        new_fingerprint = added.get(new_path)
+        if new_fingerprint is None:
+            continue
+        if (
+            new_fingerprint.mode != old_fingerprint.mode
+            or new_fingerprint.identity_digest != old_fingerprint.identity_digest
+        ):
+            continue
+        proposed[old_path] = new_path
+    claimed: dict[str, list[str]] = {}
+    for old_path, new_path in proposed.items():
+        claimed.setdefault(new_path, []).append(old_path)
+    paired: set[str] = set()
+    for new_path, sources in claimed.items():
+        if len(sources) != 1:
+            # Two removed directories cannot both be this one added
+            # directory; neither claim is trustworthy.
+            continue
+        paired.update({sources[0], new_path})
+    return frozenset(paired)
+
+
 def audit_filesystem(
     before: dict[str, FilesystemFingerprint],
     after: dict[str, FilesystemFingerprint],
     rules: AuditRules,
     *,
     classified_paths: tuple[ClassifiedPathChange, ...],
+    rename_mappings: tuple[RenameMapping, ...] = (),
 ) -> Audit:
     """Dispose of each supplemental delta, composing directory ancestry.
 
@@ -1334,6 +1395,7 @@ def audit_filesystem(
     """
     result = Audit()
     changes = compare_filesystem_evidence(before, after)
+    paired = _paired_rename_directories(changes, rename_mappings)
     directory_changes: list[FilesystemChange] = []
     # Two passes. A non-directory delta is itself a classified descendant, so
     # it must be known before any ancestor is judged: creating `x/p`
@@ -1365,6 +1427,9 @@ def audit_filesystem(
             # would be a duplicate finding for one event.
             continue
         if relevant:
+            result.sanctioned_writes.append(change.path)
+            continue
+        if change.path in paired:
             result.sanctioned_writes.append(change.path)
             continue
         if _is_canonical_quarantine_directory(change, rules):
@@ -1419,6 +1484,221 @@ def _rename_envelope(
             continue
         envelope.add(("M", relative.as_posix()))
     return frozenset(envelope)
+
+
+@dataclass(frozen=True)
+class RenameMapping:
+    """One verified old-root to new-root move, vault-relative."""
+
+    old_root: str
+    new_root: str
+
+
+def _rename_move_pairs(
+    tree: Path, axis: str, old: str, new: str, *, parent_oid: str
+) -> tuple[RenameMapping, ...]:
+    """The move pairs of one rename plan, in the planner's own order.
+
+    `_rename_envelope` computes these and discards them. Rebuilding the plan
+    here leaves the envelope comparison byte-for-byte unchanged, so the
+    sanctioning decision cannot shift.
+    """
+    plan = build_rename_plan(tree, axis, old, new, planned_head=parent_oid)
+    planned_root = plan.vault
+    return tuple(
+        RenameMapping(
+            old_root=source.relative_to(planned_root).as_posix(),
+            new_root=destination.relative_to(planned_root).as_posix(),
+        )
+        for source, destination in plan.moves
+    )
+
+
+def _matching_rename_axes(
+    record: CommitRecord, vault: Path, old: str, new: str
+) -> tuple[tuple[str, tuple[RenameMapping, ...]], ...]:
+    """Every axis whose envelope equals the commit, evaluated to completion.
+
+    `_sanctioned_rename` returns on its first matching axis and so can never
+    observe a second one. Ambiguity detection needs the full set. This is a
+    separate pass on purpose: the sanctioning decision keeps its early return
+    and its behaviour is not altered here.
+    """
+    actual = frozenset((change.status, change.path) for change in record.changes)
+    matches: list[tuple[str, tuple[RenameMapping, ...]]] = []
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        for axis in sorted(AXES):
+            try:
+                expected = _rename_envelope(
+                    tree, tracked, axis, old, new, parent_oid=record.parents[0]
+                )
+                if not expected or actual != expected:
+                    continue
+                pairs = _rename_move_pairs(
+                    tree, axis, old, new, parent_oid=record.parents[0]
+                )
+            except (OSError, RenameError, UnicodeError, sqlite3.Error):
+                continue
+            matches.append((axis, pairs))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return ()
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+    return tuple(matches)
+
+
+def _verified_rename_mappings(
+    record: CommitRecord, vault: Path
+) -> tuple[RenameMapping, ...]:
+    """Mappings only from a commit the existing verification already accepted."""
+    match = _RENAME_MESSAGE.fullmatch(record.message)
+    if match is None or len(record.parents) != 1:
+        return ()
+    if not _sanctioned_rename(record, vault):
+        return ()
+    old, new = match.groups()
+    matches = _matching_rename_axes(record, vault, old, new)
+    if len(matches) != 1:
+        # Zero means the envelope could not be reproduced here; more than one
+        # is ambiguous. Both contribute nothing rather than a best guess.
+        return ()
+    return matches[0][1]
+
+
+def _rewrite_destination(destination: str, mapping: RenameMapping) -> str | None:
+    """Apply one later mapping to an earlier destination, or None."""
+    if destination == mapping.old_root:
+        return mapping.new_root
+    prefix = mapping.old_root + "/"
+    if destination.startswith(prefix):
+        return mapping.new_root + "/" + destination[len(prefix):]
+    return None
+
+
+def _source_preimage(
+    old_root: str, composed: tuple[RenameMapping, ...]
+) -> str | None:
+    """The original source a later mapping's root sits under, if any.
+
+    Returns the sentinel `""` when nothing matches, so the caller can
+    distinguish "no earlier mapping applies" from ambiguity, which returns
+    None.
+
+    Selection is by longest matching destination. A general and a specific
+    mapping legitimately coexist after a nested rename, so several matches is
+    the normal shape, not an error: rejecting it would fail an ordinary
+    three-rename sequence closed. Only equally specific candidates predicting
+    different sources are ambiguous.
+    """
+    matches = [
+        mapping
+        for mapping in composed
+        if old_root == mapping.new_root
+        or old_root.startswith(mapping.new_root + "/")
+    ]
+    if not matches:
+        return ""
+    best = max(len(mapping.new_root) for mapping in matches)
+    predicted = set()
+    for mapping in matches:
+        if len(mapping.new_root) != best:
+            continue
+        if old_root == mapping.new_root:
+            predicted.add(mapping.old_root)
+        else:
+            tail = old_root[len(mapping.new_root) + 1:]
+            predicted.add(mapping.old_root + "/" + tail)
+    if len(predicted) != 1:
+        return None
+    return predicted.pop()
+
+
+def _compose_rename_mappings(
+    ordered: tuple[tuple[RenameMapping, ...], ...],
+) -> tuple[RenameMapping, ...]:
+    """Fold per-commit mappings oldest-first, failing closed on ambiguity.
+
+    Three relations matter and each is handled differently. A later root that
+    equals an accumulated destination is consumed by the forward rewrite; one
+    strictly beneath it is appended under its original source pre-image; one
+    that is an ancestor rewrites the accumulated destination forward and is
+    also retained for untouched tails. Collapsing any two of these breaks one
+    of the others: appending on the exact match duplicates a source, and
+    skipping the pre-image leaves an original path predicting an intermediate
+    destination that never exists on disk.
+    """
+    composed: tuple[RenameMapping, ...] = ()
+    for group in ordered:
+        rewritten: list[RenameMapping] = []
+        for existing in composed:
+            applied = [
+                candidate
+                for mapping in group
+                if (candidate := _rewrite_destination(existing.new_root, mapping))
+                is not None
+            ]
+            if len(applied) > 1:
+                return ()
+            rewritten.append(
+                RenameMapping(existing.old_root, applied[0])
+                if applied
+                else existing
+            )
+        added: list[RenameMapping] = []
+        for mapping in group:
+            # Exact-chain consumption. The forward rewrite above already
+            # carried an accumulated mapping through to this destination;
+            # appending a derived duplicate would trip the conflict check and
+            # fail an ordinary sequential rename closed.
+            if any(
+                existing.new_root == mapping.old_root for existing in composed
+            ):
+                continue
+            preimage = _source_preimage(mapping.old_root, composed)
+            if preimage is None:
+                return ()
+            added.append(
+                RenameMapping(preimage or mapping.old_root, mapping.new_root)
+            )
+        composed = tuple(rewritten + added)
+        sources = [mapping.old_root for mapping in composed]
+        destinations = [mapping.new_root for mapping in composed]
+        if len(set(sources)) != len(sources) or len(set(destinations)) != len(
+            destinations
+        ):
+            return ()
+    return composed
+
+
+def _predict_rename_destination(
+    path: str, mappings: tuple[RenameMapping, ...]
+) -> str | None:
+    """Where a verified rename says this path went, or None.
+
+    Selection is by longest matching `old_root`, never by tuple order: a
+    general and a specific mapping both apply to a nested path, and only the
+    specific one names the destination that exists on disk. Equally specific
+    candidates disagreeing is ambiguity, and fails closed.
+    """
+    candidates: list[tuple[int, str]] = []
+    for mapping in mappings:
+        if path == mapping.old_root:
+            candidates.append((len(mapping.old_root), mapping.new_root))
+        elif path.startswith(mapping.old_root + "/"):
+            tail = path[len(mapping.old_root) + 1:]
+            candidates.append(
+                (len(mapping.old_root), mapping.new_root + "/" + tail)
+            )
+    if not candidates:
+        return None
+    best = max(length for length, _ in candidates)
+    predicted = {value for length, value in candidates if length == best}
+    if len(predicted) != 1:
+        return None
+    return predicted.pop()
 
 
 def _sanctioned_rename(record: CommitRecord, vault: Path) -> bool:
@@ -2183,6 +2463,7 @@ def cmd_check() -> int:
         current.filesystem,
         rules,
         classified_paths=commit_result.path_changes + dirty_paths,
+        rename_mappings=commit_result.rename_mappings,
     )
     sanctioned_writes = sorted(
         set(dirty_audit.sanctioned_writes) | set(filesystem_audit.sanctioned_writes)

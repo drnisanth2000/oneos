@@ -3247,3 +3247,392 @@ def test_cli_check_uses_commit_relative_rules_before_an_entity_rename(
     apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
 
     assert gate3.main(["check"]) == 0
+
+
+# --- Task 10: sanctioned rename topology ------------------------------------
+
+
+def _rec(oid: str, message: str, changes) -> gate3.CommitRecord:
+    return gate3.CommitRecord(
+        oid=oid,
+        message=message,
+        parents=("e" * 40,),
+        changes=tuple(
+            gate3.PathChangeRecord(status, path) for status, path in changes
+        ),
+    )
+
+
+def _m(old_root: str, new_root: str) -> gate3.RenameMapping:
+    return gate3.RenameMapping(old_root, new_root)
+
+
+def _pair_fp(mode: int = 0o755, identity: str = "1" * 64):
+    return gate3.FilesystemFingerprint("directory", mode, identity, None)
+
+
+def _pair_audit(before, after, rules, mappings, classified=()):
+    return gate3.audit_filesystem(
+        before,
+        after,
+        rules,
+        classified_paths=tuple(classified),
+        rename_mappings=tuple(mappings),
+    )
+
+
+def test_cli_sanctioned_rename_of_an_untracked_only_directory_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A sanctioned rename must not fail the gate on a directory Git cannot see.
+
+    `archive/` holds no tracked file, so nothing is ever classified beneath
+    it. Both endpoints were reported as unsanctioned direct writes even though
+    the rename commit itself was sanctioned, and the operator had no remedy
+    but to delete the directory.
+    """
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    (vault / old / "11-library" / "archive").mkdir(parents=True, exist_ok=True)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+
+    assert gate3.main(["check"]) == 0
+
+
+def test_unsanctioned_rename_commit_contributes_no_mapping(tmp_path: Path):
+    """Only a commit the existing verification accepted may map anything."""
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    record = _rec("a" * 40, f"rename: {old} \u2192 {new}", (("M", "unrelated.md"),))
+
+    assert gate3._verified_rename_mappings(record, vault) == ()
+
+
+def test_ambiguous_axis_match_contributes_no_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two axes reproducing one envelope is ambiguous, so nothing is mapped."""
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    monkeypatch.setattr(gate3, "_sanctioned_rename", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        gate3,
+        "_matching_rename_axes",
+        lambda *_a, **_k: (
+            ("entity", (gate3.RenameMapping(old, new),)),
+            ("product", (gate3.RenameMapping(old, new),)),
+        ),
+    )
+    record = _rec("a" * 40, f"rename: {old} \u2192 {new}", (("M", "x.md"),))
+
+    assert gate3._verified_rename_mappings(record, vault) == ()
+
+
+def test_rename_mappings_compose_oldest_first_over_exact_roots():
+    """An exact chain is consumed by the forward rewrite, not duplicated."""
+    composed = gate3._compose_rename_mappings(((_m("a", "b"),), (_m("b", "c"),)))
+
+    assert composed == (_m("a", "c"),)
+
+
+@pytest.mark.parametrize(
+    ("ordered", "expected"),
+    (
+        (
+            ((_m("a/M/op", "a/M/np"),), (_m("a", "b"),)),
+            (_m("a/M/op", "b/M/np"), _m("a", "b")),
+        ),
+        (
+            ((_m("a", "b"),), (_m("b/M/op", "b/M/np"),)),
+            (_m("a", "b"), _m("a/M/op", "b/M/np")),
+        ),
+    ),
+    ids=("nested-then-ancestor", "ancestor-then-nested"),
+)
+def test_rename_mappings_compose_across_nesting_orders(ordered, expected):
+    """Both nesting orders must end at the original source and final target."""
+    assert gate3._compose_rename_mappings(ordered) == expected
+
+
+def test_rename_mappings_compose_through_a_deeper_nested_chain():
+    """A third rename beneath the second must find the most-specific source."""
+    composed = gate3._compose_rename_mappings(
+        (
+            (_m("a", "b"),),
+            (_m("b/M/op", "b/M/np"),),
+            (_m("b/M/np/dp", "b/M/np/dpr"),),
+        )
+    )
+
+    assert composed == (
+        _m("a", "b"),
+        _m("a/M/op", "b/M/np"),
+        _m("a/M/op/dp", "b/M/np/dpr"),
+    )
+    assert (
+        gate3._predict_rename_destination("a/M/op/dp/x", composed)
+        == "b/M/np/dpr/x"
+    )
+
+
+def test_composed_mappings_retain_the_general_tail():
+    """A nested rename must not shadow tails it does not touch."""
+    composed = gate3._compose_rename_mappings(
+        ((_m("a", "b"),), (_m("b/M/op", "b/M/np"),))
+    )
+
+    assert gate3._predict_rename_destination("a/other/x", composed) == "b/other/x"
+    assert gate3._predict_rename_destination("a/M/op/x", composed) == "b/M/np/x"
+
+
+@pytest.mark.parametrize("order", ("general-first", "specific-first"))
+def test_source_preimage_selects_the_unique_most_specific_mapping(order: str):
+    """Accumulated tuple order must not decide the derived source."""
+    composed = (_m("a", "b"), _m("a/M/op", "b/M/np"))
+    if order == "specific-first":
+        composed = tuple(reversed(composed))
+
+    assert gate3._source_preimage("b/M/np/dp", composed) == "a/M/op/dp"
+
+
+def test_source_preimage_fails_closed_on_equally_specific_disagreement():
+    """Two same-length destinations predicting different sources is ambiguous."""
+    assert gate3._source_preimage("p/q/z", (_m("x", "p/q"), _m("y", "p/q"))) is None
+
+
+@pytest.mark.parametrize(
+    "ordered",
+    (
+        ((_m("a", "b"), _m("a", "c")),),
+        ((_m("a", "c"), _m("b", "c")),),
+    ),
+    ids=("one-source-two-destinations", "two-sources-one-destination"),
+)
+def test_conflicting_rename_mappings_contribute_nothing(ordered):
+    assert gate3._compose_rename_mappings(ordered) == ()
+
+
+def test_paired_rename_directories_are_sanctioned_at_both_endpoints(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.sanctioned_writes == ["renamed/d/empty", "synthetic/d/empty"]
+    assert audit.violating_writes == []
+
+
+@pytest.mark.parametrize(
+    ("before_path", "after_path", "before_fp", "after_fp", "mappings"),
+    (
+        ("synthetic/d/empty", "renamed/d/empty", _pair_fp(), _pair_fp(), ()),
+        ("stranger/d/empty", "renamed/d/empty", _pair_fp(), _pair_fp(),
+         (_m("synthetic", "renamed"),)),
+        ("synthetic/d/empty", "stranger/d/empty", _pair_fp(), _pair_fp(),
+         (_m("synthetic", "renamed"),)),
+        ("synthetic/d/empty", "renamed/d/other", _pair_fp(), _pair_fp(),
+         (_m("synthetic", "renamed"),)),
+        ("synthetic/d/empty", "renamed/d/empty", _pair_fp(),
+         _pair_fp(identity="2" * 64), (_m("synthetic", "renamed"),)),
+        ("synthetic/d/empty", "renamed/d/empty", _pair_fp(),
+         _pair_fp(mode=0o700), (_m("synthetic", "renamed"),)),
+        ("synthetic/d/empty", "renamed/d/empty", _pair_fp(),
+         gate3.FilesystemFingerprint("symlink", 0o777, "1" * 64, "3" * 64),
+         (_m("synthetic", "renamed"),)),
+    ),
+    ids=(
+        "no-sanctioned-rename",
+        "wrong-old-root",
+        "wrong-new-root",
+        "different-tail",
+        "identity-mismatch",
+        "mode-mismatch",
+        "non-directory-endpoint",
+    ),
+)
+def test_unpaired_rename_shapes_remain_violations(
+    tmp_path: Path, before_path, after_path, before_fp, after_fp, mappings
+):
+    """Every shape outside the verified mapping stays a direct-write violation."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {before_path: before_fp}, {after_path: after_fp}, rules, mappings
+    )
+
+    assert audit.sanctioned_writes == []
+    assert sorted(audit.violating_writes) == sorted({before_path, after_path})
+
+
+def test_pairing_does_not_sanction_an_unrelated_sibling(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp(), "renamed/d/extra": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.violating_writes == ["renamed/d/extra"]
+    assert audit.sanctioned_writes == ["renamed/d/empty", "synthetic/d/empty"]
+
+
+def test_violating_descendant_beneath_a_paired_directory_still_fails(
+    tmp_path: Path,
+):
+    """Pairing is evaluated after the descendant rule and cannot hide it."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+        classified=[_classified("renamed/d/empty/bad.md", "added", "violating")],
+    )
+
+    assert "renamed/d/empty" not in audit.sanctioned_writes
+
+
+@pytest.mark.parametrize("order", ("general-first", "specific-first"))
+def test_pairing_selects_the_most_specific_mapping_regardless_of_order(
+    tmp_path: Path, order: str
+):
+    """Tuple order must not decide which destination is predicted."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    mappings = (_m("synthetic", "renamed"), _m("synthetic/d", "renamed/e"))
+    if order == "specific-first":
+        mappings = tuple(reversed(mappings))
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/e/empty": _pair_fp()},
+        rules,
+        mappings,
+    )
+
+    assert audit.sanctioned_writes == ["renamed/e/empty", "synthetic/d/empty"]
+    assert audit.violating_writes == []
+
+
+def test_equally_specific_mappings_that_disagree_fail_closed(tmp_path: Path):
+    """Two candidates of the same specificity are ambiguous, not a choice."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"), _m("synthetic", "other")),
+    )
+
+    assert audit.sanctioned_writes == []
+    assert "synthetic/d/empty" in audit.violating_writes
+
+
+def test_one_removed_path_never_sanctions_two_destinations(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp(), "other/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert "other/d/empty" in audit.violating_writes
+    assert audit.sanctioned_writes == ["renamed/d/empty", "synthetic/d/empty"]
+
+
+def test_two_removed_paths_never_share_one_added_path(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp(), "second/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"), _m("second", "renamed")),
+    )
+
+    assert audit.sanctioned_writes == []
+    assert sorted(audit.violating_writes) == [
+        "renamed/d/empty",
+        "second/d/empty",
+        "synthetic/d/empty",
+    ]
+
+
+def _nested_rename_files():
+    """An entity fixture that also supports a nested project rename.
+
+    The project axis is the one that moves *directories* (under
+    `02-pipeline/`), so it is what actually nests beneath an entity rename.
+    """
+    files, old, new = _rename_files("entity")
+    files[f"{old}/02-pipeline/active/oldproject/index.md"] = (
+        "---\ntype: project\n---\nrepo: oldproject\n[[oldproject]]\n"
+    )
+    return files, old, new
+
+
+@pytest.mark.parametrize("order", ("nested-then-ancestor", "ancestor-then-nested"))
+def test_cli_nested_renames_pair_an_untracked_only_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, order: str
+):
+    """Both nesting orders must reach the same final destination.
+
+    The untracked-only directory sits *inside* the project directory, so its
+    snapshot path is rewritten by both renames. Placing it outside would let
+    the general entity mapping alone explain it, and the nested source
+    derivation would never be exercised.
+    """
+    files, old, new = _nested_rename_files()
+    vault = git_vault(tmp_path / "vault", files)
+    (vault / old / "02-pipeline" / "active" / "oldproject" / "empty").mkdir(
+        parents=True, exist_ok=True
+    )
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+
+    def rename_entity():
+        apply_rename(
+            vault, plan_rename(vault, "entity", old, new), validators=[]
+        )
+
+    def rename_project():
+        apply_rename(
+            vault,
+            plan_rename(vault, "project", "oldproject", "newproject"),
+            validators=[],
+        )
+
+    if order == "nested-then-ancestor":
+        rename_project()
+        rename_entity()
+    else:
+        rename_entity()
+        rename_project()
+
+    assert gate3.main(["check"]) == 0
