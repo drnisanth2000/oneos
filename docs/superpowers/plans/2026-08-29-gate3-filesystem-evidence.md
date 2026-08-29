@@ -20,9 +20,24 @@ sanction.
 `stat`, `subprocess`, JSON, pytest, and Git. No dependency or build-system
 change.
 
-**Spec:**
-`docs/superpowers/specs/2026-08-29-gate3-filesystem-evidence-design.md`
-at approved commit `03be199cee333641700a0c347595d7d88125b194`.
+**Spec:** `docs/superpowers/specs/2026-08-29-gate3-filesystem-evidence-design.md`
+
+- Tasks 1–9 were written against **Design Revision 0**, approved at
+  `03be199cee333641700a0c347595d7d88125b194`. They are complete and are
+  retained here as a historical record. Do not re-run them.
+- Task 10 is written against **Design Revision 2**, approved at
+  `acc3f309f04a285fbec46acf0a0cc99d0175e101`, specifically its
+  "Sanctioned rename topology" rule and its "Evidence-model limitation:
+  identity is not proof of a move".
+
+**Plan revision history:**
+
+- Revision 1 — Tasks 1–9, executed to completion. Its Task 9 independent
+  review reproduced finding I1: a sanctioned entity rename moving a
+  directory with no tracked descendant reported both endpoints as
+  unsanctioned direct writes.
+- Revision 2 — this document. Adds **Task 10** for I1 only. Tasks 1–9 are
+  unchanged.
 
 ## Global Constraints
 
@@ -1324,3 +1339,858 @@ Report final pushed head, changed files, aggregate public/private gate results,
 four preservation equalities, independent findings by severity, CodeRabbit
 status, and pull-request link. Stop and request explicit owner merge
 authorization. Do not run live Gate 3, Gate 1 timing, deployment, or Phase 2.
+
+---
+
+## Task 10 status and standing constraints
+
+Task 10 is the only outstanding work in this plan. Tasks 1–9 are historical:
+their commands, counts and stop conditions are a record of what was done, not
+current instructions.
+
+**Baseline for Task 10:** branch `codex/gate3-finding-a-filesystem-evidence-20260829`
+at `acc3f309f04a285fbec46acf0a0cc99d0175e101`, whose public suite stands at
+**1950 passed, 1 skipped** and whose Gate 3 module stands at **228 passed,
+1 skipped**. The one skip is the genuine APFS undecodable-name limitation.
+
+**Gates deferred by owner amendment, still deferred:**
+
+- The trusted-local private integration gate is **deferred to the new final
+  HEAD** produced by Task 10. This session has no trusted-local vault
+  capability; `ONEOS_VAULT` stays unset and no private command runs.
+- **Push, pull-request creation, and CodeRabbit remain blocked** until the
+  owner runs that private gate against the exact final HEAD and returns a
+  sanitized PASS.
+- If CodeRabbit later requires any code change, the resulting HEAD requires
+  **another** trusted-local private integration gate before merge. A private
+  gate result is bound to the exact HEAD it ran against and never carries
+  forward across a new commit.
+
+**Evidence-model constraint (Design Revision 2).** `identity_digest` covers
+object kind, device and inode. A reused inode can make a delete-plus-create
+indistinguishable from a move. This is an accepted observational limitation.
+Task 10 must not introduce timestamps, platform birth time, content reads,
+any new dependency, or a general directory-move whitelist to close it.
+
+---
+
+### Task 10: Inherit directory topology from a verified sanctioned rename
+
+**Files:**
+- Modify: `tools/gate3_audit.py`
+- Test: `tests/test_gate3_audit.py`
+
+No other tracked file changes. The existing commit-sanctioning decision and
+the classifier taxonomy are unchanged by every step below.
+
+**Interfaces:**
+- Consumes: `CommitRecord`, `AuditRules`, `Audit`, `CommitAuditResult`,
+  `ClassifiedPathChange`, `FilesystemChange`, `FilesystemFingerprint`,
+  `_parent_tree()`, `_rename_envelope()`, `_sanctioned_rename()`,
+  `audit_commits()`, `_audit_commit_history()`, `audit_filesystem()`,
+  `_path_parts()`, and `build_rename_plan()` from `app.rename`.
+- Produces:
+
+```text
+@dataclass(frozen=True)
+class RenameMapping:
+    old_root: str
+    new_root: str
+
+_rename_move_pairs(
+    tree: Path,
+    axis: str,
+    old: str,
+    new: str,
+    *,
+    parent_oid: str,
+) -> tuple[RenameMapping, ...]
+_verified_rename_mappings(
+    record: CommitRecord, vault: Path
+) -> tuple[RenameMapping, ...]
+_compose_rename_mappings(
+    ordered: tuple[tuple[RenameMapping, ...], ...]
+) -> tuple[RenameMapping, ...]
+_paired_rename_directories(
+    changes: tuple[FilesystemChange, ...],
+    mappings: tuple[RenameMapping, ...],
+) -> frozenset[str]
+```
+
+`_audit_commit_history()` gains one field on its existing result:
+
+```python
+@dataclass(frozen=True)
+class CommitAuditResult:
+    audit: Audit
+    path_changes: tuple[ClassifiedPathChange, ...]
+    rename_mappings: tuple[RenameMapping, ...]
+```
+
+`audit_filesystem()` gains one keyword-only parameter:
+
+```text
+audit_filesystem(
+    before: dict[str, FilesystemFingerprint],
+    after: dict[str, FilesystemFingerprint],
+    rules: AuditRules,
+    *,
+    classified_paths: tuple[ClassifiedPathChange, ...],
+    rename_mappings: tuple[RenameMapping, ...] = (),
+) -> Audit
+```
+
+**Data flow.** `_audit_commit_history()` already walks records oldest-first.
+For each record it now also calls `_verified_rename_mappings()`, which returns
+mappings **only** for a record the existing `_sanctioned_rename()` already
+accepted. The per-record tuples are collected in that same oldest-first order
+and folded by `_compose_rename_mappings()` into one composed tuple carried on
+`CommitAuditResult.rename_mappings`. `cmd_check()` passes it to
+`audit_filesystem()`, which consults it only after the violating-descendant
+rule and only for directory presence deltas.
+
+- [ ] **Step 1: Write the RED reproduction of I1**
+
+Add to `tests/test_gate3_audit.py`:
+
+```python
+def test_cli_sanctioned_rename_of_an_untracked_only_directory_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A sanctioned rename must not fail the gate on a directory Git cannot see.
+
+    `archive/` here holds no tracked file, so no commit or dirty path is ever
+    classified beneath it. Before the pairing rule both endpoints were
+    reported as unsanctioned direct writes even though the rename commit
+    itself was sanctioned, and the operator had no remedy but to delete the
+    directory.
+    """
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    (vault / old / "11-library" / "archive").mkdir(parents=True, exist_ok=True)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+
+    assert gate3.main(["check"]) == 0
+```
+
+- [ ] **Step 2: Run it and observe RED**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'sanctioned_rename_of_an_untracked_only_directory' -q
+```
+
+Expected: FAIL, exit code 1 from `check`, with
+`VIOLATION direct write: <new>/11-library/archive` and
+`VIOLATION direct write: <old>/11-library/archive` on stdout. Record both
+lines as the RED evidence for Task 10.
+
+- [ ] **Step 3: Extract move pairs from the rename planner**
+
+Add beside `_rename_envelope()` in `tools/gate3_audit.py`:
+
+```python
+@dataclass(frozen=True)
+class RenameMapping:
+    """One verified old-root to new-root move, vault-relative."""
+
+    old_root: str
+    new_root: str
+
+
+def _rename_move_pairs(
+    tree: Path,
+    axis: str,
+    old: str,
+    new: str,
+    *,
+    parent_oid: str,
+) -> tuple[RenameMapping, ...]:
+    """The move pairs of one rename plan, in the planner's own order.
+
+    `_rename_envelope` computes these and discards them. Reproducing the
+    plan here keeps the envelope comparison byte-for-byte unchanged, so the
+    sanctioning decision cannot shift.
+    """
+    plan = build_rename_plan(tree, axis, old, new, planned_head=parent_oid)
+    planned_root = plan.vault
+    return tuple(
+        RenameMapping(
+            old_root=source.relative_to(planned_root).as_posix(),
+            new_root=destination.relative_to(planned_root).as_posix(),
+        )
+        for source, destination in plan.moves
+    )
+```
+
+- [ ] **Step 4: Write the RED test for ambiguity and unsanctioned commits**
+
+```python
+def _record(oid: str, message: str, changes) -> gate3.CommitRecord:
+    return gate3.CommitRecord(
+        oid=oid,
+        message=message,
+        parents=("e" * 40,),
+        changes=tuple(
+            gate3.PathChangeRecord(status, path) for status, path in changes
+        ),
+    )
+
+
+def test_unsanctioned_rename_commit_contributes_no_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Only a commit the existing verification accepted may map anything."""
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    record = _record("a" * 40, f"rename: {old} → {new}", (("M", "unrelated.md"),))
+
+    assert gate3._verified_rename_mappings(record, vault) == ()
+
+
+def test_ambiguous_axis_match_contributes_no_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two axes reproducing one envelope is ambiguous, so nothing is mapped."""
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    monkeypatch.setattr(gate3, "_sanctioned_rename", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        gate3,
+        "_matching_rename_axes",
+        lambda *_a, **_k: (
+            ("entity", (gate3.RenameMapping(old, new),)),
+            ("product", (gate3.RenameMapping(old, new),)),
+        ),
+    )
+    record = _record("a" * 40, f"rename: {old} → {new}", (("M", "x.md"),))
+
+    assert gate3._verified_rename_mappings(record, vault) == ()
+```
+
+- [ ] **Step 5: Run them and observe RED**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'contributes_no_mapping' -q
+```
+
+Expected: FAIL with `AttributeError` on `_verified_rename_mappings`.
+
+- [ ] **Step 6: Evaluate every axis without changing sanctioning**
+
+Add to `tools/gate3_audit.py`:
+
+```python
+def _matching_rename_axes(
+    record: CommitRecord, vault: Path, old: str, new: str
+) -> tuple[tuple[str, tuple[RenameMapping, ...]], ...]:
+    """Every axis whose envelope equals the commit, evaluated to completion.
+
+    `_sanctioned_rename` returns on its first matching axis and so can never
+    observe a second one. Ambiguity detection needs the full set, so this
+    walks all axes. It is a separate pass on purpose: the sanctioning
+    decision keeps its early return and its result is not consulted here.
+    """
+    actual = frozenset((change.status, change.path) for change in record.changes)
+    matches: list[tuple[str, tuple[RenameMapping, ...]]] = []
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        for axis in sorted(AXES):
+            try:
+                expected = _rename_envelope(
+                    tree, tracked, axis, old, new, parent_oid=record.parents[0]
+                )
+                if not expected or actual != expected:
+                    continue
+                pairs = _rename_move_pairs(
+                    tree, axis, old, new, parent_oid=record.parents[0]
+                )
+            except (OSError, RenameError, UnicodeError, sqlite3.Error):
+                continue
+            matches.append((axis, pairs))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return ()
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+    return tuple(matches)
+
+
+def _verified_rename_mappings(
+    record: CommitRecord, vault: Path
+) -> tuple[RenameMapping, ...]:
+    """Mappings only from a commit the existing verification already accepted."""
+    match = _RENAME_MESSAGE.fullmatch(record.message)
+    if match is None or len(record.parents) != 1:
+        return ()
+    if not _sanctioned_rename(record, vault):
+        return ()
+    old, new = match.groups()
+    matches = _matching_rename_axes(record, vault, old, new)
+    if len(matches) != 1:
+        # Zero means the envelope could not be reproduced here; more than one
+        # is ambiguous. Both contribute nothing rather than a best guess.
+        return ()
+    return matches[0][1]
+```
+
+- [ ] **Step 7: Run and confirm GREEN for Step 4's tests**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'contributes_no_mapping' -q
+```
+
+Expected: 2 passed.
+
+- [ ] **Step 8: Write the RED composition tests**
+
+```python
+def _m(old_root: str, new_root: str) -> gate3.RenameMapping:
+    return gate3.RenameMapping(old_root, new_root)
+
+
+def test_rename_mappings_compose_oldest_first_over_exact_roots():
+    composed = gate3._compose_rename_mappings(((_m("a", "b"),), (_m("b", "c"),)))
+
+    assert composed == (_m("a", "c"),)
+
+
+def test_rename_mappings_compose_over_path_prefixes():
+    """Renames on different axes nest, so exact-root composition is not enough."""
+    composed = gate3._compose_rename_mappings(
+        ((_m("a/11-library/p", "a/11-library/q"),), (_m("a", "b"),))
+    )
+
+    assert composed == (_m("a/11-library/p", "b/11-library/q"), _m("a", "b"))
+
+
+@pytest.mark.parametrize(
+    "ordered",
+    (
+        ((_m("a", "b"), _m("a", "c")),),
+        ((_m("a", "c"), _m("b", "c")),),
+    ),
+    ids=("one-source-two-destinations", "two-sources-one-destination"),
+)
+def test_conflicting_rename_mappings_contribute_nothing(ordered):
+    assert gate3._compose_rename_mappings(ordered) == ()
+```
+
+- [ ] **Step 9: Run them and observe RED**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'rename_mappings_compose or conflicting_rename_mappings' -q
+```
+
+Expected: FAIL with `AttributeError` on `_compose_rename_mappings`.
+
+- [ ] **Step 10: Implement deterministic oldest-first prefix composition**
+
+```python
+def _rewrite_destination(destination: str, mapping: RenameMapping) -> str | None:
+    """Apply one later mapping to an earlier destination, or None."""
+    if destination == mapping.old_root:
+        return mapping.new_root
+    prefix = mapping.old_root + "/"
+    if destination.startswith(prefix):
+        return mapping.new_root + "/" + destination[len(prefix):]
+    return None
+
+
+def _compose_rename_mappings(
+    ordered: tuple[tuple[RenameMapping, ...], ...],
+) -> tuple[RenameMapping, ...]:
+    """Fold per-commit mappings oldest-first, failing closed on conflict.
+
+    A later mapping rewrites an earlier destination when it names that
+    destination exactly or is a proper path-prefix of it. Renames on
+    different axes nest, so prefix rewriting is required and not a
+    refinement.
+    """
+    composed: list[RenameMapping] = []
+    for group in ordered:
+        rewritten: list[RenameMapping] = []
+        for existing in composed:
+            applied = [
+                candidate
+                for mapping in group
+                if (candidate := _rewrite_destination(existing.new_root, mapping))
+                is not None
+            ]
+            if len(applied) > 1:
+                return ()
+            rewritten.append(
+                RenameMapping(existing.old_root, applied[0])
+                if applied
+                else existing
+            )
+        composed = rewritten + [
+            mapping
+            for mapping in group
+            if not any(
+                existing.new_root == mapping.old_root for existing in composed
+            )
+        ]
+    sources = [mapping.old_root for mapping in composed]
+    destinations = [mapping.new_root for mapping in composed]
+    if len(set(sources)) != len(sources) or len(set(destinations)) != len(
+        destinations
+    ):
+        return ()
+    return tuple(composed)
+```
+
+- [ ] **Step 11: Run and confirm GREEN for Step 8's tests**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'rename_mappings_compose or conflicting_rename_mappings' -q
+```
+
+Expected: 4 passed.
+
+- [ ] **Step 12: Write the RED pairing tests for the remaining Revision 2 cases**
+
+```python
+def _pair_fp(mode: int = 0o755, identity: str = "1" * 64):
+    return gate3.FilesystemFingerprint("directory", mode, identity, None)
+
+
+def _pair_audit(before, after, rules, mappings, classified=()):
+    return gate3.audit_filesystem(
+        before,
+        after,
+        rules,
+        classified_paths=tuple(classified),
+        rename_mappings=tuple(mappings),
+    )
+
+
+def test_paired_rename_directories_are_sanctioned_at_both_endpoints(
+    tmp_path: Path,
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.sanctioned_writes == ["renamed/d/empty", "synthetic/d/empty"]
+    assert audit.violating_writes == []
+
+
+@pytest.mark.parametrize(
+    ("before_path", "after_path", "before_fp", "after_fp", "mappings"),
+    (
+        (
+            "synthetic/d/empty",
+            "renamed/d/empty",
+            _pair_fp(),
+            _pair_fp(),
+            (),
+        ),
+        (
+            "synthetic/d/empty",
+            "stranger/d/empty",
+            _pair_fp(),
+            _pair_fp(),
+            (_m("synthetic", "renamed"),),
+        ),
+        (
+            "synthetic/d/empty",
+            "renamed/d/other",
+            _pair_fp(),
+            _pair_fp(),
+            (_m("synthetic", "renamed"),),
+        ),
+        (
+            "synthetic/d/empty",
+            "renamed/d/empty",
+            _pair_fp(),
+            _pair_fp(identity="2" * 64),
+            (_m("synthetic", "renamed"),),
+        ),
+        (
+            "synthetic/d/empty",
+            "renamed/d/empty",
+            _pair_fp(),
+            _pair_fp(mode=0o700),
+            (_m("synthetic", "renamed"),),
+        ),
+        (
+            "synthetic/d/empty",
+            "renamed/d/empty",
+            _pair_fp(),
+            gate3.FilesystemFingerprint("symlink", 0o777, "1" * 64, "3" * 64),
+            (_m("synthetic", "renamed"),),
+        ),
+    ),
+    ids=(
+        "no-sanctioned-rename",
+        "wrong-new-root",
+        "different-tail",
+        "identity-mismatch",
+        "mode-mismatch",
+        "non-directory-endpoint",
+    ),
+)
+def test_unpaired_rename_shapes_remain_violations(
+    tmp_path: Path, before_path, after_path, before_fp, after_fp, mappings
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {before_path: before_fp}, {after_path: after_fp}, rules, mappings
+    )
+
+    assert audit.sanctioned_writes == []
+    assert sorted(audit.violating_writes) == sorted({before_path, after_path})
+
+
+def test_pairing_does_not_sanction_an_unrelated_sibling(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp(), "renamed/d/extra": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.violating_writes == ["renamed/d/extra"]
+    assert audit.sanctioned_writes == ["renamed/d/empty", "synthetic/d/empty"]
+
+
+def test_violating_descendant_beneath_a_paired_directory_still_fails(
+    tmp_path: Path,
+):
+    """Pairing is evaluated after the descendant rule and cannot hide it."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/empty": _pair_fp()},
+        {"renamed/d/empty": _pair_fp()},
+        rules,
+        (_m("synthetic", "renamed"),),
+        classified=[
+            _classified("renamed/d/empty/bad.md", "added", "violating"),
+        ],
+    )
+
+    assert "renamed/d/empty" not in audit.sanctioned_writes
+```
+
+- [ ] **Step 13: Run them and observe RED**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'paired_rename or unpaired_rename or pairing_does_not or violating_descendant_beneath' -q
+```
+
+Expected: FAIL — `audit_filesystem()` does not accept `rename_mappings`.
+
+- [ ] **Step 14: Implement pairing inside the existing disposition order**
+
+Add beside `audit_filesystem()`:
+
+```python
+def _paired_rename_directories(
+    changes: tuple[FilesystemChange, ...],
+    mappings: tuple[RenameMapping, ...],
+) -> frozenset[str]:
+    """Paths a verified sanctioned rename explains, at both endpoints.
+
+    Identity equality is necessary and never sufficient: every other
+    requirement is checked here independently, and a reused inode cannot
+    substitute for any of them (design "Evidence-model limitation").
+    """
+    removed = {
+        change.path: change.before
+        for change in changes
+        if change.kind == "removed"
+        and change.before is not None
+        and change.before.kind == "directory"
+    }
+    added = {
+        change.path: change.after
+        for change in changes
+        if change.kind == "added"
+        and change.after is not None
+        and change.after.kind == "directory"
+    }
+    paired: set[str] = set()
+    for old_path, old_fingerprint in removed.items():
+        for mapping in mappings:
+            if old_path == mapping.old_root:
+                tail = ""
+            elif old_path.startswith(mapping.old_root + "/"):
+                tail = old_path[len(mapping.old_root) + 1:]
+            else:
+                continue
+            new_path = mapping.new_root if not tail else (
+                mapping.new_root + "/" + tail
+            )
+            new_fingerprint = added.get(new_path)
+            if new_fingerprint is None:
+                continue
+            if (
+                new_fingerprint.mode == old_fingerprint.mode
+                and new_fingerprint.identity_digest
+                == old_fingerprint.identity_digest
+            ):
+                paired.update({old_path, new_path})
+                break
+    return frozenset(paired)
+```
+
+Change the `audit_filesystem()` signature to accept
+`rename_mappings: tuple[RenameMapping, ...] = ()`, compute
+`paired = _paired_rename_directories(changes, rename_mappings)` once after
+`changes` is built, and insert exactly one clause into the existing
+directory-disposition order, **after** the violating-descendant suppression
+and the sanctioned-descendant inheritance, and **before** the canonical
+quarantine exception:
+
+```python
+        if change.path in paired:
+            result.sanctioned_writes.append(change.path)
+            continue
+```
+
+- [ ] **Step 15: Run and confirm GREEN**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'paired_rename or unpaired_rename or pairing_does_not or violating_descendant_beneath' -q
+```
+
+Expected: 9 passed.
+
+- [ ] **Step 16: Thread mappings through the commit audit and the CLI**
+
+In `tools/gate3_audit.py`, add the field to the existing result type:
+
+```python
+@dataclass(frozen=True)
+class CommitAuditResult:
+    audit: Audit
+    path_changes: tuple[ClassifiedPathChange, ...]
+    rename_mappings: tuple[RenameMapping, ...]
+```
+
+In `_audit_commit_history()`, collect one entry per record inside the
+existing oldest-first loop, immediately after the per-commit audit:
+
+```python
+            if audited.sanctioned_commits:
+                ordered_mappings.append(
+                    _verified_rename_mappings(record, vault)
+                )
+```
+
+and return:
+
+```python
+    return CommitAuditResult(
+        audit=result,
+        path_changes=tuple(changes[path] for path in sorted(changes)),
+        rename_mappings=_compose_rename_mappings(
+            tuple(group for group in ordered_mappings if group)
+        ),
+    )
+```
+
+In `cmd_check()`, pass it through:
+
+```python
+    filesystem_audit = audit_filesystem(
+        snapshot.evidence.filesystem,
+        current.filesystem,
+        rules,
+        classified_paths=commit_result.path_changes + dirty_paths,
+        rename_mappings=commit_result.rename_mappings,
+    )
+```
+
+- [ ] **Step 17: Run the I1 reproduction and confirm GREEN**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'sanctioned_rename_of_an_untracked_only_directory' -q
+```
+
+Expected: 1 passed — `check` now returns 0 for the rename that previously
+reported two false violations.
+
+- [ ] **Step 18: Write and run the nested sequential CLI regression**
+
+```python
+def test_cli_nested_sequential_renames_pair_an_untracked_only_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two sanctioned renames nest, so composition must rewrite by prefix."""
+    files, old, new = _rename_files("entity")
+    files["_system/products.yaml"] = (
+        'version: "1.0"\nproducts:\n  ' + old + ":\n"
+        "    oldproduct:\n      label: Old\n"
+    )
+    vault = git_vault(tmp_path / "vault", files)
+    (vault / old / "11-library" / "archive").mkdir(parents=True, exist_ok=True)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+
+    apply_rename(
+        vault, plan_rename(vault, "product", "oldproduct", "newproduct"),
+        validators=[],
+    )
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+
+    assert gate3.main(["check"]) == 0
+```
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'nested_sequential_renames' -q
+```
+
+Expected: 1 passed. If it fails, composition is not rewriting by prefix;
+fix `_compose_rename_mappings()` rather than relaxing any pairing
+requirement.
+
+- [ ] **Step 19: Confirm the taxonomy and sanctioning decision are untouched**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'consumed or pending or receipt or unrelated or rename' -q
+git diff -- tools/gate3_audit.py | grep -E '^[-+].*(_commit_is_sanctioned|_sanctioned_outbox|_sanctioned_registry|_sanctioned_ingest|_load_consumed_record|_receipt_authorizations)'
+```
+
+Expected: every selected test passes, and the `grep` prints nothing —
+no line inside any commit-sanctioning or record-sanctioning helper changed.
+
+- [ ] **Step 20: Run the Gate 3 module and the full public suite**
+
+Run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py -q
+uv run python -m pytest -q
+```
+
+Expected: the Gate 3 module rises from 228 to **242 passed, 1 skipped**
+(13 Revision 2 cases plus the nested CLI regression), and the full public
+suite rises from 1950 to **1964 passed, 1 skipped**. A lower count is a stop
+condition.
+
+- [ ] **Step 21: Mutation-prove the pairing rule**
+
+Without committing, replace the single inserted clause in
+`audit_filesystem()` with `if False:` and run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'sanctioned_rename_of_an_untracked_only_directory' -q
+```
+
+Expected: RED with two `VIOLATION direct write:` lines. Then mutate
+`_paired_rename_directories()` so identity equality is not required, and run:
+
+```bash
+uv run python -m pytest tests/test_gate3_audit.py \
+  -k 'unpaired_rename_shapes_remain_violations' -q
+```
+
+Expected: RED on the `identity-mismatch` case. Restore the exact
+implementation after each mutation, verify with `cmp` and SHA-256 that the
+file is byte-identical to its preimage, and re-run both commands to GREEN.
+
+- [ ] **Step 22: Run the public acceptance gates**
+
+Run:
+
+```bash
+git diff --check
+tools/run_gitleaks.sh .
+uv run python -m tools.public_repo_audit --repo .
+uv run python -m tools.public_repo_audit --repo . --history
+git status --short
+```
+
+Expected: whitespace clean; Gitleaks clean; both audits CLEAN; only
+`tools/gate3_audit.py` and `tests/test_gate3_audit.py` modified. Confirm
+`ONEOS_VAULT` is still unset.
+
+- [ ] **Step 23: Commit the implementation checkpoint**
+
+Commit only those two files, in one sanitized commit that records the RED
+evidence, the two mutation proofs, and both test counts.
+
+- [ ] **Step 24: Obtain an independent scoped review**
+
+Invoke `superpowers:requesting-code-review` over
+`acc3f309f04a285fbec46acf0a0cc99d0175e101`..HEAD. The prompt carries only
+public requirements and synthetic evidence. Ask for Critical / Important /
+Minor findings covering: mapping provenance and the unchanged sanctioning
+decision; ambiguity and conflict handling; prefix composition including
+nested chains; the five pairing requirements; descendant precedence; the
+inode-reuse limitation being neither widened nor worked around; and test
+gaps.
+
+Verify every finding with `superpowers:receiving-code-review` before acting.
+Add a RED regression for each accepted behavioural defect, implement the
+smallest fix, re-run Steps 19–22, and request another scoped review. Return
+disputed or scope-expanding findings to the owner.
+
+- [ ] **Step 25: Stop for the trusted-local private integration gate**
+
+Report the final HEAD, changed files, RED/GREEN and mutation evidence,
+focused and full public counts, Gitleaks and both public audits, independent
+findings by severity, clean worktree, and confirmation that `ONEOS_VAULT`
+remained unset.
+
+Then **stop**. Do not push, open a pull request, request CodeRabbit, run the
+live Gate 3 trial, begin Gate 1 timing, deploy, or start Phase 2. The owner
+runs the trusted-local private integration gate against that exact HEAD —
+fresh opaque preimages, 39+ private tests, `check_v2` 0 errors and 0
+warnings, policy pass, clean combined repository-plus-vault history audit,
+and four byte-identical preservation comparisons. Only after a sanitized
+PASS may publication resume, and any later CodeRabbit code change requires a
+further private gate on the resulting HEAD.
