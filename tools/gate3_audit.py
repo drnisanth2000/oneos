@@ -35,7 +35,7 @@ from app.action_receipts import (
     validate_all_head_receipt_stores,
 )
 from app.destinations import DestinationError, resolve_classification_destination
-from app.entities import EntityCatalog
+from app.entities import EntityCatalog, EntityManifestError
 from app.outbox import OutboxError, _require_destination, _to_proposal
 from app.proposal_identity import (
     ProposalIdentityError,
@@ -1464,6 +1464,10 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         return 2
     except (
+        # An unreadable entity manifest is a `RuntimeError`, so naming it is
+        # the only way this boundary reports it. The store sweep reaches
+        # `EntityCatalog.load` from `snapshot` as well as `check`.
+        EntityManifestError,
         json.JSONDecodeError,
         KeyError,
         OSError,

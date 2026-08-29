@@ -1636,6 +1636,28 @@ def test_cli_refuses_to_store_the_snapshot_inside_the_vault(
     assert snapshot.exists() is False
 
 
+def test_cli_snapshot_reports_a_missing_entity_manifest_as_a_controlled_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+):
+    """`snapshot` must fail through the command boundary, not a traceback.
+
+    The store sweep loads the entity catalog, so `snapshot` now reaches
+    `EntityCatalog.load` where it never did before. `EntityManifestError` is a
+    `RuntimeError`, which the boundary's exception tuple does not name, so an
+    unreadable manifest escaped as an unhandled traceback and exit 1 instead
+    of the controlled outcome every other Gate 3 failure reports.
+    """
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    (vault / "_system" / "entities.yaml").unlink()
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+
+    assert gate3.main(["snapshot"]) == 2
+    assert "GATE 3 ERROR:" in capsys.readouterr().err
+    assert snapshot.exists() is False
+
+
 def test_cli_check_accepts_a_sanctioned_commit_after_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
