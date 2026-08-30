@@ -74,7 +74,7 @@ change.
   development oracle then proved that `changes[:1]` is not malformed for the
   one-change workspace envelope; Revision 7 uses the explicitly empty tuple
   for a portable malformed/empty-envelope refusal on all five axes.
-- Revision 8 — this document. Task 13's first independent review found two
+- Revision 8 — superseded. Task 13's first independent review found two
   accepted defects. A paired tracked special entry retained its sanctioned
   Git classification and could therefore sanction a refused enclosing
   directory pair through ancestry. The correction removes only sanctioned
@@ -86,6 +86,14 @@ change.
   failures now reach the controlled CLI error boundary. These corrections add
   three collected cases, require two additional mutation proofs, and permit
   `audit_filesystem` to differ in the final Task 12 AST comparison.
+- Revision 9 — this document. The second independent review confirmed both
+  Revision 8 behavioural defects closed and reported one Minor test-adequacy
+  gap: the overlapping paired-special regression covered sanctioned Git
+  classifications but did not directly pin the requirement that violating
+  classifications survive. A parallel synthetic regression now proves the
+  authoritative violation suppresses duplicate enclosing-directory findings,
+  and a third Task 13 mutation drops the disposition guard to prove that test
+  turns RED. Product code is unchanged by this review round.
 
 ## Global Constraints
 
@@ -3766,6 +3774,9 @@ and 1983 passed / 1 skipped:
   **at least 2024 passed**, 1 skipped.
 - after the accepted Task 13 review corrections: Gate 3 module **at least 305
   passed**, 1 skipped; full suite **at least 2027 passed**, 1 skipped.
+- after the accepted second-review test-adequacy correction: Gate 3 module
+  **at least 306 passed**, 1 skipped; full suite **at least 2028 passed**, 1
+  skipped.
 
 A socket case may skip where the host cannot safely bind one; any such skip
 is reported, not hidden, and the floor is reduced by exactly the number of
@@ -3783,11 +3794,14 @@ one, and any such skip must be reported.
 
 Both mutation matrices, the focused suites, the Gate 3 module, the full
 public suite, `git diff --check`, Gitleaks, both public audits, the AST
-comparison, the shadowing guard, and the two Task 13 review mutations. The
+comparison, the shadowing guard, and the three Task 13 review mutations. The
 first review mutation restores a paired non-directory's sanctioned Git
 classification as an ancestry candidate; its tracked-special regression must
 turn RED. The second treats later-axis `ValueError` and
 `CalledProcessError` as expected; both parameterized cases must turn RED.
+The third drops the disposition guard while filtering paired
+non-directories; the overlapping violating-classification regression must
+turn RED.
 
 The final AST comparison against the Task 11 checkpoint permits
 `audit_filesystem` in addition to Task 12's four intended retained-definition
