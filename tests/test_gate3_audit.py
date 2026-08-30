@@ -2211,8 +2211,10 @@ def test_filesystem_audit_rejects_new_removed_replaced_or_changed_special_entry(
     elif mutation == "removed-fifo":
         target.unlink()
     elif mutation == "replaced-fifo":
+        replacement = target.with_name("replacement")
+        os.mkfifo(replacement, 0o600)
         target.unlink()
-        os.mkfifo(target, 0o600)
+        replacement.rename(target)
     elif mutation == "fifo-to-symlink":
         target.unlink()
         target.symlink_to("elsewhere")
@@ -2797,13 +2799,15 @@ def test_filesystem_kind_is_closed_without_type_confusion():
 def test_filesystem_identity_digest_changes_on_same_kind_replacement(
     tmp_path: Path,
 ):
-    """A replaced directory of the same kind must not look unchanged."""
+    """A distinguishable same-kind replacement changes identity evidence."""
     target = tmp_path / "d"
     target.mkdir()
     first = os.stat(target, follow_symlinks=False)
     first_digest = gate3._filesystem_identity_digest("directory", first)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
     target.rmdir()
-    target.mkdir()
+    replacement.rename(target)
     second = os.stat(target, follow_symlinks=False)
     second_digest = gate3._filesystem_identity_digest("directory", second)
 
