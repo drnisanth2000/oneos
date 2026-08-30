@@ -73,9 +73,18 @@ mutation ledger record the correction rounds. The macOS no-overwrite path was
 exercised. Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
 user/platform limitation. The separately sequenced inherited items 2, 4, and 3
 are complete; `docs/STATUS.md` records their published evidence. The next work
-is the live Phase 1 exit trials: Gate 2 approval plus revert proof, Gate 3
-full-session unsanctioned-write audit, and Gate 1 timed triage of about 20 real
-inbox items. Gates 4 and 5 already pass. Phase 2 remains unauthorized.
+is a continuation of the live Phase 1 exit trials. The first live session
+exposed a Gate 3 defect, not a new transaction contract: the exact valid S7
+quarantine record needed receipt-correlated sanctioning. Independent review of
+that correction then exposed Git-invisible directories and non-regular entries
+outside the discovery boundary; deterministic no-follow filesystem evidence
+now covers them. Both corrections are integrated and their closing public,
+private, publication, and preservation gates pass. The live Gate 3 session has
+not been rerun and must not be reported as passed. Only after separate owner
+authorization, start a new live task from a fresh worktree at the current
+fetched `origin/main`, preserve the existing live evidence, rerun Gate 3, then
+complete any still-pending Gate 2 proof and Gate 1 timed triage. Gates 4 and 5
+already pass. Phase 2 remains unauthorized.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved

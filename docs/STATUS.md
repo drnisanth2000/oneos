@@ -8,16 +8,19 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-08-29, after the published completion evidence for
-inherited items 2, 4, and 3.
+Last reconciled: 2026-08-30, after integration of the Gate 3 S7-record and
+filesystem-evidence corrections.
 
 ---
 
 ## Phase 1 triage
 
 Original steps 1-10, Safety Foundation S1-S7, and the separately sequenced
-inherited items 2, 4, and 3 below are complete. The substantive next phase is
-the live Phase 1 exit trials. Phase 2 is not authorized.
+inherited items 2, 4, and 3 below are complete. The first live Phase 1 exit
+trial exposed a Gate 3 audit defect, and independent correction review exposed
+a second discovery gap. Both corrections are now integrated and synthetically
+verified. A fresh trusted-local Gate 3 rerun still requires separate owner
+authorization. Phase 2 is not authorized.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -55,6 +58,42 @@ These are published completion records, not results from this reconciliation:
 | 4 — remaining filesystem failure shapes | **COMPLETE** | 39 tests; `check_v2` 0 errors/0 warnings; combined audit CLEAN; byte-identical vault preservation. |
 | 3 — declaration completeness | **COMPLETE** — final public suite recorded 1,826 passing tests. | 39 tests; `check_v2` 0 errors/0 warnings; Gitleaks clean; combined audit CLEAN; byte-identical vault preservation. CI and CodeRabbit passed. |
 
+### Gate 3 correction integration evidence
+
+The first live Gate 3 session correctly sanctioned both action commits and
+reported zero violating commits, but it misclassified the action's exact S7
+quarantine record as a direct write. The focused S7 correction now sanctions
+only the canonical entity-local record when its proposal identity and bytes,
+regular no-follow state, and any receipt/digest evidence supplied by the
+transaction contract agree; wrong-location, malformed, mismatched,
+non-regular, and unrelated writes remain violations.
+
+Independent review of that correction exposed a separate standing discovery
+gap: Git status cannot enumerate empty directories and some non-regular
+entries. The integrated filesystem-evidence correction adds a closed snapshot
+schema, deterministic no-follow traversal, coherent Git/filesystem endpoint
+collection, and fail-closed disposition of directory and special-entry
+changes. Filesystem changes inherit sanction only from an independently
+verified rename with exact topology, kind, mode, identity, and symlink-target
+evidence; the exact canonical S7 quarantine-directory addition remains the
+sole standalone directory exception. Endpoint identity is necessary rather
+than sufficient: portable metadata cannot distinguish a genuine move from a
+delete-and-create that reuses an inode, so every other rename condition must
+also agree.
+
+The completed correction was integrated by PR #28 at merge
+`cbc15971fecd206bef782b1042fd2ddebe21db3c`. Its reviewed head recorded 306
+Gate 3 tests passing with one platform skip and 2,028 public tests passing with
+one platform skip. The trusted-local gate recorded 39 private tests,
+`check_v2` 0 errors/0 warnings, policy PASS, clean public and combined history
+audits, and byte-identical protected HEAD, status, worktree-diff, and
+cached-diff evidence preserving approved pre-existing edits. CI, CodeRabbit,
+Gitleaks, and independent scoped review passed. Linux CI also exposed tests
+that assumed inode numbers could not be immediately reused; the fixtures were
+made portable without weakening the product's fail-closed identity checks.
+The live Gate 3 rerun was deliberately not performed during correction and is
+still required before Gate 3 can be declared passed.
+
 ### Exit gates (spec §11)
 
 | Gate | State |
@@ -62,7 +101,7 @@ These are published completion records, not results from this reconciliation:
 | 2 — one commit per approval, `git revert`-clean | **AUTOMATED PASS; LIVE TRIAL PENDING** — adapter intake is committed before approval; classification and registry-delete approvals commit exactly reviewed paths; one revert restores the committed action. |
 | 4 — front-matter agreement with `policy_enforcer`, 100 files | **PASS** (100/100) |
 | 5 — cold start to usable screen < 2s | **PASS** (~0.35s) |
-| 3 — zero unsanctioned direct vault writes over a session | **AUTOMATED PASS; LIVE SESSION TRIAL PENDING** — Gate 3 validates action-specific message/path pairs, initially dirty fingerprints, sanctioned proposal writes, and receipt-only `ingest:` commits. |
+| 3 — zero unsanctioned direct vault writes over a session | **AUTOMATED PASS; LIVE SESSION RERUN REQUIRED** — Gate 3 validates action-specific message/path pairs, initial dirty evidence, exact S7 quarantine records, receipt-only `ingest:` commits, and supplemental no-follow filesystem evidence for Git-invisible directories and non-regular entries. The first live run exposed the corrected S7-record defect; later review exposed the filesystem-discovery gap. No live pass has been recorded. |
 | 1 — triage 20 items faster than Obsidian | **READY FOR LIVE TRIAL** — requires about 20 real inbox items; stopwatch exists on the triage screen. |
 
 Gates govern expansion, not usage. Live trials do not reopen completed S1-S5
@@ -98,7 +137,11 @@ unless they demonstrate a reproducible defect in those guarantees.
   on failure without overwriting concurrent same-path changes.
 - **Gate 3 authority** — a sanctioned prefix alone is never enough. The audit
   validates each new commit's action-specific path set and detects changes to
-  staged, unstaged, or untracked state captured at session start.
+  staged, unstaged, or untracked state captured at session start. Exact S7
+  quarantine records require proposal/receipt correlation; deterministic
+  no-follow filesystem evidence covers Git-invisible directories and special
+  entries. Rename inheritance requires independently sanctioned commit-relative
+  topology plus matching endpoint evidence and fails closed on ambiguity.
 - **Gate 3 historical-replay correction** — planned-head live lookup initially
   broke historical-tree audit replay. The audit now uses an explicit immutable
   parent OID builder; the correction was developed test-first and independently
@@ -182,11 +225,13 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-Run the trusted-local live Phase 1 exit trials: Gate 2 approval plus revert
-proof, Gate 3 full-session unsanctioned-write audit, and Gate 1 timed triage of
-about 20 real inbox items. Gates 4 and 5 already pass. Phase 2 remains
-unauthorized. Deployment remains blocked until all Phase 1 gates pass and the
-owner separately approves deployment; deferred UI remains out of scope.
+After separate owner authorization, start a new trusted-local task from a fresh
+worktree at the current fetched `origin/main` and rerun the Gate 3 full-session
+audit while preserving the existing live evidence. Then complete any
+still-pending Gate 2 approval/revert proof and the Gate 1 timed triage of about
+20 real inbox items. Gates 4 and 5 already pass. Phase 2 remains unauthorized.
+Deployment remains blocked until all Phase 1 gates pass and the owner
+separately approves deployment; deferred UI remains out of scope.
 
 ---
 
