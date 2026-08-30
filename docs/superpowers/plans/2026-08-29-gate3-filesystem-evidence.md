@@ -51,7 +51,8 @@ change.
 - Revision 4 — Task 10 corrected again. Executed to completion at
   `69cbff7681c00a9347ec1be22cc40ef72788730e`.
 - Revision 5 — added Tasks 11 and 12. Superseded.
-- Revision 6 — this document. Tasks 1–10 are historical and must not be
+- Revision 6 — corrected Task 12's authority and evidence model. Superseded.
+- Revision 7 — this document. Tasks 1–10 are historical and must not be
   re-run. Adds **Task 11** (I5, non-directory rename inheritance — a
   regression this branch introduces relative to canonical `origin/main`) and
   **Task 12** (I4, one immutable per-record rename analysis), sequential and
@@ -69,7 +70,10 @@ change.
   object, the historical differential oracle is disposable and untracked,
   expected and unexpected later-axis failures are exercised separately, the
   two-record test is included in RED/GREEN commands, and both mutation
-  ledgers and collected-case forecasts are internally consistent.
+  ledgers and collected-case forecasts are internally consistent. The
+  development oracle then proved that `changes[:1]` is not malformed for the
+  one-change workspace envelope; Revision 7 uses the explicitly empty tuple
+  for a portable malformed/empty-envelope refusal on all five axes.
 
 ## Global Constraints
 
@@ -3401,7 +3405,7 @@ def test_rename_analysis_preserves_literal_sanctioning_results(
             False,
         ),
         "malformed-envelope": (
-            dataclasses.replace(record, changes=record.changes[:1]),
+            dataclasses.replace(record, changes=()),
             False,
         ),
         "non-rename-message": (
