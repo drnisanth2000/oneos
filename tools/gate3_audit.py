@@ -1407,7 +1407,24 @@ def audit_filesystem(
     # Phase 1 classifies non-directory deltas before ancestry. A paired entry
     # is deliberately neutral: it proves only that the entry moved, never that
     # its enclosing directory met the directory pairing requirements.
-    candidates: list[ClassifiedPathChange] = list(classified_paths)
+    paired_non_directories = frozenset(
+        change.path
+        for change in changes
+        if change.path in paired
+        and not (
+            change.kind in {"added", "removed"}
+            and (change.before or change.after).kind == "directory"
+            and (change.before is None or change.after is None)
+        )
+    )
+    candidates: list[ClassifiedPathChange] = [
+        candidate
+        for candidate in classified_paths
+        if not (
+            candidate.path in paired_non_directories
+            and candidate.disposition == "sanctioned"
+        )
+    ]
     for change in changes:
         directory_presence = (
             change.kind in {"added", "removed"}
@@ -1529,7 +1546,10 @@ def _analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis:
     matched: list[tuple[str, tuple[RenameMapping, ...]]] = []
     temporary: tempfile.TemporaryDirectory[str] | None = None
     try:
-        temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        try:
+            temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            return empty
         for axis in sorted(AXES):
             try:
                 envelope, mappings = _axis_envelope_and_moves(
@@ -1544,8 +1564,6 @@ def _analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis:
                 continue
             if envelope and actual == envelope:
                 matched.append((axis, mappings))
-    except (OSError, subprocess.CalledProcessError, ValueError):
-        return empty
     finally:
         if temporary is not None:
             temporary.cleanup()

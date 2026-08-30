@@ -3891,6 +3891,39 @@ def test_paired_special_entry_never_sanctions_its_enclosing_directory(
     ]
 
 
+def test_tracked_paired_special_is_neutral_despite_commit_classification(
+    tmp_path: Path,
+):
+    """Sanctioned Git D/A evidence cannot bypass refused directory pairing."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    audit = _pair_audit(
+        {
+            "synthetic/d": _kind_fp("directory"),
+            "synthetic/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        {
+            "renamed/d": _kind_fp("directory", identity="2" * 64),
+            "renamed/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        rules,
+        (_m("synthetic", "renamed"),),
+        classified=(
+            gate3.ClassifiedPathChange(
+                "synthetic/d/link", "removed", "sanctioned"
+            ),
+            gate3.ClassifiedPathChange(
+                "renamed/d/link", "added", "sanctioned"
+            ),
+        ),
+    )
+
+    assert sorted(audit.violating_writes) == ["renamed/d", "synthetic/d"]
+    assert audit.sanctioned_writes == [
+        "renamed/d/link", "synthetic/d/link"
+    ]
+
+
 def test_refused_special_pair_still_suppresses_its_ancestor(tmp_path: Path):
     vault = _audit_vault(tmp_path / "vault", initialize_git=True)
     rules = gate3.AuditRules.load(vault)
@@ -4096,10 +4129,20 @@ def test_expected_later_axis_failures_preserve_an_earlier_match(
     assert analysis.mappings
 
 
+@pytest.mark.parametrize(
+    "error",
+    (
+        TypeError("synthetic unexpected axis type error"),
+        ValueError("synthetic unexpected axis value error"),
+        subprocess.CalledProcessError(1, ("synthetic", "axis")),
+    ),
+    ids=("type-error", "value-error", "called-process-error"),
+)
 def test_unexpected_later_axis_error_fails_check_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture,
+    error: Exception,
 ):
     files, old, new = _rename_files("entity")
     vault = git_vault(tmp_path / "vault", files)
@@ -4115,7 +4158,7 @@ def test_unexpected_later_axis_error_fails_check_closed(
     ):
         if axis == "entity":
             return real(tree, tracked, axis, old, new, parent_oid=parent_oid)
-        raise TypeError("synthetic unexpected axis failure")
+        raise error
 
     monkeypatch.setattr(
         gate3, "_axis_envelope_and_moves", unexpected_failure_after_match
