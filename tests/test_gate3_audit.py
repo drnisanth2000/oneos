@@ -697,7 +697,7 @@ def test_offline_rename_envelope_uses_explicit_parent_oid_without_git_repo(
     temporary, tree, tracked = gate3._parent_tree(vault, parent_oid)
     try:
         assert not (tree / ".git").exists()
-        expected = gate3._rename_envelope(
+        expected, _mappings = gate3._axis_envelope_and_moves(
             tree,
             tracked,
             "entity",
@@ -3318,17 +3318,15 @@ def test_unsanctioned_rename_commit_contributes_no_mapping(tmp_path: Path):
     head = _git(vault, "rev-parse", "HEAD").strip()
     apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
     (record,) = gate3.collect_commit_records(vault, head)
-    assert gate3._verified_rename_mappings(record, vault) != ()
+    assert gate3._analyze_rename(record, vault).mappings != ()
 
-    # `_matching_rename_axes` deliberately omits the duplicate-change guard
-    # that `_sanctioned_rename` applies, so this record still matches an axis
-    # while the sanctioning check refuses it.
     duplicated = dataclasses.replace(
         record, changes=record.changes + (record.changes[0],)
     )
 
-    assert gate3._sanctioned_rename(duplicated, vault) is False
-    assert gate3._verified_rename_mappings(duplicated, vault) == ()
+    analysis = gate3._analyze_rename(duplicated, vault)
+    assert analysis.sanctioned is False
+    assert analysis.mappings == ()
 
 
 def test_ambiguous_axis_match_contributes_no_mapping(
@@ -3344,24 +3342,20 @@ def test_ambiguous_axis_match_contributes_no_mapping(
     # Patch one level below the axis loop so the loop itself still runs. A
     # loop that returned on its first match would report one axis here and
     # the ambiguity would go undetected.
-    real_envelope = gate3._rename_envelope
-    monkeypatch.setattr(
-        gate3,
-        "_rename_envelope",
-        lambda tree, tracked, axis, o, n, *, parent_oid: real_envelope(
-            tree, tracked, "entity", o, n, parent_oid=parent_oid
-        ),
-    )
-    monkeypatch.setattr(
-        gate3,
-        "_rename_move_pairs",
-        lambda _tree, axis, o, n, *, parent_oid: (
-            gate3.RenameMapping(o, f"{n}-{axis}"),
-        ),
-    )
+    real = gate3._axis_envelope_and_moves
 
-    assert len(gate3._matching_rename_axes(record, vault, old, new)) > 1
-    assert gate3._verified_rename_mappings(record, vault) == ()
+    def every_axis_matches(tree, tracked, axis, o, n, *, parent_oid):
+        envelope, _ = real(
+            tree, tracked, "entity", o, n, parent_oid=parent_oid
+        )
+        return envelope, (gate3.RenameMapping(o, f"{n}-{axis}"),)
+
+    monkeypatch.setattr(gate3, "_axis_envelope_and_moves", every_axis_matches)
+
+    analysis = gate3._analyze_rename(record, vault)
+    assert analysis.sanctioned is True
+    assert len(analysis.matched_axes) == len(gate3.AXES)
+    assert analysis.mappings == ()
 
 
 def test_rename_mappings_compose_oldest_first_over_exact_roots():
@@ -3953,3 +3947,180 @@ def test_cli_git_visible_untracked_symlink_refuses_the_transaction(tmp_path: Pat
         apply_rename(
             vault, plan_rename(vault, "entity", old, new), validators=[]
         )
+
+
+# --- Task 12: one immutable rename analysis ---------------------------------
+
+
+def _instrumented_check(vault, snapshot, monkeypatch):
+    counts = {"parent_tree": 0, "plan": 0, "analysis": 0, "sanctioned": 0}
+    for name, key in (
+        ("_parent_tree", "parent_tree"),
+        ("build_rename_plan", "plan"),
+        ("_analyze_rename", "analysis"),
+        ("_sanctioned_rename", "sanctioned"),
+    ):
+        real = getattr(gate3, name, None)
+        if real is None:
+            continue
+
+        def wrapper(*args, _real=real, _key=key, **kwargs):
+            counts[_key] += 1
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(gate3, name, wrapper)
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["check"]) in (0, 1)
+    return counts
+
+
+def test_rename_record_performs_one_analysis_and_bounded_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    counts = _instrumented_check(vault, snapshot, monkeypatch)
+    assert counts["parent_tree"] <= 2
+    assert counts["plan"] <= len(gate3.AXES)
+    assert counts["analysis"] == 1
+    assert counts["sanctioned"] <= 1
+
+
+def test_non_rename_record_builds_no_rename_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    files, old, _ = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    receipt = f"{old}/00-inbox/active/new receipt.md"
+    (vault / receipt).write_text("redacted\n")
+    _git(vault, "add", receipt)
+    _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+    counts = _instrumented_check(vault, snapshot, monkeypatch)
+    assert counts["plan"] == 0
+    assert counts["parent_tree"] <= 1
+
+
+def test_two_rename_records_each_get_their_own_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    apply_rename(
+        vault,
+        plan_rename(vault, "entity", new, "thirdentity"),
+        validators=[],
+    )
+    counts = _instrumented_check(vault, snapshot, monkeypatch)
+    assert counts["analysis"] == 2
+
+
+def _rename_record(tmp_path: Path, axis: str = "entity"):
+    files, old, new = _rename_files(axis)
+    vault = git_vault(tmp_path / f"vault-{axis}", files)
+    head = _git(vault, "rev-parse", "HEAD").strip()
+    apply_rename(vault, plan_rename(vault, axis, old, new), validators=[])
+    (record,) = gate3.collect_commit_records(vault, head)
+    return vault, record
+
+
+@pytest.mark.parametrize("axis", sorted(AXES))
+def test_rename_analysis_preserves_literal_sanctioning_results(
+    tmp_path: Path, axis: str
+):
+    vault, record = _rename_record(tmp_path, axis)
+    variants = {
+        "sanctioned": (record, True),
+        "duplicate-change": (
+            dataclasses.replace(
+                record, changes=record.changes + (record.changes[0],)
+            ),
+            False,
+        ),
+        "wrong-parent": (
+            dataclasses.replace(record, parents=("e" * 40,)),
+            False,
+        ),
+        "malformed-envelope": (
+            dataclasses.replace(record, changes=()),
+            False,
+        ),
+        "non-rename-message": (
+            dataclasses.replace(
+                record, message="ingest: add redacted receipt"
+            ),
+            False,
+        ),
+    }
+    for name, (candidate, expected) in variants.items():
+        analysis = gate3._analyze_rename(candidate, vault)
+        assert analysis.sanctioned is expected, name
+        if not expected:
+            assert analysis.matched_axes == (), name
+            assert analysis.mappings == (), name
+
+
+def test_expected_later_axis_failures_preserve_an_earlier_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault, record = _rename_record(tmp_path)
+    real = gate3._axis_envelope_and_moves
+
+    def expected_failure_after_match(
+        tree, tracked, axis, old, new, *, parent_oid
+    ):
+        if axis == "entity":
+            return real(tree, tracked, axis, old, new, parent_oid=parent_oid)
+        raise OSError("synthetic expected axis-local failure")
+
+    monkeypatch.setattr(
+        gate3, "_axis_envelope_and_moves", expected_failure_after_match
+    )
+    analysis = gate3._analyze_rename(record, vault)
+    assert analysis.sanctioned is True
+    assert analysis.matched_axes == ("entity",)
+    assert analysis.mappings
+
+
+def test_unexpected_later_axis_error_fails_check_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+):
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    real = gate3._axis_envelope_and_moves
+
+    def unexpected_failure_after_match(
+        tree, tracked, axis, old, new, *, parent_oid
+    ):
+        if axis == "entity":
+            return real(tree, tracked, axis, old, new, parent_oid=parent_oid)
+        raise TypeError("synthetic unexpected axis failure")
+
+    monkeypatch.setattr(
+        gate3, "_axis_envelope_and_moves", unexpected_failure_after_match
+    )
+    assert gate3.main(["check"]) == 2
+    captured = capsys.readouterr()
+    assert "GATE 3 ERROR:" in captured.err
+    assert "GATE 3: PASS" not in captured.out

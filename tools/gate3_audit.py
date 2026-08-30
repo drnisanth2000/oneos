@@ -1240,11 +1240,17 @@ def _audit_commit_history(
     violating_paths: set[str] = set()
     ordered_mappings: list[tuple[RenameMapping, ...]] = []
     for record in records:
+        analysis = _analyze_rename(record, vault)
         temporary: tempfile.TemporaryDirectory[str] | None = None
         try:
             temporary, commit_tree, _ = _parent_tree(vault, record.oid)
             commit_rules = AuditRules.load(commit_tree)
-            audited = audit_commits((record,), commit_rules, vault)
+            audited = audit_commits(
+                (record,),
+                commit_rules,
+                vault,
+                analyses={record.oid: analysis},
+            )
             result.sanctioned_commits.extend(audited.sanctioned_commits)
             result.violating_commits.extend(audited.violating_commits)
             if audited.violating_commits:
@@ -1252,9 +1258,7 @@ def _audit_commit_history(
                     change.path for change in record.changes
                 )
             if audited.sanctioned_commits:
-                ordered_mappings.append(
-                    _verified_rename_mappings(record, vault)
-                )
+                ordered_mappings.append(analysis.mappings)
         finally:
             if temporary is not None:
                 temporary.cleanup()
@@ -1453,7 +1457,7 @@ def _relative_to(path: Path, parent: Path) -> Path | None:
         return None
 
 
-def _rename_envelope(
+def _axis_envelope_and_moves(
     tree: Path,
     tracked_paths: tuple[str, ...],
     axis: str,
@@ -1461,7 +1465,7 @@ def _rename_envelope(
     new: str,
     *,
     parent_oid: str,
-) -> frozenset[tuple[str, str]]:
+) -> tuple[frozenset[tuple[str, str]], tuple[RenameMapping, ...]]:
     plan = build_rename_plan(
         tree,
         axis,
@@ -1488,7 +1492,11 @@ def _rename_envelope(
         if any(_relative_to(relative, source) is not None for source, _ in moves):
             continue
         envelope.add(("M", relative.as_posix()))
-    return frozenset(envelope)
+    mappings = tuple(
+        RenameMapping(source.as_posix(), destination.as_posix())
+        for source, destination in moves
+    )
+    return frozenset(envelope), mappings
 
 
 @dataclass(frozen=True)
@@ -1499,78 +1507,53 @@ class RenameMapping:
     new_root: str
 
 
-def _rename_move_pairs(
-    tree: Path, axis: str, old: str, new: str, *, parent_oid: str
-) -> tuple[RenameMapping, ...]:
-    """The move pairs of one rename plan, in the planner's own order.
+@dataclass(frozen=True)
+class RenameAnalysis:
+    """One record's rename evidence, derived once and never recomputed."""
 
-    `_rename_envelope` computes these and discards them. Rebuilding the plan
-    here leaves the envelope comparison byte-for-byte unchanged, so the
-    sanctioning decision cannot shift.
-    """
-    plan = build_rename_plan(tree, axis, old, new, planned_head=parent_oid)
-    planned_root = plan.vault
-    return tuple(
-        RenameMapping(
-            old_root=source.relative_to(planned_root).as_posix(),
-            new_root=destination.relative_to(planned_root).as_posix(),
-        )
-        for source, destination in plan.moves
-    )
+    sanctioned: bool
+    matched_axes: tuple[str, ...]
+    mappings: tuple[RenameMapping, ...]
 
 
-def _matching_rename_axes(
-    record: CommitRecord, vault: Path, old: str, new: str
-) -> tuple[tuple[str, tuple[RenameMapping, ...]], ...]:
-    """Every axis whose envelope equals the commit, evaluated to completion.
-
-    `_sanctioned_rename` returns on its first matching axis and so can never
-    observe a second one. Ambiguity detection needs the full set. This is a
-    separate pass on purpose: the sanctioning decision keeps its early return
-    and its behaviour is not altered here.
-    """
+def _analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis:
+    """Derive one record's complete rename evidence in a single checkout."""
+    empty = RenameAnalysis(sanctioned=False, matched_axes=(), mappings=())
+    match = _RENAME_MESSAGE.fullmatch(record.message)
+    if match is None or len(record.parents) != 1:
+        return empty
     actual = frozenset((change.status, change.path) for change in record.changes)
-    matches: list[tuple[str, tuple[RenameMapping, ...]]] = []
+    if len(actual) != len(record.changes) or not actual:
+        return empty
+    old, new = match.groups()
+    matched: list[tuple[str, tuple[RenameMapping, ...]]] = []
     temporary: tempfile.TemporaryDirectory[str] | None = None
     try:
         temporary, tree, tracked = _parent_tree(vault, record.parents[0])
         for axis in sorted(AXES):
             try:
-                expected = _rename_envelope(
-                    tree, tracked, axis, old, new, parent_oid=record.parents[0]
-                )
-                if not expected or actual != expected:
-                    continue
-                pairs = _rename_move_pairs(
-                    tree, axis, old, new, parent_oid=record.parents[0]
+                envelope, mappings = _axis_envelope_and_moves(
+                    tree,
+                    tracked,
+                    axis,
+                    old,
+                    new,
+                    parent_oid=record.parents[0],
                 )
             except (OSError, RenameError, UnicodeError, sqlite3.Error):
                 continue
-            matches.append((axis, pairs))
+            if envelope and actual == envelope:
+                matched.append((axis, mappings))
     except (OSError, subprocess.CalledProcessError, ValueError):
-        return ()
+        return empty
     finally:
         if temporary is not None:
             temporary.cleanup()
-    return tuple(matches)
-
-
-def _verified_rename_mappings(
-    record: CommitRecord, vault: Path
-) -> tuple[RenameMapping, ...]:
-    """Mappings only from a commit the existing verification already accepted."""
-    match = _RENAME_MESSAGE.fullmatch(record.message)
-    if match is None or len(record.parents) != 1:
-        return ()
-    if not _sanctioned_rename(record, vault):
-        return ()
-    old, new = match.groups()
-    matches = _matching_rename_axes(record, vault, old, new)
-    if len(matches) != 1:
-        # Zero means the envelope could not be reproduced here; more than one
-        # is ambiguous. Both contribute nothing rather than a best guess.
-        return ()
-    return matches[0][1]
+    return RenameAnalysis(
+        sanctioned=bool(matched),
+        matched_axes=tuple(axis for axis, _ in matched),
+        mappings=matched[0][1] if len(matched) == 1 else (),
+    )
 
 
 def _rewrite_destination(destination: str, mapping: RenameMapping) -> str | None:
@@ -1706,41 +1689,23 @@ def _predict_rename_destination(
     return predicted.pop()
 
 
-def _sanctioned_rename(record: CommitRecord, vault: Path) -> bool:
-    match = _RENAME_MESSAGE.fullmatch(record.message)
-    if match is None or len(record.parents) != 1:
-        return False
-    actual = frozenset((change.status, change.path) for change in record.changes)
-    if len(actual) != len(record.changes) or not actual:
-        return False
-    old, new = match.groups()
-    temporary: tempfile.TemporaryDirectory[str] | None = None
-    try:
-        temporary, tree, tracked = _parent_tree(vault, record.parents[0])
-        for axis in sorted(AXES):
-            try:
-                expected = _rename_envelope(
-                    tree,
-                    tracked,
-                    axis,
-                    old,
-                    new,
-                    parent_oid=record.parents[0],
-                )
-            except (OSError, RenameError, UnicodeError, sqlite3.Error):
-                continue
-            if expected and actual == expected:
-                return True
-    except (OSError, subprocess.CalledProcessError, ValueError):
-        return False
-    finally:
-        if temporary is not None:
-            temporary.cleanup()
-    return False
+def _sanctioned_rename(
+    record: CommitRecord,
+    vault: Path,
+    *,
+    analysis: RenameAnalysis | None = None,
+) -> bool:
+    return (
+        analysis if analysis is not None else _analyze_rename(record, vault)
+    ).sanctioned
 
 
 def _commit_is_sanctioned(
-    record: CommitRecord, rules: AuditRules, vault: Path
+    record: CommitRecord,
+    rules: AuditRules,
+    vault: Path,
+    *,
+    analysis: RenameAnalysis | None = None,
 ) -> bool:
     if record.message.startswith("ingest:"):
         return _sanctioned_ingest(record, rules)
@@ -1749,18 +1714,27 @@ def _commit_is_sanctioned(
     if record.message.startswith("registry:"):
         return _sanctioned_registry(record, rules, vault)
     if record.message.startswith("rename:"):
-        return _sanctioned_rename(record, vault)
+        return _sanctioned_rename(record, vault, analysis=analysis)
     return False
 
 
 def audit_commits(
-    records: tuple[CommitRecord, ...], rules: AuditRules, vault: Path
+    records: tuple[CommitRecord, ...],
+    rules: AuditRules,
+    vault: Path,
+    *,
+    analyses: dict[str, RenameAnalysis] | None = None,
 ) -> Audit:
     result = Audit()
     for record in records:
         destination = (
             result.sanctioned_commits
-            if _commit_is_sanctioned(record, rules, vault)
+            if _commit_is_sanctioned(
+                record,
+                rules,
+                vault,
+                analysis=analyses.get(record.oid) if analyses is not None else None,
+            )
             else result.violating_commits
         )
         destination.append(record.message)
