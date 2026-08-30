@@ -52,7 +52,7 @@ change.
   `69cbff7681c00a9347ec1be22cc40ef72788730e`.
 - Revision 5 — added Tasks 11 and 12. Superseded.
 - Revision 6 — corrected Task 12's authority and evidence model. Superseded.
-- Revision 7 — this document. Tasks 1–10 are historical and must not be
+- Revision 7 — superseded. Tasks 1–10 are historical and must not be
   re-run. Adds **Task 11** (I5, non-directory rename inheritance — a
   regression this branch introduces relative to canonical `origin/main`) and
   **Task 12** (I4, one immutable per-record rename analysis), sequential and
@@ -74,6 +74,18 @@ change.
   development oracle then proved that `changes[:1]` is not malformed for the
   one-change workspace envelope; Revision 7 uses the explicitly empty tuple
   for a portable malformed/empty-envelope refusal on all five axes.
+- Revision 8 — this document. Task 13's first independent review found two
+  accepted defects. A paired tracked special entry retained its sanctioned
+  Git classification and could therefore sanction a refused enclosing
+  directory pair through ancestry. The correction removes only sanctioned
+  classifications for paired non-directories; violating classifications
+  remain authoritative. The same review found that the checkout-setup error
+  boundary also covered per-axis analysis, silently converting an unexpected
+  later-axis `ValueError` or `CalledProcessError` into an ordinary refusal.
+  The correction scopes that handler to `_parent_tree`; unexpected per-axis
+  failures now reach the controlled CLI error boundary. These corrections add
+  three collected cases, require two additional mutation proofs, and permit
+  `audit_filesystem` to differ in the final Task 12 AST comparison.
 
 ## Global Constraints
 
@@ -3752,6 +3764,8 @@ and 1983 passed / 1 skipped:
   **at least 2014 passed**, 1 skipped;
 - after Task 12: Gate 3 module **at least 302 passed**, 1 skipped; full suite
   **at least 2024 passed**, 1 skipped.
+- after the accepted Task 13 review corrections: Gate 3 module **at least 305
+  passed**, 1 skipped; full suite **at least 2027 passed**, 1 skipped.
 
 A socket case may skip where the host cannot safely bind one; any such skip
 is reported, not hidden, and the floor is reduced by exactly the number of
@@ -3769,7 +3783,16 @@ one, and any such skip must be reported.
 
 Both mutation matrices, the focused suites, the Gate 3 module, the full
 public suite, `git diff --check`, Gitleaks, both public audits, the AST
-comparison, and the shadowing guard.
+comparison, the shadowing guard, and the two Task 13 review mutations. The
+first review mutation restores a paired non-directory's sanctioned Git
+classification as an ancestry candidate; its tracked-special regression must
+turn RED. The second treats later-axis `ValueError` and
+`CalledProcessError` as expected; both parameterized cases must turn RED.
+
+The final AST comparison against the Task 11 checkpoint permits
+`audit_filesystem` in addition to Task 12's four intended retained-definition
+changes. `_paired_rename_entries` itself and every S7 sanction predicate must
+remain unchanged.
 
 - [ ] **Step 2: Obtain an independent scoped review**
 
