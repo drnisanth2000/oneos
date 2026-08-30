@@ -31,7 +31,7 @@ from app.outbox import (
     reject,
 )
 from app.registry import execute_delete, get_delete_review, propose_delete
-from app.rename import AXES, apply_rename, plan_rename
+from app.rename import AXES, RenameError, apply_rename, plan_rename
 from app.scope import Scope
 from tests.conftest import git_vault, write_tree
 import tools.gate3_audit as gate3
@@ -3685,3 +3685,271 @@ def test_cli_nested_renames_pair_an_untracked_only_directory(
         rename_project()
 
     assert gate3.main(["check"]) == 0
+
+
+# --- Task 11: non-directory rename inheritance ------------------------------
+
+
+def _kind_fp(
+    kind: str,
+    *,
+    mode: int = 0o755,
+    identity: str = "1" * 64,
+    target: str | None = None,
+):
+    return gate3.FilesystemFingerprint(kind, mode, identity, target)
+
+
+_PAIRABLE_KINDS = (
+    ("symlink", "9" * 64),
+    ("fifo", None),
+    ("socket", None),
+    ("char-device", None),
+    ("block-device", None),
+    ("other", None),
+)
+
+
+@pytest.mark.parametrize(
+    ("kind", "target"), _PAIRABLE_KINDS, ids=[kind for kind, _ in _PAIRABLE_KINDS]
+)
+def test_verified_rename_pairs_every_included_kind(
+    tmp_path: Path, kind: str, target: str | None
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/x": _kind_fp(kind, target=target)},
+        {"renamed/d/x": _kind_fp(kind, target=target)},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.sanctioned_writes == ["renamed/d/x", "synthetic/d/x"]
+    assert audit.violating_writes == []
+
+
+def test_regular_files_are_never_pairable_supplemental_evidence(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {"synthetic/d/x": _kind_fp("regular")},
+        {"renamed/d/x": _kind_fp("regular")},
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+
+    assert audit.sanctioned_writes == []
+
+
+_UNPAIRED_KIND_CASES = {
+    "no-sanctioned-rename": (
+        "synthetic/d/x", "renamed/d/x", _kind_fp("fifo"), _kind_fp("fifo"), ()
+    ),
+    "wrong-old-root": (
+        "stranger/d/x", "renamed/d/x", _kind_fp("fifo"), _kind_fp("fifo"),
+        (("synthetic", "renamed"),),
+    ),
+    "wrong-new-root": (
+        "synthetic/d/x", "stranger/d/x", _kind_fp("fifo"), _kind_fp("fifo"),
+        (("synthetic", "renamed"),),
+    ),
+    "different-tail": (
+        "synthetic/d/x", "renamed/d/y", _kind_fp("fifo"), _kind_fp("fifo"),
+        (("synthetic", "renamed"),),
+    ),
+    "prefix-only-root": (
+        "synthetic-x/d/x", "renamed/d/x", _kind_fp("fifo"), _kind_fp("fifo"),
+        (("synthetic", "renamed"),),
+    ),
+    "kind-change": (
+        "synthetic/d/x", "renamed/d/x", _kind_fp("fifo"), _kind_fp("socket"),
+        (("synthetic", "renamed"),),
+    ),
+    "mode-change": (
+        "synthetic/d/x", "renamed/d/x", _kind_fp("fifo"),
+        _kind_fp("fifo", mode=0o700), (("synthetic", "renamed"),),
+    ),
+    "identity-change": (
+        "synthetic/d/x", "renamed/d/x", _kind_fp("fifo"),
+        _kind_fp("fifo", identity="2" * 64), (("synthetic", "renamed"),),
+    ),
+    "symlink-target-change": (
+        "synthetic/d/x", "renamed/d/x", _kind_fp("symlink", target="9" * 64),
+        _kind_fp("symlink", target="8" * 64), (("synthetic", "renamed"),),
+    ),
+    "non-symlink-carries-target": (
+        "synthetic/d/x", "renamed/d/x", _kind_fp("fifo"),
+        _kind_fp("fifo", target="9" * 64), (("synthetic", "renamed"),),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_UNPAIRED_KIND_CASES))
+def test_unpaired_kind_shapes_remain_violations(tmp_path: Path, case: str):
+    before_path, after_path, before_fp, after_fp, raw = _UNPAIRED_KIND_CASES[case]
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+
+    audit = _pair_audit(
+        {before_path: before_fp},
+        {after_path: after_fp},
+        rules,
+        tuple(_m(old, new) for old, new in raw),
+    )
+
+    assert audit.sanctioned_writes == []
+    assert sorted(audit.violating_writes) == sorted({before_path, after_path})
+
+
+def test_standalone_new_special_entry_is_never_sanctioned(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    audit = _pair_audit(
+        {}, {"renamed/d/x": _kind_fp("fifo")}, rules,
+        (_m("synthetic", "renamed"),),
+    )
+    assert audit.violating_writes == ["renamed/d/x"]
+    assert audit.sanctioned_writes == []
+
+
+@pytest.mark.parametrize("side", ("added", "removed"))
+def test_unrelated_special_sibling_is_not_sanctioned(tmp_path: Path, side: str):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    before = {"synthetic/d/x": _kind_fp("fifo")}
+    after = {"renamed/d/x": _kind_fp("fifo")}
+    if side == "added":
+        after["renamed/d/extra"] = _kind_fp("fifo")
+        expected = "renamed/d/extra"
+    else:
+        before["synthetic/d/extra"] = _kind_fp("fifo")
+        expected = "synthetic/d/extra"
+    audit = _pair_audit(before, after, rules, (_m("synthetic", "renamed"),))
+    assert audit.violating_writes == [expected]
+    assert audit.sanctioned_writes == ["renamed/d/x", "synthetic/d/x"]
+
+
+@pytest.mark.parametrize("shape", ("one-to-two", "two-to-one"))
+def test_ambiguous_special_pairing_fails_closed(tmp_path: Path, shape: str):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    if shape == "one-to-two":
+        before = {"synthetic/d/x": _kind_fp("fifo")}
+        after = {
+            "renamed/d/x": _kind_fp("fifo"),
+            "other/d/x": _kind_fp("fifo"),
+        }
+        mappings = (_m("synthetic", "renamed"),)
+        expected_sanctioned = ["renamed/d/x", "synthetic/d/x"]
+    else:
+        before = {
+            "synthetic/d/x": _kind_fp("fifo"),
+            "second/d/x": _kind_fp("fifo"),
+        }
+        after = {"renamed/d/x": _kind_fp("fifo")}
+        mappings = (_m("synthetic", "renamed"), _m("second", "renamed"))
+        expected_sanctioned = []
+    audit = _pair_audit(before, after, rules, mappings)
+    assert audit.sanctioned_writes == expected_sanctioned
+
+
+def test_conflicting_mapping_never_sanctions_a_special_entry(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    audit = _pair_audit(
+        {"synthetic/d/x": _kind_fp("fifo")},
+        {"renamed/d/x": _kind_fp("fifo")},
+        rules,
+        (_m("synthetic", "renamed"), _m("synthetic", "other")),
+    )
+    assert audit.sanctioned_writes == []
+
+
+@pytest.mark.parametrize("refusal", ("mode", "identity"))
+def test_paired_special_entry_never_sanctions_its_enclosing_directory(
+    tmp_path: Path, refusal: str
+):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    refused = (
+        _kind_fp("directory", mode=0o777)
+        if refusal == "mode"
+        else _kind_fp("directory", identity="2" * 64)
+    )
+    audit = _pair_audit(
+        {
+            "synthetic/d": _kind_fp("directory"),
+            "synthetic/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        {
+            "renamed/d": refused,
+            "renamed/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        rules,
+        (_m("synthetic", "renamed"),),
+    )
+    assert sorted(audit.violating_writes) == ["renamed/d", "synthetic/d"]
+    assert audit.sanctioned_writes == [
+        "renamed/d/link", "synthetic/d/link"
+    ]
+
+
+def test_refused_special_pair_still_suppresses_its_ancestor(tmp_path: Path):
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    audit = _pair_audit(
+        {},
+        {"renamed/d": _kind_fp("directory"), "renamed/d/x": _kind_fp("fifo")},
+        rules,
+        (),
+    )
+    assert audit.violating_writes == ["renamed/d/x"]
+    assert audit.sanctioned_writes == []
+
+
+def _ignored_symlink_files():
+    files, old, new = _rename_files("entity")
+    files[".gitignore"] = "ignored-link\n"
+    return files, old, new
+
+
+@pytest.mark.parametrize(
+    "entry", ("tracked-symlink", "ignored-symlink", "fifo", "socket")
+)
+def test_cli_sanctioned_rename_carries_special_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+):
+    files, old, new = _ignored_symlink_files()
+    vault = git_vault(tmp_path / "vault", files)
+    holder = vault / old / "11-library" / "archive"
+    holder.mkdir(parents=True, exist_ok=True)
+    if entry == "tracked-symlink":
+        os.symlink("target", holder / "link")
+        _git(vault, "add", "-A")
+        _git(vault, "commit", "-q", "-m", "ingest: add redacted receipt")
+    elif entry == "ignored-symlink":
+        os.symlink("target", holder / "ignored-link")
+    elif entry == "fifo":
+        os.mkfifo(holder / "pipe", 0o600)
+    else:
+        if not _make_socket(holder / "sock"):
+            pytest.skip("host does not safely support UNIX sockets here")
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    assert gate3.main(["check"]) == 0
+
+
+def test_cli_git_visible_untracked_symlink_refuses_the_transaction(tmp_path: Path):
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    os.symlink("target", vault / old / "11-library" / "stray-link")
+    with pytest.raises(RenameError):
+        apply_rename(
+            vault, plan_rename(vault, "entity", old, new), validators=[]
+        )

@@ -1328,29 +1328,30 @@ def _is_canonical_quarantine_directory(
     )
 
 
-def _paired_rename_directories(
+def _paired_rename_entries(
     changes: tuple[FilesystemChange, ...],
     mappings: tuple[RenameMapping, ...],
 ) -> frozenset[str]:
     """Paths a verified sanctioned rename explains, at both endpoints.
 
-    Identity equality is necessary and never sufficient: every other
-    requirement is checked here independently, and a reused inode cannot
-    substitute for any of them (design "Evidence-model limitation").
+    Covers every included kind, not directories alone: the transaction moves
+    the whole verified root topology, and a special entry it carried is not a
+    direct write. Identity equality is necessary and never sufficient — every
+    other requirement is checked here independently.
     """
     removed = {
         change.path: change.before
         for change in changes
         if change.kind == "removed"
         and change.before is not None
-        and change.before.kind == "directory"
+        and change.before.kind in _FILESYSTEM_KINDS
     }
     added = {
         change.path: change.after
         for change in changes
         if change.kind == "added"
         and change.after is not None
-        and change.after.kind == "directory"
+        and change.after.kind in _FILESYSTEM_KINDS
     }
     proposed: dict[str, str] = {}
     for old_path, old_fingerprint in sorted(removed.items()):
@@ -1361,8 +1362,10 @@ def _paired_rename_directories(
         if new_fingerprint is None:
             continue
         if (
-            new_fingerprint.mode != old_fingerprint.mode
+            new_fingerprint.kind != old_fingerprint.kind
+            or new_fingerprint.mode != old_fingerprint.mode
             or new_fingerprint.identity_digest != old_fingerprint.identity_digest
+            or new_fingerprint.target_digest != old_fingerprint.target_digest
         ):
             continue
         proposed[old_path] = new_path
@@ -1372,8 +1375,8 @@ def _paired_rename_directories(
     paired: set[str] = set()
     for new_path, sources in claimed.items():
         if len(sources) != 1:
-            # Two removed directories cannot both be this one added
-            # directory; neither claim is trustworthy.
+            # Two removed entries cannot both be this one added entry;
+            # neither claim is trustworthy.
             continue
         paired.update({sources[0], new_path})
     return frozenset(paired)
@@ -1387,20 +1390,19 @@ def audit_filesystem(
     classified_paths: tuple[ClassifiedPathChange, ...],
     rename_mappings: tuple[RenameMapping, ...] = (),
 ) -> Audit:
-    """Dispose of each supplemental delta, composing directory ancestry.
+    """Dispose of each supplemental delta, composing rename and ancestry.
 
-    Only a directory presence change can inherit a descendant's disposition.
-    Every non-directory delta is a direct write: there is no general sanction
-    for one, and a non-regular lookalike can never reach the S7 record path.
+    Only directory presence changes participate in ancestry. Every included
+    kind may inherit a separately verified rename, but a paired non-directory
+    stays neutral and cannot sanction an enclosing directory.
     """
     result = Audit()
     changes = compare_filesystem_evidence(before, after)
-    paired = _paired_rename_directories(changes, rename_mappings)
+    paired = _paired_rename_entries(changes, rename_mappings)
     directory_changes: list[FilesystemChange] = []
-    # Two passes. A non-directory delta is itself a classified descendant, so
-    # it must be known before any ancestor is judged: creating `x/p`
-    # necessarily creates `x`, and reporting both would turn one event into
-    # two findings.
+    # Phase 1 classifies non-directory deltas before ancestry. A paired entry
+    # is deliberately neutral: it proves only that the entry moved, never that
+    # its enclosing directory met the directory pairing requirements.
     candidates: list[ClassifiedPathChange] = list(classified_paths)
     for change in changes:
         directory_presence = (
@@ -1410,6 +1412,9 @@ def audit_filesystem(
         )
         if directory_presence:
             directory_changes.append(change)
+            continue
+        if change.path in paired:
+            result.sanctioned_writes.append(change.path)
             continue
         result.violating_writes.append(change.path)
         candidates.append(
