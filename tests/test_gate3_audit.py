@@ -3924,6 +3924,39 @@ def test_tracked_paired_special_is_neutral_despite_commit_classification(
     ]
 
 
+def test_tracked_paired_special_preserves_violating_classification(
+    tmp_path: Path,
+):
+    """Paired evidence never erases an authoritative Git violation."""
+    vault = _audit_vault(tmp_path / "vault", initialize_git=True)
+    rules = gate3.AuditRules.load(vault)
+    audit = _pair_audit(
+        {
+            "synthetic/d": _kind_fp("directory"),
+            "synthetic/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        {
+            "renamed/d": _kind_fp("directory", identity="2" * 64),
+            "renamed/d/link": _kind_fp("symlink", target="9" * 64),
+        },
+        rules,
+        (_m("synthetic", "renamed"),),
+        classified=(
+            gate3.ClassifiedPathChange(
+                "synthetic/d/link", "removed", "violating"
+            ),
+            gate3.ClassifiedPathChange(
+                "renamed/d/link", "added", "violating"
+            ),
+        ),
+    )
+
+    assert audit.violating_writes == []
+    assert audit.sanctioned_writes == [
+        "renamed/d/link", "synthetic/d/link"
+    ]
+
+
 def test_refused_special_pair_still_suppresses_its_ancestor(tmp_path: Path):
     vault = _audit_vault(tmp_path / "vault", initialize_git=True)
     rules = gate3.AuditRules.load(vault)
