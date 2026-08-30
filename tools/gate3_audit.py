@@ -25,6 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from typing import Literal, TypeAlias
 
 import yaml
 
@@ -48,8 +49,32 @@ from app.scope import CrossScopeError, Scope
 from app.vault import DestinationRegistryError, Vault
 
 
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 4
 _OID = re.compile(r"^[0-9a-f]{40,64}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_FILESYSTEM_KINDS = frozenset(
+    {
+        "directory",
+        "symlink",
+        "fifo",
+        "socket",
+        "char-device",
+        "block-device",
+        "other",
+    }
+)
+
+FilesystemKind: TypeAlias = Literal[
+    "directory",
+    "symlink",
+    "fifo",
+    "socket",
+    "char-device",
+    "block-device",
+    "other",
+]
+ChangeKind: TypeAlias = Literal["added", "removed", "changed"]
+Disposition: TypeAlias = Literal["sanctioned", "violating"]
 _REGISTRY_MESSAGE = re.compile(
     r"^registry: (add|edit|delete) (workspace|product|member)(?: .*)?$"
 )
@@ -121,6 +146,68 @@ class DirtyFingerprint:
 
 
 @dataclass(frozen=True)
+class GitDirtyInputs:
+    """The two raw Git reads every dirty fingerprint derives from."""
+
+    statuses: dict[str, str]
+    index_entries: dict[str, tuple[str, ...]]
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, GitDirtyInputs):
+            return NotImplemented
+        return (
+            self.statuses == other.statuses
+            and self.index_entries == other.index_entries
+        )
+
+
+@dataclass(frozen=True)
+class FilesystemFingerprint:
+    """Metadata-only evidence for one non-regular entry or real directory.
+
+    Content never appears here. `identity_digest` detects replacement by a
+    different object of the same apparent kind, and `target_digest` records a
+    symlink's raw text without ever resolving it.
+    """
+
+    kind: FilesystemKind
+    mode: int
+    identity_digest: str
+    target_digest: str | None
+
+
+@dataclass(frozen=True)
+class Gate3Evidence:
+    dirty: dict[str, DirtyFingerprint]
+    filesystem: dict[str, FilesystemFingerprint]
+
+
+@dataclass(frozen=True)
+class Gate3Snapshot:
+    head: str
+    evidence: Gate3Evidence
+
+
+@dataclass(frozen=True)
+class FilesystemChange:
+    path: str
+    kind: ChangeKind
+    before: FilesystemFingerprint | None
+    after: FilesystemFingerprint | None
+
+
+@dataclass(frozen=True)
+class ClassifiedPathChange:
+    path: str
+    kind: ChangeKind
+    disposition: Disposition
+
+
+class FilesystemEvidenceError(ValueError):
+    """Gate 3 could not obtain one coherent filesystem observation."""
+
+
+@dataclass(frozen=True)
 class _ConsumedRecord:
     relative: str
     pending_relative: str
@@ -155,6 +242,13 @@ class Audit:
     @property
     def ok(self) -> bool:
         return not self.violating_commits and not self.violating_writes
+
+
+@dataclass(frozen=True)
+class CommitAuditResult:
+    audit: Audit
+    path_changes: tuple[ClassifiedPathChange, ...]
+    rename_mappings: tuple[RenameMapping, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -401,6 +495,315 @@ def _read_relative_regular_no_follow(
         os.close(parent_descriptor)
 
 
+_IDENTITY_DOMAIN = b"oneos-gate3-identity-v1\0"
+_TARGET_DOMAIN = b"oneos-gate3-target-v1\0"
+_UNCLASSIFIABLE = "Gate 3 filesystem entry is unclassifiable"
+_TRAVERSAL_FAILED = "Gate 3 filesystem traversal failed"
+
+
+#: Generic convention names. None of these is an instance value: they are
+#: the same public constants the conventions and the S7 design already name.
+_SENSITIVE_DIRECTORY_NAME = ".sensitive"
+_ROOT_SCRATCH_DIRECTORY_NAME = "_scratch"
+_ROOT_CACHE_DIRECTORY_NAME = ".obsidian"
+_OUTBOX_DIRECTORY_NAME = "outbox"
+_QUARANTINE_DIRECTORY_NAME = ".consumed"
+
+
+@dataclass(frozen=True)
+class FilesystemExclusions:
+    exact_directories: frozenset[tuple[str, ...]]
+    directory_names: frozenset[str]
+
+
+def _filesystem_exclusions(vault: Path) -> FilesystemExclusions:
+    """The authoritative traversal exclusions, none from a registry value.
+
+    The administrative directory is resolved from Git rather than assumed to
+    be a literal name, because a worktree or a redirected `.git` file would
+    otherwise be walked as ordinary content.
+    """
+    exact: set[tuple[str, ...]] = {
+        (_ROOT_SCRATCH_DIRECTORY_NAME,),
+        (_ROOT_CACHE_DIRECTORY_NAME,),
+    }
+    try:
+        git_dir = Path(
+            _git_text(vault, "rev-parse", "--absolute-git-dir").strip()
+        ).resolve()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+    relative = _relative_to(git_dir, Path(vault).resolve())
+    if relative is not None and relative.parts:
+        exact.add(relative.parts)
+    return FilesystemExclusions(
+        exact_directories=frozenset(exact),
+        directory_names=frozenset({_SENSITIVE_DIRECTORY_NAME}),
+    )
+
+
+def _open_directory(
+    path: str | Path, *, parent_descriptor: int | None = None
+) -> int:
+    """Open a directory without ever following a symlink into it."""
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if directory_flag is None or no_follow is None:
+        # Weakening the walk would silently reintroduce the blind spot this
+        # traversal exists to close.
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+    flags = os.O_RDONLY | directory_flag | no_follow
+    try:
+        if parent_descriptor is None:
+            return os.open(path, flags)
+        return os.open(path, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _close_directory(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _list_directory(descriptor: int) -> tuple[str, ...]:
+    """List one directory in raw-byte order, refusing unusable names."""
+    try:
+        names = os.listdir(descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+    for name in names:
+        # A surrogate escape means the name did not decode. Recording it
+        # would put an unrepresentable key into the snapshot; skipping it
+        # would drop real evidence. Both are wrong, so the walk fails.
+        if _is_surrogate(name) or name in {"", ".", ".."} or "/" in name:
+            raise FilesystemEvidenceError(_UNCLASSIFIABLE)
+    return tuple(sorted(names, key=os.fsencode))
+
+
+def _is_surrogate(name: str) -> bool:
+    return any("\ud800" <= character <= "\udfff" for character in name)
+
+
+def _filesystem_kind(mode: int) -> FilesystemKind:
+    """Map one no-follow mode to exactly one supplemental kind.
+
+    Regular files are deliberately not supplemental evidence — they stay
+    under Git's status, index, content and mode rules — so a regular mode
+    reaching here is internal misuse, not an unknown type.
+    """
+    if stat.S_ISREG(mode):
+        raise FilesystemEvidenceError(_UNCLASSIFIABLE)
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "char-device"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    return "other"
+
+
+def _length_delimited(*fields: bytes) -> bytes:
+    """Join fields so no concatenation can imitate a different tuple."""
+    joined = b""
+    for value in fields:
+        joined += str(len(value)).encode("ascii") + b":" + value
+    return joined
+
+
+def _filesystem_identity_digest(
+    kind: FilesystemKind, metadata: os.stat_result
+) -> str:
+    """Stable identity over device and inode, never content or path text.
+
+    This is what distinguishes a directory that was removed and recreated
+    from one that never changed; both present the same kind and mode.
+    """
+    fields = [
+        kind.encode("ascii"),
+        str(metadata.st_dev).encode("ascii"),
+        str(metadata.st_ino).encode("ascii"),
+    ]
+    if kind in {"char-device", "block-device"}:
+        fields.append(str(metadata.st_rdev).encode("ascii"))
+    return hashlib.sha256(
+        _IDENTITY_DOMAIN + _length_delimited(*fields)
+    ).hexdigest()
+
+
+def _filesystem_fingerprint(
+    parent_descriptor: int,
+    name: str,
+    metadata: os.stat_result,
+) -> FilesystemFingerprint:
+    """Fingerprint one entry from metadata already captured no-follow."""
+    kind = _filesystem_kind(metadata.st_mode)
+    target_digest: str | None = None
+    if kind == "symlink":
+        try:
+            raw_target = os.readlink(name, dir_fd=parent_descriptor)
+        except OSError as exc:
+            raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+        # The link text is the evidence. Resolving or opening the target
+        # would leave the boundary and could read outside the vault.
+        target_digest = hashlib.sha256(
+            _TARGET_DOMAIN + os.fsencode(raw_target)
+        ).hexdigest()
+    return FilesystemFingerprint(
+        kind=kind,
+        mode=stat.S_IMODE(metadata.st_mode),
+        identity_digest=_filesystem_identity_digest(kind, metadata),
+        target_digest=target_digest,
+    )
+
+
+def _identity_fields(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    """The fields every consistency comparison uses, and nothing else."""
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+    )
+
+
+def _stat_entry(parent_descriptor: int, name: str) -> os.stat_result:
+    try:
+        return os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _fstat_descriptor(descriptor: int) -> os.stat_result:
+    try:
+        return os.fstat(descriptor)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def collect_filesystem_fingerprints(
+    vault: Path,
+) -> dict[str, FilesystemFingerprint]:
+    """Every real directory and non-regular entry inside the boundary.
+
+    Depth-first and descriptor-relative, so no path is ever re-resolved from
+    text and no symlink is ever followed. Regular files are omitted: they
+    remain governed by the existing Git-derived evidence.
+    """
+    try:
+        return _collect_filesystem_fingerprints(Path(vault).resolve())
+    except FilesystemEvidenceError:
+        raise
+    except OSError as exc:
+        # The boundary owns the wording. An operating-system message would
+        # carry a real path into public Gate 3 output.
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _collect_filesystem_fingerprints(
+    root: Path,
+) -> dict[str, FilesystemFingerprint]:
+    exclusions = _filesystem_exclusions(root)
+    evidence: dict[str, FilesystemFingerprint] = {}
+    root_metadata = _stat_entry_absolute(root)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+    descriptor = _open_directory(root)
+    try:
+        if _identity_fields(_fstat_descriptor(descriptor)) != _identity_fields(
+            root_metadata
+        ):
+            raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+        _walk_directory(descriptor, (), evidence, exclusions, root_metadata)
+    finally:
+        _close_directory(descriptor)
+    return {path: evidence[path] for path in sorted(evidence, key=os.fsencode)}
+
+
+def _stat_entry_absolute(path: Path) -> os.stat_result:
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED) from exc
+
+
+def _walk_directory(
+    descriptor: int,
+    prefix: tuple[str, ...],
+    evidence: dict[str, FilesystemFingerprint],
+    exclusions: FilesystemExclusions,
+    own_metadata: os.stat_result,
+) -> None:
+    names = _list_directory(descriptor)
+    for name in names:
+        parts = prefix + (name,)
+        relative = "/".join(parts)
+        if _path_parts(relative) is None:
+            raise FilesystemEvidenceError(_UNCLASSIFIABLE)
+        metadata = _stat_entry(descriptor, name)
+        if stat.S_ISREG(metadata.st_mode):
+            # Regular files stay under Git's rules; recording one here would
+            # create a second, partly-overlapping regular-file scanner.
+            continue
+        fingerprint = _filesystem_fingerprint(descriptor, name, metadata)
+        evidence[relative] = fingerprint
+        if fingerprint.kind != "directory":
+            # Re-observe after recording. Without this, an object swapped
+            # between the stat and the fingerprint would be serialised under
+            # the identity of the one that is already gone.
+            if _identity_fields(
+                _stat_entry(descriptor, name)
+            ) != _identity_fields(metadata):
+                raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+            continue
+        # An exclusion applies only to a real directory: a symlink or
+        # special object wearing the name is recorded above and never
+        # descended into.
+        if (
+            parts in exclusions.exact_directories
+            or name in exclusions.directory_names
+        ):
+            continue
+        child = _open_directory(name, parent_descriptor=descriptor)
+        try:
+            if _identity_fields(_fstat_descriptor(child)) != _identity_fields(
+                metadata
+            ):
+                raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+            _walk_directory(child, parts, evidence, exclusions, metadata)
+        finally:
+            # Closed on the way out of this child, before the next sibling
+            # opens, so peak descriptor use is bounded by depth.
+            _close_directory(child)
+        if _identity_fields(_stat_entry(descriptor, name)) != _identity_fields(
+            metadata
+        ):
+            raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+
+    # The directory must still be the one whose children were just recorded,
+    # and must still hold exactly those children. Timestamps are compared
+    # here only: they are deliberately absent from the persisted fingerprint,
+    # where ordinary descendant activity would turn every valid tracked write
+    # into a parent-directory violation.
+    if _list_directory(descriptor) != names:
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+    final = _fstat_descriptor(descriptor)
+    if (
+        _identity_fields(final) != _identity_fields(own_metadata)
+        or final.st_mtime_ns != own_metadata.st_mtime_ns
+        or final.st_ctime_ns != own_metadata.st_ctime_ns
+    ):
+        raise FilesystemEvidenceError(_TRAVERSAL_FAILED)
+
+
 def _fingerprint_path(
     vault: Path,
     relative: str,
@@ -493,8 +896,8 @@ def _fingerprint_path(
         os.close(parent_descriptor)
 
 
-def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
-    """Fingerprint every Git-dirty path without rename pairing or path quoting."""
+def _collect_git_dirty_inputs(vault: Path) -> GitDirtyInputs:
+    """The two raw Git reads, taken together and never mutated afterwards."""
     vault = Path(vault).resolve()
     statuses = _parse_porcelain(
         _git_bytes(
@@ -509,7 +912,15 @@ def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
     index_entries = _parse_index_entries(
         _git_bytes(vault, "ls-files", "--stage", "-z")
     )
-    _supplement_untracked_consumed_entries(vault, statuses, index_entries)
+    return GitDirtyInputs(statuses=statuses, index_entries=index_entries)
+
+
+def _fingerprint_git_dirty_inputs(
+    vault: Path, inputs: GitDirtyInputs
+) -> dict[str, DirtyFingerprint]:
+    vault = Path(vault).resolve()
+    statuses = inputs.statuses
+    index_entries = inputs.index_entries
     return {
         relative: _fingerprint_path(
             vault, relative, statuses[relative], index_entries.get(relative, ())
@@ -518,53 +929,60 @@ def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
     }
 
 
-def _supplement_untracked_consumed_entries(
-    vault: Path,
-    statuses: dict[str, str],
-    index_entries: dict[str, tuple[str, ...]],
-) -> None:
-    """Make Git-invisible special leaves in exact S7 stores auditable."""
-    no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
-        return
-    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
-    catalog = EntityCatalog.load(vault)
+def collect_dirty_fingerprints(vault: Path) -> dict[str, DirtyFingerprint]:
+    """Fingerprint every Git-dirty path without rename pairing or path quoting."""
+    return _fingerprint_git_dirty_inputs(vault, _collect_git_dirty_inputs(vault))
 
-    def record_untracked(relative: str) -> None:
-        if relative not in index_entries:
-            statuses.setdefault(relative, "??")
 
-    for entity in catalog.entities:
-        descriptors: list[int] = []
-        try:
-            descriptor = os.open(vault, directory_flags)
-            descriptors.append(descriptor)
-            traversed: list[str] = []
-            for component in (entity.slug, "outbox", ".consumed"):
-                traversed.append(component)
-                try:
-                    descriptor = os.open(
-                        component, directory_flags, dir_fd=descriptor
-                    )
-                except FileNotFoundError:
-                    break
-                except OSError:
-                    record_untracked("/".join(traversed))
-                    break
-                descriptors.append(descriptor)
-            else:
-                try:
-                    leaves = os.listdir(descriptors[-1])
-                except OSError:
-                    record_untracked(f"{entity.slug}/outbox/.consumed")
-                else:
-                    for leaf in leaves:
-                        record_untracked(
-                            f"{entity.slug}/outbox/.consumed/{leaf}"
-                        )
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
+def compare_filesystem_evidence(
+    before: dict[str, FilesystemFingerprint],
+    after: dict[str, FilesystemFingerprint],
+) -> tuple[FilesystemChange, ...]:
+    """Endpoint comparison only: pure, deterministic, no I/O and no policy.
+
+    Identical evidence at both endpoints is preserved baseline, exactly as
+    Gate 3 already treats unchanged Git-derived evidence. Everything else is
+    a session change for a later stage to dispose of.
+    """
+    changes: list[FilesystemChange] = []
+    for path in sorted(set(before) | set(after)):
+        previous = before.get(path)
+        current = after.get(path)
+        if previous == current:
+            continue
+        if previous is None:
+            kind: ChangeKind = "added"
+        elif current is None:
+            kind = "removed"
+        else:
+            kind = "changed"
+        changes.append(
+            FilesystemChange(
+                path=path, kind=kind, before=previous, after=current
+            )
+        )
+    return tuple(changes)
+
+
+def collect_gate3_evidence(vault: Path) -> Gate3Evidence:
+    """One coherent observation of Git and filesystem evidence.
+
+    The filesystem walk is bracketed by two identical Git reads. One
+    observation must describe one instant: reading Git only once would let
+    the working tree change under the walk with nothing able to detect it.
+    A mismatch is never retried — a retry would just widen the window.
+    """
+    vault = Path(vault).resolve()
+    before = _collect_git_dirty_inputs(vault)
+    filesystem = collect_filesystem_fingerprints(vault)
+    dirty = _fingerprint_git_dirty_inputs(vault, before)
+    after = _collect_git_dirty_inputs(vault)
+    if after != before:
+        raise FilesystemEvidenceError(
+            "Gate 3 Git evidence changed during filesystem traversal"
+        )
+    return Gate3Evidence(dirty=dirty, filesystem=filesystem)
+
 
 
 def _path_parts(path: str) -> tuple[str, ...] | None:
@@ -766,21 +1184,286 @@ def _parent_tree(
     return temporary, tree, tracked
 
 
+def _merge_disposition(
+    changes: dict[str, ClassifiedPathChange], candidate: ClassifiedPathChange
+) -> None:
+    """A path touched more than once takes its worst disposition."""
+    existing = changes.get(candidate.path)
+    if existing is None:
+        changes[candidate.path] = candidate
+        return
+    if existing.disposition == "violating":
+        return
+    if candidate.disposition == "violating":
+        changes[candidate.path] = ClassifiedPathChange(
+            existing.path, existing.kind, "violating"
+        )
+
+
+def _net_commit_path_changes(
+    vault: Path, snapshot_head: str, audit_head: str
+) -> tuple[tuple[str, str], ...]:
+    """The net status/path pairs between the two audit endpoints."""
+    if snapshot_head == audit_head:
+        return ()
+    raw = _git_bytes(
+        vault,
+        "diff",
+        "--name-status",
+        "--no-renames",
+        "-z",
+        snapshot_head,
+        audit_head,
+    )
+    fields = [field for field in raw.split(b"\0") if field]
+    if len(fields) % 2:
+        # `_parse_name_status` raises on the same condition; silently
+        # dropping the tail would drop a path that could carry a sanction.
+        raise ValueError("Gate 3 name-status output is malformed")
+    pairs: list[tuple[str, str]] = []
+    index = 0
+    while index + 1 < len(fields):
+        status = fields[index].decode("utf-8", "surrogateescape")
+        path = fields[index + 1].decode("utf-8", "surrogateescape")
+        pairs.append((status[:1], path))
+        index += 2
+    return tuple(pairs)
+
+
 def _audit_commit_history(
-    records: tuple[CommitRecord, ...], vault: Path
-) -> Audit:
+    records: tuple[CommitRecord, ...],
+    vault: Path,
+    snapshot_head: str,
+    audit_head: str,
+) -> CommitAuditResult:
     result = Audit()
+    violating_paths: set[str] = set()
+    ordered_mappings: list[tuple[RenameMapping, ...]] = []
     for record in records:
+        analysis = _analyze_rename(record, vault)
         temporary: tempfile.TemporaryDirectory[str] | None = None
         try:
             temporary, commit_tree, _ = _parent_tree(vault, record.oid)
             commit_rules = AuditRules.load(commit_tree)
-            audited = audit_commits((record,), commit_rules, vault)
+            audited = audit_commits(
+                (record,),
+                commit_rules,
+                vault,
+                analyses={record.oid: analysis},
+            )
             result.sanctioned_commits.extend(audited.sanctioned_commits)
             result.violating_commits.extend(audited.violating_commits)
+            if audited.violating_commits:
+                violating_paths.update(
+                    change.path for change in record.changes
+                )
+            if audited.sanctioned_commits:
+                ordered_mappings.append(analysis.mappings)
         finally:
             if temporary is not None:
                 temporary.cleanup()
+    changes: dict[str, ClassifiedPathChange] = {}
+    for status, path in _net_commit_path_changes(
+        vault, snapshot_head, audit_head
+    ):
+        kind: ChangeKind = (
+            "added" if status == "A" else "removed" if status == "D" else "changed"
+        )
+        disposition: Disposition = (
+            "violating" if path in violating_paths else "sanctioned"
+        )
+        _merge_disposition(
+            changes, ClassifiedPathChange(path, kind, disposition)
+        )
+    return CommitAuditResult(
+        audit=result,
+        path_changes=tuple(changes[path] for path in sorted(changes)),
+        rename_mappings=_compose_rename_mappings(
+            tuple(group for group in ordered_mappings if group)
+        ),
+    )
+
+
+def _classify_dirty_path_changes(
+    before: dict[str, DirtyFingerprint],
+    after: dict[str, DirtyFingerprint],
+    audit: Audit,
+) -> tuple[ClassifiedPathChange, ...]:
+    """Turn the dirty audit's own verdicts into ancestry-usable changes."""
+    dispositions: dict[str, Disposition] = {
+        path: "sanctioned" for path in audit.sanctioned_writes
+    }
+    for path in audit.violating_writes:
+        dispositions[path] = "violating"
+    changes: dict[str, ClassifiedPathChange] = {}
+    for path, disposition in dispositions.items():
+        current = after.get(path)
+        if current is None or current.kind == "absence":
+            kind: ChangeKind = "removed"
+        elif path not in before:
+            kind = "added"
+        else:
+            kind = "changed"
+        _merge_disposition(
+            changes, ClassifiedPathChange(path, kind, disposition)
+        )
+    return tuple(changes[path] for path in sorted(changes))
+
+
+def _is_canonical_quarantine_directory(
+    change: FilesystemChange, rules: AuditRules
+) -> bool:
+    """Exactly `<entity>/outbox/.consumed` added, for a manifest entity.
+
+    It authorizes that one directory and nothing inside or beside it: child
+    records still pass every unchanged S7 record predicate.
+    """
+    if change.kind != "added" or change.before is not None:
+        return False
+    if change.after is None or change.after.kind != "directory":
+        return False
+    parts = _path_parts(change.path)
+    return (
+        parts is not None
+        and len(parts) == 3
+        and parts[0] in rules.entities
+        and parts[1] == _OUTBOX_DIRECTORY_NAME
+        and parts[2] == _QUARANTINE_DIRECTORY_NAME
+    )
+
+
+def _paired_rename_entries(
+    changes: tuple[FilesystemChange, ...],
+    mappings: tuple[RenameMapping, ...],
+) -> frozenset[str]:
+    """Paths a verified sanctioned rename explains, at both endpoints.
+
+    Covers every included kind, not directories alone: the transaction moves
+    the whole verified root topology, and a special entry it carried is not a
+    direct write. Identity equality is necessary and never sufficient — every
+    other requirement is checked here independently.
+    """
+    removed = {
+        change.path: change.before
+        for change in changes
+        if change.kind == "removed"
+        and change.before is not None
+        and change.before.kind in _FILESYSTEM_KINDS
+    }
+    added = {
+        change.path: change.after
+        for change in changes
+        if change.kind == "added"
+        and change.after is not None
+        and change.after.kind in _FILESYSTEM_KINDS
+    }
+    proposed: dict[str, str] = {}
+    for old_path, old_fingerprint in sorted(removed.items()):
+        new_path = _predict_rename_destination(old_path, mappings)
+        if new_path is None:
+            continue
+        new_fingerprint = added.get(new_path)
+        if new_fingerprint is None:
+            continue
+        if (
+            new_fingerprint.kind != old_fingerprint.kind
+            or new_fingerprint.mode != old_fingerprint.mode
+            or new_fingerprint.identity_digest != old_fingerprint.identity_digest
+            or new_fingerprint.target_digest != old_fingerprint.target_digest
+        ):
+            continue
+        proposed[old_path] = new_path
+    claimed: dict[str, list[str]] = {}
+    for old_path, new_path in proposed.items():
+        claimed.setdefault(new_path, []).append(old_path)
+    paired: set[str] = set()
+    for new_path, sources in claimed.items():
+        if len(sources) != 1:
+            # Two removed entries cannot both be this one added entry;
+            # neither claim is trustworthy.
+            continue
+        paired.update({sources[0], new_path})
+    return frozenset(paired)
+
+
+def audit_filesystem(
+    before: dict[str, FilesystemFingerprint],
+    after: dict[str, FilesystemFingerprint],
+    rules: AuditRules,
+    *,
+    classified_paths: tuple[ClassifiedPathChange, ...],
+    rename_mappings: tuple[RenameMapping, ...] = (),
+) -> Audit:
+    """Dispose of each supplemental delta, composing rename and ancestry.
+
+    Only directory presence changes participate in ancestry. Every included
+    kind may inherit a separately verified rename, but a paired non-directory
+    stays neutral and cannot sanction an enclosing directory.
+    """
+    result = Audit()
+    changes = compare_filesystem_evidence(before, after)
+    paired = _paired_rename_entries(changes, rename_mappings)
+    directory_changes: list[FilesystemChange] = []
+    # Phase 1 classifies non-directory deltas before ancestry. A paired entry
+    # is deliberately neutral: it proves only that the entry moved, never that
+    # its enclosing directory met the directory pairing requirements.
+    paired_non_directories = frozenset(
+        change.path
+        for change in changes
+        if change.path in paired
+        and not (
+            change.kind in {"added", "removed"}
+            and (change.before or change.after).kind == "directory"
+            and (change.before is None or change.after is None)
+        )
+    )
+    candidates: list[ClassifiedPathChange] = [
+        candidate
+        for candidate in classified_paths
+        if not (
+            candidate.path in paired_non_directories
+            and candidate.disposition == "sanctioned"
+        )
+    ]
+    for change in changes:
+        directory_presence = (
+            change.kind in {"added", "removed"}
+            and (change.before or change.after).kind == "directory"
+            and (change.before is None or change.after is None)
+        )
+        if directory_presence:
+            directory_changes.append(change)
+            continue
+        if change.path in paired:
+            result.sanctioned_writes.append(change.path)
+            continue
+        result.violating_writes.append(change.path)
+        candidates.append(
+            ClassifiedPathChange(change.path, change.kind, "violating")
+        )
+    for change in directory_changes:
+        relevant = [
+            candidate
+            for candidate in candidates
+            if candidate.path.startswith(change.path + "/")
+            and candidate.kind == change.kind
+        ]
+        if any(candidate.disposition == "violating" for candidate in relevant):
+            # The descendant already fails the gate; repeating its ancestor
+            # would be a duplicate finding for one event.
+            continue
+        if relevant:
+            result.sanctioned_writes.append(change.path)
+            continue
+        if change.path in paired:
+            result.sanctioned_writes.append(change.path)
+            continue
+        if _is_canonical_quarantine_directory(change, rules):
+            result.sanctioned_writes.append(change.path)
+            continue
+        result.violating_writes.append(change.path)
+    result.sanctioned_writes.sort()
+    result.violating_writes.sort()
     return result
 
 
@@ -791,7 +1474,7 @@ def _relative_to(path: Path, parent: Path) -> Path | None:
         return None
 
 
-def _rename_envelope(
+def _axis_envelope_and_moves(
     tree: Path,
     tracked_paths: tuple[str, ...],
     axis: str,
@@ -799,7 +1482,7 @@ def _rename_envelope(
     new: str,
     *,
     parent_oid: str,
-) -> frozenset[tuple[str, str]]:
+) -> tuple[frozenset[tuple[str, str]], tuple[RenameMapping, ...]]:
     plan = build_rename_plan(
         tree,
         axis,
@@ -826,23 +1509,50 @@ def _rename_envelope(
         if any(_relative_to(relative, source) is not None for source, _ in moves):
             continue
         envelope.add(("M", relative.as_posix()))
-    return frozenset(envelope)
+    mappings = tuple(
+        RenameMapping(source.as_posix(), destination.as_posix())
+        for source, destination in moves
+    )
+    return frozenset(envelope), mappings
 
 
-def _sanctioned_rename(record: CommitRecord, vault: Path) -> bool:
+@dataclass(frozen=True)
+class RenameMapping:
+    """One verified old-root to new-root move, vault-relative."""
+
+    old_root: str
+    new_root: str
+
+
+@dataclass(frozen=True)
+class RenameAnalysis:
+    """One record's rename evidence, derived once and never recomputed."""
+
+    sanctioned: bool
+    matched_axes: tuple[str, ...]
+    mappings: tuple[RenameMapping, ...]
+
+
+def _analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis:
+    """Derive one record's complete rename evidence in a single checkout."""
+    empty = RenameAnalysis(sanctioned=False, matched_axes=(), mappings=())
     match = _RENAME_MESSAGE.fullmatch(record.message)
     if match is None or len(record.parents) != 1:
-        return False
+        return empty
     actual = frozenset((change.status, change.path) for change in record.changes)
     if len(actual) != len(record.changes) or not actual:
-        return False
+        return empty
     old, new = match.groups()
+    matched: list[tuple[str, tuple[RenameMapping, ...]]] = []
     temporary: tempfile.TemporaryDirectory[str] | None = None
     try:
-        temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        try:
+            temporary, tree, tracked = _parent_tree(vault, record.parents[0])
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            return empty
         for axis in sorted(AXES):
             try:
-                expected = _rename_envelope(
+                envelope, mappings = _axis_envelope_and_moves(
                     tree,
                     tracked,
                     axis,
@@ -852,18 +1562,168 @@ def _sanctioned_rename(record: CommitRecord, vault: Path) -> bool:
                 )
             except (OSError, RenameError, UnicodeError, sqlite3.Error):
                 continue
-            if expected and actual == expected:
-                return True
-    except (OSError, subprocess.CalledProcessError, ValueError):
-        return False
+            if envelope and actual == envelope:
+                matched.append((axis, mappings))
     finally:
         if temporary is not None:
             temporary.cleanup()
-    return False
+    return RenameAnalysis(
+        sanctioned=bool(matched),
+        matched_axes=tuple(axis for axis, _ in matched),
+        mappings=matched[0][1] if len(matched) == 1 else (),
+    )
+
+
+def _rewrite_destination(destination: str, mapping: RenameMapping) -> str | None:
+    """Apply one later mapping to an earlier destination, or None."""
+    if destination == mapping.old_root:
+        return mapping.new_root
+    prefix = mapping.old_root + "/"
+    if destination.startswith(prefix):
+        return mapping.new_root + "/" + destination[len(prefix):]
+    return None
+
+
+def _source_preimage(
+    old_root: str, composed: tuple[RenameMapping, ...]
+) -> str | None:
+    """The original source a later mapping's root sits under, if any.
+
+    Returns the sentinel `""` when nothing matches, so the caller can
+    distinguish "no earlier mapping applies" from ambiguity, which returns
+    None.
+
+    Selection is by longest matching destination. A general and a specific
+    mapping legitimately coexist after a nested rename, so several matches is
+    the normal shape, not an error: rejecting it would fail an ordinary
+    three-rename sequence closed. Only equally specific candidates predicting
+    different sources are ambiguous.
+    """
+    matches = [
+        mapping
+        for mapping in composed
+        if old_root == mapping.new_root
+        or old_root.startswith(mapping.new_root + "/")
+    ]
+    if not matches:
+        return ""
+    best = max(len(mapping.new_root) for mapping in matches)
+    predicted = set()
+    for mapping in matches:
+        if len(mapping.new_root) != best:
+            continue
+        if old_root == mapping.new_root:
+            predicted.add(mapping.old_root)
+        else:
+            tail = old_root[len(mapping.new_root) + 1:]
+            predicted.add(mapping.old_root + "/" + tail)
+    if len(predicted) != 1:
+        return None
+    return predicted.pop()
+
+
+def _compose_rename_mappings(
+    ordered: tuple[tuple[RenameMapping, ...], ...],
+) -> tuple[RenameMapping, ...]:
+    """Fold per-commit mappings oldest-first, failing closed on ambiguity.
+
+    Three relations matter and each is handled differently. A later root that
+    equals an accumulated destination is consumed by the forward rewrite; one
+    strictly beneath it is appended under its original source pre-image; one
+    that is an ancestor rewrites the accumulated destination forward and is
+    also retained for untouched tails. Collapsing any two of these breaks one
+    of the others: appending on the exact match duplicates a source, and
+    skipping the pre-image leaves an original path predicting an intermediate
+    destination that never exists on disk.
+    """
+    composed: tuple[RenameMapping, ...] = ()
+    for group in ordered:
+        rewritten: list[RenameMapping] = []
+        for existing in composed:
+            applied = [
+                candidate
+                for mapping in group
+                if (candidate := _rewrite_destination(existing.new_root, mapping))
+                is not None
+            ]
+            if len(applied) > 1:
+                return ()
+            rewritten.append(
+                RenameMapping(existing.old_root, applied[0])
+                if applied
+                else existing
+            )
+        added: list[RenameMapping] = []
+        for mapping in group:
+            # Exact-chain consumption. The forward rewrite above already
+            # carried an accumulated mapping through to this destination;
+            # appending a derived duplicate would trip the conflict check and
+            # fail an ordinary sequential rename closed.
+            if any(
+                existing.new_root == mapping.old_root for existing in composed
+            ):
+                continue
+            preimage = _source_preimage(mapping.old_root, composed)
+            if preimage is None:
+                return ()
+            added.append(
+                RenameMapping(preimage or mapping.old_root, mapping.new_root)
+            )
+        composed = tuple(rewritten + added)
+        sources = [mapping.old_root for mapping in composed]
+        destinations = [mapping.new_root for mapping in composed]
+        if len(set(sources)) != len(sources) or len(set(destinations)) != len(
+            destinations
+        ):
+            return ()
+    return composed
+
+
+def _predict_rename_destination(
+    path: str, mappings: tuple[RenameMapping, ...]
+) -> str | None:
+    """Where a verified rename says this path went, or None.
+
+    Selection is by longest matching `old_root`, never by tuple order: a
+    general and a specific mapping both apply to a nested path, and only the
+    specific one names the destination that exists on disk. Equally specific
+    candidates disagreeing is ambiguity, and fails closed.
+    """
+    candidates: list[tuple[int, str]] = []
+    for mapping in mappings:
+        if path == mapping.old_root:
+            candidates.append((len(mapping.old_root), mapping.new_root))
+        elif path.startswith(mapping.old_root + "/"):
+            tail = path[len(mapping.old_root) + 1:]
+            candidates.append(
+                (len(mapping.old_root), mapping.new_root + "/" + tail)
+            )
+    if not candidates:
+        return None
+    best = max(length for length, _ in candidates)
+    predicted = {value for length, value in candidates if length == best}
+    if len(predicted) != 1:
+        return None
+    return predicted.pop()
+
+
+def _sanctioned_rename(
+    record: CommitRecord,
+    vault: Path,
+    *,
+    analysis: RenameAnalysis | None = None,
+) -> bool:
+    return (
+        analysis if analysis is not None else _analyze_rename(record, vault)
+    ).sanctioned
 
 
 def _commit_is_sanctioned(
-    record: CommitRecord, rules: AuditRules, vault: Path
+    record: CommitRecord,
+    rules: AuditRules,
+    vault: Path,
+    *,
+    analysis: RenameAnalysis | None = None,
 ) -> bool:
     if record.message.startswith("ingest:"):
         return _sanctioned_ingest(record, rules)
@@ -872,18 +1732,27 @@ def _commit_is_sanctioned(
     if record.message.startswith("registry:"):
         return _sanctioned_registry(record, rules, vault)
     if record.message.startswith("rename:"):
-        return _sanctioned_rename(record, vault)
+        return _sanctioned_rename(record, vault, analysis=analysis)
     return False
 
 
 def audit_commits(
-    records: tuple[CommitRecord, ...], rules: AuditRules, vault: Path
+    records: tuple[CommitRecord, ...],
+    rules: AuditRules,
+    vault: Path,
+    *,
+    analyses: dict[str, RenameAnalysis] | None = None,
 ) -> Audit:
     result = Audit()
     for record in records:
         destination = (
             result.sanctioned_commits
-            if _commit_is_sanctioned(record, rules, vault)
+            if _commit_is_sanctioned(
+                record,
+                rules,
+                vault,
+                analysis=analyses.get(record.oid) if analyses is not None else None,
+            )
             else result.violating_commits
         )
         destination.append(record.message)
@@ -1406,19 +2275,108 @@ def _snapshot_path(vault: Path) -> Path:
     return path
 
 
-def _snapshot_payload(vault: Path) -> dict:
-    dirty = collect_dirty_fingerprints(vault)
+def _snapshot_payload(vault: Path) -> dict[str, object]:
+    evidence = collect_gate3_evidence(vault)
     return {
         "version": SNAPSHOT_VERSION,
         "head": _git_text(vault, "rev-parse", "HEAD").strip(),
-        "dirty": {path: asdict(fingerprint) for path, fingerprint in dirty.items()},
+        "dirty": {
+            path: asdict(fingerprint)
+            for path, fingerprint in sorted(evidence.dirty.items())
+        },
+        "filesystem": {
+            path: asdict(fingerprint)
+            for path, fingerprint in sorted(evidence.filesystem.items())
+        },
     }
 
 
-def _load_snapshot(path: Path) -> tuple[str, dict[str, DirtyFingerprint]]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("version") != SNAPSHOT_VERSION:
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """`json.loads` keeps the last repeated key and drops the rest silently.
+
+    A second value for one snapshot path would overwrite the evidence the
+    snapshot recorded, so the repetition is refused before it can collapse.
+    """
+    seen: dict[str, object] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError("Gate 3 snapshot has a duplicate key")
+        seen[key] = value
+    return seen
+
+
+def _load_filesystem_fingerprint(value: object) -> FilesystemFingerprint:
+    """Parse one closed supplemental entry, rejecting every other shape."""
+    expected = {"kind", "mode", "identity_digest", "target_digest"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("Gate 3 snapshot filesystem fingerprint is malformed")
+    kind = value["kind"]
+    mode = value["mode"]
+    identity_digest = value["identity_digest"]
+    target_digest = value["target_digest"]
+    if kind not in _FILESYSTEM_KINDS:
+        raise ValueError("Gate 3 snapshot filesystem kind is malformed")
+    # `bool` is an `int` subclass, so `mode: true` would otherwise pass.
+    # The upper bound keeps the shape genuinely closed: these are permission
+    # bits, never a whole st_mode.
+    if (
+        isinstance(mode, bool)
+        or not isinstance(mode, int)
+        or mode < 0
+        or mode > 0o7777
+    ):
+        raise ValueError("Gate 3 snapshot filesystem mode is malformed")
+    if (
+        not isinstance(identity_digest, str)
+        or _SHA256_HEX.fullmatch(identity_digest) is None
+    ):
+        raise ValueError("Gate 3 snapshot filesystem digest is malformed")
+    if kind == "symlink":
+        if (
+            not isinstance(target_digest, str)
+            or _SHA256_HEX.fullmatch(target_digest) is None
+        ):
+            raise ValueError("Gate 3 snapshot filesystem digest is malformed")
+    elif target_digest is not None:
+        raise ValueError("Gate 3 snapshot filesystem digest is malformed")
+    return FilesystemFingerprint(
+        kind=kind,
+        mode=mode,
+        identity_digest=identity_digest,
+        target_digest=target_digest,
+    )
+
+
+def _load_filesystem_map(raw: object) -> dict[str, FilesystemFingerprint]:
+    if not isinstance(raw, dict):
+        raise ValueError("Gate 3 snapshot filesystem map is malformed")
+    fingerprints: dict[str, FilesystemFingerprint] = {}
+    for relative, value in raw.items():
+        if not isinstance(relative, str) or _path_parts(relative) is None:
+            raise ValueError("Gate 3 snapshot filesystem path is malformed")
+        try:
+            relative.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "Gate 3 snapshot filesystem path is malformed"
+            ) from exc
+        fingerprints[relative] = _load_filesystem_fingerprint(value)
+    return fingerprints
+
+
+def _load_snapshot(path: Path) -> Gate3Snapshot:
+    raw = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys
+    )
+    if not isinstance(raw, dict):
+        raise ValueError("Gate 3 snapshot is malformed")
+    # Version first: an operator holding an older snapshot needs the
+    # actionable reason, not a generic shape complaint about the map that
+    # version never had.
+    if raw.get("version") != SNAPSHOT_VERSION:
         raise ValueError("Gate 3 snapshot version is unsupported")
+    if set(raw) != {"version", "head", "dirty", "filesystem"}:
+        raise ValueError("Gate 3 snapshot is malformed")
     head = raw.get("head")
     dirty = raw.get("dirty")
     if not isinstance(head, str) or _OID.fullmatch(head) is None:
@@ -1457,7 +2415,13 @@ def _load_snapshot(path: Path) -> tuple[str, dict[str, DirtyFingerprint]]:
         ):
             raise ValueError("Gate 3 snapshot fingerprint types are malformed")
         fingerprints[relative] = fingerprint
-    return head, fingerprints
+    return Gate3Snapshot(
+        head=head,
+        evidence=Gate3Evidence(
+            dirty=fingerprints,
+            filesystem=_load_filesystem_map(raw.get("filesystem")),
+        ),
+    )
 
 
 def cmd_snapshot() -> int:
@@ -1469,7 +2433,8 @@ def cmd_snapshot() -> int:
     )
     print(
         f"snapshot: HEAD={snapshot['head'][:8]} "
-        f"dirty={len(snapshot['dirty'])} -> {snapshot_path}"
+        f"dirty={len(snapshot['dirty'])} "
+        f"filesystem={len(snapshot['filesystem'])} -> {snapshot_path}"
     )
     return 0
 
@@ -1477,19 +2442,37 @@ def cmd_snapshot() -> int:
 def cmd_check() -> int:
     vault = _vault()
     snapshot_path = _snapshot_path(vault)
-    head, before = _load_snapshot(snapshot_path)
+    snapshot = _load_snapshot(snapshot_path)
+    head = snapshot.head
+    before = snapshot.evidence.dirty
     audit_head = _head_oid(vault)
     rules = AuditRules.load(vault)
     _validate_receipt_stores(vault, rules)
     records = collect_commit_records(vault, head, audit_head)
-    after = collect_dirty_fingerprints(vault)
-    commit_audit = _audit_commit_history(records, vault)
+    current = collect_gate3_evidence(vault)
+    after = current.dirty
+    commit_result = _audit_commit_history(records, vault, head, audit_head)
+    commit_audit = commit_result.audit
     dirty_audit = audit_dirty(before, after, rules, vault, records=records)
+    dirty_paths = _classify_dirty_path_changes(before, after, dirty_audit)
+    filesystem_audit = audit_filesystem(
+        snapshot.evidence.filesystem,
+        current.filesystem,
+        rules,
+        classified_paths=commit_result.path_changes + dirty_paths,
+        rename_mappings=commit_result.rename_mappings,
+    )
+    sanctioned_writes = sorted(
+        set(dirty_audit.sanctioned_writes) | set(filesystem_audit.sanctioned_writes)
+    )
+    violating_writes = sorted(
+        set(dirty_audit.violating_writes) | set(filesystem_audit.violating_writes)
+    )
     result = Audit(
         sanctioned_commits=commit_audit.sanctioned_commits,
         violating_commits=commit_audit.violating_commits,
-        sanctioned_writes=dirty_audit.sanctioned_writes,
-        violating_writes=dirty_audit.violating_writes,
+        sanctioned_writes=sanctioned_writes,
+        violating_writes=violating_writes,
     )
     if _head_oid(vault) != audit_head:
         raise ValueError("Gate 3 HEAD changed during the audit")
@@ -1500,6 +2483,7 @@ def cmd_check() -> int:
     )
     print(f"  sanctioned commits: {len(result.sanctioned_commits)}")
     print(f"  sanctioned dirty writes: {len(result.sanctioned_writes)}")
+    print(f"  filesystem evidence: {len(current.filesystem)} path(s)")
     for message in result.violating_commits:
         print(f"  VIOLATION commit: {message}")
     for relative in result.violating_writes:
@@ -1520,8 +2504,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except (
         # An unreadable entity manifest is a `RuntimeError`, so naming it is
-        # the only way this boundary reports it. The store sweep reaches
-        # `EntityCatalog.load` from `snapshot` as well as `check`.
+        # the only way this boundary reports it. `check` reaches
+        # `EntityCatalog.load` through `AuditRules.load`.
         EntityManifestError,
         json.JSONDecodeError,
         KeyError,
