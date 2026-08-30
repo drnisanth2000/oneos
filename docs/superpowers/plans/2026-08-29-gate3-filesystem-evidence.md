@@ -86,7 +86,7 @@ change.
   failures now reach the controlled CLI error boundary. These corrections add
   three collected cases, require two additional mutation proofs, and permit
   `audit_filesystem` to differ in the final Task 12 AST comparison.
-- Revision 9 — this document. The second independent review confirmed both
+- Revision 9 — superseded. The second independent review confirmed both
   Revision 8 behavioural defects closed and reported one Minor test-adequacy
   gap: the overlapping paired-special regression covered sanctioned Git
   classifications but did not directly pin the requirement that violating
@@ -94,6 +94,14 @@ change.
   authoritative violation suppresses duplicate enclosing-directory findings,
   and a third Task 13 mutation drops the disposition guard to prove that test
   turns RED. Product code is unchanged by this review round.
+- Revision 10 — this document. The first published CI run exposed two
+  non-portable replacement fixtures on Linux: immediate unlink/recreate reused
+  the same inode, which the approved design records as an accepted
+  observational limitation rather than a detectable replacement. Each fixture
+  now creates the replacement while the original object still exists and then
+  moves it into place, guaranteeing distinguishable identity without changing
+  product behavior or weakening the audit. The CI run is the RED evidence;
+  focused local reproduction is GREEN after the fixture correction.
 
 ## Global Constraints
 
