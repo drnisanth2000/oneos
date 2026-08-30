@@ -29,9 +29,8 @@ change.
   `acc3f309f04a285fbec46acf0a0cc99d0175e101`, specifically its
   "Sanctioned rename topology" rule and its "Evidence-model limitation:
   identity is not proof of a move".
-- Tasks 11 and 12 are written against **Design Revision 4**, approved at
-  `f8003a500881a9bb612a6c18999590b6be17ead4` and recorded approved at
-  `99a0ff522703d0ec281d2876b49d8ca7cc7d535a`. Task 11 implements its
+- Tasks 11 and 12 are written against **Design Revision 5**, approved and
+  recorded at `4a6530168d0299a0ac895f49c873693a75875a12`. Task 11 implements its
   non-directory rename-topology inheritance and three-phase disposition
   order; Task 12 implements its one immutable per-record rename analysis.
 
@@ -51,7 +50,8 @@ change.
   rename.
 - Revision 4 — Task 10 corrected again. Executed to completion at
   `69cbff7681c00a9347ec1be22cc40ef72788730e`.
-- Revision 5 — this document. Tasks 1–10 are historical and must not be
+- Revision 5 — added Tasks 11 and 12. Superseded.
+- Revision 6 — this document. Tasks 1–10 are historical and must not be
   re-run. Adds **Task 11** (I5, non-directory rename inheritance — a
   regression this branch introduces relative to canonical `origin/main`) and
   **Task 12** (I4, one immutable per-record rename analysis), sequential and
@@ -64,7 +64,12 @@ change.
   pairing selects the unique most-specific applicable mapping instead of the
   first tuple entry. Adds the missing wrong-old-root case and replaces the
   grep-based unchanged-helpers claim with an exact AST comparison. Tasks 1–9
-  remain unchanged.
+  remain unchanged. Revision 6 also binds Task 12 to Design Revision 5:
+  permanent tests use literal expectations rather than a branch-local Git
+  object, the historical differential oracle is disposable and untracked,
+  expected and unexpected later-axis failures are exercised separately, the
+  two-record test is included in RED/GREEN commands, and both mutation
+  ledgers and collected-case forecasts are internally consistent.
 
 ## Global Constraints
 
@@ -2603,8 +2608,8 @@ state is **261 passed, 1 skipped** in the Gate 3 module (262 collected) and
 APFS undecodable-filename case and must remain the only skip on hosts that
 support UNIX sockets.
 
-**Design authority:** Revision 4 at
-`f8003a500881a9bb612a6c18999590b6be17ead4`.
+**Design authority:** Revision 5 at
+`4a6530168d0299a0ac895f49c873693a75875a12`.
 
 **Standing constraints for both tasks:**
 
@@ -2658,7 +2663,7 @@ _paired_rename_entries(
 `audit_filesystem()` keeps its existing signature exactly. Only its body
 changes.
 
-**Normative disposition order (Design Revision 4).** Three phases, in this
+**Normative disposition order (Design Revision 5).** Three phases, in this
 order:
 
 1. **Pair non-directory deltas.** Sanctioned pairs are recorded and become
@@ -3124,7 +3129,7 @@ definition.
 
 - [ ] **Step 9: Mutation-prove every security-bearing condition**
 
-Six mutations. For each: apply without committing, run the named command,
+Seven mutations. For each: apply without committing, run the named command,
 restore from a preimage, verify with `cmp` **and** SHA-256 that the file is
 byte-identical, then re-run to GREEN.
 
@@ -3166,7 +3171,7 @@ git status --short
 Require the floors in "Collected-case forecast" below, both audits CLEAN,
 Gitleaks clean, only the two approved files modified, and `ONEOS_VAULT`
 still unset. Commit those two files in one sanitized checkpoint recording the
-RED evidence, all six mutation results, and both counts.
+RED evidence, all seven mutation results, and both counts.
 
 ---
 
@@ -3313,7 +3318,7 @@ the fixture's shape, not from scoping the count.
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'one_analysis_and_bounded_work or builds_no_rename_plan' -q
+  -k 'one_analysis_and_bounded_work or builds_no_rename_plan or two_rename_records' -q
 ```
 
 Expected: `test_rename_record_performs_one_analysis_and_bounded_work` FAILS —
@@ -3329,122 +3334,186 @@ same-object checkout inside the dirty audit's commit-relative rules loader —
 that, not any scoping of the counter, is the mechanism, and the counter is
 global.
 
-- [ ] **Step 3: Write the RED differential oracle**
+`test_two_rename_records_each_get_their_own_analysis` FAILS with
+`analysis == 0`; it prevents a later implementation from satisfying the
+single-record bounds with shared or cached state.
+
+- [ ] **Step 3: Run the untracked development differential oracle**
+
+Before changing product code, run a disposable script outside the repository.
+It must load
+`acc3f309f04a285fbec46acf0a0cc99d0175e101:tools/gate3_audit.py` with
+`git show` using `check=True`, load it under a unique module name, and
+compare its completed `_sanctioned_rename` outcomes with HEAD over every
+axis and these literal variants:
 
 ```python
-def _baseline_gate3(tmp_path: Path):
-    """Load the approved-checkpoint module under its own name."""
-    import importlib.util
+_EXPECTED_SANCTIONING = {
+    "sanctioned": True,
+    "duplicate-change": False,
+    "wrong-parent": False,
+    "malformed-envelope": False,
+    "non-rename-message": False,
+}
+```
 
-    source = subprocess.run(
-        ["git", "show", "acc3f309f04a285fbec46acf0a0cc99d0175e101:tools/gate3_audit.py"],
-        cwd=Path(__file__).resolve().parents[1],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    path = tmp_path / "baseline_gate3.py"
-    path.write_text(source, encoding="utf-8")
-    name = f"baseline_gate3_{path.stem}_{abs(hash(source)) % 10**8}"
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    # Registered under a unique name and removed afterwards, so repeated
-    # parametrized calls never share or clobber one module object.
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.modules.pop(name, None)
-    return module
+The disposable oracle lives under `/private/tmp`, is never staged, and is
+removed after the post-change comparison. If the approved object cannot be
+read, the development oracle **fails**; it never skips. Do not include
+multi-axis ambiguity or injected planner exceptions in the differential
+comparison because the historical function cannot complete those new
+all-axis observations. Record the before-change equality now and repeat it
+after Step 7.
 
+- [ ] **Step 4: Write the permanent self-contained RED corpus**
 
-@pytest.mark.parametrize("axis", sorted(("entity", "product", "member",
-                                         "project", "workspace")))
-def test_sanctioning_matches_the_approved_baseline(
-    tmp_path: Path, axis: str
-):
-    """Structural identity is lost, so behaviour is proven instead."""
-    baseline = _baseline_gate3(tmp_path)
+Append tests whose expected results are literal and independent of repository
+history. The multi-axis body below retargets the existing
+`test_ambiguous_axis_match_contributes_no_mapping` regression rather than
+adding duplicate coverage:
+
+```python
+def _rename_record(tmp_path: Path, axis: str = "entity"):
     files, old, new = _rename_files(axis)
     vault = git_vault(tmp_path / f"vault-{axis}", files)
     head = _git(vault, "rev-parse", "HEAD").strip()
     apply_rename(vault, plan_rename(vault, axis, old, new), validators=[])
     (record,) = gate3.collect_commit_records(vault, head)
+    return vault, record
 
+
+@pytest.mark.parametrize("axis", sorted(("entity", "product", "member",
+                                         "project", "workspace")))
+def test_rename_analysis_preserves_literal_sanctioning_results(
+    tmp_path: Path, axis: str
+):
+    vault, record = _rename_record(tmp_path, axis)
     variants = {
-        "sanctioned": record,
-        "duplicate-change": dataclasses.replace(
-            record, changes=record.changes + (record.changes[0],)
+        "sanctioned": (record, True),
+        "duplicate-change": (
+            dataclasses.replace(
+                record, changes=record.changes + (record.changes[0],)
+            ),
+            False,
         ),
-        "wrong-parent": dataclasses.replace(record, parents=("e" * 40,)),
-        "malformed-envelope": dataclasses.replace(
-            record, changes=record.changes[:1]
+        "wrong-parent": (
+            dataclasses.replace(record, parents=("e" * 40,)),
+            False,
         ),
-        "non-rename-message": dataclasses.replace(
-            record, message="ingest: add redacted receipt"
+        "malformed-envelope": (
+            dataclasses.replace(record, changes=record.changes[:1]),
+            False,
         ),
-        # Pins the early-return deviation: a later axis's planner raising
-        # must not change the sanctioning result.
-        "later-axis-raises": record,
+        "non-rename-message": (
+            dataclasses.replace(
+                record, message="ingest: add redacted receipt"
+            ),
+            False,
+        ),
     }
-    for name, candidate in variants.items():
-        assert gate3._sanctioned_rename(candidate, vault) == (
-            baseline._sanctioned_rename(candidate, vault)
-        ), name
+
+    for name, (candidate, expected) in variants.items():
+        analysis = gate3._analyze_rename(candidate, vault)
+        assert analysis.sanctioned is expected, name
+        if not expected:
+            assert analysis.matched_axes == (), name
+            assert analysis.mappings == (), name
 
 
-def test_multi_axis_ambiguity_matches_the_approved_baseline(
+def test_expected_later_axis_failures_preserve_an_earlier_match(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """The one shape where sanctioning and the matching-axis set diverge.
-
-    `apply_rename` always commits `rename: <old> → <new>`, so no *message*
-    edit can produce an ambiguous record — a second axis must actually
-    reproduce the envelope. Patch one level below the axis loop, exactly as
-    the existing suite does, so the loop itself still runs.
-    """
-    baseline = _baseline_gate3(tmp_path)
-    files, old, new = _rename_files("entity")
-    vault = git_vault(tmp_path / "vault", files)
-    head = _git(vault, "rev-parse", "HEAD").strip()
-    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
-    (record,) = gate3.collect_commit_records(vault, head)
-
+    vault, record = _rename_record(tmp_path)
     real = gate3._axis_envelope_and_moves
 
-    def every_axis_matches(tree, tracked, axis, o, n, *, parent_oid):
-        envelope, _moves = real(
-            tree, tracked, "entity", o, n, parent_oid=parent_oid
-        )
-        return envelope, (gate3.RenameMapping(o, f"{n}-{axis}"),)
+    def expected_failure_after_match(tree, tracked, axis, old, new, *,
+                                     parent_oid):
+        if axis == "entity":
+            return real(
+                tree, tracked, axis, old, new, parent_oid=parent_oid
+            )
+        raise OSError("synthetic expected axis-local failure")
 
-    monkeypatch.setattr(gate3, "_axis_envelope_and_moves", every_axis_matches)
+    monkeypatch.setattr(
+        gate3, "_axis_envelope_and_moves", expected_failure_after_match
+    )
+
     analysis = gate3._analyze_rename(record, vault)
 
-    assert len(analysis.matched_axes) > 1
-    assert analysis.mappings == (), "ambiguity yields no mappings"
-    assert analysis.sanctioned is True, "sanctioning is unchanged by ambiguity"
-    assert analysis.sanctioned == baseline._sanctioned_rename(record, vault)
+    assert analysis.sanctioned is True
+    assert analysis.matched_axes == ("entity",)
+    assert analysis.mappings
+
+
+def test_ambiguous_axis_match_contributes_no_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    vault, record = _rename_record(tmp_path)
+    real = gate3._axis_envelope_and_moves
+
+    def every_axis_matches(tree, tracked, axis, old, new, *, parent_oid):
+        envelope, _ = real(
+            tree, tracked, "entity", old, new, parent_oid=parent_oid
+        )
+        return envelope, (gate3.RenameMapping(old, f"{new}-{axis}"),)
+
+    monkeypatch.setattr(gate3, "_axis_envelope_and_moves", every_axis_matches)
+
+    analysis = gate3._analyze_rename(record, vault)
+
+    assert analysis.sanctioned is True
+    assert len(analysis.matched_axes) == len(gate3.AXES)
+    assert analysis.mappings == ()
+
+
+def test_unexpected_later_axis_error_fails_check_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+):
+    files, old, new = _rename_files("entity")
+    vault = git_vault(tmp_path / "vault", files)
+    snapshot = tmp_path / "gate3.json"
+    monkeypatch.setenv("ONEOS_VAULT", os.fspath(vault))
+    monkeypatch.setenv("GATE3_SNAP", os.fspath(snapshot))
+    assert gate3.main(["snapshot"]) == 0
+    apply_rename(vault, plan_rename(vault, "entity", old, new), validators=[])
+    real = gate3._axis_envelope_and_moves
+
+    def unexpected_failure_after_match(tree, tracked, axis, old, new, *,
+                                       parent_oid):
+        if axis == "entity":
+            return real(
+                tree, tracked, axis, old, new, parent_oid=parent_oid
+            )
+        raise TypeError("synthetic unexpected axis failure")
+
+    monkeypatch.setattr(
+        gate3, "_axis_envelope_and_moves", unexpected_failure_after_match
+    )
+
+    assert gate3.main(["check"]) == 2
+    captured = capsys.readouterr()
+    assert "GATE 3 ERROR:" in captured.err
+    assert "GATE 3: PASS" not in captured.out
 ```
 
-Import `sys` and `dataclasses` in the test module if not already present.
+Import `dataclasses` if it is not already present. These tests permanently
+pin the five-axis result corpus, expected later-axis continuation,
+multi-axis ambiguity, and the controlled boundary for an unexpected later
+error. They contain no `git show`, historical SHA, dynamic baseline module,
+or history-dependent skip.
 
-- [ ] **Step 4: Run the oracle and observe it GREEN before the change**
+Run:
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'matches_the_approved_baseline' -q
+  -k 'literal_sanctioning_results or expected_later_axis or ambiguous_axis_match or unexpected_later_axis' -q
+uv run python -m pytest tests/test_console_invariants.py -k shadow -q
 ```
 
-Expected: PASS — but record it as a **fixture smoke-test, not evidence**. At
-`acc3f309` the sanctioning helpers are byte-identical to HEAD, so before the
-change the oracle compares a function to a verbatim copy of itself. Its
-evidential value is entirely post-change, where it is the substitute for the
-AST identity the consolidation destroys.
-
-The baseline must also survive this branch being merged: `git show` on a
-branch-local commit fails once the branch is gone, and `check=True` would
-then error all five cases permanently. Resolve the baseline defensively —
-`pytest.skip` with an explicit reason when the object is unreachable — so a
-merged main-line suite degrades to a reported skip rather than a failure.
+Expected: RED because `RenameAnalysis`, `_analyze_rename`, and
+`_axis_envelope_and_moves` do not exist. The unexpected-error case may fail
+earlier for that same missing interface, but after the interfaces exist it
+must reach the real `main(["check"])` boundary and return 2.
 
 - [ ] **Step 5: Implement the analysis**
 
@@ -3498,8 +3567,9 @@ def _axis_envelope_and_moves(
 
 The envelope body must reproduce `_rename_envelope`'s exactly — including
 the edits filter and `.relative_to`, both of which are load-bearing. The
-differential oracle is what proves it did. Before writing it, diff the two
-bodies line by line and confirm no guard was dropped.
+untracked development oracle and permanent literal corpus prove the result.
+Before writing it, diff the two bodies line by line and confirm no guard was
+dropped.
 
 ```python
 def _analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis:
@@ -3509,16 +3579,13 @@ def _analyze_rename(record: CommitRecord, vault: Path) -> RenameAnalysis:
     duplicate-change guard: `sanctioned` is true when any axis matches, which
     is what first-match acceptance computed.
 
-    It does **not** keep the early return. The design requires every axis to
-    be evaluated so ambiguity is observable, and one pass cannot both stop at
-    the first match and see the second. The observable consequence is that
-    planners for later axes now run on records where they previously did not,
-    so an exception they raise outside the inner tuple could flip a
-    sanctioned record to unsanctioned. The differential oracle covers this
-    with a variant in which a non-matching axis raises. Report this deviation
-    to the owner as a design-text correction — the design says the
-    sanctioning decision "keeps its early return", which this consolidation
-    makes impossible.
+    It does **not** keep the historical physical early return. Design Revision
+    5 resolves that contradiction: every axis runs exactly once, while the
+    sanctioning *result* remains `True` when any axis exactly matches.
+    Expected axis-local planning failures contribute no match and evaluation
+    continues. An unexpected failure is not caught here; it reaches the
+    controlled Gate 3 command boundary and fails the command closed rather
+    than returning partial evidence.
 
     Ambiguity applies only to the mappings: more than one matching axis
     yields none.
@@ -3589,7 +3656,7 @@ design still requires:
 
 ```bash
 uv run python -m pytest tests/test_gate3_audit.py \
-  -k 'one_analysis_and_bounded_work or builds_no_rename_plan or matches_the_approved_baseline' -q
+  -k 'one_analysis_and_bounded_work or builds_no_rename_plan or two_rename_records or literal_sanctioning_results or expected_later_axis or ambiguous_axis_match or unexpected_later_axis' -q
 uv run python -m pytest tests/test_gate3_audit.py -q
 uv run python -m pytest tests/test_console_invariants.py -k shadow -q
 ```
@@ -3627,12 +3694,12 @@ condition.
 | # | Mutation | Command | Expected RED |
 |---|---|---|---|
 | 1 | make `_audit_commit_history` call `_sanctioned_rename(record, vault)` again before appending `analysis.mappings` | `-k one_analysis_and_bounded_work` | `sanctioned <= 1` |
-| 1b | make `_sanctioned_rename` ignore its `analysis` argument and always recompute | `-k one_analysis_and_bounded_work` | `parent_tree <= 2` |
-| 2 | call `build_rename_plan` a second time for the move pairs | `-k one_analysis_and_bounded_work` | `plan <= len(AXES)` |
-| 3 | open a second `_parent_tree` inside `_analyze_rename` | `-k one_analysis_and_bounded_work` | `parent_tree <= 2` |
-| 4 | drop the duplicate-change guard from `_analyze_rename` | `-k matches_the_approved_baseline` | `duplicate-change` |
-| 5 | make `sanctioned` require exactly one matched axis | `-k matches_the_approved_baseline` | a multi-axis variant |
-| 6 | build a plan for a non-rename record | `-k builds_no_rename_plan` | `plan == 0` |
+| 2 | make `_sanctioned_rename` ignore its `analysis` argument and always recompute | `-k one_analysis_and_bounded_work` | `parent_tree <= 2` |
+| 3 | call `build_rename_plan` a second time for the move pairs | `-k one_analysis_and_bounded_work` | `plan <= len(AXES)` |
+| 4 | open a second `_parent_tree` inside `_analyze_rename` | `-k one_analysis_and_bounded_work` | `parent_tree <= 2` |
+| 5 | drop the duplicate-change guard from `_analyze_rename` | `-k literal_sanctioning_results` | `duplicate-change` |
+| 6 | make `sanctioned` require exactly one matched axis | `-k ambiguous_axis_match` | the multi-axis case |
+| 7 | build a plan for a non-rename record | `-k builds_no_rename_plan` | `plan == 0` |
 
 Restore byte-identically after each, verified by `cmp` and SHA-256.
 
@@ -3659,11 +3726,11 @@ full suite **1983 passed, 1 skipped**.
 | 11 | CLI carried entries ×4 + refusal (Step 5) | 2 | 5 |
 | **11 total** | | **11** | **31** |
 | 12 | call-count tests, incl. two-record analysis (Step 1) | 3 | 3 |
-| 12 | differential oracle ×5 axes (Step 3) | 1 | 5 |
-| 12 | multi-axis ambiguity oracle (Step 3) | 1 | 1 |
-| **12 new** | | **5** | **9** |
+| 12 | literal sanctioning corpus ×5 axes (Step 4) | 1 | 5 |
+| 12 | expected and unexpected later-axis failures (Step 4) | 2 | 2 |
+| **12 new** | | **6** | **10** |
 | 12 | four retargeted tests (Step 6) — rewritten, not added | 0 | 0 |
-| **Both** | | **16** | **40** |
+| **Both** | | **17** | **41** |
 
 Task 12 Step 6 **retargets** four existing tests rather than deleting them,
 so it adds no net retirement: the offline-envelope regression, the
@@ -3679,8 +3746,8 @@ and 1983 passed / 1 skipped:
 
 - after Task 11: Gate 3 module **at least 292 passed**, 1 skipped; full suite
   **at least 2014 passed**, 1 skipped;
-- after Task 12: Gate 3 module **at least 301 passed**, 1 skipped; full suite
-  **at least 2023 passed**, 1 skipped.
+- after Task 12: Gate 3 module **at least 302 passed**, 1 skipped; full suite
+  **at least 2024 passed**, 1 skipped.
 
 A socket case may skip where the host cannot safely bind one; any such skip
 is reported, not hidden, and the floor is reduced by exactly the number of
