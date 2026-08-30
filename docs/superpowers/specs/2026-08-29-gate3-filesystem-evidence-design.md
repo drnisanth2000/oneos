@@ -24,10 +24,11 @@ sanctioning *result* while exposing ambiguity and failing closed on errors.
   can never produce PASS. The permanent regression corpus is self-contained;
   a development-time differential oracle may use the historical checkpoint
   only as an untracked, disposable proof.
-- Revision 4 — this document. Documentation-only consistency corrections to
-  Revision 3, which was architecturally approved: the "exactly three end
-  sanctioned" count is scoped to the directory cases so it no longer reads as
-  contradicting the six sanctioned non-directory kinds; the directory case
+- Revision 4 — superseded by Revision 5. Documentation-only consistency
+  corrections to Revision 3, which was architecturally approved: the
+  "exactly three end sanctioned" count is scoped to the directory cases so it
+  no longer reads as contradicting the six sanctioned non-directory kinds;
+  the directory case
   holding "ignored or untracked regular content" is narrowed to content the
   transaction can actually carry; a positive ignored-symlink regression is
   added; and the stale literal "8 plan builds" is replaced by the measured
