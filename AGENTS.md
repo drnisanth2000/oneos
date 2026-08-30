@@ -46,11 +46,19 @@ The macOS no-overwrite path was exercised;
 Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
 user/platform limitation. The separately sequenced inherited items 2, 4, and 3
 are also complete; `docs/STATUS.md` records their published public and
-trusted-local evidence. The substantive next phase is the live Phase 1 exit
-trials: Gate 2 approval plus revert proof, Gate 3 full-session
-unsanctioned-write audit, and Gate 1 timed triage of about 20 real inbox items.
-Gates 4 and 5 already pass. Phase 2 remains unauthorized, and deployment stays
-blocked until every Phase 1 gate passes and the owner separately approves it.
+trusted-local evidence. The first live exit trial exposed a Gate 3 defect: an
+exact valid S7 quarantine record was misclassified. Independent review of that
+correction then exposed Git-invisible filesystem entries outside the discovery
+boundary. Both corrections are integrated. Their closing evidence recorded
+2,028 public tests and 306 focused
+Gate 3 tests passing with one platform skip in each suite; 39 private tests;
+`check_v2` 0/0; clean policy, Gitleaks, public, and combined history audits;
+and byte-identical protected vault state. After separate owner authorization,
+the next live work is a fresh trusted-local Gate 3 rerun from the current
+fetched `origin/main`, followed by any still-pending Gate 2 proof and Gate 1
+timed triage. Gates 4 and 5 already pass. Phase 2 remains unauthorized, and
+deployment stays blocked until every Phase 1 gate passes and the owner
+separately approves it.
 A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
