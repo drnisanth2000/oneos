@@ -1,18 +1,29 @@
 # Gate 3 Filesystem Evidence Boundary
 
-**Status:** REVISION 4 — APPROVED by the product owner on 2026-08-29 at
-design commit `f8003a500881a9bb612a6c18999590b6be17ead4`. Implementation of
-its two changes is planned as Tasks 11 and 12. Revision 3 extends verified
+**Status:** REVISION 5 — APPROVED by the product owner on 2026-08-30.
+Implementation of its two changes is planned as Tasks 11 and 12. Revision 3
+extends verified
 rename-topology inheritance from directories to every included non-regular
 kind, replacing the blanket rule that made a sanctioned rename produce false
 violations, and consolidates rename evidence into one immutable per-record
-analysis. Revisions 0 through 2 are approved; that approval does not extend
-to this revision.
+analysis. Revision 4 reconciled the test matrix with those rules. Revision 5
+clarifies the only executable all-axis analysis that preserves the existing
+sanctioning *result* while exposing ambiguity and failing closed on errors.
 
 **Revision history:**
 
 - Revision 0 — approved 2026-08-29. Implementation of Tasks 1–8 proceeded
   against it.
+- Revision 5 — this document. The owner approved correcting the Revision 4
+  contradiction between all-axis ambiguity detection and a physical
+  first-match return. Every axis is evaluated exactly once. The sanctioning
+  result remains `true` when any axis exactly reproduces the envelope;
+  ambiguity removes mappings, not sanction. Expected axis-local planning
+  failures contribute no match and evaluation continues, while an unexpected
+  failure aborts through the controlled Gate 3 boundary so partial evidence
+  can never produce PASS. The permanent regression corpus is self-contained;
+  a development-time differential oracle may use the historical checkpoint
+  only as an untracked, disposable proof.
 - Revision 4 — this document. Documentation-only consistency corrections to
   Revision 3, which was architecturally approved: the "exactly three end
   sanctioned" count is scoped to the directory cases so it no longer reads as
@@ -478,10 +489,21 @@ or ambiguity fails closed and the delta is judged as if no pairing existed.
    sanctioned:** the sanctioning decision keeps its present semantics
    exactly.
 
-   Detecting ambiguity also requires the mapping pass to evaluate every axis
-   to completion. The present check returns on its first matching axis and so
-   can never observe a second one. The mapping pass must not inherit that
-   early return, while the sanctioning decision keeps it.
+   Detecting ambiguity requires one analysis to evaluate every axis to
+   completion. The historical check returned on its first matching axis and
+   therefore could not observe a second one. The consolidated implementation
+   does not retain that physical early return. It preserves the exact
+   *result*: `sanctioned` is true when any axis exactly reproduces the
+   envelope; more than one match contributes no mapping but remains
+   sanctioned. Duplicate changes, a wrong parent shape, a malformed or empty
+   envelope, and a non-rename message remain unsanctioned.
+
+   Expected per-axis planning failures — `OSError`, `RenameError`,
+   `UnicodeError`, and `sqlite3.Error` — contribute no match for that axis and
+   evaluation continues. Any unexpected exception from a later axis is not
+   converted into a non-match and is not allowed to leave an earlier match as
+   a partial success. It escapes to the existing controlled command boundary,
+   which fails Gate 3 closed.
 3. **Exact relative path beneath the roots.** For one mapped pair
    `(old_root, new_root)`, the removed path must be `old_root/tail` and the
    added path must be `new_root/tail` for the identical `tail`. When several
@@ -663,16 +685,24 @@ all of them. It must be **narrowed, not dropped**:
   exception, and the filesystem fingerprint and traversal primitives.
 
 Because structural identity is lost for the changed set, behaviour is proven
-instead by a **differential oracle**: load the baseline module from the
-approved design checkpoint and assert the new and baseline sanctioning
-decisions agree over a corpus spanning all five axes, sanctioned records,
-records with duplicated change entries, **records whose envelope more than
-one axis reproduces**, wrong-parent records, malformed envelopes, and
-non-rename messages. The ambiguous record matters most: it is where the
-sanctioning result and the matching-axis set diverge furthest, because one
-applies the duplicate-change guard and early-returns while the other does
-neither. Every existing sanctioning regression is
-retained unchanged alongside it. A differential disagreement is a stop
+in two layers. During development, an **untracked disposable differential
+oracle** loads the approved checkpoint and compares completed outcomes. It
+must fail rather than skip if that checkpoint cannot be read in the
+development clone, and it is removed before commit. It compares only outcomes
+the baseline can complete: all five axes, sanctioned records, duplicate
+changes, wrong parents, malformed envelopes, and non-rename messages.
+
+Permanent tracked tests are self-contained and derive literal expectations
+from this design. They cover the same five-axis corpus, a record whose
+envelope multiple axes reproduce, expected failures on a later axis, and an
+unexpected later-axis failure at the controlled command boundary. No tracked
+test may depend on a branch-local commit object, repository history, or a
+history-dependent skip. The ambiguous record pins the intentional split:
+`sanctioned` remains true while `mappings` is empty. Expected later-axis
+failures leave an earlier exact match sanctioned; unexpected later-axis
+failures fail the command closed and never yield a partial PASS. Every
+existing sanctioning regression is retained unchanged alongside this corpus.
+A differential disagreement or permanent-corpus disagreement is a stop
 condition, not a finding to triage.
 
 ### Exact S7 quarantine-directory exception
@@ -862,8 +892,11 @@ against a literal 8:
 - it performs exactly one semantic rename analysis with no repeated sanction
   verification;
 - a non-rename record performs at most 1 checkout and zero plan builds;
-- a differential oracle agrees with the baseline sanctioning decision across
-  all five axes and the adversarial record corpus.
+- an untracked development oracle agrees with the baseline sanctioning result
+  across all five axes and every baseline-completable adversarial record;
+- a permanent self-contained corpus pins those literal results, multi-axis
+  ambiguity, expected later-axis failures, and controlled failure for an
+  unexpected later-axis error without depending on Git history.
 
 ### Traversal and races
 
