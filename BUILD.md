@@ -79,12 +79,18 @@ quarantine record needed receipt-correlated sanctioning. Independent review of
 that correction then exposed Git-invisible directories and non-regular entries
 outside the discovery boundary; deterministic no-follow filesystem evidence
 now covers them. Both corrections are integrated and their closing public,
-private, publication, and preservation gates pass. The live Gate 3 session has
-not been rerun and must not be reported as passed. Only after separate owner
-authorization, start a new live task from a fresh worktree at the current
-fetched `origin/main`, preserve the existing live evidence, rerun Gate 3, then
-complete any still-pending Gate 2 proof and Gate 1 timed triage. Gates 4 and 5
-already pass. Phase 2 remains unauthorized.
+private, publication, and preservation gates pass. A later fresh
+owner-reviewed, trusted-local live session at the exact fetched `origin/main`
+`bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action
+commit, two sanctioned dirty-write transitions, and zero violating commits or
+writes across all observed filesystem entries: Gate 3 passed. Its
+preflight recorded 2,054 public tests passing with four platform skips, 39
+private tests, `check_v2` 0/0, and clean policy, Gitleaks, public, and combined
+history audits; opaque closing preimages and the protected snapshot evidence
+remained byte-identical across the read-only audit, preserving all pre-existing
+dirty entries recorded at the session baseline. Next complete any
+still-pending Gate 2 proof and Gate 1 timed triage. Gates 3, 4, and 5 pass.
+Phase 2 remains unauthorized.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved
