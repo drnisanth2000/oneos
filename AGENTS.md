@@ -61,7 +61,7 @@ writes across all observed filesystem entries: Gate 3 passed. Its preflight
 recorded 2,054 public tests passing with four platform skips, 39 private tests,
 `check_v2` 0/0, and clean policy, Gitleaks, public, and combined history audits;
 opaque closing preimages and the protected snapshot evidence remained
-byte-identical across the read-only audit, preserving all seven pre-existing
+byte-identical across the read-only audit, preserving all pre-existing
 dirty entries recorded at the session baseline. The next live work is any
 still-pending Gate 2 proof and Gate 1 timed triage. Gates 3, 4, and 5 pass.
 Phase 2 remains unauthorized, and deployment stays blocked until every Phase
