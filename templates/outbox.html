@@ -4,14 +4,15 @@
   {% set page_title = "OneOS · Outbox" %}
   {% include "_head.html" %}
 </head>
-<body hx-ext="alpine-morph">
+<body class="review-surface" hx-ext="alpine-morph">
   {% include "_sidebar.html" %}
   <main class="main">
-    <h1 class="triage-h">Outbox · {{ entity }}</h1>
-    <p class="muted">
-      Approving performs the move and commits it — one revertible commit each.
-      <a href="/triage/{{ entity }}">← back to triage</a>
-    </p>
+    <header class="review-page-head">
+      <a href="/triage/{{ entity }}">Back to triage</a>
+      <h1 class="triage-h">Review proposed changes</h1>
+      <p class="muted">Outbox · {{ entity }}. Check the destination before you approve.
+        Each approval records one reversible change.</p>
+    </header>
     {% include "blocks/outbox_list.html" %}
   </main>
 </body>

@@ -1,7 +1,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ page_title | default("OneOS") }}</title>
-<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/app.css?v={{ stylesheet_version }}">
 <!-- HTMX 2.0.4 does not swap non-2xx by default; override the [45].. entry
      so described attention statuses still reach the operator's screen while
      keeping error:true for htmx:responseError (S6 design §4). The meta form
