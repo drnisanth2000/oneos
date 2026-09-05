@@ -66,9 +66,10 @@ Original steps 1-10, Safety Foundation S1-S7, and the separately sequenced
 inherited items 2, 4, and 3 below are complete. The first live Phase 1 exit
 trial exposed a Gate 3 audit defect, and independent correction review exposed
 a second discovery gap. Both corrections are now integrated and synthetically
-verified. A fresh trusted-local Gate 3 session subsequently passed with one
-sanctioned action commit and no violating commit or write. Phase 2 is not
-authorized.
+verified. A fresh owner-reviewed, trusted-local Gate 3 session at exact fetched
+`origin/main` `bb317451133aba7f419a6b360138bc379f32a5ec` subsequently passed
+with one sanctioned action commit and no violating commit or write. Phase 2 is
+not authorized.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -140,9 +141,10 @@ Gitleaks, and independent scoped review passed. Linux CI also exposed tests
 that assumed inode numbers could not be immediately reused; the fixtures were
 made portable without weakening the product's fail-closed identity checks.
 The correction task deliberately deferred the live Gate 3 rerun. A later fresh
-trusted-local session at the current fetched `origin/main` recorded one new
-sanctioned action commit, two sanctioned dirty-write transitions, 392
-filesystem entries, and zero violating commits or writes. Its preflight
+owner-reviewed, trusted-local session at the exact fetched `origin/main`
+`bb317451133aba7f419a6b360138bc379f32a5ec` recorded one new sanctioned action
+commit, two sanctioned dirty-write transitions, and zero violating commits or
+writes across all observed filesystem entries. Its preflight
 recorded 2,054 public tests passing with four platform skips, 39 private tests,
 `check_v2` 0 errors/0 warnings, policy PASS, and clean Gitleaks, public, and
 combined history audits. Opaque closing preimages and the protected snapshot
@@ -159,7 +161,7 @@ evidence remains preserved and was not treated as a product defect.
 | 2 — one commit per approval, `git revert`-clean | **AUTOMATED PASS; LIVE TRIAL PENDING** — adapter intake is committed before approval; classification and registry-delete approvals commit exactly reviewed paths; one revert restores the committed action. |
 | 4 — front-matter agreement with `policy_enforcer`, 100 files | **PASS** (100/100) |
 | 5 — cold start to usable screen < 2s | **PASS** (~0.35s) |
-| 3 — zero unsanctioned direct vault writes over a session | **PASS** — A fresh trusted-local live session at the current fetched `origin/main` recorded one sanctioned action commit, two sanctioned dirty-write transitions, 392 filesystem entries, and zero violating commits or writes. The snapshot and opaque closing evidence remained protected and the read-only audit left the vault byte-identical to its closing preimages. |
+| 3 — zero unsanctioned direct vault writes over a session | **PASS** — A fresh owner-reviewed, trusted-local live session at exact fetched `origin/main` `bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action commit, two sanctioned dirty-write transitions, and zero violating commits or writes across all observed filesystem entries. The snapshot and opaque closing evidence remained protected and the read-only audit left the vault byte-identical to its closing preimages. |
 | 1 — triage 20 items faster than Obsidian | **READY FOR LIVE TRIAL** — requires about 20 real inbox items; stopwatch exists on the triage screen. |
 
 Gates govern expansion, not usage. Live trials do not reopen completed S1-S5

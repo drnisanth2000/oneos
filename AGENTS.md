@@ -53,11 +53,12 @@ boundary. Both corrections are integrated. Their closing evidence recorded
 2,028 public tests and 306 focused
 Gate 3 tests passing with one platform skip in each suite; 39 private tests;
 `check_v2` 0/0; clean policy, Gitleaks, public, and combined history audits;
-and byte-identical protected vault state. A later fresh trusted-local live
-session at the current fetched `origin/main` recorded one sanctioned action
+and byte-identical protected vault state. A later fresh owner-reviewed,
+trusted-local live session at the exact fetched `origin/main`
+`bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action
 commit, two sanctioned dirty-write transitions, and zero violating commits or
-writes across 392 filesystem entries: Gate 3 passed. Its preflight recorded
-2,054 public tests passing with four platform skips, 39 private tests,
+writes across all observed filesystem entries: Gate 3 passed. Its preflight
+recorded 2,054 public tests passing with four platform skips, 39 private tests,
 `check_v2` 0/0, and clean policy, Gitleaks, public, and combined history audits;
 opaque closing preimages and the protected snapshot evidence remained
 byte-identical across the read-only audit, preserving all seven pre-existing

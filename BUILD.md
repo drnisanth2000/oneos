@@ -80,9 +80,10 @@ that correction then exposed Git-invisible directories and non-regular entries
 outside the discovery boundary; deterministic no-follow filesystem evidence
 now covers them. Both corrections are integrated and their closing public,
 private, publication, and preservation gates pass. A later fresh
-trusted-local live session at the current fetched `origin/main` recorded one
-sanctioned action commit, two sanctioned dirty-write transitions, and zero
-violating commits or writes across 392 filesystem entries: Gate 3 passed. Its
+owner-reviewed, trusted-local live session at the exact fetched `origin/main`
+`bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action
+commit, two sanctioned dirty-write transitions, and zero violating commits or
+writes across all observed filesystem entries: Gate 3 passed. Its
 preflight recorded 2,054 public tests passing with four platform skips, 39
 private tests, `check_v2` 0/0, and clean policy, Gitleaks, public, and combined
 history audits; opaque closing preimages and the protected snapshot evidence
