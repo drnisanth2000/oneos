@@ -193,6 +193,7 @@ button.reject:hover { border-color: var(--err-ink); color: var(--err-ink); }
 .review-surface {
   --bg: #f5f7fa; --panel: #fff; --ink: #192b3a;
   --ink-dim: #516475; --line: #d8e1e8; --accent: #245b86;
+
   line-height: 1.5;
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
 }
