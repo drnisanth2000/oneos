@@ -7,18 +7,30 @@
    changed-review response append the current card beside the old one and
    disable exactly the controls that were issued for the stale bytes.
  #}
-<div class="proposal"
+<div class="proposal classification-review"
      id="review-card-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
-  <div class="prop-head">
-    <code class="prop-id">{{ row.proposal.id }}</code>
-    <span class="prop-route">{{ row.proposal.module }} / {{ row.proposal.sub }} <span class="block-tag">{{ row.proposal.block }}</span></span>
-  </div>
-  {% if row.diff is not none %}
-  <pre class="diff-body">{{ row.diff }}</pre>
-  {% elif error %}
+  <h2 class="review-title">{{ row.title or row.proposal.src.split('/')[-1] }}</h2>
+  <dl class="review-route">
+    <div><dt>From</dt><dd>{{ row.proposal.src.split('/')[1] }}</dd></div>
+    <div><dt>To</dt><dd class="prop-route">{{ row.proposal.module }}</dd></div>
+    <div><dt>Category</dt><dd>{{ row.proposal.sub or 'No category' }}</dd></div>
+  </dl>
+  <p class="review-consequence">Approval moves this document and records the change in history.
+    Reject leaves the document where it is.</p>
+  {% if error %}
   {% include "blocks/alert.html" %}
   {% endif %}
+  <details class="review-technical">
+    <summary>Technical details</summary>
+    <dl class="review-metadata">
+      <div><dt>Proposal ID</dt><dd><code>{{ row.proposal.id }}</code></dd></div>
+      <div><dt>Source</dt><dd><code>{{ row.proposal.src }}</code></dd></div>
+      <div><dt>Destination</dt><dd><code>{{ row.proposal.dst }}</code></dd></div>
+      <div><dt>Block</dt><dd>{{ row.proposal.block }}</dd></div>
+    </dl>
+    {% if row.diff is not none %}<pre class="diff-body">{{ row.diff }}</pre>{% endif %}
+  </details>
   {% if error %}
   {# This row is well-formed but something it depends on is not — a missing
      or unreadable source. Its id is validated, so it can be re-read on its
@@ -58,7 +70,7 @@
             hx-post="/outbox/{{ entity }}/approve"
             hx-vals='{{ outbox_values | tojson }}'
             hx-target="#outbox-list" hx-swap="outerHTML"
-            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">Approve → move + commit</button>
+            hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">Approve move</button>
     {% endif %}
     {% if row.can_reject %}
     <button class="reject"

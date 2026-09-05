@@ -7,6 +7,7 @@ bundle's flags only. No slug, path, or module list is hardcoded here.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import secrets
 
@@ -74,6 +75,9 @@ from .vault import DestinationRegistryError, Vault
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
+templates.env.globals["stylesheet_version"] = hashlib.sha256(
+    (BASE / "static/app.css").read_bytes()
+).hexdigest()[:12]
 
 #: S7: a DOM id must name one *issuance* of a review, not one version of it.
 #: `(proposal id, digest)` recurs — an editor undo or an idempotent

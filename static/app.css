@@ -187,3 +187,75 @@ button.reject:hover { border-color: var(--err-ink); color: var(--err-ink); }
   font-family: var(--mono); font-size: 11px; margin-right: 8px;
   text-transform: uppercase; letter-spacing: .5px;
 }
+
+/* Review sheets: document first, destination second, implementation on demand.
+   Scoped palette/layout leaves other screens and the approval protocol alone. */
+.review-surface {
+  --bg: #f5f7fa; --panel: #fff; --ink: #192b3a;
+  --ink-dim: #516475; --line: #d8e1e8; --accent: #245b86;
+  line-height: 1.5;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+}
+.review-surface .main { min-width: 0; padding: 32px clamp(18px, 4vw, 56px); }
+.review-surface a { color: var(--accent); text-underline-offset: 3px; }
+.review-surface :is(button, select, summary, .review-link) { min-height: 44px; }
+.review-surface :is(button, select) { font-size: 15px; }
+.review-surface :is(button, select, a, summary):focus-visible,
+.classification-review :is(button, a, summary):focus-visible {
+  outline: 3px solid var(--accent); outline-offset: 3px;
+}
+.review-surface .triage-h { font-size: 26px; line-height: 1.25; margin: 12px 0; }
+.review-page-head { max-width: 760px; margin-bottom: 28px; }
+.review-page-head .muted { font-size: 15px; max-width: 62ch; }
+.classification-review { padding: 26px; overflow-wrap: anywhere; }
+.review-title { margin: 0 0 24px; font-size: 20px; line-height: 1.35; font-weight: 650; }
+.review-route { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 24px; margin: 0; }
+.review-route > div:last-child { grid-column: 2; }
+.review-route dt, .review-metadata dt { font-size: 13px; color: var(--ink-dim); }
+.review-route dd { margin: 3px 0 0; font-size: 16px; font-weight: 600; }
+.review-consequence { max-width: 65ch; color: var(--ink-dim); font-size: 14px; margin: 24px 0; }
+.review-technical { border-top: 1px solid var(--line); padding-top: 6px; min-width: 0; }
+.review-technical > summary { cursor: pointer; color: var(--accent); padding: 10px 0; font-size: 14px; }
+.review-metadata { font-size: 13px; margin: 10px 0; }
+.review-metadata > div { margin-bottom: 10px; }
+.review-metadata dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+.classification-review .prop-actions { flex-wrap: wrap; gap: 12px; margin-top: 22px; }
+.classification-review button { min-height: 44px; padding: 10px 20px; }
+.classification-review button.approve { background: var(--accent); color: var(--panel); font-weight: 600; }
+.classification-review button.approve:hover { filter: brightness(.9); }
+.classification-review button.reject { background: transparent; }
+.review-surface .triage-list { max-width: 760px; margin-top: 24px; }
+.review-surface .triage-item { padding: 22px 24px; margin-bottom: 18px; cursor: auto; }
+.review-surface .triage-item.sel { background: var(--panel); }
+.review-surface .ti-head { flex-wrap: wrap; }
+.review-surface .ti-title { font-size: 20px; overflow-wrap: anywhere; }
+.review-surface .ti-sum { font-size: 14px; max-width: 65ch; overflow-wrap: anywhere; }
+.review-surface .ti-prop { flex-wrap: wrap; }
+.review-surface .manual-destination { margin-top: 18px; font-size: 15px; }
+.review-surface .manual-destination summary { padding: 10px 0; }
+.review-surface .destination-fields { gap: 16px; }
+.review-surface .destination-fields label { display: block; }
+.review-surface .destination-fields select { display: block; margin-top: 6px; padding: 10px; }
+.review-surface .destination-help { font-size: 13px; margin-top: 14px; }
+.diff-panel { padding: 18px; background: var(--bg); border-left: 3px solid var(--accent); overflow-wrap: anywhere; }
+.preview-title { font-size: 16px; margin: 0; }
+.diff-panel p { font-size: 14px; margin: 10px 0; }
+.review-link { display: inline-flex; align-items: center; font-weight: 600; margin-bottom: 10px; }
+@media (prefers-color-scheme: dark) {
+  .review-surface {
+    --bg: #17212b; --panel: #202d39; --ink: #edf2f7;
+    --ink-dim: #b4c2cf; --line: #415363; --accent: #a6d2f5;
+  }
+}
+@media (max-width: 760px) {
+  .review-surface { display: block; height: auto; }
+  .review-surface .sidebar { max-height: 220px; border-bottom: 1px solid var(--line); border-right: 0; }
+  .review-surface .main { overflow: visible; padding: 24px 16px; }
+  .classification-review, .review-surface .triage-item { padding: 20px 16px; }
+  .review-route { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .review-route > div:last-child { grid-column: auto; }
+  .classification-review .prop-actions > button { flex: 1 1 auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .review-surface .chev { transition: none; }
+}

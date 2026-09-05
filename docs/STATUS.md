@@ -15,6 +15,28 @@ filesystem-evidence corrections.
 
 ## Phase 1 triage
 
+### Readable classification reviews (2026-09-05)
+
+Outbox classification cards lead with the document title, source folder,
+destination folder and category. Empty categories read "No category"; proposal
+IDs, full paths and the unchanged Git diff remain in collapsed technical
+details. Errors and recovery controls stay visible. The triage preview explains
+that nothing has moved and links to Outbox for separate approval.
+
+The title comes from the same no-follow source observation as the diff, with a
+filename fallback. It is display-only: proposal bytes, review fingerprints,
+issuance IDs, stale-review handling and transaction behavior are unchanged.
+The shared stylesheet is content-versioned to avoid stale styling after an
+application update. The layout supports narrow screens and keyboard focus.
+Regression coverage is in `tests/test_outbox_presentation.py`.
+
+Destination editing remains deferred. In particular, an exact rejected record
+created entirely after a Gate 3 snapshot cannot be proven sanctioned by the
+existing receipt-free reject evidence. This presentation change neither
+relaxes that rule nor introduces replacement proposals, new receipts or a new
+snapshot format. It does not establish a live gate result or authorize a live
+app update.
+
 ### Manual destination selection
 
 The triage screen offers a folder and optional category selector when a rule

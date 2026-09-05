@@ -157,6 +157,8 @@ class OutboxRow:
     #: holds a real regular leaf. Receipt authority is still HEAD; this flag
     #: controls only the truthful lingering-record sentence on a spent card.
     record_present: bool = False
+    #: Display only, extracted from the same safe source read as the diff.
+    title: str | None = None
 
     def __post_init__(self) -> None:
         # Controls and fingerprint are issued together or not at all. A
@@ -570,7 +572,7 @@ def _apply_sub(text: str, sub: str | None) -> str:
 def _diff_text(proposal: Proposal, old: str) -> str:
     """Render the move diff from already-decoded source text.
 
-    Shared by `_render_diff` and `preview_diff`, which differ only in **read
+    Shared by `_render_review` and `preview_diff`, which differ only in **read
     policy** — the diff production itself is identical, and duplicating it let
     the two drift with no test able to notice.
     """
@@ -582,13 +584,13 @@ def _diff_text(proposal: Proposal, old: str) -> str:
     return f"move: {proposal.src} → {proposal.dst}\n" + "".join(diff)
 
 
-def _render_diff(scope: Scope, proposal: Proposal) -> str:
-    """Diff-only work on an **already-validated** record (design §3 phase 3).
+@structured_reader(category="front-matter")
+def _render_review(scope: Scope, proposal: Proposal) -> tuple[str, str]:
+    """Diff and display title for an **already-validated** record (phase 3).
     Reads the source receipt through the same safe-read boundary `approve`
     uses, and translates failures into the same domain types `approve` raises
     for the identical physical cause — so a projected row and its approve
     button never describe different conditions for one cause."""
-    src = scope.root / proposal.src
     try:
         source_bytes = _read_no_follow_bytes(scope.root, proposal.src)
     except FileNotFoundError as exc:
@@ -602,7 +604,17 @@ def _render_diff(scope: Scope, proposal: Proposal) -> str:
         raise OutboxDestinationError(
             "proposal source is not UTF-8 markdown"
         ) from exc
-    return _diff_text(proposal, old)
+    try:
+        fm, _ = split_front_matter(old)
+    except (ValueError, AttributeError, KeyError):
+        # PyYAML scalar construction (invalid dates or explicit timestamp /
+        # bool tags) can raise these instead of YAMLError. Display metadata
+        # must not change the existing diff or action eligibility.
+        fm = {}
+    title = fm.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = Path(proposal.src).name
+    return _diff_text(proposal, old), title.strip()
 
 
 @failure_contract(
@@ -619,13 +631,13 @@ def preview_diff(scope: Scope, proposal: Proposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves.
 
-    Deliberately does **not** delegate to `_render_diff`: `_render_diff`
+    Deliberately does **not** delegate to `_render_review`: `_render_review`
     raises a described error for a missing/redirected/undecodable receipt
     (the projection's phase-3 contract), while `preview_diff` renders an
     empty-old diff for a missing source without raising.
 
     Task 12 moved every outbox *route* — `outbox_screen`, `outbox_approve`,
-    `outbox_reject` — onto `project_outbox`/`_render_diff`, leaving `propose`
+    `outbox_reject` — onto `project_outbox`/`_render_review`, leaving `propose`
     as the sole remaining caller. The empty-old fallback is kept because
     changing it would alter `propose`'s behaviour, which Task 12 does not own
     — **not** because the source is expected to be absent there:
@@ -768,7 +780,7 @@ def project_outbox(scope: Scope) -> OutboxListing:
             continue
 
         try:
-            diff = _render_diff(scope, review.value)
+            diff, title = _render_review(scope, review.value)
         except (
             MissingProposalSource,
             RedirectedPathError,
@@ -793,6 +805,7 @@ def project_outbox(scope: Scope) -> OutboxListing:
                 proposal=review.value, diff=diff, error=None,
                 can_approve=True, can_reject=True,
                 review_sha256=review.sha256,
+                title=title,
             )
         )
 
@@ -813,6 +826,7 @@ def project_outbox(scope: Scope) -> OutboxListing:
                 proposal_id=row.proposal_id,
                 receipt=row.receipt,
                 record_present=row.record_present,
+                title=row.title,
             )
             for row in rows
         ]

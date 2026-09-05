@@ -1,8 +1,12 @@
 <div class="diff-panel">
-  <div class="diff-head">
-    Proposal <code>{{ proposal.id }}</code> written to
-    <code>{{ proposal.entity }}/outbox/</code> — nothing moved yet.
-    Approve or reject on the outbox screen (step 8).
-  </div>
-  <pre class="diff-body">{{ diff }}</pre>
+  <h3 class="preview-title">Ready for your review</h3>
+  <p>Proposed folder: <strong>{{ proposal.module }}</strong><br>
+    Category: {{ proposal.sub or 'No category' }}</p>
+  <p>Saved to Outbox; nothing moved yet.</p>
+  <a class="review-link" href="/outbox/{{ proposal.entity }}">Review in Outbox</a>
+  <details class="review-technical">
+    <summary>Technical details</summary>
+    <p>Proposal <code>{{ proposal.id }}</code></p>
+    <pre class="diff-body">{{ diff }}</pre>
+  </details>
 </div>
