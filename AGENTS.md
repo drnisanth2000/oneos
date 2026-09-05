@@ -53,12 +53,17 @@ boundary. Both corrections are integrated. Their closing evidence recorded
 2,028 public tests and 306 focused
 Gate 3 tests passing with one platform skip in each suite; 39 private tests;
 `check_v2` 0/0; clean policy, Gitleaks, public, and combined history audits;
-and byte-identical protected vault state. After separate owner authorization,
-the next live work is a fresh trusted-local Gate 3 rerun from the current
-fetched `origin/main`, followed by any still-pending Gate 2 proof and Gate 1
-timed triage. Gates 4 and 5 already pass. Phase 2 remains unauthorized, and
-deployment stays blocked until every Phase 1 gate passes and the owner
-separately approves it.
+and byte-identical protected vault state. A later fresh trusted-local live
+session at the current fetched `origin/main` recorded one sanctioned action
+commit, two sanctioned dirty-write transitions, and zero violating commits or
+writes across 392 filesystem entries: Gate 3 passed. Its preflight recorded
+2,054 public tests passing with four platform skips, 39 private tests,
+`check_v2` 0/0, and clean policy, Gitleaks, public, and combined history audits;
+opaque closing preimages and the protected snapshot evidence remained
+byte-identical across the read-only audit. The next live work is any
+still-pending Gate 2 proof and Gate 1 timed triage. Gates 3, 4, and 5 pass.
+Phase 2 remains unauthorized, and deployment stays blocked until every Phase
+1 gate passes and the owner separately approves it.
 A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
