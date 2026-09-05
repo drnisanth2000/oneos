@@ -146,10 +146,11 @@ filesystem entries, and zero violating commits or writes. Its preflight
 recorded 2,054 public tests passing with four platform skips, 39 private tests,
 `check_v2` 0 errors/0 warnings, policy PASS, and clean Gitleaks, public, and
 combined history audits. Opaque closing preimages and the protected snapshot
-evidence remained byte-identical across the read-only audit. An immediately
-preceding stale-snapshot attempt failed closed on an earlier revert and an
-unprovable post-snapshot receipt-free rejection; that failed evidence remains
-preserved and was not treated as a product defect.
+evidence remained byte-identical across the read-only audit, preserving all
+seven pre-existing dirty entries recorded at the session baseline. An
+immediately preceding stale-snapshot attempt failed closed on an earlier
+revert and an unprovable post-snapshot receipt-free rejection; that failed
+evidence remains preserved and was not treated as a product defect.
 
 ### Exit gates (spec §11)
 
