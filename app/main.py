@@ -513,6 +513,21 @@ def _triage_page(request: Request, scope: Scope) -> HTMLResponse:
             # page rather than a per-row alert.
             error = describe(exc)
         rows.append((item, classification, destination, error))
+    # Choices are hints, not authority: the existing POST resolver rechecks
+    # scope, flags, source and destination paths when a proposal is submitted.
+    # Keep missing modules visible; the sidebar reports E4 and POST refuses
+    # them. A directory scan would silently hide that configuration error.
+    manual_destinations = {}
+    inbox_modules = {item.path.parent.parent.name for item, *_ in rows}
+    if rows:
+        for module in sorted(vault.active_modules_for(scope)):
+            if (
+                module not in inbox_modules
+                and vault.module_spec(module).get("lifecycle_pattern", True)
+            ):
+                manual_destinations[module] = sorted(
+                    vault.active_submodules_for(scope, module)
+                )
     return templates.TemplateResponse(
         request,
         "triage.html",
@@ -520,6 +535,7 @@ def _triage_page(request: Request, scope: Scope) -> HTMLResponse:
             "bundles": vault.bundles(),
             "entity": selected,
             "rows": rows,
+            "manual_destinations": manual_destinations,
             "persisted_event": _PROPOSAL_PERSISTED_EVENT,
         },
     )

@@ -15,6 +15,31 @@ filesystem-evidence corrections.
 
 ## Phase 1 triage
 
+### Manual destination selection
+
+The triage screen offers a folder and optional category selector when a rule
+cannot provide a usable suggestion, and a correction control beside usable
+suggestions. Choices come from the selected entity's active registry entries;
+the source inbox and modules without an active lifecycle are not destinations.
+Missing configured modules remain visible rather than silently disappearing.
+
+Preview submits to the existing classification-proposal endpoint. That endpoint
+revalidates scope, flags and paths, writes only a proposal, and renders its diff.
+Nothing moves until separate Outbox review and approval. Manual selection does
+not create classifier rules, call a model, or enable Hermes or messaging.
+Keyboard shortcuts ignore form controls; the stopwatch retains its existing
+persisted-proposal signal. An open correction form owns the accept shortcut;
+an incomplete correction never falls back to the original recommendation.
+Integrity-error rows expose no manual action or source filename.
+Regression coverage is in
+`tests/test_triage_manual.py`.
+
+This usability change does not establish a live Gate 1 result or change the
+historical gate records below. Model-provider and Hermes integration remain
+separate work under the existing asynchronous, propose-only boundary.
+
+### Historical foundation and gate record
+
 Original steps 1-10, Safety Foundation S1-S7, and the separately sequenced
 inherited items 2, 4, and 3 below are complete. The first live Phase 1 exit
 trial exposed a Gate 3 audit defect, and independent correction review exposed

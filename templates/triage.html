@@ -79,6 +79,49 @@
             </button>
           </div>
           {% endif %}
+          {% if not error or error.code == "E-DEST" %}
+          {% if manual_destinations %}
+          <details class="manual-destination" hx-disabled-elt="find fieldset"
+                   {% if not c.confident or not destination %}open{% endif %}>
+            <summary>{% if c.confident and destination %}Choose a different destination{% else %}Choose a destination{% endif %}</summary>
+            <form class="manual-propose accept"
+                  action="/triage/{{ entity }}/propose" method="post"
+                  hx-post="/triage/{{ entity }}/propose"
+                  hx-target="#diff-{{ loop.index0 }}" hx-swap="innerHTML"
+                  x-data="{ module: '', sub: '', choices: TRIAGE_DESTINATIONS }">
+              <input type="hidden" name="filename" value="{{ it.path.name }}">
+              <fieldset class="destination-fields">
+                <legend class="sr-only">Destination for {{ it.title }}</legend>
+                <label for="module-{{ loop.index0 }}">Folder
+                  <select id="module-{{ loop.index0 }}" name="module" required
+                          x-model="module" @change="sub = ''">
+                    <option value="">Choose a folder…</option>
+                    {% for module in manual_destinations %}
+                    <option value="{{ module }}">{{ module }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label for="sub-{{ loop.index0 }}">Category <span class="muted">(optional)</span>
+                  <select id="sub-{{ loop.index0 }}" name="sub" x-model="sub"
+                          :disabled="!module || !(choices[module] || []).length">
+                    <option value="">No category</option>
+                    <template x-for="category in (choices[module] || [])" :key="category">
+                      <option :value="category" x-text="category"></option>
+                    </template>
+                  </select>
+                </label>
+                <button class="manual-submit" type="submit" disabled :disabled="!module">
+                  Preview proposal
+                </button>
+              </fieldset>
+              <p class="muted destination-help">Nothing moves until you review and approve in
+                <a href="/outbox/{{ entity }}">Outbox</a>. This choice does not change future rules.</p>
+            </form>
+          </details>
+          {% else %}
+          <p class="muted">No active destinations are available. Check the module configuration.</p>
+          {% endif %}
+          {% endif %}
           <div class="diff-slot" id="diff-{{ loop.index0 }}"></div>
         </li>
         {% endfor %}
@@ -92,18 +135,30 @@
     // server-side so the JS below and app/main.py's `_PROPOSAL_PERSISTED_EVENT`
     // can never drift apart.
     const PROPOSAL_PERSISTED_EVENT = {{ persisted_event | tojson }};
+    const TRIAGE_DESTINATIONS = {{ manual_destinations | tojson }};
 
     function triage(n) {
       return {
         i: 0, n: n,
         onkey(e) {
+          // Typing/selecting a value must never accept an item or move focus.
+          if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey ||
+              (e.target && (e.target.isContentEditable ||
+                e.target.closest?.('input, select, textarea, button, summary')))) return;
           if (e.key === 'j') { this.i = Math.min(this.i + 1, this.n - 1); }
           else if (e.key === 'k') { this.i = Math.max(this.i - 1, 0); }
           else if (e.key === 'a') {
             const item = document.querySelectorAll('.triage-item')[this.i];
-            const btn = item && item.querySelector('.accept');
+            // An open correction owns the choice, even when incomplete.
+            // Never fall back to the original suggestion behind that editor.
+            const btn = item && (
+              item.querySelector('.manual-destination[open] .manual-submit') ||
+              item.querySelector('button.accept')
+            );
             if (btn) btn.click();
           }
+          else return;
+          e.preventDefault();
         },
       };
     }
