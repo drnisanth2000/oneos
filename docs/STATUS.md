@@ -8,8 +8,8 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-09-05, after the successful trusted-local live Gate 3
-rerun.
+Last reconciled: 2026-09-07, after the successful trusted-local live Gate 2
+approval/revert proof.
 
 ---
 
@@ -68,8 +68,11 @@ trial exposed a Gate 3 audit defect, and independent correction review exposed
 a second discovery gap. Both corrections are now integrated and synthetically
 verified. A fresh owner-reviewed, trusted-local Gate 3 session at exact fetched
 `origin/main` `bb317451133aba7f419a6b360138bc379f32a5ec` subsequently passed
-with one sanctioned action commit and no violating commit or write. Phase 2 is
-not authorized.
+with one sanctioned action commit and no violating commit or write. A later
+owner-authorized, trusted-local Gate 2 proof at the exact fetched `origin/main`
+recorded in its external evidence proved that approval of a real adapter-created
+receipt is exactly one commit and one revert restores it to triage without
+manual cleanup. Phase 2 is not authorized.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -154,11 +157,33 @@ immediately preceding stale-snapshot attempt failed closed on an earlier
 revert and an unprovable post-snapshot receipt-free rejection; that failed
 evidence remains preserved and was not treated as a product defect.
 
+### Gate 2 live approval/revert evidence
+
+At the exact fetched `origin/main` recorded in the external evidence, a fresh
+owner-authorized, trusted-local proof established that the current action was
+one sanctioned approval commit over a receipt created by one sanctioned
+adapter-ingest commit. The approval changed exactly the contract's three
+tracked paths and did not overlap any pre-existing dirty path. One
+`git revert --no-edit`, executed while holding the shared action lock, created
+exactly one revert commit with the same paths and inverse statuses. The tracked
+receipt returned to triage, the approval destination and action receipt were
+removed, and the committed tree matched the approval's parent. No manual
+cleanup was required. Opaque status, worktree-diff, and cached-diff evidence
+remained byte-identical, preserving all pre-existing dirty state without
+publishing instance measurements.
+
+The fresh public baseline and closing suite each recorded 2,057 tests passing
+with one platform skip. The private closing suite recorded 39 tests;
+`check_v2` remained at 0 errors/0 warnings; the policy self-test passed; and
+preflight Gitleaks, public history, and combined repository-plus-vault history
+audits were clean. No product code, conventions, registries, or curated content
+was edited by the documentation task.
+
 ### Exit gates (spec §11)
 
 | Gate | State |
 |---|---|
-| 2 — one commit per approval, `git revert`-clean | **AUTOMATED PASS; LIVE TRIAL PENDING** — adapter intake is committed before approval; classification and registry-delete approvals commit exactly reviewed paths; one revert restores the committed action. |
+| 2 — one commit per approval, `git revert`-clean | **PASS** — An owner-authorized trusted-local proof at the exact fetched `origin/main` recorded in its external evidence verified one sanctioned adapter ingest, one sanctioned approval commit, and one revert commit. The tracked receipt returned to triage, the committed tree matched the approval parent, no manual cleanup was required, and all pre-existing dirty state was preserved byte-identically. |
 | 4 — front-matter agreement with `policy_enforcer`, 100 files | **PASS** (100/100) |
 | 5 — cold start to usable screen < 2s | **PASS** (~0.35s) |
 | 3 — zero unsanctioned direct vault writes over a session | **PASS** — A fresh owner-reviewed, trusted-local live session at exact fetched `origin/main` `bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action commit, two sanctioned dirty-write transitions, and zero violating commits or writes across all observed filesystem entries. The snapshot and opaque closing evidence remained protected and the read-only audit left the vault byte-identical to its closing preimages. |
@@ -285,9 +310,8 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-Complete any still-pending Gate 2 approval/revert proof and the Gate 1 timed
-triage of about 20 real inbox items. Gates 3, 4, and 5 pass. Phase 2 remains
-unauthorized.
+Complete the Gate 1 timed triage of about 20 real inbox items. Gates 2, 3, 4,
+and 5 pass. Phase 2 remains unauthorized.
 Deployment remains blocked until all Phase 1 gates pass and the owner
 separately approves deployment; deferred UI remains out of scope.
 
