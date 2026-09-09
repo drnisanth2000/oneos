@@ -249,7 +249,8 @@ or the sidebar and the validator will disagree on which modules exist.
   _templates/   active/   archive/   status.md
 ```
 
-`12-archive` is the exception (no `active/`, no `archive/`).
+`12-archive` is the exception (no `active/`, no `archive/`, no `status.md`),
+as required by conventions v2 §3.
 `13-analytics` adds `snapshots/`, `dashboard.md`, `kpis.yaml`.
 
 **Sub-modules are front-matter, not folders.** A file in `09-marketing/active/`
