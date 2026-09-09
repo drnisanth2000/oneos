@@ -242,14 +242,20 @@ the flag list once; it is **never merged at read time** (`decisions.md`
 2026-08-05). `check_v2.load_expected_modules` follows the same rule — match it,
 or the sidebar and the validator will disagree on which modules exist.
 
-**Every module has the lifecycle layer:**
+**Lifecycle-enabled modules have the lifecycle layer:**
 
 ```
 <entity>/<NN-module>/
   _templates/   active/   archive/   status.md
 ```
 
-`12-archive` is the exception (no `active/`, no `archive/`).
+Lifecycle shape applies only where the registry enables `lifecycle_pattern`
+(default `true`). A flag-selected module with `lifecycle_pattern: false` is
+excluded from lifecycle-shape checks, not from manifest-required module
+discovery or applicable non-lifecycle validation.
+`12-archive` retains `_templates/` but omits `active/`, `archive/`, and
+`status.md`, as required by conventions v2 §3. Test this named exception
+separately from a synthetic lifecycle-disabled module.
 `13-analytics` adds `snapshots/`, `dashboard.md`, `kpis.yaml`.
 
 **Sub-modules are front-matter, not folders.** A file in `09-marketing/active/`
