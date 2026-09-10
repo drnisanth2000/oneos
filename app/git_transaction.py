@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import ctypes
 import ctypes.util
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import platform
 import sys
@@ -192,6 +192,30 @@ class PathChange:
 
 
 @dataclass(frozen=True)
+class DirectoryChange:
+    """One immediate placeholder parent, bound to its no-follow preimage."""
+
+    path: str
+    before: tuple[int, int, int] | None
+    after_mode: int | None
+    parent_identity: tuple[int, int, int]
+
+    def __post_init__(self) -> None:
+        _validate_transaction_path(self.path)
+        for value in (self.before, self.parent_identity):
+            if value is not None and (
+                not isinstance(value, tuple) or len(value) != 3
+                or any(type(part) is not int or part < 0 for part in value)
+                or value[2] > 0o7777
+            ):
+                raise ValueError("directory identity is invalid")
+        if self.parent_identity is None or (
+            self.before is None and self.after_mode != 0o755
+        ) or (self.before is not None and self.after_mode is not None):
+            raise ValueError("directory change must create 0755 or remove an owned directory")
+
+
+@dataclass(frozen=True)
 class TransactionPreconditionRefused:
     reason: object
 
@@ -217,6 +241,9 @@ class TransactionPlan:
     #: check and the lock, and the transaction's own expected states would
     #: still match. Each callable raises to refuse; none may mutate.
     preconditions: tuple[Precondition, ...] = ()
+    directories: tuple[DirectoryChange, ...] = ()
+    before_apply: Callable[[], None] | None = None
+    after_commit: Callable[[TransactionResult], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.message, str) or not self.message or "\n" in self.message:
@@ -229,6 +256,24 @@ class TransactionPlan:
             raise ValueError("preconditions must be a tuple")
         if not isinstance(self.owned_changes, tuple):
             raise ValueError("owned changes must be a tuple")
+
+        if not isinstance(self.directories, tuple):
+            raise ValueError("directories must be a tuple")
+        directory_paths = [change.path for change in self.directories]
+        if len(set(directory_paths)) != len(directory_paths):
+            raise ValueError("directories must be duplicate-free")
+        reviewed = {change.path: change for change in self.changes}
+        for directory in self.directories:
+            placeholder = reviewed.get(directory.path + "/.gitkeep")
+            absent, empty = PathState.absent(), PathState.regular(b"", 0o644)
+            expected = (absent, empty) if directory.before is None else (empty, absent)
+            if placeholder is None or placeholder.create_parent or (
+                placeholder.before, placeholder.after
+            ) != expected:
+                raise ValueError("directory requires its exact reviewed empty placeholder")
+            if any(path.startswith(directory.path + "/") and path != placeholder.path
+                   for path in reviewed):
+                raise ValueError("directory may own only its placeholder")
 
         all_paths = tuple(change.path for change in self.changes + self.owned_changes)
         for value in all_paths + self.commit_paths:
@@ -494,6 +539,7 @@ def execute_transaction(
             reviewed_index = _capture_reviewed_index(vault, plan.commit_paths)
             _require_owned_paths_untracked(vault, start_head, plan.owned_changes)
             unrelated = _capture_unrelated_state(vault, plan)
+            _require_directory_preimages(vault, plan)
             _require_expected_states(vault, plan)
             # Under the lock, before anything is applied: the last moment at
             # which a refusal still costs nothing.
@@ -505,9 +551,16 @@ def execute_transaction(
             _require_reviewed_index_matches_head(
                 vault, start_head, plan.commit_paths
             )
+            if plan.before_apply is not None:
+                plan.before_apply()
             result = _execute_locked(
                 vault, start_head, reviewed_index, unrelated, plan
             )
+            if plan.after_commit is not None:
+                try:
+                    plan.after_commit(result)
+                except OSError as exc:
+                    raise GitTransactionCommittedError(result, exc) from exc
     except ActionLockCleanupFailure as exc:
         if result is None:
             raise
@@ -539,11 +592,22 @@ def _execute_locked(
     already gone wrong.
     """
     quarantined: list[tuple[PathChange, QuarantinedRecord]] = []
+    directories: list[_OwnedDirectory] = []
+    leaves: dict[str, _OwnedLeaf] = {}
     try:
         return _execute_locked_body(
-            vault, start_head, reviewed_index, unrelated, plan, quarantined
+            vault, start_head, reviewed_index, unrelated, plan, quarantined, directories, leaves
         )
     finally:
+        for leaf in leaves.values():
+            leaf.close()
+        for directory in directories:
+            for descriptor in directory.held_fds:
+                os.close(descriptor)
+            os.close(directory.parent_fd)
+            for descriptor in (directory.backup_fd, directory.backup_parent_fd):
+                if descriptor is not None:
+                    os.close(descriptor)
         for _change, _record in quarantined:
             # Not guarded. These descriptors are owned here and closed
             # exactly once, so a failure is a double-close or a corrupted
@@ -559,6 +623,8 @@ def _execute_locked_body(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
     quarantined: list[tuple[PathChange, QuarantinedRecord]],
+    directories: list[_OwnedDirectory],
+    leaves: dict[str, _OwnedLeaf],
 ) -> TransactionResult:
     applied_changes: list[tuple[PathChange, PathState]] = []
     temporary_index: str | None = None
@@ -570,15 +636,34 @@ def _execute_locked_body(
     transaction_error: GitTransactionError | None = None
     transaction_cause: Exception | None = None
     try:
+        for change in plan.directories:
+            owned = _hold_directory(vault, change)
+            directories.append(owned)
+            if change.before is None:
+                owned.create()
+                _checkpoint("directory-created")
         for change in plan.changes:
+            leaf = _OwnedLeaf() if plan.directories else None
+            if leaf is not None:
+                leaves[change.path] = leaf
+            for directory in directories:
+                directory.require_identity(vault)
             _apply_state(
                 vault,
                 change,
+                lifecycle_leaf=leaf,
+                no_overwrite=bool(plan.directories),
                 on_applied=lambda state, change=change: applied_changes.append(
                     (change, state)
                 ),
             )
+        for directory in directories:
+            if directory.change.after_mode is None:
+                directory.require_identity(vault)
+                directory.remove(vault)
+                _checkpoint("directory-removed")
         _checkpoint("filesystem-applied")
+        _require_lifecycle_leaf_ownership(vault, plan, leaves)
 
         descriptor, temporary_index = tempfile.mkstemp(prefix="oneos-index-")
         os.close(descriptor)
@@ -617,6 +702,8 @@ def _execute_locked_body(
             nonlocal transaction_index
             transaction_index = desired_index
 
+        for directory in directories:
+            directory.require_identity(vault)
         _sync_reviewed_index(
             vault,
             reviewed_index,
@@ -626,7 +713,10 @@ def _execute_locked_body(
         )
         _verify_reviewed_index_matches_head(vault, commit_oid, plan.commit_paths)
         _checkpoint("real-index-synchronized")
+        _require_lifecycle_leaf_ownership(vault, plan, leaves)
         _require_unrelated_state_unchanged(vault, unrelated, plan)
+        for directory in directories:
+            directory.require_identity(vault)
         _require_committed_states(vault, plan)
         _require_head_matches(vault, commit_oid)
         result = TransactionResult(commit_oid, tuple(sorted(plan.commit_paths)))
@@ -643,6 +733,8 @@ def _execute_locked_body(
             unrelated,
             plan,
             applied_changes,
+            directories,
+            leaves,
         )
         blocked_paths = set(rolled_back_paths)
         if isinstance(exc, _ReviewedIndexOwnershipConflict):
@@ -680,6 +772,8 @@ def _execute_locked_body(
     # Any failure here preserves the commit and receipt and never invokes
     # rollback or a name-based rename-back.
     try:
+        for directory in directories:
+            directory.finish_removal()
         _checkpoint("before-proposal-quarantine")
         for change in plan.owned_changes:
             quarantined.append(
@@ -688,6 +782,9 @@ def _execute_locked_body(
                     quarantine_path_if_unchanged(vault, change.path, change.before),
                 )
             )
+        for directory in directories:
+            directory.require_identity(vault)
+        _require_lifecycle_leaf_ownership(vault, plan, leaves)
         _require_final_states(vault, plan)
         _require_unrelated_state_unchanged(vault, unrelated, plan)
         _require_head_matches(vault, result.commit_oid)
@@ -719,11 +816,26 @@ def _rollback_transaction(
     unrelated: _UnrelatedState,
     plan: TransactionPlan,
     applied_changes: list[tuple[PathChange, PathState]],
+    directories: list[_OwnedDirectory],
+    leaves: dict[str, _OwnedLeaf],
 ) -> tuple[str, ...]:
     blocked_paths: set[str] = set()
 
-    for change, state_written in reversed(applied_changes):
+    for directory in directories:
         try:
+            directory.require_identity(vault)
+            if directory.removed:
+                directory.restore()
+        except (OSError, GitTransactionError):
+            blocked_paths.add(directory.change.path)
+
+    for change, state_written in reversed(applied_changes):
+        if str(PurePosixPath(change.path).parent) in blocked_paths:
+            blocked_paths.add(change.path)
+            continue
+        try:
+            if change.path in leaves:
+                leaves[change.path].require_written(vault, change.path, state_written)
             current = capture_path_state(vault, change.path)
         except (OSError, GitTransactionError):
             blocked_paths.add(change.path)
@@ -733,10 +845,26 @@ def _rollback_transaction(
             continue
         try:
             _apply_state(
-                vault, PathChange(change.path, state_written, change.before)
+                vault, PathChange(change.path, state_written, change.before),
+                no_overwrite=bool(plan.directories),
             )
         except (OSError, GitTransactionError):
             blocked_paths.add(change.path)
+
+    for directory in reversed(directories):
+        if directory.change.before is None and directory.identity is not None:
+            try:
+                directory.require_identity(vault)
+                directory.remove()
+            except (OSError, GitTransactionError):
+                blocked_paths.add(directory.change.path)
+
+    for directory in directories:
+        if directory.backup_name is not None and not directory.removed:
+            try:
+                directory._remove_backup_container()
+            except (OSError, GitTransactionError):
+                blocked_paths.add(directory.change.path)
 
     if transaction_index is not None:
         blocked_paths.update(
@@ -1219,6 +1347,153 @@ def _fingerprint_path(
         os.close(directory_descriptor)
 
 
+def _directory_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return value.st_dev, value.st_ino, stat.S_IMODE(value.st_mode)
+
+
+@dataclass
+class _OwnedDirectory:
+    change: DirectoryChange
+    parent_fd: int
+    leaf: str
+    identity: tuple[int, int, int] | None
+    removed: bool = False
+    held_fds: list[int] = field(default_factory=list)
+    backup_fd: int | None = None
+    backup_parent_fd: int | None = None
+    backup_name: str | None = None
+
+    def require_identity(self, vault: Path) -> None:
+        current_fd, leaf = _walk_to_parent(vault, self.change.path)
+        try:
+            if _directory_identity(os.fstat(current_fd)) != self.change.parent_identity:
+                raise ReviewedStateChanged("reviewed directory parent changed")
+            try:
+                value = os.lstat(leaf, dir_fd=current_fd)
+            except FileNotFoundError:
+                if self.identity is None:
+                    return
+                raise ReviewedStateChanged("owned directory disappeared")
+            if not stat.S_ISDIR(value.st_mode) or _directory_identity(value) != self.identity:
+                raise ReviewedStateChanged("owned directory changed")
+        finally:
+            os.close(current_fd)
+
+    def create(self) -> None:
+        os.mkdir(self.leaf, 0o755, dir_fd=self.parent_fd)
+        # Record ownership before any fallible mode adjustment.
+        self.identity = _directory_identity(os.lstat(self.leaf, dir_fd=self.parent_fd))
+        descriptor = _open_checked_directory(self.leaf, "owned directory", dir_fd=self.parent_fd)
+        self.held_fds.append(descriptor)
+        os.fchmod(descriptor, self.change.before[2] if self.change.before else 0o755)
+        self.identity = _directory_identity(os.fstat(descriptor))
+        self.removed = False
+
+    def _require_backup(self) -> None:
+        if self.backup_fd is None:
+            raise ReviewedStateChanged("directory recovery evidence is absent")
+        value = os.lstat("directory", dir_fd=self.backup_fd)
+        if not stat.S_ISDIR(value.st_mode) or _directory_identity(value) != self.change.before:
+            raise ReviewedStateChanged("directory recovery evidence was replaced")
+        if os.listdir(self.held_fds[0]):
+            raise ReviewedStateChanged("saved directory is no longer empty")
+
+    def _remove_backup_container(self) -> None:
+        if self.backup_name is None:
+            return
+        if self.backup_fd is None or self.backup_parent_fd is None:
+            raise ReviewedStateChanged("directory recovery container ownership is unavailable")
+        current = os.lstat(self.backup_name, dir_fd=self.backup_parent_fd)
+        opened = os.fstat(self.backup_fd)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ReviewedStateChanged("directory recovery container changed")
+        os.rmdir(self.backup_name, dir_fd=self.backup_parent_fd)
+        self.backup_name = None
+
+    def remove(self, vault: Path | None = None) -> None:
+        if self.change.before is None:
+            os.rmdir(self.leaf, dir_fd=self.parent_fd)
+        else:
+            if vault is None:
+                raise ReviewedStateChanged("removal needs a recovery location")
+            git_dir = Path(_git_text(vault, "rev-parse", "--absolute-git-dir").strip())
+            self.backup_parent_fd = _open_checked_directory(git_dir, "Git directory")
+            if os.fstat(self.backup_parent_fd).st_dev != os.fstat(self.parent_fd).st_dev:
+                raise ReviewedStateChanged("directory recovery requires the same filesystem")
+            self.backup_name = "oneos-directory-" + secrets.token_hex(16)
+            os.mkdir(self.backup_name, 0o700, dir_fd=self.backup_parent_fd)
+            self.backup_fd = _open_checked_directory(self.backup_name, "directory recovery", dir_fd=self.backup_parent_fd)
+            try:
+                _move_no_replace(self.parent_fd, self.leaf, self.backup_fd, "directory")
+            except BaseException:
+                self._remove_backup_container()
+                raise
+            self.identity = None
+            self.removed = True
+            self._require_backup()
+            return
+        self.identity = None
+        self.removed = True
+
+    def restore(self) -> None:
+        self._require_backup()
+        _move_no_replace(self.backup_fd, "directory", self.parent_fd, self.leaf)
+        self.identity = self.change.before
+        self.removed = False
+        self._remove_backup_container()
+
+    def finish_removal(self) -> None:
+        if self.backup_name is None:
+            return
+        self._require_backup()
+        os.rmdir("directory", dir_fd=self.backup_fd)
+        self._remove_backup_container()
+
+
+def _hold_directory(vault: Path, change: DirectoryChange) -> _OwnedDirectory:
+    descriptor, leaf = _walk_to_parent(vault, change.path)
+    owned = _OwnedDirectory(change, descriptor, leaf, change.before)
+    try:
+        owned.require_identity(vault)
+        if change.before is not None:
+            directory_fd = _open_checked_directory(leaf, "owned directory", dir_fd=descriptor)
+            owned.held_fds.append(directory_fd)
+            if os.listdir(directory_fd) != [".gitkeep"]:
+                raise ReviewedStateChanged("owned directory is occupied")
+        return owned
+    except BaseException:
+        for held_fd in owned.held_fds:
+            os.close(held_fd)
+        os.close(descriptor)
+        raise
+
+
+def _require_directory_preimages(vault: Path, plan: TransactionPlan) -> None:
+    for change in plan.directories:
+        owned = _hold_directory(vault, change)
+        for descriptor in owned.held_fds:
+            os.close(descriptor)
+        os.close(owned.parent_fd)
+
+
+def _capture_plan_state(vault: Path, change: PathChange, plan: TransactionPlan, *, after: bool) -> PathState:
+    for directory in plan.directories:
+        absent = directory.after_mode is None if after else directory.before is None
+        if absent and change.path == directory.path + "/.gitkeep":
+            descriptor, leaf = _walk_to_parent(vault, directory.path)
+            try:
+                if _directory_identity(os.fstat(descriptor)) != directory.parent_identity:
+                    raise ReviewedStateChanged("reviewed directory parent changed")
+                try:
+                    os.lstat(leaf, dir_fd=descriptor)
+                except FileNotFoundError:
+                    return PathState.absent()
+                raise ReviewedStateChanged("reviewed directory is no longer absent")
+            finally:
+                os.close(descriptor)
+    return _capture_change_state(vault, change)
+
+
 def _require_expected_states(
     vault: Path,
     plan: TransactionPlan,
@@ -1226,7 +1501,7 @@ def _require_expected_states(
     for change in plan.changes + plan.owned_changes:
         if change.create_parent:
             continue
-        if _capture_change_state(vault, change) != change.before:
+        if _capture_plan_state(vault, change, plan, after=False) != change.before:
             raise ReviewedStateChanged(
                 f"reviewed path does not match expected state: {change.path}"
             )
@@ -1814,11 +2089,46 @@ def _held_state(descriptor: int) -> PathState:
     return PathState.regular(_read_open_file(descriptor), stat.S_IMODE(opened.st_mode))
 
 
+@dataclass
+class _OwnedLeaf:
+    before_fd: int | None = None
+    written_fd: int | None = None
+
+    def require_written(self, vault: Path, path: str, expected: PathState) -> None:
+        if expected.contents is None:
+            return
+        if self.written_fd is None:
+            raise ReviewedStateChanged("written leaf ownership is unavailable")
+        parent, leaf = _walk_to_parent(vault, path)
+        try:
+            current = os.lstat(leaf, dir_fd=parent)
+            held = os.fstat(self.written_fd)
+            if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+                raise ReviewedStateChanged("transaction leaf was replaced")
+        finally:
+            os.close(parent)
+
+    def close(self) -> None:
+        for descriptor in (self.before_fd, self.written_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _require_lifecycle_leaf_ownership(
+    vault: Path, plan: TransactionPlan, leaves: dict[str, _OwnedLeaf]
+) -> None:
+    for change in plan.changes:
+        if change.path in leaves:
+            leaves[change.path].require_written(vault, change.path, change.after)
+
+
 def _apply_state(
     vault: Path,
     change: PathChange,
     *,
     on_applied: Callable[[PathState], None] | None = None,
+    lifecycle_leaf: _OwnedLeaf | None = None,
+    no_overwrite: bool = False,
 ) -> None:
     parts = PurePosixPath(change.path).parts
     directory_descriptor = _open_checked_directory(vault, "vault root")
@@ -1858,6 +2168,14 @@ def _apply_state(
             raise ReviewedStateChanged(
                 f"reviewed path changed before mutation: {change.path}"
             )
+        if lifecycle_leaf is not None and change.before.contents is not None:
+            lifecycle_leaf.before_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor)
+            if _held_state(lifecycle_leaf.before_fd) != change.before:
+                raise ReviewedStateChanged("lifecycle leaf changed while opening")
+            current = os.lstat(leaf, dir_fd=directory_descriptor)
+            held = os.fstat(lifecycle_leaf.before_fd)
+            if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+                raise ReviewedStateChanged("lifecycle leaf was replaced")
         if change.after.contents is None:
             if change.before.contents is not None:
                 # Not a proposal record: this branch serves approve's
@@ -1900,12 +2218,17 @@ def _apply_state(
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
                 os.fchmod(temporary_file.fileno(), change.after.mode)
-            os.replace(
-                temporary_leaf,
-                leaf,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-            )
+                if lifecycle_leaf is not None:
+                    lifecycle_leaf.written_fd = os.dup(temporary_file.fileno())
+            if no_overwrite and change.before.contents is None:
+                _move_no_replace(directory_descriptor, temporary_leaf, directory_descriptor, leaf)
+            else:
+                os.replace(
+                    temporary_leaf,
+                    leaf,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
             temporary_leaf = ""
             if on_applied is not None:
                 on_applied(change.after)
@@ -2033,7 +2356,7 @@ def _require_entries_match_after_states(
 
 def _require_final_states(vault: Path, plan: TransactionPlan) -> None:
     for change in plan.changes + plan.owned_changes:
-        if capture_path_state(vault, change.path) != change.after:
+        if _capture_plan_state(vault, change, plan, after=True) != change.after:
             raise GitTransactionFailure(
                 f"transaction-owned path changed before success: {change.path}"
             )
@@ -2042,7 +2365,7 @@ def _require_final_states(vault: Path, plan: TransactionPlan) -> None:
 def _require_committed_states(vault: Path, plan: TransactionPlan) -> None:
     """Verify only the action and receipt before proposal consumption."""
     for change in plan.changes:
-        if capture_path_state(vault, change.path) != change.after:
+        if _capture_plan_state(vault, change, plan, after=True) != change.after:
             raise GitTransactionFailure(
                 f"committed path changed before consumption: {change.path}"
             )

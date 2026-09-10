@@ -1,0 +1,37 @@
+{% set issue = issue | default(new_issue()) %}
+{% set rollback = row.proposal.action == 'lifecycle_rollback' %}
+<div class="proposal lifecycle-review" id="review-card-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
+  {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
+  <h2 class="review-title">{{ 'Lifecycle rollback' if rollback else 'Lifecycle repair' }}</h2>
+  <p class="review-consequence">{{ 'Remove the unchanged repair placeholders and their empty directories.' if rollback else 'Create the listed missing directories with empty placeholders.' }} Approval retains an audit receipt in history. Reject leaves the structure unchanged.</p>
+  <dl class="review-route">
+  {% for entry in row.proposal.manifest %}
+    <div><dt>{{ 'Remove' if rollback else 'Create' }}</dt><dd><code>{{ entry.path }}</code></dd></div>
+    <div><dt>Declared by</dt><dd>{{ entry.declaration }}</dd></div>
+  {% endfor %}
+  </dl>
+  {% if error %}{% include "blocks/alert.html" %}{% endif %}
+  <details class="review-technical">
+    <summary>Exact changes and retained receipt</summary>
+    {% if row.diff is not none %}<pre class="diff-body">{{ row.diff }}</pre>{% endif %}
+  </details>
+  {% if row.can_approve or row.can_reject %}
+  {% set outbox_values = {"id": row.proposal.id, "review_sha256": row.review_sha256} %}
+  <div id="review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}" hidden>
+    <input type="hidden" name="reviewed_values" value='{{ row.proposal.reviewed_fields | tojson }}'>
+    <input type="hidden" name="review_issue" value="{{ issue }}">
+  </div>
+  <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
+    {% if row.can_approve %}
+    <button class="approve" hx-post="/outbox/{{ entity }}/approve"
+      hx-vals='{{ outbox_values | tojson }}' hx-target="#outbox-list" hx-swap="outerHTML"
+      hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">{{ 'Approve rollback' if rollback else 'Approve repair' }}</button>
+    {% endif %}
+    {% if row.can_reject %}
+    <button class="reject" hx-post="/outbox/{{ entity }}/reject"
+      hx-vals='{{ outbox_values | tojson }}' hx-target="#outbox-list" hx-swap="outerHTML"
+      hx-include="#review-fields-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">Reject</button>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>

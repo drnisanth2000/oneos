@@ -47,6 +47,8 @@ from .outbox import (
     OutboxDestinationError,
     OutboxError,
     OutboxRow,
+    LifecycleProposal,
+    lifecycle_review_journal,
     UnreadableProposalRecord,
     approve,
     pending_proposal_entry_exists,
@@ -1136,6 +1138,8 @@ def _outbox_review_changed(
 
     def fields(ctx):
         proposal = ctx["row"].proposal
+        if isinstance(proposal, LifecycleProposal):
+            return proposal.reviewed_fields
         # Every action-relevant value, including the source: a proposal
         # rewritten to move a *different* file is exactly the change an
         # operator most needs named.
@@ -1397,7 +1401,9 @@ def _outbox_approve_response(
         # S7: the operator's own fingerprint, passed through untouched. The
         # route must never derive one — recomputing here would rebind the
         # action to whatever is on disk now, which is the defect S7 closes.
-        result = approve(scope, id, review_sha256)
+        journal = getattr(request.app.state, "lifecycle_journal", None)
+        with lifecycle_review_journal(journal):
+            result = approve(scope, id, review_sha256)
     except ReviewedProposalChanged as exc:
         # Not a list re-render: the operator keeps the version they reviewed
         # on screen and reconfirms against the current one beside it.

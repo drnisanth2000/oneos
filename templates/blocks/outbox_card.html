@@ -1,3 +1,6 @@
+{% if row.proposal.action in ["lifecycle_repair", "lifecycle_rollback"] %}
+{% include "blocks/lifecycle_card.html" %}
+{% else %}
 {% set issue = issue | default(new_issue()) %}
 {# One classification review.
 
@@ -82,3 +85,5 @@
   </div>
   {% endif %}
 </div>
+
+{% endif %}

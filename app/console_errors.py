@@ -291,6 +291,8 @@ from . import review_tokens as _review_tokens  # noqa: E402
 from . import rename as _rename  # noqa: E402
 from . import scope as _scope  # noqa: E402
 from . import vault as _vault  # noqa: E402
+from . import lifecycle_shape as _lifecycle_shape  # noqa: E402
+from . import lifecycle_journal as _lifecycle_journal  # noqa: E402
 from . import cutover as _cutover  # noqa: E402
 from . import cutover_build as _cutover_build  # noqa: E402
 from . import cutover_db as _cutover_db  # noqa: E402
@@ -307,6 +309,8 @@ CLOSED_FAMILY = _git_transaction.GitTransactionError
 
 #: `exact` — the entry applies to that class only, never through MRO.
 _EXACT: dict[type[BaseException], ConsoleError] = {
+    _lifecycle_shape.LifecycleShapeError: _CODES["E-CONFIG"],
+    _lifecycle_journal.JournalError: _CODES["E-UNAVAILABLE"],
     _config.VaultRootUnavailable: _CODES["E-TAMPER"],
     _rename.RenameCommittedError: _CODES["E-COMMITTED"],
     _cutover_build.CutoverCommittedError: _CODES["E-COMMITTED"],
