@@ -86,6 +86,48 @@ def test_complete_journal_has_two_sanctioned_commits(lifecycle_vault):
     assert len(result.sanctioned_commits) == 2
 
 
+def test_ordinary_commit_between_repair_and_rollback_fails_closed(lifecycle_vault, monkeypatch, tmp_path):
+    import json
+    from app.lifecycle_journal import LifecycleJournal
+    from tools import gate3_audit as gate
+
+    v = lifecycle_vault
+    baseline = git(v, 'rev-parse', 'HEAD')
+    snapshot = tmp_path / 'baseline.json'
+    snapshot.write_text(json.dumps(gate._snapshot_payload(v)))
+    store = tmp_path / 'journal'; store.mkdir()
+    journal = LifecycleJournal.create(store, v)
+    scope = Scope(v, 'sample')
+    review = propose_repair(scope, actor='owner')
+    repaired = approve_lifecycle(scope, review.value['id'], review.sha256,
+                                 actor='owner', journal=journal)
+
+    # A real tracked change, with no tampered journal or lifecycle receipt.
+    status = v / 'sample/01-work/status.md'
+    status.write_text(status.read_text() + '\nOrdinary status update.\n')
+    git(v, 'add', 'sample/01-work/status.md')
+    git(v, 'commit', '-qm', 'Update module status')
+    ordinary = git(v, 'rev-parse', 'HEAD')
+
+    review = propose_rollback(scope, repaired.commit_oid, actor='owner', journal=journal)
+    rolled_back = approve_lifecycle(scope, review.value['id'], review.sha256,
+                                    actor='owner', journal=journal)
+    assert git(v, 'rev-list', '--reverse', baseline + '..HEAD').splitlines() == [
+        repaired.commit_oid, ordinary, rolled_back.commit_oid,
+    ]
+    assert history().validated_commit(v, repaired.commit_oid)[0].action_kind == 'lifecycle_repair'
+    assert history().validated_commit(v, rolled_back.commit_oid)[0].action_kind == 'lifecycle_rollback'
+
+    result = gate.audit_lifecycle_session(v, journal.session_path, journal.anchor)
+    assert not result.ok, result
+    assert result.violating_writes
+    monkeypatch.setattr(gate, '_vault', lambda: v)
+    monkeypatch.setattr(gate, '_snapshot_path', lambda vault: snapshot)
+    monkeypatch.setenv('ONEOS_LIFECYCLE_JOURNAL', str(journal.session_path))
+    monkeypatch.setenv('ONEOS_LIFECYCLE_ANCHOR', journal.anchor)
+    assert gate.cmd_check() == 1
+
+
 @pytest.mark.parametrize('damage', ['missing', 'reordered', 'tampered', 'receipt', 'extra'])
 def test_incomplete_or_changed_session_refuses(lifecycle_vault, damage):
     from tools import gate3_audit as gate
