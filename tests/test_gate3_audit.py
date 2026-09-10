@@ -916,9 +916,13 @@ def test_lifecycle_reject_requires_canonical_consumed_bytes(lifecycle_vault):
     vault = lifecycle_vault
     scope = Scope(vault, "sample")
     review = propose_repair(scope, actor="owner")
-    proposal_relative = f"sample/outbox/{review.value['id']}.yaml"
+    proposal = vault / "sample" / "outbox" / f"{review.value['id']}.yaml"
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    record = json.loads(proposal.read_bytes())
+    record["baseline_head"] = "not-an-object-id"
+    proposal.write_text(json.dumps(record), encoding="utf-8")
+    malformed_bytes = proposal.read_bytes()
     before = gate3.collect_dirty_fingerprints(vault)
-    reject(scope, review.value["id"], review.sha256)
     consumed = (
         vault
         / "sample"
@@ -926,9 +930,10 @@ def test_lifecycle_reject_requires_canonical_consumed_bytes(lifecycle_vault):
         / ".consumed"
         / f"{review.value['id']}.yaml"
     )
-    record = json.loads(consumed.read_bytes())
-    record["baseline_head"] = "not-an-object-id"
-    consumed.write_text(json.dumps(record), encoding="utf-8")
+    consumed.parent.mkdir()
+    proposal.rename(consumed)
+
+    assert consumed.read_bytes() == malformed_bytes
 
     consumed_relative = consumed.relative_to(vault).as_posix()
     result = gate3.audit_dirty(
