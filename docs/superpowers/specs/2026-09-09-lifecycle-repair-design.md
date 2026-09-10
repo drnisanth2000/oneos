@@ -1,7 +1,8 @@
 # Governed lifecycle repair design
 
-Status: owner-review draft. Development was requested; the policy and schema
-decision below remains pending. This document does not enable either action.
+Status: owner approved the action/receipt contract for synthetic implementation
+on 2026-09-10. No live-vault access, repair, validator installation or Gate 1
+resumption is authorized. Runtime actions remain explicitly policy-gated.
 
 Baseline: `6d0c8e7d7bcb727e9b32190f197e911fa9e7f1bf`, freshly fetched before
 branch creation. Governing proposal: `docs/LIFECYCLE-REPAIR-PROPOSAL.md`.

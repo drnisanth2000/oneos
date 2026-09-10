@@ -1725,6 +1725,13 @@ def _commit_is_sanctioned(
     *,
     analysis: RenameAnalysis | None = None,
 ) -> bool:
+    if record.message.startswith(("lifecycle_repair:", "lifecycle_rollback:")):
+        from app.lifecycle_history import validated_commit
+        try:
+            validated_commit(vault, record.oid)
+            return True
+        except (ValueError, OSError, ReceiptError, OutboxError):
+            return False
     if record.message.startswith("ingest:"):
         return _sanctioned_ingest(record, rules)
     if record.message.startswith("outbox:"):
@@ -2439,6 +2446,139 @@ def cmd_snapshot() -> int:
     return 0
 
 
+def _lifecycle_identity(identity):
+    return hashlib.sha256(_IDENTITY_DOMAIN + _length_delimited(
+        b'directory', str(identity[0]).encode(), str(identity[1]).encode())).hexdigest()
+
+
+def audit_lifecycle_session(vault: Path, session_path: Path, anchor: str) -> Audit:
+    """Account for every adjacent checkpoint and exact historical authority.
+
+    The independently retained initial digest authenticates the journal prefix;
+    final live evidence prevents a truncated suffix from certifying completion.
+    """
+    import base64
+    from app.lifecycle_journal import load_journal
+    from app.lifecycle_history import validated_commit, _tree
+    from app.lifecycle_repair import LifecycleError
+
+    result = Audit()
+    try:
+        checkpoints = load_journal(session_path, anchor)
+        if len(checkpoints) < 3 or checkpoints[-1]['phase'] != 'after':
+            raise ValueError('lifecycle journal has no complete action')
+        current = json.loads(json.dumps(_snapshot_payload(vault)))
+        if current != checkpoints[-1]['snapshot']:
+            raise ValueError('live state differs from closing checkpoint')
+        actual_index = _git_bytes(vault, 'ls-files', '--stage', '-z')
+        if actual_index != base64.b64decode(checkpoints[-1]['index_entries'], validate=True):
+            raise ValueError('live index differs from closing checkpoint')
+        initial_head = checkpoints[0]['head']
+        final_head = checkpoints[-1]['head']
+        all_commits = _git_text(vault, 'rev-list', '--reverse', initial_head + '..' + final_head).split()
+        observed_commits = []
+        retained = []
+        repair_directories = {}
+        previous = checkpoints[0]
+        used_ids = set()
+        for offset in range(1, len(checkpoints), 2):
+            before, after = checkpoints[offset:offset + 2]
+            if before['phase'] != 'before' or after['phase'] != 'after':
+                raise ValueError('lifecycle checkpoint pair missing')
+            oid = after['commit_oid']
+            receipt, receipt_path, blob = validated_commit(vault, oid)
+            p = receipt.proposal
+            proposal_id = p['id']
+            if (before['proposal_id'] != proposal_id or after['proposal_id'] != proposal_id
+                or proposal_id in used_ids or before['head'] != previous['head']
+                or p['baseline_head'] != before['head'] or after['head'] != oid):
+                raise ValueError('checkpoint action does not match its authority')
+            used_ids.add(proposal_id)
+            pending = p['entity'] + '/outbox/' + proposal_id + '.yaml'
+            consumed = p['entity'] + '/outbox/.consumed/' + proposal_id + '.yaml'
+            expected_pending = {'status': '??', 'index_entries': [], 'kind': 'file',
+                                'mode': 0o600, 'digest': receipt.review_sha256}
+            a, b, c = previous['snapshot'], before['snapshot'], after['snapshot']
+            # Between actions, only creation of this exact reviewed proposal.
+            if a['filesystem'] != b['filesystem'] or previous['index_entries'] != before['index_entries']:
+                raise ValueError('unaccounted state between lifecycle actions')
+            if b['dirty'].get(pending) != expected_pending:
+                raise ValueError('before checkpoint lacks exact reviewed proposal')
+            if a['dirty'].get(pending) not in (None, expected_pending):
+                raise ValueError('proposal replaced pre-existing dirty state')
+            if {k:v for k,v in a['dirty'].items() if k != pending} != {k:v for k,v in b['dirty'].items() if k != pending}:
+                raise ValueError('unaccounted dirty write between actions')
+            if pending in c['dirty'] or consumed in b['dirty'] or c['dirty'].get(consumed) != expected_pending:
+                raise ValueError('exact proposal quarantine is missing')
+            if {k:v for k,v in b['dirty'].items() if k != pending} != {k:v for k,v in c['dirty'].items() if k != consumed}:
+                raise ValueError('unaccounted dirty write during action')
+            owned_paths = {e['path'] + '/.gitkeep' for e in p['manifest']} | {receipt_path}
+            if owned_paths & (b['dirty'].keys() | c['dirty'].keys()):
+                raise ValueError('owned path has unreviewed dirty state')
+            left = _parse_index_entries(base64.b64decode(before['index_entries'], validate=True))
+            right = _parse_index_entries(base64.b64decode(after['index_entries'], validate=True))
+            if {k:v for k,v in left.items() if k not in owned_paths} != {k:v for k,v in right.items() if k not in owned_paths}:
+                raise ValueError('unrelated index entries changed')
+            for index, tree in ((left, _tree(vault, before['head'])), (right, _tree(vault, oid))):
+                for path in owned_paths:
+                    entry = tree.get(path)
+                    expected = () if entry is None else (f'{entry[0]}:{entry[2]}:0',)
+                    if index.get(path, ()) != expected:
+                        raise ValueError('owned index is not the corresponding committed tree')
+            allowed = set()
+            for entry in p['manifest']:
+                path = entry['path']; parent = str(Path(path).parent)
+                parent_state = b['filesystem'].get(parent)
+                if (parent_state is None or parent_state['kind'] != 'directory'
+                    or parent_state['mode'] != entry['parent_identity'][2]
+                    or parent_state['identity_digest'] != _lifecycle_identity(entry['parent_identity'])):
+                    raise ValueError('directory parent differs from reviewed evidence')
+                old, new = b['filesystem'].get(path), c['filesystem'].get(path)
+                if p['action'] == 'lifecycle_repair':
+                    if old is not None or new is None or new['kind'] != 'directory' or new['mode'] != 0o755:
+                        raise ValueError('repair directory transition is invalid')
+                    repair_directories[(oid, path)] = new
+                else:
+                    expected_old = repair_directories.get((p['repair']['commit'], path))
+                    if (expected_old is None or old != expected_old or new is not None
+                        or old['identity_digest'] != _lifecycle_identity(entry['before_identity'])
+                        or old['mode'] != entry['before_identity'][2]):
+                        raise ValueError('rollback did not remove the original observed repair directory')
+                allowed.add(path)
+            for name in ('.receipts', '.consumed'):
+                path = p['entity'] + '/outbox/' + name
+                old, new = b['filesystem'].get(path), c['filesystem'].get(path)
+                if old is None and new is not None:
+                    if new['kind'] != 'directory' or new['mode'] != 0o700:
+                        raise ValueError('invalid evidence directory creation')
+                    allowed.add(path)
+            for path in b['filesystem'].keys() | c['filesystem'].keys():
+                if b['filesystem'].get(path) != c['filesystem'].get(path):
+                    if path not in allowed:
+                        raise ValueError('unaccounted filesystem transition: ' + path)
+                    result.sanctioned_writes.append(path)
+            retained.append((receipt_path, blob))
+            observed_commits.append(oid)
+            result.sanctioned_commits.append(p['action'] + ': ' + proposal_id)
+            result.sanctioned_writes.extend((pending, consumed, *sorted(owned_paths)))
+            previous = after
+        if observed_commits != all_commits:
+            raise ValueError('journal does not account for every intervening commit')
+        final_tree = _tree(vault, final_head)
+        for path, blob in retained:
+            if final_tree.get(path) != ('100644', 'blob', blob):
+                raise ValueError('retained receipt was changed or removed')
+            contents, mode = _read_relative_regular_no_follow(vault, path)
+            if mode != 0o644 or contents != _git_bytes(vault, 'cat-file', 'blob', blob):
+                raise ValueError('live retained receipt was changed or removed')
+        _validate_receipt_stores(vault, AuditRules.load(vault))
+        if _head_oid(vault) != final_head:
+            raise ValueError('HEAD changed during lifecycle audit')
+    except (ValueError, OSError, ReceiptError, LifecycleError) as exc:
+        result.violating_writes.append('lifecycle journal: ' + str(exc))
+    return result
+
+
 def cmd_check() -> int:
     vault = _vault()
     snapshot_path = _snapshot_path(vault)
@@ -2449,6 +2589,31 @@ def cmd_check() -> int:
     rules = AuditRules.load(vault)
     _validate_receipt_stores(vault, rules)
     records = collect_commit_records(vault, head, audit_head)
+    lifecycle = any(record.message.startswith(("lifecycle_repair:", "lifecycle_rollback:")) for record in records)
+    if lifecycle:
+        journal = os.environ.get("ONEOS_LIFECYCLE_JOURNAL")
+        anchor = os.environ.get("ONEOS_LIFECYCLE_ANCHOR")
+        if not journal or not anchor:
+            print("GATE 3: FAIL — lifecycle actions require the complete checkpoint journal")
+            return 1
+        result = audit_lifecycle_session(vault, Path(journal), anchor)
+        # The journal must cover this snapshot's entire session boundary.
+        from app.lifecycle_journal import load_journal
+        try:
+            checkpoints = load_journal(Path(journal), anchor)
+            expected_initial = json.loads(json.dumps(dict(
+                version=SNAPSHOT_VERSION, head=head,
+                dirty={path: asdict(value) for path, value in snapshot.evidence.dirty.items()},
+                filesystem={path: asdict(value) for path, value in snapshot.evidence.filesystem.items()},
+            )))
+            if checkpoints[0]['snapshot'] != expected_initial:
+                result.violating_writes.append('journal baseline differs from snapshot')
+        except OSError:
+            result.violating_writes.append('journal cannot be read')
+        for violation in result.violating_writes:
+            print("  VIOLATION:", violation)
+        print("GATE 3:", "PASS" if result.ok else "FAIL")
+        return 0 if result.ok else 1
     current = collect_gate3_evidence(vault)
     after = current.dirty
     commit_result = _audit_commit_history(records, vault, head, audit_head)

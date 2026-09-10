@@ -11,6 +11,8 @@ block-mapping validation — so it never trips check_v2 or the module lint.
 from __future__ import annotations
 
 import difflib
+from contextlib import contextmanager
+from contextvars import ContextVar
 import errno
 import hashlib
 import os
@@ -72,6 +74,19 @@ from .scope import CrossScopeError, OutOfScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError
 
 
+_lifecycle_journal = ContextVar("outbox_lifecycle_journal", default=None)
+
+
+@contextmanager
+def lifecycle_review_journal(journal):
+    """Bind configured evidence to this request without changing legacy actions."""
+    token = _lifecycle_journal.set(journal)
+    try:
+        yield
+    finally:
+        _lifecycle_journal.reset(token)
+
+
 class OutboxError(Exception):
     pass
 
@@ -125,7 +140,35 @@ class Proposal:
     status: str = "pending"
 
 
-ClassificationActionResult = Proposal | SpentAction
+@dataclass(frozen=True)
+class LifecycleProposal:
+    """Review model for maintenance; never pretends to move a source document."""
+    id: str
+    path: Path
+    action: str
+    entity: str
+    created: str
+    contents: bytes
+
+    @property
+    def record(self) -> dict:
+        from .lifecycle_receipts import parse_proposal
+        return parse_proposal(self.contents, self.path)
+
+    @property
+    def manifest(self) -> list[dict]:
+        return self.record["manifest"]
+
+    @property
+    def reviewed_fields(self) -> dict[str, str]:
+        from .lifecycle_receipts import canonical
+        record = self.record
+        return {key: (value if isinstance(value, str) else canonical(value).decode())
+                for key, value in record.items() if key not in {"id", "version", "created"}}
+
+
+OutboxProposal = Proposal | LifecycleProposal
+ClassificationActionResult = OutboxProposal | SpentAction
 
 
 @dataclass(frozen=True)
@@ -133,7 +176,7 @@ class OutboxRow:
     """One outbox entry as the Console can safely present it. Rows carry
     **capabilities**, not kinds (design §3): a row that cannot be diffed or
     approved is still a row, and it never withholds another row's controls."""
-    proposal: Proposal | None
+    proposal: Proposal | LifecycleProposal | None
     diff: str | None
     error: BaseException | None
     can_approve: bool
@@ -493,10 +536,23 @@ def _validate_record(path: Path, record: object) -> Proposal | None:
         ) from exc
 
 
+def _proposal_from_contents(path: Path, contents: bytes) -> Proposal | LifecycleProposal | None:
+    record = _parse_record_bytes(contents)
+    if isinstance(record, dict) and record.get("action") in ("lifecycle_repair", "lifecycle_rollback"):
+        from .lifecycle_receipts import parse_proposal
+        try:
+            validated = parse_proposal(contents, path)
+        except InvalidActionReceipt as exc:
+            raise UnreadableProposalRecord("lifecycle proposal is malformed") from exc
+        return LifecycleProposal(validated["id"], path, validated["action"],
+                                 validated["entity"], validated["created"], contents)
+    return _validate_record(path, record)
+
+
 def review_snapshot_for(
     scope: Scope, leaf: Path
-) -> ReviewSnapshot[Proposal] | None:
-    """The one place a classification review snapshot is ever constructed.
+) -> ReviewSnapshot[OutboxProposal] | None:
+    """The shared constructor for classification and lifecycle review snapshots.
 
     Capture once, parse *those* bytes, validate the value they produced,
     fingerprint the same bytes. `None` for a well-formed `action: delete`
@@ -510,13 +566,13 @@ def review_snapshot_for(
     drift apart again.
     """
     contents = _capture_proposal_contents(scope, leaf)
-    proposal = _validate_record(leaf, _parse_record_bytes(contents))
+    proposal = _proposal_from_contents(leaf, contents)
     if proposal is None:
         return None
     return make_review_snapshot(_require_destination(scope, proposal), contents)
 
 
-def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
+def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[OutboxProposal]]:
     """The strict loader, as review snapshots — one safe scan, one read each.
 
     Every record is captured through the same no-follow boundary the actions
@@ -533,7 +589,7 @@ def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
     outbox = _require_outbox_path(scope)
     if not outbox.exists():
         return []
-    reviews: list[ReviewSnapshot[Proposal]] = []
+    reviews: list[ReviewSnapshot[OutboxProposal]] = []
     for discovered in sorted(outbox.glob("*.yaml")):
         leaf = _require_outbox_path(scope, discovered, require_leaf=True)
         try:
@@ -551,7 +607,7 @@ def _load_proposal_reviews(scope: Scope) -> list[ReviewSnapshot[Proposal]]:
     return reviews
 
 
-def load_proposals(scope: Scope) -> list[Proposal]:
+def load_proposals(scope: Scope) -> list[OutboxProposal]:
     return [review.value for review in _load_proposal_reviews(scope)]
 
 
@@ -585,12 +641,24 @@ def _diff_text(proposal: Proposal, old: str) -> str:
 
 
 @structured_reader(category="front-matter")
-def _render_review(scope: Scope, proposal: Proposal) -> tuple[str, str]:
+def _render_review(scope: Scope, proposal: OutboxProposal) -> tuple[str, str]:
     """Diff and display title for an **already-validated** record (phase 3).
     Reads the source receipt through the same safe-read boundary `approve`
     uses, and translates failures into the same domain types `approve` raises
     for the identical physical cause — so a projected row and its approve
     button never describe different conditions for one cause."""
+    if isinstance(proposal, LifecycleProposal):
+        from .lifecycle_receipts import render_lifecycle_receipt
+        removing = proposal.action == "lifecycle_rollback"
+        lines = ["Lifecycle rollback" if removing else "Lifecycle repair"]
+        for entry in proposal.manifest:
+            lines.extend([f"{'remove' if removing else 'create'} directory: {entry['path']}",
+                          f"declaration: {entry['declaration']}",
+                          f"{'delete' if removing else 'add'} file: {entry['path']}/.gitkeep (0 bytes, mode 0644)"])
+        receipt_path = receipt_relative_path(proposal.entity, proposal.id)
+        lines.extend([f"add retained receipt: {receipt_path} (mode 0644)",
+                      render_lifecycle_receipt(proposal.contents).decode("utf-8")])
+        return "\n".join(lines), lines[0]
     try:
         source_bytes = _read_no_follow_bytes(scope.root, proposal.src)
     except FileNotFoundError as exc:
@@ -627,7 +695,7 @@ def _render_review(scope: Scope, proposal: Proposal) -> tuple[str, str]:
         EntitySelectionError,
     )
 )
-def preview_diff(scope: Scope, proposal: Proposal) -> str:
+def preview_diff(scope: Scope, proposal: OutboxProposal) -> str:
     """A unified diff previewing what approval would do — the file moving from
     src to dst with `sub:` updated. Reads only; renders, never moves.
 
@@ -656,6 +724,8 @@ def preview_diff(scope: Scope, proposal: Proposal) -> str:
     if reloaded.id != proposal.id or reloaded.path != proposal.path:
         raise OutboxDestinationError("proposal changed since it was loaded")
     proposal = reloaded
+    if isinstance(proposal, LifecycleProposal):
+        return _render_review(scope, proposal)[0]
     src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
     return _diff_text(proposal, old)
@@ -834,15 +904,17 @@ def project_outbox(scope: Scope) -> OutboxListing:
     return OutboxListing(rows=tuple(rows), blocked=blocked)
 
 
-def _require_scope(scope: Scope, proposal: Proposal) -> Proposal:
+def _require_scope(scope: Scope, proposal: OutboxProposal) -> OutboxProposal:
     if proposal.entity != scope.current_entity():
         raise OutboxScopeError("proposal belongs to another entity")
     return proposal
 
 
-def _require_destination(scope: Scope, proposal: Proposal) -> Proposal:
+def _require_destination(scope: Scope, proposal: OutboxProposal) -> OutboxProposal:
     proposal = _require_scope(scope, proposal)
     _require_outbox_path(scope, proposal.path, require_leaf=True)
+    if isinstance(proposal, LifecycleProposal):
+        return proposal
     try:
         source = scope.root / proposal.src
         canonical = resolve_classification_destination(
@@ -895,8 +967,8 @@ def _capture_proposal_contents(scope: Scope, path: Path) -> bytes:
     return _capture_proposal_state(scope, relative).contents
 
 
-def get_proposal_review(scope: Scope, proposal_id: str) -> ReviewSnapshot[Proposal]:
-    """The reviewable state of one classification proposal.
+def get_proposal_review(scope: Scope, proposal_id: str) -> ReviewSnapshot[OutboxProposal]:
+    """The reviewable state of one supported outbox proposal.
 
     The sequence is fixed (design §Architecture-1): capture one byte
     snapshot, parse *those* bytes, validate the value they produced, and
@@ -916,7 +988,7 @@ def get_proposal_review(scope: Scope, proposal_id: str) -> ReviewSnapshot[Propos
     raise OutboxError(f"no pending proposal {proposal_id!r} for {entity}")
 
 
-def get_proposal(scope: Scope, proposal_id: str) -> Proposal:
+def get_proposal(scope: Scope, proposal_id: str) -> OutboxProposal:
     """The validated value alone, for callers that will not act on it.
 
     No action may use this: an action needs the fingerprint that came from
@@ -940,7 +1012,7 @@ def _own_reviewed_proposal(
     scope: Scope,
     proposal_id: str,
     review_sha256: object,
-) -> tuple[str, PathState, Proposal, str]:
+) -> tuple[str, PathState, OutboxProposal, str]:
     """Take ownership of the exact proposal state the operator reviewed.
 
     This is S7's boundary, and the order is normative (design §3):
@@ -960,8 +1032,10 @@ def _own_reviewed_proposal(
 
     proposal_state = _capture_proposal_state(scope, proposal_rel)
     review_digest = require_review_match(proposal_state.contents, review_sha256)
-    record = _parse_record_bytes(proposal_state.contents)
-    proposal = _require_destination(scope, _to_proposal(vault / proposal_rel, record))
+    proposal = _proposal_from_contents(vault / proposal_rel, proposal_state.contents)
+    if proposal is None:
+        raise OutboxDestinationError("proposal is not an outbox action")
+    proposal = _require_destination(scope, proposal)
     return proposal_rel, proposal_state, proposal, review_digest
 
 
@@ -1031,6 +1105,13 @@ def approve(
     )
     _require_destination(scope, prop)
     _require_outbox_path(scope, prop.path, require_leaf=True)
+    if isinstance(prop, LifecycleProposal):
+        from .lifecycle_repair import approve_lifecycle
+        try:
+            result = approve_lifecycle(scope, proposal_id, review_sha256, actor="owner", journal=_lifecycle_journal.get())
+        except (GitTransactionError, OSError, ValueError) as exc:
+            raise OutboxTransactionError("lifecycle approval could not complete") from exc
+        return result if isinstance(result, SpentAction) else prop
 
     # One capture of the source, as late as possible, and every check below
     # is about *these* bytes. Approve used to read the source twice — a

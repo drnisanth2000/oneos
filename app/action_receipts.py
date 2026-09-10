@@ -202,6 +202,12 @@ def _load_receipt_mapping(contents: bytes) -> dict[object, object]:
 
 
 def parse_action_receipt(path: Path, contents: bytes) -> ActionReceipt:
+    # Version two is a separate closed schema; version one remains unchanged.
+    if type(contents) is bytes:
+        from .lifecycle_receipts import load_mapping, parse_lifecycle_receipt
+        candidate = load_mapping(contents)
+        if type(candidate.get("version")) is int and candidate["version"] == 2:
+            return parse_lifecycle_receipt(path, contents)
     record = _load_receipt_mapping(contents)
     receipt = _validate_fields(
         record["version"],
@@ -346,7 +352,7 @@ def resolve_head_receipts(
             continue
         try:
             receipt = parse_action_receipt(
-                Path(f"{proposal_id}.yaml"), batch_object.contents
+                Path(receipt_relative_path(entity, proposal_id)), batch_object.contents
             )
         except InvalidActionReceipt as exc:
             resolutions[proposal_id] = ReceiptResolution(proposal_id, None, exc)
