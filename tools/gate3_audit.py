@@ -37,6 +37,7 @@ from app.action_receipts import (
 )
 from app.destinations import DestinationError, resolve_classification_destination
 from app.entities import EntityCatalog, EntityManifestError
+from app.lifecycle_receipts import ACTIONS as LIFECYCLE_ACTIONS, parse_proposal
 from app.outbox import OutboxError, _require_destination, _to_proposal
 from app.proposal_identity import (
     ProposalIdentityError,
@@ -1938,10 +1939,21 @@ def _load_consumed_record(
         if (
             loaded.get("id") != canonical_id
             or loaded.get("entity") != entity
-            or loaded.get("status") != "pending"
         ):
             return None
         action = loaded.get("action")
+        if action in LIFECYCLE_ACTIONS:
+            proposal = parse_proposal(contents, pending_path)
+            return _ConsumedRecord(
+                relative=relative,
+                pending_relative=pending_relative,
+                entity=entity,
+                proposal_id=canonical_id,
+                action=proposal["action"],
+                digest=digest,
+            )
+        if loaded.get("status") != "pending":
+            return None
         scope = Scope(vault, entity)
         if action == "classify":
             if not _canonical_classification_record(loaded):
@@ -1989,6 +2001,7 @@ def _load_consumed_record(
         OSError,
         OutboxError,
         ProposalIdentityError,
+        ReceiptError,
         RegistryError,
         UnicodeError,
         ValueError,
@@ -2211,7 +2224,7 @@ def _sanctioned_consumed_paths(
             for record in records
         )
         if (
-            consumed.action == "classify"
+            (consumed.action == "classify" or consumed.action in LIFECYCLE_ACTIONS)
             and not matching
             and snapshot_pair
             and not mentioned

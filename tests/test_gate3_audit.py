@@ -34,6 +34,7 @@ from app.registry import execute_delete, get_delete_review, propose_delete
 from app.rename import AXES, RenameError, apply_rename, plan_rename
 from app.scope import Scope
 from tests.conftest import git_vault, write_tree
+from tests.test_lifecycle_repair import lifecycle_vault
 import tools.gate3_audit as gate3
 
 
@@ -840,6 +841,152 @@ def test_sanctioned_reject_consumed_record_is_not_a_direct_write(
     result = gate3.audit_dirty(
         before,
         after,
+        gate3.AuditRules.load(vault),
+        vault,
+        records=(),
+    )
+
+    assert result.ok is True
+    assert set(result.sanctioned_writes) == {
+        proposal_relative,
+        consumed_relative,
+    }
+    assert result.violating_writes == []
+
+
+def test_sanctioned_lifecycle_reject_is_not_a_direct_write(lifecycle_vault):
+    from app.lifecycle_repair import propose_repair
+
+    vault = lifecycle_vault
+    scope = Scope(vault, "sample")
+    review = propose_repair(scope, actor="owner")
+    proposal_id = review.value["id"]
+    proposal_relative = f"sample/outbox/{proposal_id}.yaml"
+    before = gate3.collect_dirty_fingerprints(vault)
+
+    reject(scope, proposal_id, review.sha256)
+
+    after = gate3.collect_dirty_fingerprints(vault)
+    consumed_relative = f"sample/outbox/.consumed/{proposal_id}.yaml"
+    result = gate3.audit_dirty(
+        before,
+        after,
+        gate3.AuditRules.load(vault),
+        vault,
+        records=(),
+    )
+
+    assert result.ok is True
+    assert set(result.sanctioned_writes) == {
+        proposal_relative,
+        consumed_relative,
+    }
+    assert result.violating_writes == []
+
+
+def test_lifecycle_reject_created_after_snapshot_remains_a_violation(
+    lifecycle_vault,
+):
+    from app.lifecycle_repair import propose_repair
+
+    vault = lifecycle_vault
+    scope = Scope(vault, "sample")
+    review = propose_repair(scope, actor="owner")
+
+    reject(scope, review.value["id"], review.sha256)
+
+    consumed_relative = (
+        f"sample/outbox/.consumed/{review.value['id']}.yaml"
+    )
+    result = gate3.audit_dirty(
+        {},
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=(),
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [consumed_relative]
+
+
+def test_lifecycle_reject_requires_canonical_consumed_bytes(lifecycle_vault):
+    from app.lifecycle_repair import propose_repair
+
+    vault = lifecycle_vault
+    scope = Scope(vault, "sample")
+    review = propose_repair(scope, actor="owner")
+    proposal = vault / "sample" / "outbox" / f"{review.value['id']}.yaml"
+    proposal_relative = proposal.relative_to(vault).as_posix()
+    record = json.loads(proposal.read_bytes())
+    record["baseline_head"] = "not-an-object-id"
+    proposal.write_text(json.dumps(record), encoding="utf-8")
+    malformed_bytes = proposal.read_bytes()
+    before = gate3.collect_dirty_fingerprints(vault)
+    consumed = (
+        vault
+        / "sample"
+        / "outbox"
+        / ".consumed"
+        / f"{review.value['id']}.yaml"
+    )
+    consumed.parent.mkdir()
+    proposal.rename(consumed)
+
+    assert consumed.read_bytes() == malformed_bytes
+
+    consumed_relative = consumed.relative_to(vault).as_posix()
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
+        gate3.AuditRules.load(vault),
+        vault,
+        records=(),
+    )
+
+    assert result.sanctioned_writes == []
+    assert result.violating_writes == [consumed_relative, proposal_relative]
+
+
+def test_sanctioned_lifecycle_rollback_reject_is_not_a_direct_write(
+    lifecycle_vault, tmp_path: Path
+):
+    from app.lifecycle_journal import LifecycleJournal
+    from app.lifecycle_repair import (
+        approve_lifecycle,
+        propose_repair,
+        propose_rollback,
+    )
+
+    vault = lifecycle_vault
+    scope = Scope(vault, "sample")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    journal = LifecycleJournal.create(evidence, vault)
+    repair = propose_repair(scope, actor="owner")
+    repaired = approve_lifecycle(
+        scope,
+        repair.value["id"],
+        repair.sha256,
+        actor="owner",
+        journal=journal,
+    )
+    rollback = propose_rollback(
+        scope,
+        repaired.commit_oid,
+        actor="owner",
+        journal=journal,
+    )
+    proposal_id = rollback.value["id"]
+    proposal_relative = f"sample/outbox/{proposal_id}.yaml"
+    before = gate3.collect_dirty_fingerprints(vault)
+
+    reject(scope, proposal_id, rollback.sha256)
+
+    consumed_relative = f"sample/outbox/.consumed/{proposal_id}.yaml"
+    result = gate3.audit_dirty(
+        before,
+        gate3.collect_dirty_fingerprints(vault),
         gate3.AuditRules.load(vault),
         vault,
         records=(),
