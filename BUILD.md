@@ -94,8 +94,18 @@ external evidence verified one sanctioned approval of a real adapter-created
 receipt and one revert commit. The revert exactly inverted the approval paths,
 returned the tracked receipt to triage, restored the pre-approval committed
 tree, required no manual cleanup, and preserved all pre-existing dirty state
-byte-identically. Gate 2 passed. Gate 1 timed triage is the remaining live exit
-trial; Gates 2, 3, 4, and 5 pass. Phase 2 remains unauthorized.
+byte-identically. Gate 2 passed; at that point Gate 1 timed triage was the
+remaining live exit trial. A later trusted-local Gate 1 trial at exact
+fetched `origin/main` `aa1eafdc6047debb9698a32099889665eda1c40b`
+completed 20 real inbox items in 157.8 seconds (7.89 seconds per item), compared
+with 217.0 seconds (10.85 seconds per item) in Obsidian: 59.2 seconds, or 27.3%,
+less elapsed time. It created exactly 20 review proposals before any content
+moved. Separate owner review produced 20 sanctioned approval commits and left
+triage and Outbox empty. Closing Gate 3 passed with no violation; 39 private
+tests passed, `check_v2` reported 0 errors/0 warnings, and pre-existing
+worktree and index differences were preserved byte-identically. Gate 1 passed;
+all five Phase 1 exit gates now pass. Phase 2 remains unauthorized, and Step 11
+deployment still requires separate owner approval.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved

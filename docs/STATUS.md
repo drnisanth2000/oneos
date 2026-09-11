@@ -8,8 +8,8 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-09-07, after the successful trusted-local live Gate 2
-approval/revert proof.
+Last reconciled: 2026-09-11, after the successful trusted-local live Gate 1
+timed-triage and approval session.
 
 ---
 
@@ -56,9 +56,10 @@ Integrity-error rows expose no manual action or source filename.
 Regression coverage is in
 `tests/test_triage_manual.py`.
 
-This usability change does not establish a live Gate 1 result or change the
-historical gate records below. Model-provider and Hermes integration remain
-separate work under the existing asynchronous, propose-only boundary.
+This usability change did not by itself establish a live Gate 1 result. The
+later trusted-local trial recorded below supplied that evidence. Model-provider
+and Hermes integration remain separate work under the existing asynchronous,
+propose-only boundary.
 
 ### Historical foundation and gate record
 
@@ -72,7 +73,11 @@ with one sanctioned action commit and no violating commit or write. A later
 owner-authorized, trusted-local Gate 2 proof at the exact fetched `origin/main`
 recorded in its external evidence proved that approval of a real adapter-created
 receipt is exactly one commit and one revert restores it to triage without
-manual cleanup. Phase 2 is not authorized.
+manual cleanup. A subsequent trusted-local Gate 1 comparison completed 20 real
+inbox items measurably faster in OneOS than in Obsidian, then closed every
+reviewed item through sanctioned approvals with no Gate 3 violation. All five
+Phase 1 exit gates pass. Phase 2 is not authorized, and deployment still
+requires separate owner approval.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -179,6 +184,25 @@ preflight Gitleaks, public history, and combined repository-plus-vault history
 audits were clean. No product code, conventions, registries, or curated content
 was edited by the documentation task.
 
+### Gate 1 live timed-triage evidence
+
+At exact fetched `origin/main`
+`aa1eafdc6047debb9698a32099889665eda1c40b`, the trusted-local trial measured
+the same 20 real inbox items in both interfaces. Obsidian took 217.0 seconds
+(10.85 seconds per item); OneOS took 157.8 seconds (7.89 seconds per item).
+OneOS therefore used 59.2 seconds, or 27.3%, less elapsed time.
+
+The stopwatch counted only the 20 successful proposal-persisted signals. The
+timed pass created 20 readable review proposals and made no approval or move.
+After timing stopped, separate owner review approved all 20 proposals. Triage
+and Outbox both closed at zero, and each approval produced one sanctioned
+commit. The closing Gate 3 audit reported 20 new sanctioned commits, 20
+sanctioned dirty writes, no violation, and 414 observed filesystem entries.
+The private closing suite passed all 39 tests, `check_v2` reported 0 errors and
+0 warnings, and the pre-existing worktree and index differences remained
+byte-identical. No instance name, document title, destination, vault path, or
+private evidence content is published here.
+
 ### Exit gates (spec §11)
 
 | Gate | State |
@@ -186,8 +210,8 @@ was edited by the documentation task.
 | 2 — one commit per approval, `git revert`-clean | **PASS** — An owner-authorized trusted-local proof at the exact fetched `origin/main` recorded in its external evidence verified one sanctioned adapter ingest, one sanctioned approval commit, and one revert commit. The tracked receipt returned to triage, the committed tree matched the approval parent, no manual cleanup was required, and all pre-existing dirty state was preserved byte-identically. |
 | 4 — front-matter agreement with `policy_enforcer`, 100 files | **PASS** (100/100) |
 | 5 — cold start to usable screen < 2s | **PASS** (~0.35s) |
-| 3 — zero unsanctioned direct vault writes over a session | **PASS** — A fresh owner-reviewed, trusted-local live session at exact fetched `origin/main` `bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action commit, two sanctioned dirty-write transitions, and zero violating commits or writes across all observed filesystem entries. The snapshot and opaque closing evidence remained protected and the read-only audit left the vault byte-identical to its closing preimages. |
-| 1 — triage 20 items faster than Obsidian | **READY FOR LIVE TRIAL** — requires about 20 real inbox items; stopwatch exists on the triage screen. |
+| 3 — zero unsanctioned direct vault writes over a session | **PASS** — A fresh owner-reviewed, trusted-local live session at exact fetched `origin/main` `bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action commit, two sanctioned dirty-write transitions, and zero violating commits or writes across all observed filesystem entries. The later Gate 1 session also passed Gate 3 with 20 sanctioned approval commits, 20 sanctioned dirty writes, and no violation across 414 observed filesystem entries. Protected pre-existing state was preserved in both sessions. |
+| 1 — triage 20 items faster than Obsidian | **PASS** — At exact fetched `origin/main` `aa1eafdc6047debb9698a32099889665eda1c40b`, OneOS completed the same 20 real inbox items in 157.8 seconds (7.89 seconds/item), versus 217.0 seconds (10.85 seconds/item) in Obsidian: 59.2 seconds, or 27.3%, less elapsed time. |
 
 Gates govern expansion, not usage. Live trials do not reopen completed S1-S5
 unless they demonstrate a reproducible defect in those guarantees.
@@ -310,10 +334,9 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Next step
 
-Complete the Gate 1 timed triage of about 20 real inbox items. Gates 2, 3, 4,
-and 5 pass. Phase 2 remains unauthorized.
-Deployment remains blocked until all Phase 1 gates pass and the owner
-separately approves deployment; deferred UI remains out of scope.
+All five Phase 1 exit gates pass. The next authorized expansion decision is
+whether to deploy Step 11; deployment still requires separate owner approval.
+Phase 2 remains unauthorized, and deferred UI remains out of scope.
 
 ---
 
