@@ -5,12 +5,14 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
 import shutil
 import shlex
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -52,25 +54,26 @@ def write_json(path: Path, value):
             os.unlink(temporary)
 
 
-def load_config(state: Path):
+def load_config(state: Path, *, validate_runtime_paths=True):
     state = safe_path(state)
     if state.stat().st_uid != os.getuid() or state.stat().st_mode & 0o077:
         raise ValueError('state directory must be private')
     config = json.loads(private_file(state / 'config.json').read_text())
     if Path(config['state_dir']) != state:
         raise ValueError('state identity mismatch')
-    for key in ('vault', 'repo_dir'):
-        safe_path(Path(config[key]))
+    if validate_runtime_paths:
+        for key in ('vault', 'repo_dir'):
+            safe_path(Path(config[key]))
     return config
 
 
 @contextmanager
-def operation_lock(state: Path):
+def operation_lock(state: Path, *, wait=False):
     safe_path(state)
     fd = os.open(state / 'operation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError as exc:
             raise ValueError('another service or backup operation is running') from exc
         yield
@@ -94,7 +97,8 @@ class Runtime:
         command = ['docker-compose'] if shutil.which('docker-compose') else ['docker', '--context', 'colima-oneos', 'compose']
         return subprocess.run([*command, '--project-name', 'oneos', '--env-file', '/dev/null',
                                '--file', str(Path(self.config['repo_dir']) / 'compose.yaml'), *args],
-                              env=self.env, check=True, capture_output=not interactive, text=True)
+                              env=self.env, check=True, capture_output=not interactive, text=True,
+                              timeout=15 if args and args[0] in {'version', 'ps'} else None)
 
     def running_services(self):
         return self.compose('ps', '--services', '--status', 'running').stdout.split()
@@ -160,8 +164,106 @@ def start(config):
     (Path(config['state_dir']) / 'manual-stop').unlink(missing_ok=True)
 
 
-def login_start(config):
+def login_start(config, *, requested_at=None):
+    if requested_at is not None:
+        marker = Path(config['state_dir']) / 'manual-stop'
+        if marker.exists():
+            stopped = json.loads(private_file(marker).read_text())
+            if stopped.get('stopped_at', 0) >= requested_at:
+                return
     start(config)
+
+
+def run_login(config):
+    requested_at = time.time()
+    # Launchd's one-shot RunAtLoad must queue behind setup, backup and enrollment.
+    # Other manual mutations still fail fast instead of silently queuing work.
+    with operation_lock(Path(config['state_dir']), wait=True):
+        login_start(config, requested_at=requested_at)
+
+
+def finding(state, action):
+    return {'state': state, 'action': action}
+
+
+def authentication_diagnostic(config):
+    path = Path(config['state_dir']) / 'auth/owner.sqlite3'
+    try:
+        directory = safe_path(path.parent)
+        if directory.stat().st_mode & 0o077 or directory.stat().st_uid != os.getuid():
+            raise ValueError('unsafe auth directory')
+        if not path.exists() and not path.is_symlink():
+            return finding('not_enrolled', 'Run enroll from the private launcher in a terminal.')
+        private_file(path)
+        if any(Path(str(path) + suffix).exists() for suffix in ('-journal', '-wal', '-shm')):
+            return finding('busy', 'Retry after the current authentication activity finishes.')
+        # Immutable read avoids creating journals, SHM files or a write transaction.
+        # This reports enrollment presence only; the app performs full validation.
+        with sqlite3.connect(path.as_uri() + '?immutable=1', uri=True) as db:
+            healthy = db.execute('pragma quick_check').fetchone() == ('ok',)
+            enrolled = db.execute("SELECT EXISTS(SELECT 1 FROM owner WHERE id=1 AND password LIKE '$argon2id$%' AND length(secret)=32 AND typeof(counter)='integer')").fetchone()[0]
+        if healthy and enrolled:
+            return finding('enrolled', 'Owner enrollment is present; use the login screen.')
+    except (OSError, ValueError, sqlite3.Error):
+        pass
+    return finding('unavailable', 'Inspect private auth permissions; use recover after resolving state errors.')
+
+
+def diagnostics(config):
+    """Read-only aggregate diagnostics; never forward external output or paths."""
+    result = {'configuration': finding('valid', 'Private configuration loaded.')}
+    missing = [name for name in ('colima', 'docker', 'restic', 'diskutil') if not shutil.which(name)]
+    result['tools'] = finding('missing' if missing else 'available',
+                              'Install required local tools: ' + ', '.join(missing) if missing else 'Required executables are available.')
+    runtime = Runtime(config)
+    try:
+        runtime.compose('version', '--short')
+        result['compose'] = finding('available', 'Compose is available.')
+    except (OSError, subprocess.SubprocessError):
+        result['compose'] = finding('unavailable', 'Install Docker Compose or repair its plugin discovery.')
+    try:
+        if 'colima' in missing or 'docker' in missing:
+            raise ValueError('runtime tools missing')
+        subprocess.run(['colima', 'status', '--profile', 'oneos'], check=True, capture_output=True, timeout=15)
+        subprocess.run(['docker', '--context', 'colima-oneos', 'info', '--format', '{{.ServerVersion}}'],
+                       env=runtime.env, check=True, capture_output=True, timeout=15)
+        result['runtime'] = finding('available', 'The dedicated runtime is available.')
+        running = set(runtime.running_services())
+        state = 'running' if {'app', 'caddy'} <= running else ('partial' if running else 'stopped')
+        result['services'] = finding(state, 'Services are running.' if state == 'running' else 'Run start when service availability is wanted.')
+    except (OSError, ValueError, subprocess.SubprocessError):
+        result['runtime'] = finding('unavailable', 'Run start; if it fails, inspect the dedicated Colima profile.')
+        result['services'] = finding('unknown', 'Restore runtime availability before checking services.')
+    try:
+        vault = safe_path(Path(config['vault']))
+        safe_path(vault / '.git')
+        with os.scandir(vault) as entries:
+            next(entries, None)
+        result['vault'] = finding('accessible', 'Configured vault and Git directory are accessible.')
+    except (OSError, ValueError):
+        result['vault'] = finding('unavailable', 'Reconnect the configured vault and check private path permissions; do not create an empty replacement.')
+    result['authentication'] = authentication_diagnostic(config)
+    if 'backup' not in config:
+        result['backup'] = finding('not_configured', 'Run setup-backup with the intended external drive and an offline key copy.')
+    else:
+        from tools.local_backup import validate_volume
+        try:
+            validate_volume(config['backup'])
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            result['backup'] = finding('disconnected', 'Connect the original external physical drive; verify its configured identity.')
+        else:
+            try:
+                status = json.loads(private_file(Path(config['state_dir']) / 'status/backup-status.json').read_text())
+                last = status.get('last_success')
+                state = status.get('state')
+                if state not in {'ok', 'never', 'missed', 'failed'}:
+                    raise ValueError('invalid backup status')
+                if state == 'ok' and (not isinstance(last, (float, int)) or not math.isfinite(last) or not 0 < last <= time.time() or time.time() - last >= 86400):
+                    state = 'missed'
+                result['backup'] = finding(state, 'Backup is current.' if state == 'ok' else 'Run backup, then restore-check to verify recovery.')
+            except (OSError, ValueError, TypeError):
+                result['backup'] = finding('unknown', 'Run backup to establish verified backup status.')
+    return result
 
 
 def install_login(config):
@@ -203,7 +305,18 @@ def main(argv=None):
                 parser.error('--vault required for setup')
             setup(args.state_dir, args.vault, Path(__file__).resolve().parents[1], input('Git name: '), input('Git email: '))
             return 0
-        config = load_config(args.state_dir)
+        config = load_config(args.state_dir, validate_runtime_paths=args.command not in ('doctor', 'status'))
+        if args.command in ('doctor', 'status'):
+            report = diagnostics(config)
+            print(json.dumps(report))
+            return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'disconnected'} for item in report.values()))
+        if args.command == 'login-start':
+            run_login(config)
+            return 0
+        if args.command == 'stop':
+            # Record intent before lock acquisition, so delayed login cannot
+            # override an explicit stop requested while it was waiting.
+            write_json(args.state_dir / 'manual-stop', {'stopped': True, 'stopped_at': time.time()})
         with operation_lock(args.state_dir):
             runtime = Runtime(config)
             if args.command == 'start': start(config)
@@ -214,16 +327,9 @@ def main(argv=None):
                 if not sys.stdin.isatty() or not sys.stdout.isatty():
                     raise ValueError('owner administration requires an interactive terminal')
                 runtime.compose('exec', 'app', 'python', '-m', 'app.auth_admin', args.command, interactive=True)
-            elif args.command == 'login-start': login_start(config)
             elif args.command == 'stop':
-                write_json(args.state_dir / 'manual-stop', {'stopped': True})
                 runtime.compose('stop')
-            elif args.command == 'status': print(runtime.compose('ps').stdout)
             elif args.command == 'logs': print(runtime.compose('logs', '--tail', '200').stdout)
-            elif args.command == 'doctor':
-                missing = [name for name in ('colima', 'docker', 'restic', 'diskutil') if not shutil.which(name)]
-                print(json.dumps({'missing_tools': missing, 'config': 'valid'}))
-                return bool(missing)
             elif args.command == 'install-login': install_login(config)
             else:
                 from tools.local_backup import backup, restore_check, setup_backup
@@ -233,8 +339,11 @@ def main(argv=None):
                 elif args.command == 'restore-check': print(restore_check(config))
                 else: backup(config, runtime, due_only=args.command == 'backup-due')
         return 0
-    except (ValueError, OSError, KeyError, subprocess.SubprocessError):
-        print('Operation failed. Check private configuration, service state, and external drive.', file=sys.stderr)
+    except (ValueError, TypeError, OSError, KeyError, subprocess.SubprocessError):
+        if args.command in ('doctor', 'status'):
+            print(json.dumps({'configuration': finding('unavailable', 'Check that private state and config.json exist, are owner-only, and use canonical paths. Restore the intended configuration; do not replace the vault.')}))
+        else:
+            print('Operation could not complete. Run doctor for safe configuration, runtime, enrollment and backup diagnostics. If another operation is running, retry after it finishes.', file=sys.stderr)
         return 1
 
 

@@ -76,3 +76,105 @@ def test_compose_uses_explicit_context_and_ignores_ambient_overrides(monkeypatch
     assert 'DOCKER_HOST' not in options['env']
     assert 'COMPOSE_PROJECT_NAME' not in options['env']
     assert not options.get('shell', False)
+
+
+def test_login_waits_for_backup_lock(tmp_path, monkeypatch):
+    import threading
+    from tools import local_service as service
+    started = threading.Event()
+    entered = threading.Event()
+    monkeypatch.setattr(service, 'start', lambda config: started.set())
+    def login():
+        entered.set()
+        service.run_login({'state_dir': str(tmp_path)})
+    with service.operation_lock(tmp_path):
+        worker = threading.Thread(target=login)
+        worker.start()
+        assert entered.wait(1)
+        assert not started.wait(0.05)
+    worker.join(2)
+    assert not worker.is_alive()
+    assert started.is_set()
+
+
+def test_delayed_login_respects_new_stop_request(tmp_path, monkeypatch):
+    from tools import local_service as service
+    service.write_json(tmp_path / 'manual-stop', {'stopped_at': 200})
+    monkeypatch.setattr(service, 'start', lambda config: pytest.fail('new stop wins'))
+    service.login_start({'state_dir': str(tmp_path)}, requested_at=100)
+
+
+def diagnostic_config(tmp_path):
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    for child in ('auth', 'status'):
+        (state / child).mkdir(mode=0o700)
+    vault = tmp_path / 'vault'
+    vault.mkdir()
+    (vault / '.git').mkdir()
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    return dict(state_dir=str(state), vault=str(vault), repo_dir=str(repo), uid=501, gid=20,
+                git_name='Test', git_email='test@example.invalid')
+
+
+def test_diagnostics_report_disconnected_backup_and_missing_enrollment_without_paths(tmp_path, monkeypatch):
+    from tools import local_service as service
+    from tools import local_backup
+    config = diagnostic_config(tmp_path)
+    config['backup'] = {'mount': '/private/sensitive-volume', 'volume_uuid': 'private-uuid'}
+    monkeypatch.setattr(service.shutil, 'which', lambda name: '/synthetic/tool')
+    monkeypatch.setattr(service.subprocess, 'run', lambda *args, **kwargs: type('Result', (), {'stdout': '', 'returncode': 0})())
+    monkeypatch.setattr(service.Runtime, 'running_services', lambda self: ['app', 'caddy'])
+    monkeypatch.setattr(local_backup, 'validate_volume', lambda config: (_ for _ in ()).throw(ValueError('private-uuid')))
+    result = service.diagnostics(config)
+    assert result['backup']['state'] == 'disconnected'
+    assert result['authentication']['state'] == 'not_enrolled'
+    assert result['services']['state'] == 'running'
+    output = json.dumps(result)
+    assert str(tmp_path) not in output
+    assert 'private-uuid' not in output
+    assert '/private/sensitive-volume' not in output
+
+
+def test_diagnostics_read_enrollment_without_mutating_database(tmp_path, monkeypatch):
+    import sqlite3
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    path = tmp_path / 'state/auth/owner.sqlite3'
+    with sqlite3.connect(path) as db:
+        db.execute('create table owner(id integer, password text, secret text, counter integer)')
+        db.execute('insert into owner values(1,?,?,1)', ('$argon2id$synthetic', 'A' * 32))
+    path.chmod(0o600)
+    before = path.read_bytes()
+    result = service.authentication_diagnostic(config)
+    assert result['state'] == 'enrolled'
+    assert path.read_bytes() == before
+    assert list(path.parent.iterdir()) == [path]
+
+
+def test_diagnostics_missing_vault_is_actionable(tmp_path, monkeypatch):
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    config['vault'] = str(tmp_path / 'missing-sensitive-vault')
+    monkeypatch.setattr(service.shutil, 'which', lambda name: None)
+    result = service.diagnostics(config)
+    assert result['vault']['state'] == 'unavailable'
+    assert result['runtime']['state'] == 'unavailable'
+    assert result['backup']['state'] == 'not_configured'
+    assert 'missing-sensitive-vault' not in json.dumps(result)
+
+
+@pytest.mark.parametrize(('state', 'last', 'expected'), [('ok', 1, 'missed'), ('failed', 1, 'failed'), ('never', None, 'never')])
+def test_diagnostics_report_backup_freshness(tmp_path, monkeypatch, state, last, expected):
+    from tools import local_service as service
+    from tools import local_backup
+    config = diagnostic_config(tmp_path)
+    config['backup'] = {}
+    service.write_status(config, state, last)
+    monkeypatch.setattr(service.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(service.Runtime, 'compose', lambda *args: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(local_backup, 'validate_volume', lambda config: None)
+    result = service.diagnostics(config)
+    assert result['backup']['state'] == expected
+    assert 'Run backup' in result['backup']['action']

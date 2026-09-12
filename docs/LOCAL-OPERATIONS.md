@@ -58,6 +58,21 @@ or backup availability during sleep. Reinstallation refuses existing job files
 so an operator can inspect them. To disable a job, unload its exact
 `local.oneos.login` or `local.oneos.backup` plist with `launchctl bootout`.
 
+The login job waits for any active setup, backup, or enrollment operation before
+starting. A new explicit stop request received while login is waiting cancels
+that delayed startup. Other mutations still report contention immediately; retry
+them after the active operation finishes. This also handles both RunAtLoad jobs
+starting while installation still holds the service-operation lock.
+
+`doctor` and `status` return safe aggregate JSON with an action for each check:
+configuration, required tools, Compose, the dedicated runtime, service state,
+vault accessibility, owner enrollment presence, and backup configuration/drive/
+freshness. They do not acquire the mutation lock or reveal subprocess output,
+paths, credentials, or volume identities. Authentication inspection does not
+write to its database; active journal sidecars report busy. The app still
+performs full credential-state validation. `doctor` exits nonzero for unavailable
+or failed checks; `status` succeeds when it can provide the report.
+
 ```sh
 python -m tools.local_service --state-dir "$ONEOS_STATE_DIR" install-login
 ```
