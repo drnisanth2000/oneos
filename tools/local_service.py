@@ -145,6 +145,18 @@ def setup(state, vault, repo, name, email):
         launcher = state / 'OneOS.command'
         if launcher.exists() or launcher.is_symlink():
             raise ValueError('launcher already exists; inspect before setup')
+        for path in (state / 'auth', state / 'status'):
+            if path.exists():
+                if path.is_symlink():
+                    raise ValueError('refuse stale private state')
+                if not path.is_dir():
+                    raise ValueError('refuse stale private state')
+                try:
+                    next(path.iterdir())
+                except StopIteration:
+                    pass
+                else:
+                    raise ValueError('refuse stale private state')
         status_path = state / 'status/backup-status.json'
         if status_path.exists() or status_path.is_symlink():
             raise ValueError('backup status already exists; inspect before setup')
@@ -444,6 +456,9 @@ def main(argv=None):
                 elif args.command == 'restore-check': print(restore_check(config))
                 else: backup(config, runtime, due_only=args.command == 'backup-due')
         return 0
+    except KeyboardInterrupt:
+        print(json.dumps({'code': 'operation_cancelled', 'message': 'Operation was interrupted by user input.'}), file=sys.stderr)
+        return 1
     except (ValueError, TypeError, OSError, KeyError, subprocess.SubprocessError,
             GitTransactionError) as error:
         if args.command in ('doctor', 'status'):

@@ -214,6 +214,40 @@ def test_setup_preflights_existing_launcher_before_configuration(tmp_path):
     assert not (state / 'auth').exists()
 
 
+def test_setup_refuses_existing_nonempty_auth_or_status_directory(tmp_path):
+    import subprocess
+    from tools.local_service import setup
+
+    vault = tmp_path / 'vault'
+    vault.mkdir()
+    subprocess.run(['git', 'init', '-q', str(vault)], check=True)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    for path in (state / 'auth', state / 'status'):
+        path.mkdir(mode=0o700)
+        (path / 'stale.txt').write_text('retain private content')
+
+    with pytest.raises(ValueError, match='refuse stale private state'):
+        setup(state, vault, repo, 'Test', 'test@example.invalid')
+
+
+def test_main_returns_sanitized_interrupt_json(tmp_path, monkeypatch, capsys):
+    from tools import local_service as service
+
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    service.write_json(state / 'config.json', dict(
+        state_dir=str(state), vault='/vault', repo_dir='/repo', uid=501, gid=20, git_name='Owner',
+        git_email='owner@example.invalid',
+    ))
+    monkeypatch.setattr(service.subprocess, 'run', lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt))
+    assert service.main(['--state-dir', str(state), 'status']) == 1
+    output = capsys.readouterr()
+    assert json.loads(output.err) == {'code': 'operation_cancelled', 'message': 'Operation was interrupted by user input.'}
+
+
 def test_setup_preserves_preexisting_dangling_config_symlink(tmp_path):
     import subprocess
     from tools.local_service import setup
