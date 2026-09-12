@@ -137,6 +137,63 @@ def test_real_restic_encrypted_backup_and_isolated_restore(tmp_path, monkeypatch
             assert bytes.fromhex(value.decode()) == b'\xff\x00\x0a'
 
 
+def test_setup_backup_rejects_existing_configuration_before_creating_key(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+
+    config, mount = backup_config(tmp_path, monkeypatch)
+    config['backup'] = {'mount': '/existing', 'volume_uuid': 'existing'}
+    key = Path(config['state_dir']) / 'backup-key'
+    monkeypatch.setattr(backup, 'disk_info', lambda path: pytest.fail('must reject before drive access'))
+    with pytest.raises(ValueError, match='backup already configured'):
+        backup.setup_backup(config, mount, False)
+    assert not key.exists()
+
+
+@pytest.mark.parametrize('invalid_last_success',
+                         ['not-a-number', True, 0, -1, float('nan'), float('inf'), 1001, 10 ** 400])
+def test_due_backup_treats_invalid_or_future_success_as_overdue(tmp_path, monkeypatch,
+                                                               invalid_last_success):
+    from tools import local_backup as backup
+    from tools.local_service import write_status
+
+    config, mount = backup_config(tmp_path, monkeypatch)
+    config['backup'] = {'mount': str(mount), 'volume_uuid': 'expected',
+                        'password_file': str(Path(config['state_dir']) / 'backup-key')}
+    write_status(config, 'ok', invalid_last_success)
+    monkeypatch.setattr(backup.time, 'time', lambda: 1000)
+    attempted = []
+
+    def stop_after_attempt(backup_config):
+        attempted.append(backup_config)
+        raise ValueError('synthetic catch-up attempt')
+
+    monkeypatch.setattr(backup, 'validate_volume', stop_after_attempt)
+    with pytest.raises(ValueError, match='synthetic catch-up attempt'):
+        backup.backup(config, object(), due_only=True)
+    assert attempted == [config['backup']]
+
+
+def test_due_backup_treats_non_mapping_status_as_overdue(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+
+    config, mount = backup_config(tmp_path, monkeypatch)
+    config['backup'] = {'mount': str(mount), 'volume_uuid': 'expected',
+                        'password_file': str(Path(config['state_dir']) / 'backup-key')}
+    status = Path(config['state_dir']) / 'status/backup-status.json'
+    status.write_text('[]')
+    monkeypatch.setattr(backup.time, 'time', lambda: 1000)
+    attempted = []
+
+    def stop_after_attempt(backup_config):
+        attempted.append(backup_config)
+        raise ValueError('synthetic catch-up attempt')
+
+    monkeypatch.setattr(backup, 'validate_volume', stop_after_attempt)
+    with pytest.raises(ValueError, match='synthetic catch-up attempt'):
+        backup.backup(config, object(), due_only=True)
+    assert attempted == [config['backup']]
+
+
 def test_interrupted_backup_restores_service_and_retains_last_success(tmp_path, monkeypatch):
     from tools import local_backup as backup
     from tools.local_service import write_status

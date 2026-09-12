@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -265,6 +266,8 @@ def restic(config, *args, cwd=None):
 
 
 def setup_backup(config, mount, offline_confirmed):
+    if 'backup' in config:
+        raise ValueError('backup already configured')
     mount = safe_path(mount)
     info = disk_info(mount)
     backup_config = dict(mount=str(mount), volume_uuid=info.get('VolumeUUID'),
@@ -278,8 +281,6 @@ def setup_backup(config, mount, offline_confirmed):
     private_file(key)
     if not offline_confirmed:
         raise ValueError('copy the private backup key offline before confirming setup')
-    if 'backup' in config:
-        raise ValueError('backup already configured')
     proposed = {**config, 'backup': backup_config}
     restic(proposed, 'init')
     write_json(Path(config['state_dir']) / 'config.json', proposed)
@@ -288,8 +289,18 @@ def setup_backup(config, mount, offline_confirmed):
 
 def previous_success(config):
     try:
-        return json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text()).get('last_success')
-    except (OSError, ValueError):
+        status = json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text())
+        if not isinstance(status, dict):
+            return None
+        last = status.get('last_success')
+        if isinstance(last, bool) or not isinstance(last, (int, float)):
+            return None
+        if isinstance(last, float) and not math.isfinite(last):
+            return None
+        if not 0 < last <= time.time():
+            return None
+        return last
+    except (OSError, ValueError, TypeError):
         return None
 
 

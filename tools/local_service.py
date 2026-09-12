@@ -122,6 +122,8 @@ def setup(state, vault, repo, name, email):
     vault, repo = safe_path(vault), safe_path(repo)
     if not (vault / '.git').is_dir() or (vault / '.git').is_symlink():
         raise ValueError('vault must be a standalone Git checkout')
+    if vault.is_relative_to(repo):
+        raise ValueError('vault must be separate from the repository build context')
     if not name.strip() or not email.strip() or '\n' in name + email:
         raise ValueError('explicit Git identity required')
     state = Path(os.path.abspath(state))
@@ -135,13 +137,15 @@ def setup(state, vault, repo, name, email):
     with operation_lock(state):
         if (state / 'config.json').exists():
             raise ValueError('configuration already exists')
+        launcher = state / 'OneOS.command'
+        if launcher.exists() or launcher.is_symlink():
+            raise ValueError('launcher already exists; inspect before setup')
         for child in ('auth', 'status', 'logs', 'caddy', 'caddy/data', 'caddy/config'):
             (state / child).mkdir(mode=0o700, exist_ok=True)
             safe_path(state / child)
         config = dict(state_dir=str(state), vault=str(vault), repo_dir=str(repo), git_name=name,
                       git_email=email, uid=os.getuid(), gid=os.getgid())
         write_json(state / 'config.json', config)
-        launcher = state / 'OneOS.command'
         fd = os.open(launcher, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
         with os.fdopen(fd, 'w') as output:
             output.write('#!/bin/sh\nset -eu\ncd ' + shlex.quote(str(repo)) + '\n'
@@ -305,16 +309,50 @@ def install_login(config):
     paths = [destination / ('local.oneos.' + suffix + '.plist') for suffix, _ in jobs]
     if any(path.exists() or path.is_symlink() for path in paths):
         raise ValueError('login job already exists; inspect before replacing')
-    for (suffix, command), path in zip(jobs, paths, strict=True):
-        value = {'Label': 'local.oneos.' + suffix,
-                 'ProgramArguments': [python, '-m', 'tools.local_service', '--state-dir', config['state_dir'], command],
-                 'WorkingDirectory': config['repo_dir'], 'RunAtLoad': True,
-                 'EnvironmentVariables': {'PATH': os.environ.get('PATH', '')}}
-        if suffix == 'backup':
-            value['StartInterval'] = 3600
-        with path.open('xb') as output:
-            output.write(plistlib.dumps(value))
-        subprocess.run(['launchctl', 'bootstrap', 'gui/' + str(os.getuid()), str(path)], check=True, capture_output=True)
+    domain = 'gui/' + str(os.getuid())
+    targets = [domain + '/local.oneos.' + suffix for suffix, _ in jobs]
+    for target in targets:
+        result = subprocess.run(['launchctl', 'print', target], check=False, capture_output=True)
+        if result.returncode == 0:
+            raise ValueError('login job already loaded; inspect before replacing')
+        if result.returncode != 113:
+            raise OSError('unable to verify login job state')
+    created, attempted, bootstrapped = [], [], set()
+    try:
+        for (suffix, command), path, target in zip(jobs, paths, targets, strict=True):
+            label = 'local.oneos.' + suffix
+            value = {'Label': label,
+                     'ProgramArguments': [python, '-m', 'tools.local_service', '--state-dir', config['state_dir'], command],
+                     'WorkingDirectory': config['repo_dir'], 'RunAtLoad': True,
+                     'EnvironmentVariables': {'PATH': os.environ.get('PATH', '')}}
+            if suffix == 'backup':
+                value['StartInterval'] = 3600
+            output = path.open('xb')
+            created.append(path)
+            with output:
+                output.write(plistlib.dumps(value))
+            attempted.append(target)
+            subprocess.run(['launchctl', 'bootstrap', domain, str(path)],
+                           check=True, capture_output=True)
+            bootstrapped.add(target)
+    except BaseException as error:
+        cleanup_error = None
+        for target in reversed(attempted):
+            try:
+                result = subprocess.run(['launchctl', 'bootout', target], check=False,
+                                        capture_output=True)
+                if result.returncode and (target in bootstrapped or result.returncode != 113):
+                    cleanup_error = OSError('login job rollback incomplete')
+            except OSError:
+                cleanup_error = OSError('login job rollback incomplete')
+        for path in reversed(created):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                cleanup_error = OSError('login job rollback incomplete')
+        if cleanup_error:
+            raise cleanup_error from error
+        raise
 
 
 def main(argv=None):

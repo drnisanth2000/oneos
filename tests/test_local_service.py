@@ -70,6 +70,41 @@ def test_setup_refuses_private_state_inside_public_repository(tmp_path):
     assert not (repo / 'private-state').exists()
 
 
+def test_setup_refuses_vault_inside_container_build_context(tmp_path):
+    import subprocess
+    from tools.local_service import setup
+
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    vault = repo / 'private-vault'
+    vault.mkdir()
+    subprocess.run(['git', 'init', '-q', str(vault)], check=True)
+    state = tmp_path / 'state'
+    with pytest.raises(ValueError, match='vault must be separate'):
+        setup(state, vault, repo, 'Test', 'test@example.invalid')
+    assert not state.exists()
+
+
+def test_setup_preflights_existing_launcher_before_configuration(tmp_path):
+    import subprocess
+    from tools.local_service import setup
+
+    vault = tmp_path / 'vault'
+    vault.mkdir()
+    subprocess.run(['git', 'init', '-q', str(vault)], check=True)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    launcher = state / 'OneOS.command'
+    launcher.write_text('preserve existing launcher')
+    with pytest.raises((ValueError, FileExistsError)):
+        setup(state, vault, repo, 'Test', 'test@example.invalid')
+    assert launcher.read_text() == 'preserve existing launcher'
+    assert not (state / 'config.json').exists()
+    assert not (state / 'auth').exists()
+
+
 def test_compose_uses_explicit_context_and_ignores_ambient_overrides(monkeypatch):
     from tools import local_service as service
     calls = []
@@ -160,6 +195,126 @@ def test_install_login_preflights_all_destinations_before_writing(tmp_path, monk
         service.install_login(config)
     assert not (launch_agents / 'local.oneos.login.plist').exists()
     assert (launch_agents / 'local.oneos.backup.plist').read_bytes() == b'preserve'
+
+
+def test_install_login_rolls_back_jobs_and_plists_after_bootstrap_failure(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    calls = []
+
+    def launchctl(command, **kwargs):
+        calls.append(command)
+        if command[1] == 'print':
+            return subprocess.CompletedProcess(command, 113)
+        if command[1] == 'bootstrap' and command[-1].endswith('backup.plist'):
+            raise subprocess.CalledProcessError(5, command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(service.subprocess, 'run', launchctl)
+    config = {'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'}
+    with pytest.raises(subprocess.CalledProcessError):
+        service.install_login(config)
+    assert not list(launch_agents.glob('local.oneos.*.plist'))
+    bootouts = [command[-1] for command in calls if command[1] == 'bootout']
+    assert bootouts == ['gui/' + str(service.os.getuid()) + '/local.oneos.backup',
+                        'gui/' + str(service.os.getuid()) + '/local.oneos.login']
+
+
+def test_install_login_removes_partial_plist_after_write_failure(tmp_path, monkeypatch):
+    from tools import local_service as service
+
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    original_open = service.Path.open
+
+    class FailingWrite:
+        def __init__(self, output):
+            self.output = output
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.output.close()
+
+        def write(self, value):
+            self.output.write(value[:8])
+            self.output.flush()
+            raise OSError('synthetic disk full')
+
+    def failing_open(path, *args, **kwargs):
+        output = original_open(path, *args, **kwargs)
+        if path.name == 'local.oneos.login.plist':
+            return FailingWrite(output)
+        return output
+
+    monkeypatch.setattr(service.Path, 'open', failing_open)
+
+    def launchctl(command, **kwargs):
+        if command[1] == 'print':
+            return type('Result', (), {'returncode': 113})()
+        pytest.fail('write must fail before launchctl bootstrap')
+
+    monkeypatch.setattr(service.subprocess, 'run', launchctl)
+    with pytest.raises(OSError, match='synthetic disk full'):
+        service.install_login({'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'})
+    assert not list(launch_agents.glob('local.oneos.*.plist'))
+
+
+def test_install_login_preserves_preexisting_loaded_job(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    calls = []
+
+    def launchctl(command, **kwargs):
+        calls.append(command)
+        if command[1] == 'print':
+            return subprocess.CompletedProcess(command, 0)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(service.subprocess, 'run', launchctl)
+    with pytest.raises(ValueError, match='already loaded'):
+        service.install_login({'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'})
+    assert not list(launch_agents.glob('local.oneos.*.plist'))
+    assert [command[1] for command in calls] == ['print']
+
+
+def test_install_login_removes_job_installed_before_bootstrap_interrupt(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    from tools import local_service as service
+
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    loaded = set()
+
+    def launchctl(command, **kwargs):
+        if command[1] == 'print':
+            return subprocess.CompletedProcess(command, 0 if command[-1] in loaded else 113)
+        if command[1] == 'bootstrap':
+            label = 'local.oneos.' + Path(command[-1]).stem.rsplit('.', 1)[-1]
+            loaded.add('gui/' + str(service.os.getuid()) + '/' + label)
+            raise InterruptedError('synthetic post-install interruption')
+        if command[1] == 'bootout':
+            loaded.discard(command[-1])
+            return subprocess.CompletedProcess(command, 0)
+        pytest.fail('unexpected launchctl command')
+
+    monkeypatch.setattr(service.subprocess, 'run', launchctl)
+    with pytest.raises(InterruptedError, match='post-install interruption'):
+        service.install_login({'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'})
+    assert loaded == set()
+    assert not list(launch_agents.glob('local.oneos.*.plist'))
 
 
 def test_delayed_login_respects_new_stop_request(tmp_path, monkeypatch):

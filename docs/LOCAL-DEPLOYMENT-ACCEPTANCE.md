@@ -36,11 +36,15 @@ external-repository validation and read-only extended-attribute recovery.
 Expanded regression tests cover these boundaries, including failure-path file
 descriptor cleanup. Internal app traffic remains on the unpublished dedicated
 Compose network; HTTPS terminates at Caddy as approved for this localhost-only
-deployment.
+deployment. Exact-head re-review additionally closed build-context vault
+containment, partial setup and LaunchAgent rollback, repeat backup-key setup,
+and malformed scheduled-backup timestamp cases. LaunchAgent rollback preserves
+pre-existing loaded jobs while cleaning jobs installed before an interrupted
+bootstrap result.
 
 ## Closing implementation verification
 
-- Locked Python 3.12 public suite: **2,319 passed, 1 skipped**.
+- Locked Python 3.12 public suite: **2,335 passed, 1 skipped**.
 - Trusted-local private suite: **39 passed**; structural validation: **0 errors,
   0 warnings**. Opaque before/after Git evidence preserved pre-existing state.
 - Actual synthetic HTTPS verified password/TOTP login, secure cookies, protected
