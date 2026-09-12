@@ -1,10 +1,49 @@
 """Owner boundary tests use only temporary synthetic authentication state."""
 import re
 from contextlib import closing
+from html.parser import HTMLParser
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.mark.parametrize("reviewed", [
+    {"module": "02-work", "sub": ""},
+    {"module": 'quoted" autofocus onfocus="bad()', "sub": "'>&<"},
+])
+def test_action_form_preserves_json_as_one_escaped_attribute(reviewed):
+    """Trusted JSON Markup must not escape the hidden input's value boundary."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+    class Inputs(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.inputs = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "input":
+                self.inputs.append(dict(attrs))
+
+    environment = Environment(
+        loader=FileSystemLoader(Path(__file__).resolve().parents[1] / "templates"),
+        autoescape=select_autoescape(),
+    )
+    template = environment.from_string(
+        '{% from "_auth_forms.html" import action_form with context %}'
+        '{{ action_form("review", {"reviewed_values": reviewed | tojson}, "/approve") }}'
+    )
+    parser = Inputs()
+    parser.feed(template.render(
+        reviewed=reviewed, request=SimpleNamespace(state=SimpleNamespace(csrf_token="synthetic"))
+    ))
+    hidden = next(item for item in parser.inputs if item.get("name") == "reviewed_values")
+    assert set(hidden) == {"type", "name", "value"}
+    assert hidden["type"] == "hidden"
+    assert json.loads(hidden["value"]) == reviewed
 
 
 @pytest.fixture(autouse=True)
