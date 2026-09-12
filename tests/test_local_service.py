@@ -68,7 +68,7 @@ def test_timeout_restores_paused_services_and_releases_operation_lock(tmp_path, 
             pytest.fail('stop timed out')
     assert calls == [
         ['stop', 'app', 'caddy'],
-        ['up', '-d', '--wait', '--wait-timeout', '120', 'app', 'caddy'],
+        ['up', '-d', '--no-deps', '--wait', '--wait-timeout', '120', 'app', 'caddy'],
     ]
     with service.operation_lock(state):
         pass
@@ -170,7 +170,7 @@ def test_backup_pause_restores_previous_state_even_on_interrupt(tmp_path, runnin
     with pytest.raises(KeyboardInterrupt):
         with paused(Runtime()):
             raise KeyboardInterrupt
-    assert calls == ([('stop', 'app'), ('up', '-d', '--wait', '--wait-timeout', '120', 'app')]
+    assert calls == ([('stop', 'app'), ('up', '-d', '--no-deps', '--wait', '--wait-timeout', '120', 'app')]
                      if running else [])
     assert marker.exists() is not running
 
@@ -196,6 +196,28 @@ def test_backup_pause_keeps_manual_stop_when_health_restoration_fails(tmp_path):
         with paused(Runtime()):
             pass
     assert marker.read_text() == 'preserved'
+
+
+def test_backup_pause_restores_only_the_previously_running_partial_service(tmp_path):
+    from tools.local_service import paused
+
+    calls = []
+
+    class Runtime:
+        config = {'state_dir': str(tmp_path)}
+
+        def running_services(self):
+            return ['caddy']
+
+        def compose(self, *args):
+            calls.append(args)
+
+    with paused(Runtime()):
+        pass
+    assert calls == [
+        ('stop', 'caddy'),
+        ('up', '-d', '--no-deps', '--wait', '--wait-timeout', '120', 'caddy'),
+    ]
 
 
 def test_setup_refuses_private_state_inside_public_repository(tmp_path):
@@ -618,6 +640,24 @@ def test_login_start_rejects_malformed_stop_record_without_traceback(
     service.write_json(state / 'config.json', config)
     service.write_json(state / 'manual-stop', record)
     monkeypatch.setattr(service, 'start', lambda *_: pytest.fail('invalid stop record started service'))
+
+    assert service.main(['--state-dir', str(state), 'login-start']) == 1
+    output = capsys.readouterr()
+    assert output.out == ''
+    assert json.loads(output.err)['code'] == 'operation_failed'
+    assert 'Traceback' not in output.err
+
+
+def test_login_start_rejects_dangling_stop_marker_symlink_without_starting(
+    tmp_path, monkeypatch, capsys
+):
+    from tools import local_service as service
+
+    config = diagnostic_config(tmp_path)
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    (state / 'manual-stop').symlink_to(state / 'missing-stop-record')
+    monkeypatch.setattr(service, 'start', lambda *_: pytest.fail('dangling marker started service'))
 
     assert service.main(['--state-dir', str(state), 'login-start']) == 1
     output = capsys.readouterr()

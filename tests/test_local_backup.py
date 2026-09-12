@@ -273,7 +273,7 @@ def test_backup_pauses_before_inventory_of_volatile_auth_journal(tmp_path, monke
                 self.running = False
                 journal.unlink(missing_ok=True)
             else:
-                assert args == ('up', '-d', '--wait', '--wait-timeout', '120', 'app', 'caddy')
+                assert args == ('up', '-d', '--no-deps', '--wait', '--wait-timeout', '120', 'app', 'caddy')
                 self.running = True
     runtime = Runtime(config)
     original_digest = backup.digest
@@ -302,7 +302,7 @@ def test_capacity_failure_restores_services_after_paused_sizing(tmp_path, monkey
     monkeypatch.setattr(backup.shutil, 'disk_usage', lambda path: type('Usage', (), {'free': 0})())
     with pytest.raises(ValueError, match='insufficient private staging capacity'):
         backup.backup(config, Runtime(config))
-    assert calls == [('stop', 'app'), ('up', '-d', '--wait', '--wait-timeout', '120', 'app')]
+    assert calls == [('stop', 'app'), ('up', '-d', '--no-deps', '--wait', '--wait-timeout', '120', 'app')]
     assert not list(Path(config['state_dir']).glob('snapshot-*'))
     assert json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text())['state'] == 'failed'
 
@@ -537,7 +537,7 @@ def test_interrupted_backup_restores_service_and_retains_last_success(tmp_path, 
         backup.backup(config, RunningRuntime(config))
     assert calls == [
         ('stop', 'app', 'caddy'),
-        ('up', '-d', '--wait', '--wait-timeout', '120', 'app', 'caddy'),
+        ('up', '-d', '--no-deps', '--wait', '--wait-timeout', '120', 'app', 'caddy'),
     ]
     status = json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text())
     assert status['state'] == 'failed'

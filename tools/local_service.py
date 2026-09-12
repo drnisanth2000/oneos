@@ -118,7 +118,7 @@ def paused(runtime):
             runtime.compose('stop', *running)
             yield
         finally:
-            runtime.compose('up', '-d', '--wait', '--wait-timeout', '120', *running)
+            runtime.compose('up', '-d', '--no-deps', '--wait', '--wait-timeout', '120', *running)
             (Path(runtime.config['state_dir']) / 'manual-stop').unlink(missing_ok=True)
     else:
         yield
@@ -237,7 +237,7 @@ def start(config):
 def login_start(config, *, requested_at=None):
     if requested_at is not None:
         marker = Path(config['state_dir']) / 'manual-stop'
-        if marker.exists():
+        if marker.exists() or marker.is_symlink():
             stopped = json.loads(private_file(marker).read_text())
             if not isinstance(stopped, dict):
                 raise ValueError('invalid manual stop record')
