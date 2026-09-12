@@ -52,10 +52,15 @@ native form identities, external-volume descriptor cleanup and finite deadlines
 for every non-interactive local subprocess. Git-lock discovery timeouts now stay
 inside the established transaction error family for both web approvals and the
 sanitized local CLI.
+Subsequent exact-head review added bounded arbitrary-size backup timestamps,
+strict restored-session row validation, a failing doctor result until the first
+verified backup, and root-aware catalog reuse. A cached catalog is now reused
+only while it matches the currently validated vault root; root changes reload
+from that same validated path without a second environment read.
 
 ## Closing implementation verification
 
-- Locked Python 3.12 public suite: **2,398 passed, 4 skipped**.
+- Locked Python 3.12 public suite: **2,422 passed, 4 skipped**.
 - Trusted-local private suite: **39 passed**; structural validation: **0 errors,
   0 warnings**. Opaque before/after Git evidence preserved pre-existing state.
 - Actual synthetic HTTPS verified password/TOTP login, secure cookies, protected

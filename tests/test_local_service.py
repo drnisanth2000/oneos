@@ -632,6 +632,57 @@ def test_diagnostics_report_backup_freshness(tmp_path, monkeypatch, state, last,
     assert 'Run backup' in result['backup']['action']
 
 
+@pytest.mark.parametrize(('last', 'expected'), [
+    pytest.param(10 ** 400, 'missed', id='oversized-integer'),
+    pytest.param(True, 'missed', id='boolean'),
+    pytest.param(float('inf'), 'missed', id='infinity'),
+    pytest.param(float('nan'), 'missed', id='nan'),
+    pytest.param(1001, 'missed', id='future'),
+    pytest.param(-1, 'missed', id='negative'),
+    pytest.param(999, 'ok', id='valid-integer'),
+    pytest.param(999.5, 'ok', id='valid-float'),
+])
+def test_diagnostics_handles_backup_timestamp_types_and_bounds(tmp_path, monkeypatch, last, expected):
+    from tools import local_service as service
+    from tools import local_backup
+    config = diagnostic_config(tmp_path)
+    config['backup'] = {}
+    service.write_status(config, 'ok', last)
+    monkeypatch.setattr(service.time, 'time', lambda: 1000)
+    monkeypatch.setattr(service.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(service.Runtime, 'compose', lambda *args: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(local_backup, 'validate_volume', lambda config: None)
+    assert service.diagnostics(config)['backup']['state'] == expected
+
+
+def test_doctor_fails_when_backup_has_never_succeeded(tmp_path, monkeypatch, capsys):
+    import sqlite3
+    import subprocess
+    from tools import local_service as service
+    from tools import local_backup
+    config = diagnostic_config(tmp_path)
+    config['backup'] = {}
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    service.write_status(config, 'never', None)
+    owner = state / 'auth/owner.sqlite3'
+    with sqlite3.connect(owner) as db:
+        db.execute('create table owner(id integer, password text, secret text, counter integer)')
+        db.execute('insert into owner values(1,?,?,1)', ('$argon2id$synthetic', 'A' * 32))
+    owner.chmod(0o600)
+    monkeypatch.setattr(service.shutil, 'which', lambda name: '/synthetic/tool')
+    monkeypatch.setattr(service.subprocess, 'run', lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=''))
+    monkeypatch.setattr(service.Runtime, 'running_services', lambda self: ['app', 'caddy'])
+    monkeypatch.setattr(local_backup, 'validate_volume', lambda config: None)
+    assert service.main(['--state-dir', str(state), 'doctor']) == 1
+    output = capsys.readouterr()
+    report = json.loads(output.out)
+    assert report['backup']['state'] == 'never'
+    assert all(item['state'] in {'valid', 'available', 'running', 'accessible', 'enrolled'}
+               for name, item in report.items() if name != 'backup')
+    assert output.err == ''
+
+
 def test_safe_error_reasons_never_echo_unrecognized_private_text():
     import subprocess
     from tools.local_service import safe_failure

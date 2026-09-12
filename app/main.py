@@ -137,7 +137,7 @@ except (VaultRootUnavailable, EntityManifestError):
 
 
 def current_catalog():
-    return catalog if catalog is not None else build_catalog()
+    return build_catalog(catalog)
 
 
 @failure_contract(calls=(build_scope,))

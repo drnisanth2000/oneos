@@ -456,3 +456,47 @@ def test_authentication_refuses_sidecar_permission_error(owner, monkeypatch, suf
     monkeypatch.setattr(Path, "lstat", denied_lstat)
     with pytest.raises(AuthUnavailable):
         store.available()
+
+
+@pytest.mark.parametrize("column,bad_value", [
+    ("token", b"a" * 64), ("token", "invalid"),
+    ("csrf", b"a" * 43), ("csrf", "short"), ("csrf", "é" * 43),
+    ("created", "not-a-time"), ("seen", b"not-a-time"),
+    ("created", float("inf")), ("seen", float("inf")),
+    ("created", -1), ("seen", 1),
+])
+def test_corrupt_session_is_unavailable_without_mutation_and_restore_recovers(owner, column, bad_value):
+    import sqlite3
+    import pyotp
+    from app.auth import AuthUnavailable
+    from app.main import app
+
+    store, secret = owner
+    token = store.login("synthetic owner password", pyotp.TOTP(secret).now())
+    with closing(sqlite3.connect(store.path)) as db:
+        original = db.execute("SELECT token,csrf,created,seen FROM sessions").fetchone()
+        with db:
+            db.execute(f"UPDATE sessions SET {column}=?", (bad_value,))
+        corrupted = db.execute("SELECT token,csrf,created,seen FROM sessions").fetchone()
+    with pytest.raises(AuthUnavailable):
+        store.available()
+    if column != "token":
+        with pytest.raises(AuthUnavailable):
+            store.session(token)
+    with TestClient(app, base_url="https://localhost:8443") as client:
+        client.cookies.set("__Host-oneos", token)
+        for method, path, kwargs in [
+            ("GET", "/docs", {}),
+            ("POST", "/logout", {"headers": {"Origin": "https://localhost:8443", "X-CSRF-Token": original[1]}}),
+        ]:
+            response = client.request(method, path, **kwargs)
+            assert response.status_code == 503
+            assert response.text == "Owner authentication unavailable. Run local setup or recovery."
+        with closing(sqlite3.connect(store.path)) as db:
+            assert db.execute("SELECT token,csrf,created,seen FROM sessions").fetchone() == corrupted
+            with db:
+                db.execute("DELETE FROM sessions")
+                db.execute("INSERT INTO sessions VALUES(?,?,?,?)", original)
+        store.available()
+        assert store.session(token) == original[1]
+        assert client.get("/docs").status_code == 200

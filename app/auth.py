@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import secrets
@@ -28,6 +29,16 @@ class AuthUnavailable(Exception):
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _validate_session(row):
+    token, csrf, created, seen = row
+    if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token)
+            or not isinstance(csrf, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", csrf)
+            or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                   for value in (created, seen))
+            or seen < created):
+        raise AuthUnavailable()
 
 
 class AuthStore:
@@ -91,7 +102,8 @@ class AuthStore:
             throttle = db.execute("SELECT failures, blocked FROM throttle WHERE id=1").fetchone()
             if not throttle or not isinstance(throttle[0], int) or throttle[0] < 0 or not isinstance(throttle[1], (int, float)):
                 raise AuthUnavailable()
-            db.execute("SELECT token,csrf,created,seen FROM sessions LIMIT 1")
+            for session in db.execute("SELECT token,csrf,created,seen FROM sessions"):
+                _validate_session(session)
             if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise AuthUnavailable()
 
@@ -175,14 +187,15 @@ class AuthStore:
             # Order production timestamps by the write transaction, not by
             # concurrent requests reaching this method.
             now = time.time() if now is None else now
-            row = db.execute("SELECT csrf,created,seen FROM sessions WHERE token=?", (digest(token),)).fetchone()
+            row = db.execute("SELECT token,csrf,created,seen FROM sessions WHERE token=?", (digest(token),)).fetchone()
             if not row:
                 return None
-            if now-row[1] >= ABSOLUTE_SECONDS or now-row[2] >= IDLE_SECONDS or now < row[2]:
+            _validate_session(row)
+            if now-row[2] >= ABSOLUTE_SECONDS or now-row[3] >= IDLE_SECONDS or now < row[3]:
                 db.execute("DELETE FROM sessions WHERE token=?", (digest(token),))
                 return None
             db.execute("UPDATE sessions SET seen=? WHERE token=?", (now, digest(token)))
-            return row[0]
+            return row[1]
 
     def logout(self, token):
         with self.connect() as db:

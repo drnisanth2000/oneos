@@ -317,8 +317,13 @@ def diagnostics(config):
                 state = status.get('state')
                 if state not in {'ok', 'never', 'missed', 'failed'}:
                     raise ValueError('invalid backup status')
-                if state == 'ok' and (not isinstance(last, (float, int)) or not math.isfinite(last) or not 0 < last <= time.time() or time.time() - last >= 86400):
-                    state = 'missed'
+                if state == 'ok':
+                    now = time.time()
+                    if (isinstance(last, bool) or not isinstance(last, (int, float))
+                            or not 0 < last <= now
+                            or (isinstance(last, float) and not math.isfinite(last))
+                            or now - last >= 86400):
+                        state = 'missed'
                 result['backup'] = finding(state, 'Backup is current.' if state == 'ok' else 'Run backup, then restore-check to verify recovery.')
             except (OSError, ValueError, TypeError):
                 result['backup'] = finding('unknown', 'Run backup to establish verified backup status.')
@@ -403,7 +408,7 @@ def main(argv=None):
         if args.command in ('doctor', 'status'):
             report = diagnostics(config)
             print(json.dumps(report))
-            return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'disconnected', 'not_enrolled', 'not_configured'} for item in report.values()))
+            return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'never', 'disconnected', 'not_enrolled', 'not_configured'} for item in report.values()))
         if args.command == 'login-start':
             run_login(config)
             return 0

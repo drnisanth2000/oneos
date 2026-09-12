@@ -57,8 +57,11 @@ def vault_root() -> Path:
     return root
 
 
-def build_catalog() -> EntityCatalog:
-    return EntityCatalog.load(vault_root())
+def build_catalog(cached: EntityCatalog | None = None) -> EntityCatalog:
+    root = vault_root().resolve()
+    # Revalidate the configured root before reusing its startup manifest.
+    # Reload from that same root, without rereading the environment.
+    return cached if cached is not None and cached.root == root else EntityCatalog.load(root)
 
 
 @failure_contract(

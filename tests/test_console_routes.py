@@ -4190,6 +4190,7 @@ def test_shell_and_triage_default_declared_family_never_reaches_the_global_fallb
     # (the same vehicle `test_pulse_declares_no_family` uses) and
     # `triage_default`'s own `RedirectResponse(...)` call.
     monkeypatch.undo()
+    monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
     monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
 
     class _BoomDatetime:
