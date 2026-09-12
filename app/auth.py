@@ -91,7 +91,10 @@ class AuthStore:
     def available(self):
         with self.connect() as db:
             row = db.execute("SELECT password, secret, counter FROM owner WHERE id=1").fetchone()
-            if not row or not isinstance(row[0], str) or not row[0].startswith("$argon2id$") or not isinstance(row[1], str) or not re.fullmatch(r"[A-Z2-7]{32}", row[1]) or not isinstance(row[2], int):
+            current_counter = int(time.time() // 30)
+            if (not row or not isinstance(row[0], str) or not row[0].startswith("$argon2id$")
+                    or not isinstance(row[1], str) or not re.fullmatch(r"[A-Z2-7]{32}", row[1])
+                    or type(row[2]) is not int or not 0 <= row[2] <= current_counter):
                 raise AuthUnavailable()
             try:
                 parameters = extract_parameters(row[0])

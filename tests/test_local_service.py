@@ -57,7 +57,8 @@ def test_timeout_restores_paused_services_and_releases_operation_lock(tmp_path, 
         assert isinstance(timeout, (int, float)) and 0 < timeout <= 900
         if 'ps' in command:
             return subprocess.CompletedProcess(command, 0, stdout='app\ncaddy\n')
-        calls.append(command[-3:])
+        action = next(index for index, value in enumerate(command) if value in {'stop', 'up'})
+        calls.append(command[action:])
         if 'stop' in command:
             raise subprocess.TimeoutExpired(['synthetic-private-command'], timeout, stderr='synthetic-secret')
         return subprocess.CompletedProcess(command, 0)
@@ -65,7 +66,10 @@ def test_timeout_restores_paused_services_and_releases_operation_lock(tmp_path, 
     with pytest.raises(subprocess.TimeoutExpired):
         with service.operation_lock(state), service.paused(service.Runtime(config)):
             pytest.fail('stop timed out')
-    assert calls == [['stop', 'app', 'caddy'], ['start', 'app', 'caddy']]
+    assert calls == [
+        ['stop', 'app', 'caddy'],
+        ['up', '-d', '--wait', '--wait-timeout', '120', 'app', 'caddy'],
+    ]
     with service.operation_lock(state):
         pass
     assert service.main(['--state-dir', str(state), 'stop']) == 1
@@ -154,16 +158,44 @@ def test_start_bounds_compose_health_wait(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('running', [True, False])
-def test_backup_pause_restores_previous_state_even_on_interrupt(running):
+def test_backup_pause_restores_previous_state_even_on_interrupt(tmp_path, running):
     from tools.local_service import paused
+    marker = tmp_path / 'manual-stop'
+    marker.write_text('preserve until healthy')
     calls = []
     class Runtime:
+        config = {'state_dir': str(tmp_path)}
         def running_services(self): return ['app'] if running else []
         def compose(self, *args): calls.append(args)
     with pytest.raises(KeyboardInterrupt):
         with paused(Runtime()):
             raise KeyboardInterrupt
-    assert calls == ([('stop', 'app'), ('start', 'app')] if running else [])
+    assert calls == ([('stop', 'app'), ('up', '-d', '--wait', '--wait-timeout', '120', 'app')]
+                     if running else [])
+    assert marker.exists() is not running
+
+
+def test_backup_pause_keeps_manual_stop_when_health_restoration_fails(tmp_path):
+    import subprocess
+    from tools.local_service import paused
+
+    marker = tmp_path / 'manual-stop'
+    marker.write_text('preserved')
+
+    class Runtime:
+        config = {'state_dir': str(tmp_path)}
+
+        def running_services(self):
+            return ['app']
+
+        def compose(self, *args):
+            if args[0] == 'up':
+                raise subprocess.TimeoutExpired(args, 120)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        with paused(Runtime()):
+            pass
+    assert marker.read_text() == 'preserved'
 
 
 def test_setup_refuses_private_state_inside_public_repository(tmp_path):
@@ -561,6 +593,36 @@ def test_delayed_login_respects_new_stop_request(tmp_path, monkeypatch):
     service.write_json(tmp_path / 'manual-stop', {'stopped_at': 200})
     monkeypatch.setattr(service, 'start', lambda config: pytest.fail('new stop wins'))
     service.login_start({'state_dir': str(tmp_path)}, requested_at=100)
+
+
+@pytest.mark.parametrize('record', [
+    None,
+    [],
+    'invalid',
+    1,
+    True,
+    {'stopped_at': None},
+    {'stopped_at': True},
+    {'stopped_at': -1},
+    {'stopped_at': float('inf')},
+    {'stopped_at': 1e300},
+])
+def test_login_start_rejects_malformed_stop_record_without_traceback(
+    tmp_path, monkeypatch, capsys, record
+):
+    from tools import local_service as service
+
+    config = diagnostic_config(tmp_path)
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    service.write_json(state / 'manual-stop', record)
+    monkeypatch.setattr(service, 'start', lambda *_: pytest.fail('invalid stop record started service'))
+
+    assert service.main(['--state-dir', str(state), 'login-start']) == 1
+    output = capsys.readouterr()
+    assert output.out == ''
+    assert json.loads(output.err)['code'] == 'operation_failed'
+    assert 'Traceback' not in output.err
 
 
 def test_stop_reasserts_marker_after_acquiring_operation_lock(tmp_path, monkeypatch):

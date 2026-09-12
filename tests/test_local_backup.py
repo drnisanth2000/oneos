@@ -263,14 +263,19 @@ def test_backup_pauses_before_inventory_of_volatile_auth_journal(tmp_path, monke
     journal.write_bytes(b'synthetic active writer journal')
     class Runtime:
         running = True
+        def __init__(self, runtime_config):
+            self.config = runtime_config
         def running_services(self):
             return ['app', 'caddy'] if self.running else []
         def compose(self, *args):
-            assert args[1:] == ('app', 'caddy')
-            self.running = args[0] == 'start'
             if args[0] == 'stop':
+                assert args[1:] == ('app', 'caddy')
+                self.running = False
                 journal.unlink(missing_ok=True)
-    runtime = Runtime()
+            else:
+                assert args == ('up', '-d', '--wait', '--wait-timeout', '120', 'app', 'caddy')
+                self.running = True
+    runtime = Runtime(config)
     original_digest = backup.digest
     def concurrent_writer(path):
         if path == journal and runtime.running:
@@ -291,12 +296,13 @@ def test_capacity_failure_restores_services_after_paused_sizing(tmp_path, monkey
     config['backup'] = dict(mount=str(mount), volume_uuid='expected', password_file='unused')
     calls = []
     class Runtime:
+        def __init__(self, runtime_config): self.config = runtime_config
         def running_services(self): return ['app']
         def compose(self, *args): calls.append(args)
     monkeypatch.setattr(backup.shutil, 'disk_usage', lambda path: type('Usage', (), {'free': 0})())
     with pytest.raises(ValueError, match='insufficient private staging capacity'):
-        backup.backup(config, Runtime())
-    assert calls == [('stop', 'app'), ('start', 'app')]
+        backup.backup(config, Runtime(config))
+    assert calls == [('stop', 'app'), ('up', '-d', '--wait', '--wait-timeout', '120', 'app')]
     assert not list(Path(config['state_dir']).glob('snapshot-*'))
     assert json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text())['state'] == 'failed'
 
@@ -522,13 +528,17 @@ def test_interrupted_backup_restores_service_and_retains_last_success(tmp_path, 
     write_status(config, 'ok', 123)
     calls = []
     class RunningRuntime:
+        def __init__(self, runtime_config): self.config = runtime_config
         def running_services(self): return ['app', 'caddy']
         def compose(self, *args): calls.append(args)
     def interrupted(*args): raise KeyboardInterrupt
     monkeypatch.setattr(backup, 'snapshot', interrupted)
     with pytest.raises(KeyboardInterrupt):
-        backup.backup(config, RunningRuntime())
-    assert calls == [('stop', 'app', 'caddy'), ('start', 'app', 'caddy')]
+        backup.backup(config, RunningRuntime(config))
+    assert calls == [
+        ('stop', 'app', 'caddy'),
+        ('up', '-d', '--wait', '--wait-timeout', '120', 'app', 'caddy'),
+    ]
     status = json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text())
     assert status['state'] == 'failed'
     assert status['last_success'] == 123

@@ -103,6 +103,18 @@ def test_invalid_throttle_deadline_is_unavailable(owner, blocked):
         store.available()
 
 
+def test_future_totp_counter_is_unavailable(owner, monkeypatch):
+    from app import auth
+    from app.auth import AuthUnavailable
+
+    store, _ = owner
+    monkeypatch.setattr(auth.time, "time", lambda: 3000)
+    with store.connect() as db:
+        db.execute("UPDATE owner SET counter=? WHERE id=1", (101,))
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
 def test_recovery_recreates_missing_throttle_and_allows_new_login(owner):
     import pyotp
     store, secret = owner
