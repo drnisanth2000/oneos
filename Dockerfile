@@ -43,6 +43,7 @@ ARG ONEOS_GID=10001
 
 RUN test "${ONEOS_UID}" -gt 0 \
     && test "${ONEOS_GID}" -gt 0 \
+    && setcap -r /usr/bin/caddy \
     && chown -R ${ONEOS_UID}:${ONEOS_GID} /data /config
 
 USER ${ONEOS_UID}:${ONEOS_GID}

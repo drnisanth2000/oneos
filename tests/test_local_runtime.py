@@ -123,10 +123,28 @@ def test_caddy_image_is_digest_pinned_and_built_for_selected_non_root_ids():
     assert "chown -R ${ONEOS_UID}:${ONEOS_GID} /data /config" in dockerfile
 
 
+def test_caddy_drops_unneeded_low_port_file_capability_before_cap_drop():
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "setcap -r /usr/bin/caddy" in dockerfile
+
+
 def test_build_context_excludes_runtime_data_and_local_secrets():
     ignored = set((ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines())
 
-    assert {".git", ".env", ".env.*", "config.json", "*.pem", "*.key", "vault", "state"} <= ignored
+    assert {
+        ".agents",
+        ".codex",
+        ".git",
+        ".superpowers",
+        ".env",
+        ".env.*",
+        "config.json",
+        "*.pem",
+        "*.key",
+        "vault",
+        "state",
+    } <= ignored
 
 
 def test_caddy_terminates_internal_tls_on_the_declared_origin():

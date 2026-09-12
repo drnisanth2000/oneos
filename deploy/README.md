@@ -30,6 +30,9 @@ the application image also creates a matching passwd entry for Git and Python
 libraries that resolve the current user. Both services drop Linux capabilities, prohibit
 privilege escalation, rotate local logs, and use `unless-stopped`, which
 restarts crashes without undoing an explicit stop. No Docker socket is mounted.
+Caddy's inherited low-port file capability is removed in the derived image:
+port 8443 does not need it, and retaining it would make Linux refuse execution
+when all container capabilities are dropped with `no-new-privileges` enabled.
 
 The image installs production dependencies exactly from `uv.lock`, carries Git
 for audited vault transactions, and keeps the environment's Python first on
