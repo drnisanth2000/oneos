@@ -34,12 +34,12 @@ def test_configured_vault_replaced_at_the_same_path_is_unavailable(
         vault_root()
 
 
-def test_unset_vault_remains_a_startup_configuration_error(
+def test_unset_vault_has_a_typed_configuration_error_for_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.delenv(ENV_VAULT, raising=False)
 
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(VaultRootUnavailable) as raised:
         vault_root()
 
-    assert not isinstance(raised.value, VaultRootUnavailable)
+    assert ENV_VAULT in str(raised.value)

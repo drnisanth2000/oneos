@@ -162,7 +162,12 @@ def test_every_application_exception_resolves_to_its_designed_code():
                     "Error" in name or "Exception" in name for name in base_names
                 ), f"{source} defines exception class {node.name}"
 
-    exempt = _abstract_bases()
+    # Authentication terminates at the pre-routing boundary with a generic
+    # 503. It must not invoke the vault-backed console error renderer; the
+    # fail-closed response and untouched downstream route are tested in auth.
+    from app.auth import AuthUnavailable
+
+    exempt = _abstract_bases() | {AuthUnavailable}
     for cls in _application_exception_classes():
         if cls in exempt:
             continue
@@ -1997,7 +2002,13 @@ def _registered_console_endpoints(app):
 
 
 def _expected_route_services(main):
+    # Deployment endpoints join the sweep with their explicit service contracts;
+    # existing console endpoints are not excluded to accommodate new routes.
+    health_endpoints = {route.path: route.endpoint for route in main.app.routes
+                        if getattr(route, "path", None) in ("/healthz", "/readyz")}
     return {
+        health_endpoints["/healthz"]: (),
+        health_endpoints["/readyz"]: (main.Vault.bundles,),
         main.shell: (main.Vault.bundles,),
         main.pulse: (),
         main.triage_default: (main.Vault.bundles,),
@@ -2053,9 +2064,9 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
-    assert sum(len(services) for services in expected.values()) == 35
+    assert sum(len(services) for services in expected.values()) == 36
     endpoints = list(_registered_console_endpoints(main.app))
-    assert len(endpoints) == 13, endpoints
+    assert len(endpoints) == 15, endpoints
     assert set(endpoints) == set(expected), (
         "registered route/service inventory mismatch: "
         f"missing={set(endpoints) - set(expected)}, "

@@ -48,7 +48,7 @@ def _pinned_vault_root_identity(root: Path) -> tuple[Path, int, int]:
 def vault_root() -> Path:
     raw = os.environ.get(ENV_VAULT)
     if not raw:
-        raise RuntimeError(
+        raise VaultRootUnavailable(
             f"{ENV_VAULT} is not set — point it at the vault root before starting."
         )
     root = Path(raw).expanduser().absolute()

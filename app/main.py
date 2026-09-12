@@ -75,6 +75,7 @@ from .registry import (
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 from .auth_web import OwnerAuthMiddleware
+from .deployment_health import install_health
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -123,9 +124,19 @@ templates.env.globals["new_issue"] = _new_issue
 
 app = FastAPI(title="OneOS")
 app.add_middleware(OwnerAuthMiddleware)
+install_health(app)
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 
-catalog = build_catalog()
+try:
+    catalog = build_catalog()
+except (VaultRootUnavailable, EntityManifestError):
+    # Keep the existing startup catalog when valid, but do not prevent the
+    # authenticated diagnostic surface from starting on configuration failure.
+    catalog = None
+
+
+def current_catalog():
+    return catalog if catalog is not None else build_catalog()
 
 
 @failure_contract(calls=(build_scope,))
@@ -210,7 +221,7 @@ def _endpoint_for(request: Request):
 #: `DestinationRegistryError`. Coverage is these five access points and no
 #: others; see `tests/test_console_readers.py::test_bundles_shape_space_boundary_conversion`
 #: for the enumeration.
-_SIDEBAR_CATCHES = (DestinationRegistryError, EntityManifestError)
+_SIDEBAR_CATCHES = (DestinationRegistryError, EntityManifestError, VaultRootUnavailable)
 
 
 def _render_console_error(
@@ -273,7 +284,7 @@ def _render_console_error(
     # `except Exception` invariant 6 forbids for a registered endpoint's own
     # body — `app/main.py` is one.
     try:
-        bundles = Vault(catalog).bundles()
+        bundles = Vault(current_catalog()).bundles()
     except _SIDEBAR_CATCHES:
         bundles = None
     return templates.TemplateResponse(
@@ -395,7 +406,7 @@ def shell(request: Request) -> HTMLResponse:
     logged traceback. Task 10 added the declaration; this adds the handler.
     """
     try:
-        bundles = Vault(catalog).bundles()
+        bundles = Vault(current_catalog()).bundles()
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
@@ -437,7 +448,7 @@ def pulse(request: Request) -> HTMLResponse:
 def triage_default(request: Request):
     """Same boundary as `shell`, and for the same reason."""
     try:
-        bundles = Vault(catalog).bundles()
+        bundles = Vault(current_catalog()).bundles()
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     if not bundles:
@@ -499,7 +510,7 @@ def triage(request: Request, scope: EntityScope) -> HTMLResponse:
 
 def _triage_page(request: Request, scope: Scope) -> HTMLResponse:
     selected = scope.current_entity()
-    vault = Vault(catalog)
+    vault = Vault(current_catalog())
     clf = Classifier(vault)
     rows = []
     for item in read_inbox(scope):
@@ -802,7 +813,7 @@ def outbox_screen(request: Request, scope: EntityScope) -> HTMLResponse:
 
 
 def _outbox_page(request: Request, scope: Scope) -> HTMLResponse:
-    vault = Vault(catalog)
+    vault = Vault(current_catalog())
     listing = project_outbox(scope)
     rows, blocked_notice = _outbox_rows(listing)
     return templates.TemplateResponse(
@@ -1630,7 +1641,7 @@ def registry_products(request: Request, scope: EntityScope) -> HTMLResponse:
     # because one route is guarded more carefully than the other.
     try:
         selected = scope.current_entity()
-        vault = Vault(catalog)
+        vault = Vault(current_catalog())
         return templates.TemplateResponse(
             request, "registry.html",
             {"bundles": vault.bundles(), "entity": selected,

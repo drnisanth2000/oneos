@@ -235,6 +235,12 @@ def _full_page_route_paths(main) -> list[str]:
             continue
         if endpoint is main.triage_default:
             continue
+        # Process/readiness diagnostics do not use HTMX or console templates.
+        # Their JSON schema, authenticated HTML and no-leak failure responses
+        # have separate tests; do not require client mutation scripts there.
+        if route.path in {"/healthz", "/readyz"}:
+            assert endpoint.__module__ == "app.deployment_health"
+            continue
         if "GET" not in (getattr(route, "methods", None) or set()):
             continue
         paths.append(route.path.replace("{entity}", "alpha"))
