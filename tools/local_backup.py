@@ -342,7 +342,16 @@ def setup_backup(config, mount, offline_confirmed):
 
 def previous_success(config):
     try:
-        status = json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text())
+        path = safe_path(Path(config['state_dir']) / 'status/backup-status.json', directory=False)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                return None
+            raw = stream.read(4097)
+            if len(raw) > 4096:
+                return None
+            status = json.loads(raw)
         if not isinstance(status, dict):
             return None
         last = status.get('last_success')

@@ -93,6 +93,30 @@ def test_hash_replay_concurrency_and_recovery(owner):
     assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3090), now=3090) is None
 
 
+@pytest.mark.parametrize("blocked", [float("inf"), float("-inf"), -1])
+def test_invalid_throttle_deadline_is_unavailable(owner, blocked):
+    from app.auth import AuthUnavailable
+    store, _ = owner
+    with store.connect() as db:
+        db.execute("UPDATE throttle SET blocked=? WHERE id=1", (blocked,))
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
+def test_recovery_recreates_missing_throttle_and_allows_new_login(owner):
+    import pyotp
+    store, secret = owner
+    old_token = store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
+    with store.connect() as db:
+        db.execute("DELETE FROM throttle")
+    new_secret = pyotp.random_base32()
+    store.enroll("replacement owner password", new_secret,
+                 pyotp.TOTP(new_secret).at(3060), now=3060, recover=True)
+    store.available()
+    assert store.session(old_token, now=3061) is None
+    assert store.login("replacement owner password", pyotp.TOTP(new_secret).at(3090), now=3090)
+
+
 def test_session_expiry_logout_and_throttle(owner):
     import pyotp
     store, secret = owner

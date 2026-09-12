@@ -57,10 +57,16 @@ strict restored-session row validation, a failing doctor result until the first
 verified backup, and root-aware catalog reuse. A cached catalog is now reused
 only while it matches the currently validated vault root; root changes reload
 from that same validated path without a second environment read.
+The next review correction rejects redirected, non-regular and oversized
+backup-status reads before deciding to skip a scheduled backup. Authentication
+availability rejects non-finite or negative throttle deadlines, and local owner
+recovery recreates a missing throttle singleton while invalidating old sessions.
+Seven regression cases reproduced the defects before the production changes;
+independent scoped verification passed 102 tests with no review findings.
 
 ## Closing implementation verification
 
-- Locked Python 3.12 public suite: **2,422 passed, 4 skipped**.
+- Locked Python 3.12 public suite: **2,432 passed, 1 skipped**.
 - Trusted-local private suite: **39 passed**; structural validation: **0 errors,
   0 warnings**. Opaque before/after Git evidence preserved pre-existing state.
 - Actual synthetic HTTPS verified password/TOTP login, secure cookies, protected

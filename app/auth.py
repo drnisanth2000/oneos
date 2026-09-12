@@ -100,7 +100,9 @@ class AuthStore:
             if parameters.type != Type.ID or not 1 <= parameters.time_cost <= 10 or not 8 <= parameters.memory_cost <= 262144 or not 1 <= parameters.parallelism <= 16 or not 16 <= parameters.hash_len <= 128 or not 16 <= parameters.salt_len <= 128:
                 raise AuthUnavailable()
             throttle = db.execute("SELECT failures, blocked FROM throttle WHERE id=1").fetchone()
-            if not throttle or not isinstance(throttle[0], int) or throttle[0] < 0 or not isinstance(throttle[1], (int, float)):
+            if (not throttle or not isinstance(throttle[0], int) or throttle[0] < 0
+                    or not isinstance(throttle[1], (int, float))
+                    or not math.isfinite(throttle[1]) or throttle[1] < 0):
                 raise AuthUnavailable()
             for session in db.execute("SELECT token,csrf,created,seen FROM sessions"):
                 _validate_session(session)
@@ -148,7 +150,7 @@ class AuthStore:
                 db.execute("INSERT INTO throttle VALUES(1,0,0)")
             db.execute("INSERT OR REPLACE INTO owner VALUES(1,?,?,?)", (password_hash, secret, int(now // 30)))
             db.execute("DELETE FROM sessions")
-            db.execute("UPDATE throttle SET failures=0, blocked=0 WHERE id=1")
+            db.execute("INSERT INTO throttle VALUES(1,0,0) ON CONFLICT(id) DO UPDATE SET failures=0, blocked=0")
 
     def login(self, password, code, *, now=None):
         now = time.time() if now is None else now

@@ -444,6 +444,31 @@ def test_setup_backup_rejects_existing_configuration_before_creating_key(tmp_pat
     assert not key.exists()
 
 
+@pytest.mark.parametrize('kind', ['symlink', 'parent_symlink', 'oversized'])
+def test_previous_success_refuses_unsafe_status_files(tmp_path, monkeypatch, kind):
+    from tools import local_backup as backup
+    config, _ = backup_config(tmp_path, monkeypatch)
+    directory = Path(config['state_dir']) / 'status'
+    directory.mkdir(exist_ok=True)
+    path = directory / 'backup-status.json'
+    path.unlink(missing_ok=True)
+    payload = json.dumps({'last_success': 999})
+    monkeypatch.setattr(backup.time, 'time', lambda: 1000)
+    if kind == 'symlink':
+        target = tmp_path / 'redirected.json'
+        target.write_text(payload)
+        path.symlink_to(target)
+    elif kind == 'parent_symlink':
+        directory.rmdir()
+        target = tmp_path / 'redirected'
+        target.mkdir()
+        (target / path.name).write_text(payload)
+        directory.symlink_to(target, target_is_directory=True)
+    else:
+        path.write_text(payload + ' ' * 4096)
+    assert backup.previous_success(config) is None
+
+
 @pytest.mark.parametrize('invalid_last_success',
                          ['not-a-number', True, 0, -1, float('nan'), float('inf'), 1001, 10 ** 400])
 def test_due_backup_treats_invalid_or_future_success_as_overdue(tmp_path, monkeypatch,
