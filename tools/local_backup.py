@@ -24,7 +24,7 @@ from tools.local_metadata import read_xattrs, write_xattrs
 
 
 def disk_info(path):
-    result = subprocess.run(['diskutil', 'info', '-plist', str(path)], check=True, capture_output=True)
+    result = subprocess.run(['diskutil', 'info', '-plist', str(path)], check=True, capture_output=True, timeout=30)
     return plistlib.loads(result.stdout)
 
 
@@ -57,9 +57,9 @@ def external_session(config):
     """
     mount = validate_volume(config)
     original = os.open('.', os.O_RDONLY)
-    volume = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    root = None
+    volume = root = None
     try:
+        volume = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         validate_volume(config)
         if (os.fstat(volume).st_dev, os.fstat(volume).st_ino) != (mount.stat().st_dev, mount.stat().st_ino):
             raise ValueError('volume was replaced')
@@ -73,9 +73,11 @@ def external_session(config):
         os.fchdir(root)
         yield root
     finally:
-        os.fchdir(original)
-        for fd in (root, volume, original):
-            if fd is not None: os.close(fd)
+        try:
+            os.fchdir(original)
+        finally:
+            for fd in (root, volume, original):
+                if fd is not None: os.close(fd)
 
 
 def digest(path):
@@ -118,7 +120,7 @@ def inventory(root):
         paths = [str(root / relative) for relative in result]
         for offset in range(0, len(paths), 100):
             batch = paths[offset:offset + 100]
-            listing = subprocess.run(['/bin/ls', '-lde', *batch], capture_output=True, check=True)
+            listing = subprocess.run(['/bin/ls', '-lde', *batch], capture_output=True, check=True, timeout=30)
             if re.search(rb'^\s*\d+:\s', listing.stdout, re.MULTILINE):
                 raise ValueError('macOS ACLs require a metadata-aware backup plan')
     return result
@@ -167,15 +169,15 @@ def check_git_layout(source):
         if (git_dir / path).exists():
             raise ValueError('external Git storage or linked worktrees unsupported')
     result = subprocess.run(['git', '-C', str(source), 'config', '--get', 'core.worktree'],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, timeout=30)
     if result.returncode != 1:
         raise ValueError('explicit Git worktree redirection is unsupported')
     hooks = subprocess.run(['git', '-C', str(source), 'config', '--path', '--get', 'core.hooksPath'],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=30)
     if hooks.returncode == 0:
         configured = Path(hooks.stdout.rstrip('\n'))
         captured = subprocess.run(['git', '-C', str(source), 'config', '--local', '--no-includes',
-                                   '--path', '--get', 'core.hooksPath'], capture_output=True, text=True)
+                                   '--path', '--get', 'core.hooksPath'], capture_output=True, text=True, timeout=30)
         if captured.returncode != 0 or captured.stdout != hooks.stdout:
             raise ValueError('Git hooks configuration must be captured in the local repository')
         # Absolute paths still point at the original checkout after recovery.
@@ -248,7 +250,7 @@ def verify_snapshot(target):
         raise ValueError('snapshot manifest mismatch')
     check_git_layout(target / 'vault')
     subprocess.run(['git', '-C', str(target / 'vault'), 'fsck', '--full'],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, timeout=900)
     for database in sqlite_files(target / 'sqlite'):
         with sqlite3.connect(database.as_uri() + '?immutable=1', uri=True) as db:
             if db.execute('pragma integrity_check').fetchall() != [('ok',)]:
@@ -283,7 +285,7 @@ def restic(config, *args, cwd=None):
             # directory, so replacing the visible mount path cannot redirect it.
             os.fchdir(repository)
             return subprocess.run(['restic', '--no-cache', '--repo', '.', *args],
-                                  env=env, check=True, capture_output=True, text=True)
+                                  env=env, check=True, capture_output=True, text=True, timeout=7200)
         finally:
             os.close(repository)
 
@@ -366,13 +368,15 @@ def backup(config, runtime, due_only=False):
         validate_volume(config['backup'])
         validate_backup_location(config, Path(config['backup']['mount']))
         state = safe_path(Path(config['state_dir']))
-        needed = sum(entry.get('size', 0) + sum(len(value) // 2 for value in entry.get('xattrs', {}).values())
-                     for root in (Path(config['vault']), state / 'caddy', state / 'auth')
-                     for entry in inventory(root).values())
-        if shutil.disk_usage(state).free < needed * 3 + 64 * 1024 * 1024:
-            raise ValueError('insufficient private staging capacity')
         with paused(runtime):
             with action_lock(Path(config['vault'])):
+                # Sizing inventories hash files too: pause the app and acquire
+                # the writer lock before traversing volatile SQLite sidecars.
+                needed = sum(entry.get('size', 0) + sum(len(value) // 2 for value in entry.get('xattrs', {}).values())
+                             for root in (Path(config['vault']), state / 'caddy', state / 'auth')
+                             for entry in inventory(root).values())
+                if shutil.disk_usage(state).free < needed * 3 + 64 * 1024 * 1024:
+                    raise ValueError('insufficient private staging capacity')
                 stage = Path(tempfile.mkdtemp(prefix='snapshot-', dir=state))
                 payload = stage / 'snapshot'
                 snapshot(Path(config['vault']), payload)

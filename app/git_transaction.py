@@ -475,8 +475,9 @@ def action_lock(vault: Path) -> Iterator[None]:
             check=True,
             capture_output=True,
             text=True,
+            timeout=30,
         ).stdout
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise GitTransactionFailure("could not determine vault Git directory") from exc
 
     lock_path = Path(git_dir_output.strip()) / "oneos-approval.lock"

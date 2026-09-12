@@ -46,10 +46,16 @@ kept backup media separate from plaintext state and vault data, retained only
 portable captured Git hooks, made backup setup resumable after repository
 initialization, and closed setup, explicit-stop and review-card identity races.
 Direct Compose validation rebuilds both application and proxy images.
+Exact-head pull-request review then hardened malformed backup-status handling,
+transient SQLite sidecar removal, backup sizing under the paused writer lock,
+native form identities, external-volume descriptor cleanup and finite deadlines
+for every non-interactive local subprocess. Git-lock discovery timeouts now stay
+inside the established transaction error family for both web approvals and the
+sanitized local CLI.
 
 ## Closing implementation verification
 
-- Locked Python 3.12 public suite: **2,356 passed, 4 skipped**.
+- Locked Python 3.12 public suite: **2,398 passed, 4 skipped**.
 - Trusted-local private suite: **39 passed**; structural validation: **0 errors,
   0 warnings**. Opaque before/after Git evidence preserved pre-existing state.
 - Actual synthetic HTTPS verified password/TOTP login, secure cookies, protected

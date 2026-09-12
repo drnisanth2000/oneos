@@ -19,6 +19,8 @@ import sys
 import tempfile
 import time
 
+from app.git_transaction import GitTransactionError
+
 
 def safe_path(path: Path, *, directory=True) -> Path:
     path = Path(os.path.abspath(path))
@@ -95,10 +97,13 @@ class Runtime:
     def compose(self, *args, interactive=False):
         self.env['DOCKER_CONTEXT'] = 'colima-oneos'
         command = ['docker-compose'] if shutil.which('docker-compose') else ['docker', '--context', 'colima-oneos', 'compose']
+        timeout = 15 if args and args[0] in {'version', 'ps'} else 900
+        if interactive and args and args[0] == 'exec':
+            timeout = None  # Owner enrollment/recovery waits for terminal input.
         return subprocess.run([*command, '--project-name', 'oneos', '--env-file', '/dev/null',
                                '--file', str(Path(self.config['repo_dir']) / 'compose.yaml'), *args],
                               env=self.env, check=True, capture_output=not interactive, text=True,
-                              timeout=15 if args and args[0] in {'version', 'ps'} else None)
+                              timeout=timeout)
 
     def running_services(self):
         return self.compose('ps', '--services', '--status', 'running').stdout.split()
@@ -211,7 +216,7 @@ def safe_failure(error):
 
 def start(config):
     subprocess.run(['colima', 'start', '--profile', 'oneos', '--activate=false', '--ssh-config=false', '--mount', config['vault'] + ':w',
-                    '--mount', config['state_dir'] + ':w', '--mount', config['repo_dir']], check=True, capture_output=True)
+                    '--mount', config['state_dir'] + ':w', '--mount', config['repo_dir']], check=True, capture_output=True, timeout=900)
     Runtime(config).compose('up', '-d', '--build', '--wait', '--wait-timeout', '120')
     (Path(config['state_dir']) / 'manual-stop').unlink(missing_ok=True)
 
@@ -306,6 +311,8 @@ def diagnostics(config):
         else:
             try:
                 status = json.loads(private_file(Path(config['state_dir']) / 'status/backup-status.json').read_text())
+                if not isinstance(status, dict):
+                    raise ValueError('invalid backup status')
                 last = status.get('last_success')
                 state = status.get('state')
                 if state not in {'ok', 'never', 'missed', 'failed'}:
@@ -331,7 +338,7 @@ def install_login(config):
     domain = 'gui/' + str(os.getuid())
     targets = [domain + '/local.oneos.' + suffix for suffix, _ in jobs]
     for target in targets:
-        result = subprocess.run(['launchctl', 'print', target], check=False, capture_output=True)
+        result = subprocess.run(['launchctl', 'print', target], check=False, capture_output=True, timeout=30)
         if result.returncode == 0:
             raise ValueError('login job already loaded; inspect before replacing')
         if result.returncode != 113:
@@ -352,17 +359,17 @@ def install_login(config):
                 output.write(plistlib.dumps(value))
             attempted.append(target)
             subprocess.run(['launchctl', 'bootstrap', domain, str(path)],
-                           check=True, capture_output=True)
+                           check=True, capture_output=True, timeout=30)
             bootstrapped.add(target)
     except BaseException as error:
         cleanup_error = None
         for target in reversed(attempted):
             try:
                 result = subprocess.run(['launchctl', 'bootout', target], check=False,
-                                        capture_output=True)
+                                        capture_output=True, timeout=30)
                 if result.returncode and (target in bootstrapped or result.returncode != 113):
                     cleanup_error = OSError('login job rollback incomplete')
-            except OSError:
+            except (OSError, subprocess.SubprocessError):
                 cleanup_error = OSError('login job rollback incomplete')
         for path in reversed(created):
             try:
@@ -411,7 +418,7 @@ def main(argv=None):
             if args.command == 'start': start(config)
             elif args.command == 'open':
                 start(config)
-                subprocess.run(['open', 'https://localhost:8443'], check=True, capture_output=True)
+                subprocess.run(['open', 'https://localhost:8443'], check=True, capture_output=True, timeout=30)
             elif args.command in ('enroll', 'recover'):
                 if not sys.stdin.isatty() or not sys.stdout.isatty():
                     raise ValueError('owner administration requires an interactive terminal')
@@ -432,7 +439,8 @@ def main(argv=None):
                 elif args.command == 'restore-check': print(restore_check(config))
                 else: backup(config, runtime, due_only=args.command == 'backup-due')
         return 0
-    except (ValueError, TypeError, OSError, KeyError, subprocess.SubprocessError) as error:
+    except (ValueError, TypeError, OSError, KeyError, subprocess.SubprocessError,
+            GitTransactionError) as error:
         if args.command in ('doctor', 'status'):
             print(json.dumps({'configuration': finding('unavailable', 'Check that private state and config.json exist, are owner-only, and use canonical paths. Restore the intended configuration; do not replace the vault.')}))
         else:

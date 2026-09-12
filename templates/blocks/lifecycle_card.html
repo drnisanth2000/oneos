@@ -23,7 +23,7 @@
   </div>
   <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
     {% from "_auth_forms.html" import action_form with context %}
-    {% set form_id = 'action-form-' ~ issue %}
+    {% set form_id = 'action-form-' ~ row.proposal.id ~ '-' ~ row.review_sha256 ~ '-' ~ issue %}
     {{ action_form(form_id, dict(outbox_values, reviewed_values=row.proposal.reviewed_fields | tojson, review_issue=issue), '/outbox/' ~ entity ~ '/approve') }}
     {% if row.can_approve %}
     <button class="approve" hx-post="/outbox/{{ entity }}/approve"

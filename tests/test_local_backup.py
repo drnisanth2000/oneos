@@ -6,6 +6,94 @@ from pathlib import Path
 import pytest
 
 
+def test_external_session_closes_original_descriptor_when_volume_open_fails(tmp_path, monkeypatch):
+    import errno
+    import os
+    from tools import local_backup as backup
+    config, mount = backup_config(tmp_path, monkeypatch)
+    original_open = os.open
+    opened = []
+    def fail_volume(path, flags, *args, **kwargs):
+        if path == mount:
+            raise OSError('injected volume open failure')
+        fd = original_open(path, flags, *args, **kwargs)
+        if path == '.':
+            opened.append(fd)
+        return fd
+    monkeypatch.setattr(os, 'open', fail_volume)
+    with pytest.raises(OSError, match='injected volume'):
+        with backup.external_session(dict(mount=str(mount), volume_uuid='expected')):
+            pytest.fail('volume open must fail')
+    assert len(opened) == 1
+    try:
+        with pytest.raises(OSError) as closed:
+            os.fstat(opened[0])
+        assert closed.value.errno == errno.EBADF
+    finally:
+        try:
+            os.close(opened[0])
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize('command', ['backup', 'restore'])
+def test_restic_timeout_restores_cwd_and_closes_repository(tmp_path, monkeypatch, command):
+    import os
+    from tools import local_backup as backup
+    config, mount = backup_config(tmp_path, monkeypatch)
+    key = Path(config['state_dir']) / 'backup-key'
+    key.write_text('synthetic-key')
+    key.chmod(0o600)
+    config['backup'] = dict(mount=str(mount), volume_uuid='expected', password_file=str(key))
+    (mount / 'oneos-backup/repository').mkdir(parents=True)
+    before = Path.cwd()
+    opened = []
+    original_open = os.open
+    def tracked_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if path == 'repository':
+            opened.append(fd)
+        return fd
+    def hung_child(args, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 7200
+        raise subprocess.TimeoutExpired(args, timeout)
+    monkeypatch.setattr(os, 'open', tracked_open)
+    monkeypatch.setattr(subprocess, 'run', hung_child)
+    with pytest.raises(subprocess.TimeoutExpired):
+        backup.restic(config, command)
+    assert Path.cwd() == before
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_snapshot_inspection_subprocesses_have_deadlines(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+    source = tmp_path / 'source'
+    source.mkdir()
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    original = subprocess.run
+    def bounded(command, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 900
+        return original(command, **kwargs)
+    monkeypatch.setattr(subprocess, 'run', bounded)
+    backup.snapshot(source, tmp_path / 'snapshot')
+    backup.verify_snapshot(tmp_path / 'snapshot')
+
+
+def test_disk_identity_timeout_is_propagated(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+    def hung(command, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 30
+        raise subprocess.TimeoutExpired(command, timeout)
+    monkeypatch.setattr(subprocess, 'run', hung)
+    with pytest.raises(subprocess.TimeoutExpired):
+        backup.disk_info(tmp_path)
+
+
 @pytest.mark.parametrize('private_path', ['vault', 'state_dir'])
 @pytest.mark.parametrize('placement', ['root', 'child'])
 def test_setup_backup_refuses_volume_containing_private_source(tmp_path, monkeypatch, private_path, placement):
@@ -156,6 +244,61 @@ def test_setup_backup_retries_empty_repository_after_child_interruption(tmp_path
     backup.setup_backup(config, mount, True)
     assert (Path(config['state_dir']) / 'backup-key').read_bytes() == key_before
     assert json.loads(backup.restic(config, 'cat', 'config').stdout)['id']
+
+
+def test_backup_pauses_before_inventory_of_volatile_auth_journal(tmp_path, monkeypatch):
+    import shutil
+    from tools import local_backup as backup
+    if not shutil.which('restic'):
+        pytest.skip('restic executable unavailable')
+    config, mount = backup_config(tmp_path, monkeypatch)
+    backup.setup_backup(config, mount, True)
+    state = Path(config['state_dir'])
+    database = state / 'auth/owner.sqlite3'
+    with sqlite3.connect(database) as db:
+        db.execute('create table preserved (value integer)')
+        db.execute('insert into preserved values (17)')
+    before = database.read_bytes()
+    journal = Path(str(database) + '-journal')
+    journal.write_bytes(b'synthetic active writer journal')
+    class Runtime:
+        running = True
+        def running_services(self):
+            return ['app', 'caddy'] if self.running else []
+        def compose(self, *args):
+            assert args[1:] == ('app', 'caddy')
+            self.running = args[0] == 'start'
+            if args[0] == 'stop':
+                journal.unlink(missing_ok=True)
+    runtime = Runtime()
+    original_digest = backup.digest
+    def concurrent_writer(path):
+        if path == journal and runtime.running:
+            # Deterministically finish the transaction after inventory discovers
+            # its journal, before the journal's contents can be hashed.
+            journal.unlink()
+        return original_digest(path)
+    monkeypatch.setattr(backup, 'digest', concurrent_writer)
+    backup.backup(config, runtime)
+    assert runtime.running
+    assert database.read_bytes() == before
+    assert json.loads((state / 'status/backup-status.json').read_text())['state'] == 'ok'
+
+
+def test_capacity_failure_restores_services_after_paused_sizing(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+    config, mount = backup_config(tmp_path, monkeypatch)
+    config['backup'] = dict(mount=str(mount), volume_uuid='expected', password_file='unused')
+    calls = []
+    class Runtime:
+        def running_services(self): return ['app']
+        def compose(self, *args): calls.append(args)
+    monkeypatch.setattr(backup.shutil, 'disk_usage', lambda path: type('Usage', (), {'free': 0})())
+    with pytest.raises(ValueError, match='insufficient private staging capacity'):
+        backup.backup(config, Runtime())
+    assert calls == [('stop', 'app'), ('start', 'app')]
+    assert not list(Path(config['state_dir']).glob('snapshot-*'))
+    assert json.loads((Path(config['state_dir']) / 'status/backup-status.json').read_text())['state'] == 'failed'
 
 
 def test_snapshot_preserves_git_dirty_files_and_sqlite(tmp_path):

@@ -32,6 +32,19 @@ from tests.conftest import (
 )
 
 
+def test_action_lock_git_lookup_deadline_fails_before_creating_lock(tmp_path, monkeypatch):
+    def hung_lookup(command, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 30
+        raise subprocess.TimeoutExpired(command, timeout)
+    monkeypatch.setattr(transaction.subprocess, 'run', hung_lookup)
+    with pytest.raises(transaction.GitTransactionFailure) as raised:
+        with transaction.action_lock(tmp_path):
+            pytest.fail('timed-out lookup must not enter the action lock')
+    assert isinstance(raised.value.__cause__, subprocess.TimeoutExpired)
+    assert list(tmp_path.iterdir()) == []
+
+
 def _vault(tmp_path: Path) -> Path:
     return git_entity_vault(
         tmp_path,

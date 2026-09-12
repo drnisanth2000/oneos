@@ -45,11 +45,15 @@ class AuthStore:
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
                 raise AuthUnavailable()
             for path in (self.path, Path(str(self.path) + "-journal"), Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm")):
-                if not path.exists() and not path.is_symlink():
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    # SQLite may remove optional sidecars at transaction close.
+                    # A single no-follow stat avoids racing a separate exists
+                    # check; all other errors and unsafe file types still fail.
                     if path == self.path and not creating:
                         raise AuthUnavailable()
                     continue
-                info = path.lstat()
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_mode & 0o077:
                     raise AuthUnavailable()
         except OSError as exc:

@@ -398,3 +398,61 @@ AuthStore(Path(sys.argv[1])).enroll("synthetic owner password", secret, pyotp.TO
     assert result.returncode == 77, result.stderr
     AuthStore(directory).available()
     assert (directory / "owner.sqlite3").stat().st_nlink == 1
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_authentication_tolerates_sidecar_removed_during_safety_check(owner, monkeypatch, suffix):
+    from pathlib import Path
+
+    store, _ = owner
+    sidecar = Path(str(store.path) + suffix)
+    sidecar.write_bytes(b"")
+    sidecar.chmod(0o600)
+    original_lstat = Path.lstat
+
+    def removed_before_lstat(path, *args, **kwargs):
+        if path == sidecar:
+            path.unlink(missing_ok=True)
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", removed_before_lstat)
+    store.available()
+    assert not sidecar.exists()
+
+
+def test_authentication_refuses_main_database_removed_during_safety_check(owner, monkeypatch):
+    from pathlib import Path
+    from app.auth import AuthUnavailable
+
+    store, _ = owner
+    original_lstat = Path.lstat
+
+    def removed_before_lstat(path, *args, **kwargs):
+        if path == store.path:
+            path.unlink(missing_ok=True)
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", removed_before_lstat)
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_authentication_refuses_sidecar_permission_error(owner, monkeypatch, suffix):
+    from pathlib import Path
+    from app.auth import AuthUnavailable
+
+    store, _ = owner
+    sidecar = Path(str(store.path) + suffix)
+    sidecar.write_bytes(b"")
+    sidecar.chmod(0o600)
+    original_lstat = Path.lstat
+
+    def denied_lstat(path, *args, **kwargs):
+        if path == sidecar:
+            raise PermissionError("synthetic access denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+    with pytest.raises(AuthUnavailable):
+        store.available()

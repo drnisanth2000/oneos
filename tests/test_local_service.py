@@ -2,6 +2,108 @@ import json
 import pytest
 
 
+@pytest.mark.parametrize('command', ['up', 'stop', 'start', 'logs'])
+@pytest.mark.parametrize('interactive', [False, True])
+def test_compose_lifecycle_has_deadline(tmp_path, monkeypatch, command, interactive):
+    import subprocess
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    def hung_child(args, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 900
+        raise subprocess.TimeoutExpired(args, timeout)
+    monkeypatch.setattr(service.subprocess, 'run', hung_child)
+    with pytest.raises(subprocess.TimeoutExpired):
+        service.Runtime(config).compose(command, interactive=interactive)
+
+
+def test_interactive_enrollment_has_no_deadline(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+    def interactive_child(args, **kwargs):
+        assert kwargs.get('timeout') is None
+        assert kwargs['capture_output'] is False
+        return subprocess.CompletedProcess(args, 0)
+    monkeypatch.setattr(service.subprocess, 'run', interactive_child)
+    assert service.Runtime(diagnostic_config(tmp_path)).compose('exec', 'app', 'python', '-m',
+                                                               'app.auth_admin', 'enroll', interactive=True).returncode == 0
+
+
+def test_colima_start_deadline_keeps_manual_stop_marker(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    marker = tmp_path / 'state/manual-stop'
+    marker.write_text('preserved')
+    def hung_child(args, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 900
+        raise subprocess.TimeoutExpired(args, timeout)
+    monkeypatch.setattr(service.subprocess, 'run', hung_child)
+    with pytest.raises(subprocess.TimeoutExpired):
+        service.start(config)
+    assert marker.read_text() == 'preserved'
+
+
+def test_timeout_restores_paused_services_and_releases_operation_lock(tmp_path, monkeypatch, capsys):
+    import subprocess
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    calls = []
+    def child(command, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 900
+        if 'ps' in command:
+            return subprocess.CompletedProcess(command, 0, stdout='app\ncaddy\n')
+        calls.append(command[-3:])
+        if 'stop' in command:
+            raise subprocess.TimeoutExpired(['synthetic-private-command'], timeout, stderr='synthetic-secret')
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr(service.subprocess, 'run', child)
+    with pytest.raises(subprocess.TimeoutExpired):
+        with service.operation_lock(state), service.paused(service.Runtime(config)):
+            pytest.fail('stop timed out')
+    assert calls == [['stop', 'app', 'caddy'], ['start', 'app', 'caddy']]
+    with service.operation_lock(state):
+        pass
+    assert service.main(['--state-dir', str(state), 'stop']) == 1
+    output = capsys.readouterr()
+    assert json.loads(output.err)['code'] == 'operation_failed'
+    assert 'synthetic-secret' not in output.err
+    assert 'synthetic-private-command' not in output.err
+
+
+def test_backup_git_lock_timeout_is_sanitized_and_releases_operation_lock(
+    tmp_path, monkeypatch, capsys
+):
+    import subprocess
+    from app.git_transaction import GitTransactionFailure
+    from tools import local_backup, local_service as service
+
+    config = diagnostic_config(tmp_path)
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    timeout = subprocess.TimeoutExpired(
+        ['git', 'rev-parse', '/private/sensitive-path'], 30,
+        stderr='private secret',
+    )
+
+    def failed_backup(*_args, **_kwargs):
+        raise GitTransactionFailure('private vault lock failure') from timeout
+
+    monkeypatch.setattr(local_backup, 'backup', failed_backup)
+
+    assert service.main(['--state-dir', str(state), 'backup']) == 1
+    output = capsys.readouterr()
+    assert json.loads(output.err)['code'] == 'operation_failed'
+    assert 'private' not in output.err
+    assert 'sensitive-path' not in output.err
+    with service.operation_lock(state):
+        pass
+
+
 def test_direct_compose_validation_rebuilds_both_images():
     from pathlib import Path
 
@@ -274,6 +376,8 @@ def test_install_login_rolls_back_jobs_and_plists_after_bootstrap_failure(tmp_pa
     calls = []
 
     def launchctl(command, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 30
         calls.append(command)
         if command[1] == 'print':
             return subprocess.CompletedProcess(command, 113)
@@ -289,6 +393,40 @@ def test_install_login_rolls_back_jobs_and_plists_after_bootstrap_failure(tmp_pa
     bootouts = [command[-1] for command in calls if command[1] == 'bootout']
     assert bootouts == ['gui/' + str(service.os.getuid()) + '/local.oneos.backup',
                         'gui/' + str(service.os.getuid()) + '/local.oneos.login']
+
+
+def test_login_rollback_timeout_still_removes_created_plists(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    def launchctl(command, **kwargs):
+        if command[1] == 'print':
+            return subprocess.CompletedProcess(command, 113)
+        raise subprocess.TimeoutExpired(command, kwargs.get('timeout', 30))
+    monkeypatch.setattr(service.subprocess, 'run', launchctl)
+    with pytest.raises(OSError, match='rollback incomplete'):
+        service.install_login({'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'})
+    assert not list(launch_agents.glob('local.oneos.*.plist'))
+
+
+def test_browser_open_timeout_releases_operation_lock(tmp_path, monkeypatch, capsys):
+    import subprocess
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    monkeypatch.setattr(service, 'start', lambda config: None)
+    def hung(command, **kwargs):
+        timeout = kwargs.get('timeout')
+        assert isinstance(timeout, (int, float)) and 0 < timeout <= 30
+        raise subprocess.TimeoutExpired(command, timeout)
+    monkeypatch.setattr(service.subprocess, 'run', hung)
+    assert service.main(['--state-dir', str(state), 'open']) == 1
+    assert json.loads(capsys.readouterr().err)['code'] == 'operation_failed'
+    with service.operation_lock(state):
+        pass
 
 
 def test_install_login_removes_partial_plist_after_write_failure(tmp_path, monkeypatch):
@@ -503,3 +641,24 @@ def test_safe_error_reasons_never_echo_unrecognized_private_text():
     assert safe_failure(partial)['code'] == 'partial_backup'
     assert 'private' not in json.dumps(safe_failure(ValueError('private secret path')))
     assert 'sensitive-path' not in json.dumps(safe_failure(partial))
+
+
+@pytest.mark.parametrize('payload', [[], None, 'private-status-value', 7, True])
+@pytest.mark.parametrize('command', ['doctor', 'status'])
+def test_diagnostics_non_mapping_backup_status_is_safe_unknown(tmp_path, monkeypatch, capsys, payload, command):
+    from tools import local_service as service
+    from tools import local_backup
+    config = diagnostic_config(tmp_path)
+    config['backup'] = {}
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    service.write_json(state / 'status/backup-status.json', payload)
+    monkeypatch.setattr(service.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(service.Runtime, 'compose', lambda *args: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(local_backup, 'validate_volume', lambda config: None)
+    assert service.main(['--state-dir', str(state), command]) == (1 if command == 'doctor' else 0)
+    output = capsys.readouterr()
+    assert json.loads(output.out)['backup']['state'] == 'unknown'
+    assert output.err == ''
+    assert 'private-status-value' not in output.out
+    assert str(state) not in output.out
