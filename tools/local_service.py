@@ -135,24 +135,43 @@ def setup(state, vault, repo, name, email):
     if state.stat().st_mode & 0o077:
         raise ValueError('state directory must be private')
     with operation_lock(state):
-        if (state / 'config.json').exists():
+        if (state / 'config.json').exists() or (state / 'config.json').is_symlink():
             raise ValueError('configuration already exists')
         launcher = state / 'OneOS.command'
         if launcher.exists() or launcher.is_symlink():
             raise ValueError('launcher already exists; inspect before setup')
+        status_path = state / 'status/backup-status.json'
+        if status_path.exists() or status_path.is_symlink():
+            raise ValueError('backup status already exists; inspect before setup')
         for child in ('auth', 'status', 'logs', 'caddy', 'caddy/data', 'caddy/config'):
             (state / child).mkdir(mode=0o700, exist_ok=True)
             safe_path(state / child)
         config = dict(state_dir=str(state), vault=str(vault), repo_dir=str(repo), git_name=name,
                       git_email=email, uid=os.getuid(), gid=os.getgid())
-        write_json(state / 'config.json', config)
-        fd = os.open(launcher, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
-        with os.fdopen(fd, 'w') as output:
-            output.write('#!/bin/sh\nset -eu\ncd ' + shlex.quote(str(repo)) + '\n'
-                         'if [ "$#" -eq 0 ]; then set -- open; fi\nexec ' + shlex.quote(sys.executable)
-                         + ' -m tools.local_service --state-dir ' + shlex.quote(str(state)) + ' "$@"\n')
-        write_status(config, 'never', None)
-        return config
+        created = []
+        try:
+            config_path = state / 'config.json'
+            created.append(config_path)
+            write_json(config_path, config)
+            fd = os.open(launcher, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+            created.append(launcher)
+            with os.fdopen(fd, 'w') as output:
+                output.write('#!/bin/sh\nset -eu\ncd ' + shlex.quote(str(repo)) + '\n'
+                             'if [ "$#" -eq 0 ]; then set -- open; fi\nexec ' + shlex.quote(sys.executable)
+                             + ' -m tools.local_service --state-dir ' + shlex.quote(str(state)) + ' "$@"\n')
+            created.append(status_path)
+            write_status(config, 'never', None)
+            return config
+        except BaseException as error:
+            cleanup_error = None
+            for path in reversed(created):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    cleanup_error = OSError('setup rollback incomplete')
+            if cleanup_error:
+                raise cleanup_error from error
+            raise
 
 
 def write_status(config, status, last_success, *, reason=None):
@@ -381,10 +400,12 @@ def main(argv=None):
         if args.command == 'login-start':
             run_login(config)
             return 0
+        stop_marker = None
         if args.command == 'stop':
             # Record intent before lock acquisition, so delayed login cannot
             # override an explicit stop requested while it was waiting.
-            write_json(args.state_dir / 'manual-stop', {'stopped': True, 'stopped_at': time.time()})
+            stop_marker = {'stopped': True, 'stopped_at': time.time()}
+            write_json(args.state_dir / 'manual-stop', stop_marker)
         with operation_lock(args.state_dir):
             runtime = Runtime(config)
             if args.command == 'start': start(config)
@@ -396,6 +417,10 @@ def main(argv=None):
                     raise ValueError('owner administration requires an interactive terminal')
                 runtime.compose('exec', 'app', 'python', '-m', 'app.auth_admin', args.command, interactive=True)
             elif args.command == 'stop':
+                # A concurrent start can remove the early intent marker while
+                # stop waits for this lock. Reassert the same request now that
+                # the service transition is exclusively ours.
+                write_json(args.state_dir / 'manual-stop', stop_marker)
                 runtime.compose('stop')
             elif args.command == 'logs': print(runtime.compose('logs', '--tail', '200').stdout)
             elif args.command == 'install-login': install_login(config)

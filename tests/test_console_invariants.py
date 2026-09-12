@@ -21,6 +21,17 @@ AMBIGUOUS = {"CrossScopeError", "ReviewedStateConflict",
              "UnsafeDestinationPath", "InvalidSourceLeaf", "ReceiptError"}
 
 
+def test_outbox_action_form_id_includes_deterministic_review_identity():
+    template = (_REPO_ROOT / "templates/blocks/outbox_card.html").read_text(
+        encoding="utf-8"
+    )
+    form_id = re.search(r"set form_id = ([^\n]+)", template)
+    assert form_id is not None
+    expression = form_id.group(1)
+    assert "row.proposal.id" in expression
+    assert "row.review_sha256" in expression
+
+
 def test_no_direct_raise_of_an_ambiguous_base():
     offenders = []
     for path in (_REPO_ROOT / "app").rglob("*.py"):

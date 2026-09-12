@@ -6,6 +6,158 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.parametrize('private_path', ['vault', 'state_dir'])
+@pytest.mark.parametrize('placement', ['root', 'child'])
+def test_setup_backup_refuses_volume_containing_private_source(tmp_path, monkeypatch, private_path, placement):
+    from tools import local_backup as backup
+    config, mount = backup_config(tmp_path, monkeypatch)
+    config[private_path] = str(mount if placement == 'root' else mount / 'private-source')
+    Path(config[private_path]).mkdir(mode=0o700, exist_ok=True)
+    with pytest.raises(ValueError, match='separate'):
+        backup.setup_backup(config, mount, True)
+    assert not (mount / 'oneos-backup').exists()
+    assert not (Path(config['state_dir']) / 'backup-key').exists()
+
+
+@pytest.mark.parametrize('private_path', ['vault', 'state_dir'])
+def test_existing_backup_refuses_relocated_private_source(tmp_path, monkeypatch, private_path):
+    from tools import local_backup as backup
+    config, mount = backup_config(tmp_path, monkeypatch)
+    key = Path(config['state_dir']) / 'backup-key'
+    key.write_text('synthetic-key')
+    key.chmod(0o600)
+    config['backup'] = dict(mount=str(mount), volume_uuid='expected', password_file=str(key))
+    config[private_path] = str(mount / 'private-source')
+    Path(config[private_path]).mkdir(mode=0o700)
+    with pytest.raises(ValueError, match='separate'):
+        backup.restic(config, 'init')
+    assert not (mount / 'oneos-backup').exists()
+
+
+@pytest.mark.parametrize('hooks_path', ['absolute', 'relative-escape', 'inherited-relative', 'absolute-internal'])
+def test_snapshot_refuses_external_git_hooks(tmp_path, hooks_path):
+    from tools.local_backup import snapshot
+    source = tmp_path / 'source'
+    source.mkdir()
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    hooks = tmp_path / 'policy-hooks'
+    hooks.mkdir()
+    (hooks / 'pre-commit').write_text('#!/bin/sh\nexit 1\n')
+    configured = str(hooks) if hooks_path == 'absolute' else '../policy-hooks'
+    if hooks_path in ('inherited-relative', 'absolute-internal'):
+        hooks = source / 'policy-hooks'
+        hooks.mkdir()
+        (hooks / 'pre-commit').write_text('#!/bin/sh\nexit 1\n')
+        configured = str(hooks)
+    if hooks_path == 'inherited-relative':
+        external_config = tmp_path / 'external-config'
+        subprocess.run(['git', 'config', '--file', str(external_config), 'core.hooksPath', 'policy-hooks'], check=True)
+        subprocess.run(['git', '-C', str(source), 'config', 'include.path', str(external_config)], check=True)
+    else:
+        subprocess.run(['git', '-C', str(source), 'config', 'core.hooksPath', configured], check=True)
+    with pytest.raises(ValueError, match='hooks'):
+        snapshot(source, tmp_path / 'snapshot')
+    assert not (tmp_path / 'snapshot').exists()
+
+
+def test_snapshot_keeps_relative_internal_git_policy_hook(tmp_path):
+    from tools.local_backup import snapshot
+    source = tmp_path / 'source'
+    source.mkdir()
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    hooks = source / 'policy-hooks'
+    hooks.mkdir()
+    hook = hooks / 'pre-commit'
+    hook.write_text('#!/bin/sh\nexit 42\n')
+    hook.chmod(0o700)
+    subprocess.run(['git', '-C', str(source), 'config', 'core.hooksPath', 'policy-hooks'], check=True)
+    snapshot(source, tmp_path / 'snapshot')
+    restored = tmp_path / 'snapshot/vault'
+    result = subprocess.run(['git', '-C', str(restored), '-c', 'user.name=Test',
+                             '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-m', 'must refuse'],
+                            capture_output=True)
+    assert result.returncode != 0
+    assert not (restored / '.git/refs/heads/main').exists()
+    assert (restored / 'policy-hooks/pre-commit').read_bytes() == hook.read_bytes()
+
+
+@pytest.mark.parametrize('failure', ['config-write', 'after-init'])
+def test_setup_backup_retry_after_initialized_repository(tmp_path, monkeypatch, failure):
+    import shutil
+    from tools import local_backup as backup
+    if not shutil.which('restic'):
+        pytest.skip('restic executable unavailable')
+    config, mount = backup_config(tmp_path, monkeypatch)
+    original_write = backup.write_json
+    original_restic = backup.restic
+    def failed_write(*args, **kwargs):
+        raise OSError('injected config persistence failure')
+    def interrupted_restic(*args, **kwargs):
+        original_restic(*args, **kwargs)
+        raise InterruptedError('injected interruption after repository initialization')
+    if failure == 'config-write':
+        monkeypatch.setattr(backup, 'write_json', failed_write)
+    else:
+        monkeypatch.setattr(backup, 'restic', interrupted_restic)
+    with pytest.raises(OSError):
+        backup.setup_backup(config, mount, True)
+    assert 'backup' not in config
+    state = Path(config['state_dir'])
+    assert 'backup' not in json.loads((state / 'config.json').read_text())
+    key_before = (state / 'backup-key').read_bytes()
+    repository_before = (mount / 'oneos-backup/repository/config').read_bytes()
+    monkeypatch.setattr(backup, 'write_json', original_write)
+    monkeypatch.setattr(backup, 'restic', original_restic)
+    backup.setup_backup(config, mount, True)
+    assert json.loads((state / 'config.json').read_text())['backup'] == config['backup']
+    assert (state / 'backup-key').read_bytes() == key_before
+    assert (mount / 'oneos-backup/repository/config').read_bytes() == repository_before
+    assert json.loads(backup.restic(config, 'cat', 'config').stdout)['id']
+
+
+def test_setup_backup_refuses_existing_repository_with_wrong_key(tmp_path, monkeypatch):
+    import shutil
+    from tools import local_backup as backup
+    if not shutil.which('restic'):
+        pytest.skip('restic executable unavailable')
+    config, mount = backup_config(tmp_path, monkeypatch)
+    backup.setup_backup(config, mount, True)
+    state = Path(config['state_dir'])
+    del config['backup']
+    backup.write_json(state / 'config.json', config)
+    (state / 'backup-key').write_text('wrong-synthetic-key')
+    before = backup.inventory(mount / 'oneos-backup/repository')
+    with pytest.raises(subprocess.CalledProcessError):
+        backup.setup_backup(config, mount, True)
+    assert backup.inventory(mount / 'oneos-backup/repository') == before
+    assert 'backup' not in config
+    assert 'backup' not in json.loads((state / 'config.json').read_text())
+
+
+def test_setup_backup_retries_empty_repository_after_child_interruption(tmp_path, monkeypatch):
+    import shutil
+    from tools import local_backup as backup
+    if not shutil.which('restic'):
+        pytest.skip('restic executable unavailable')
+    config, mount = backup_config(tmp_path, monkeypatch)
+    original = subprocess.run
+    def interrupted(args, **kwargs):
+        if args[0] == 'restic':
+            raise InterruptedError('injected child startup interruption')
+        return original(args, **kwargs)
+    monkeypatch.setattr(subprocess, 'run', interrupted)
+    with pytest.raises(InterruptedError):
+        backup.setup_backup(config, mount, True)
+    repository = mount / 'oneos-backup/repository'
+    assert repository.is_dir()
+    assert list(repository.iterdir()) == []
+    key_before = (Path(config['state_dir']) / 'backup-key').read_bytes()
+    monkeypatch.setattr(subprocess, 'run', original)
+    backup.setup_backup(config, mount, True)
+    assert (Path(config['state_dir']) / 'backup-key').read_bytes() == key_before
+    assert json.loads(backup.restic(config, 'cat', 'config').stdout)['id']
+
+
 def test_snapshot_preserves_git_dirty_files_and_sqlite(tmp_path):
     from tools.local_backup import snapshot, verify_snapshot
     source = tmp_path / 'source'

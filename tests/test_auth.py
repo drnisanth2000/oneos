@@ -292,3 +292,109 @@ def test_private_directory_uri_punctuation_is_literal(tmp_path):
     assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
     assert not (tmp_path / "private").exists()
     assert store.path.stat().st_size > 0
+
+
+def test_authenticated_maximum_lifecycle_review_passes_body_guard(owner):
+    import pyotp
+    from pathlib import Path
+    from fastapi import FastAPI, Request
+    from app.auth_web import AuthenticatedFormRoute, OwnerAuthMiddleware
+    from app.lifecycle_receipts import canonical, EMPTY_SHA, REGISTRIES
+    from app.outbox import LifecycleProposal
+
+    record = dict(version=1, id="20260915T120000-" + "a" * 32, action="lifecycle_repair",
+                  entity="sample", created="2026-09-15T12:00:00", baseline_head="a" * 40,
+                  vault_identity="b" * 64, shape_sha256="c" * 64,
+                  registry_sha256={key: "d" * 64 for key in REGISTRIES}, repair=None,
+                  manifest=[dict(path=f"sample/{index:04d}-module/active",
+                                 declaration="\u2603" * 255, parent_identity=[1, 2, 493],
+                                 before_identity=None, after_mode=493, placeholder_sha256=EMPTY_SHA)
+                            for index in range(1024)])
+    proposal = LifecycleProposal(record["id"], Path(record["id"] + ".yaml"),
+                                 record["action"], "sample", record["created"], canonical(record))
+    reviewed = proposal.reviewed_fields  # Real schema validation at its manifest/declaration maximum.
+    app = FastAPI()
+    app.router.route_class = AuthenticatedFormRoute
+    app.add_middleware(OwnerAuthMiddleware)
+
+    @app.post("/review")
+    async def review(request: Request):
+        fields = await request.form()
+        return {"reviewed": json.loads(fields["reviewed_values"])}
+
+    store, secret = owner
+    token = store.login("synthetic owner password", pyotp.TOTP(secret).now())
+    with TestClient(app, base_url="https://localhost:8443") as client:
+        client.cookies.set("__Host-oneos", token)
+        response = client.post("/review", headers={"Origin": "https://localhost:8443"},
+                               data={"csrf_token": store.session(token), "reviewed_values": json.dumps(reviewed)})
+        assert response.status_code == 200, response.text
+        assert response.json()["reviewed"] == reviewed
+        assert client.post("/login", headers={"Origin": "https://localhost:8443"},
+                           content=b"x" * 16385).status_code == 413
+        assert client.post("/review", headers={"Origin": "https://localhost:8443"},
+                           content=(b"x" * (1024 * 1024) for _ in range(40))).status_code == 413
+    from app.main import app as production_app
+    with TestClient(production_app, base_url="https://localhost:8443") as client:
+        client.cookies.set("__Host-oneos", token)
+        # The actual Form(...) route must reach proposal-id validation,
+        # rather than fail in either body parser. Invalid id prevents mutation.
+        response = client.post("/outbox/sample/approve", headers={"Origin": "https://localhost:8443"},
+                               data={"csrf_token": store.session(token), "reviewed_values": json.dumps(reviewed),
+                                     "id": "invalid", "review_sha256": "e" * 64})
+        assert "E-INVALID" in response.text, response.text
+        assert "E-REQUEST" not in response.text
+
+
+@pytest.mark.parametrize("failure", ["io", "interrupt"])
+def test_failed_first_enrollment_is_atomic_and_retryable(tmp_path, monkeypatch, failure):
+    import sqlite3
+    import pyotp
+    from app.auth import AuthStore, AuthUnavailable
+
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    store = AuthStore(directory)
+    secret = pyotp.random_base32()
+    original_connect = sqlite3.connect
+
+    class InterruptedConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            result = super().execute(sql, *args, **kwargs)
+            if sql.startswith("INSERT OR REPLACE INTO owner"):
+                if failure == "io":
+                    raise sqlite3.OperationalError("synthetic write failure")
+                raise KeyboardInterrupt("synthetic enrollment interruption")
+            return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", lambda *a, **kw: original_connect(*a, **kw, factory=InterruptedConnection))
+        with pytest.raises((AuthUnavailable, KeyboardInterrupt)):
+            store.enroll("synthetic owner password", secret, pyotp.TOTP(secret).at(3000), now=3000)
+    assert not store.path.exists(), "failed enrollment exposed an incomplete live database"
+    store.enroll("synthetic owner password", secret, pyotp.TOTP(secret).at(3000), now=3000)
+    store.available()
+    assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
+
+
+def test_published_enrollment_survives_process_exit_before_staging_cleanup(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from app.auth import AuthStore
+
+    directory = tmp_path / "private"
+    directory.mkdir(mode=0o700)
+    script = '''
+import os, sys, tempfile, pyotp
+from pathlib import Path
+from app.auth import AuthStore
+tempfile.TemporaryDirectory.__exit__ = lambda *args: os._exit(77)
+secret = pyotp.random_base32()
+AuthStore(Path(sys.argv[1])).enroll("synthetic owner password", secret, pyotp.TOTP(secret).at(3000), now=3000)
+'''
+    result = subprocess.run([sys.executable, "-c", script, str(directory)],
+                            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}, capture_output=True)
+    assert result.returncode == 77, result.stderr
+    AuthStore(directory).available()
+    assert (directory / "owner.sqlite3").stat().st_nlink == 1

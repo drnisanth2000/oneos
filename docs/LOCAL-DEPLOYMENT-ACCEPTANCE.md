@@ -40,11 +40,16 @@ deployment. Exact-head re-review additionally closed build-context vault
 containment, partial setup and LaunchAgent rollback, repeat backup-key setup,
 and malformed scheduled-backup timestamp cases. LaunchAgent rollback preserves
 pre-existing loaded jobs while cleaning jobs installed before an interrupted
-bootstrap result.
+bootstrap result. Final review also made owner enrollment atomically retryable,
+aligned authenticated form parsing with the maximum lifecycle proposal shape,
+kept backup media separate from plaintext state and vault data, retained only
+portable captured Git hooks, made backup setup resumable after repository
+initialization, and closed setup, explicit-stop and review-card identity races.
+Direct Compose validation rebuilds both application and proxy images.
 
 ## Closing implementation verification
 
-- Locked Python 3.12 public suite: **2,335 passed, 1 skipped**.
+- Locked Python 3.12 public suite: **2,356 passed, 4 skipped**.
 - Trusted-local private suite: **39 passed**; structural validation: **0 errors,
   0 warnings**. Opaque before/after Git evidence preserved pre-existing state.
 - Actual synthetic HTTPS verified password/TOTP login, secure cookies, protected

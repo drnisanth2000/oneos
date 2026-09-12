@@ -4,6 +4,7 @@ import secrets
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from fastapi.routing import APIRoute
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
@@ -13,6 +14,28 @@ from .auth import AuthStore, AuthUnavailable
 COOKIE = "__Host-oneos"
 LOGIN_COOKIE = "__Host-oneos-login"
 LIMIT = 16384
+# Lifecycle proposal bytes may reach 4 MiB. Their reviewed fields add JSON
+# escaping and form percent-encoding; leave room for both and the form envelope.
+AUTHENTICATED_LIMIT = 32 * 1024 * 1024
+
+
+class AuthenticatedFormRoute(APIRoute):
+    """Align the framework form parser with the already authenticated body cap."""
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def authenticated_form(request):
+            if (getattr(request.state, "owner_authenticated", False)
+                    and request.method not in ("GET", "HEAD", "OPTIONS")
+                    and request.headers.get("content-type", "").split(";")[0]
+                    == "application/x-www-form-urlencoded"):
+                # FastAPI reuses this request's cached FormData for Form(...).
+                # Login never reaches routing; development/anonymous requests
+                # retain the framework defaults.
+                await request.form(max_fields=40, max_part_size=AUTHENTICATED_LIMIT)
+            return await handler(request)
+
+        return authenticated_form
 
 
 class OwnerAuthMiddleware:
@@ -81,9 +104,10 @@ class OwnerAuthMiddleware:
                     return await finish(PlainTextResponse("Invalid origin", 403))
                 chunks = []
                 size = 0
+                limit = LIMIT if login else AUTHENTICATED_LIMIT
                 async for chunk in request.stream():
                     size += len(chunk)
-                    if size > LIMIT:
+                    if size > limit:
                         return await finish(PlainTextResponse("Request too large", 413))
                     chunks.append(chunk)
                 body = b"".join(chunks)

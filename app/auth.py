@@ -7,6 +7,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -96,17 +97,39 @@ class AuthStore:
             raise ValueError("Use a password of 14–1024 characters and a current authenticator code.")
         password_hash = HASHER.hash(password)
         self._check(creating=not recover)
-        if not recover:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        if recover:
+            self._save_owner(password_hash, secret, now, creating=False)
+            return
+        if self.path.exists():
+            raise FileExistsError("owner already enrolled")
+        # A crash before publication leaves only private staging, never an
+        # incomplete live owner DB. Exclusive publication also arbitrates
+        # concurrent enrollments without replacing the winning credentials.
+        with tempfile.TemporaryDirectory(prefix=".enroll-", dir=self.directory) as staging:
+            staged = AuthStore(Path(staging))
+            fd = os.open(staged.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             os.close(fd)
+            staged._save_owner(password_hash, secret, now, creating=True)
+            from .git_transaction import _move_no_replace
+            source_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                target_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    _move_no_replace(source_fd, staged.path.name, target_fd, self.path.name)
+                finally:
+                    os.close(target_fd)
+            finally:
+                os.close(source_fd)
+
+    def _save_owner(self, password_hash, secret, now, *, creating):
         with self.connect() as db:
-            if not recover:
-                db.executescript("""
-                    CREATE TABLE owner(id INTEGER PRIMARY KEY CHECK(id=1), password TEXT NOT NULL, secret TEXT NOT NULL, counter INTEGER NOT NULL);
-                    CREATE TABLE sessions(token TEXT PRIMARY KEY, csrf TEXT NOT NULL, created REAL NOT NULL, seen REAL NOT NULL);
-                    CREATE TABLE throttle(id INTEGER PRIMARY KEY CHECK(id=1), failures INTEGER NOT NULL, blocked REAL NOT NULL);
-                    INSERT INTO throttle VALUES(1,0,0);
-                """)
+            if creating:
+                # executescript implicitly commits a pending transaction.
+                # Individual statements keep schema and owner atomic together.
+                db.execute("CREATE TABLE owner(id INTEGER PRIMARY KEY CHECK(id=1), password TEXT NOT NULL, secret TEXT NOT NULL, counter INTEGER NOT NULL)")
+                db.execute("CREATE TABLE sessions(token TEXT PRIMARY KEY, csrf TEXT NOT NULL, created REAL NOT NULL, seen REAL NOT NULL)")
+                db.execute("CREATE TABLE throttle(id INTEGER PRIMARY KEY CHECK(id=1), failures INTEGER NOT NULL, blocked REAL NOT NULL)")
+                db.execute("INSERT INTO throttle VALUES(1,0,0)")
             db.execute("INSERT OR REPLACE INTO owner VALUES(1,?,?,?)", (password_hash, secret, int(now // 30)))
             db.execute("DELETE FROM sessions")
             db.execute("UPDATE throttle SET failures=0, blocked=0 WHERE id=1")

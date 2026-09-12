@@ -2,6 +2,13 @@ import json
 import pytest
 
 
+def test_direct_compose_validation_rebuilds_both_images():
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parents[1] / 'deploy/README.md').read_text()
+    assert 'docker compose build --pull app caddy' in readme
+
+
 def test_missing_vault_is_never_created(tmp_path):
     from tools.local_service import setup
     with pytest.raises((ValueError, FileNotFoundError)):
@@ -103,6 +110,66 @@ def test_setup_preflights_existing_launcher_before_configuration(tmp_path):
     assert launcher.read_text() == 'preserve existing launcher'
     assert not (state / 'config.json').exists()
     assert not (state / 'auth').exists()
+
+
+def test_setup_preserves_preexisting_dangling_config_symlink(tmp_path):
+    import subprocess
+    from tools.local_service import setup
+
+    vault = tmp_path / 'vault'
+    vault.mkdir()
+    subprocess.run(['git', 'init', '-q', str(vault)], check=True)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    config = state / 'config.json'
+    config.symlink_to(tmp_path / 'missing-config-target')
+
+    with pytest.raises(ValueError, match='configuration already exists'):
+        setup(state, vault, repo, 'Test', 'test@example.invalid')
+
+    assert config.is_symlink()
+    assert config.readlink() == tmp_path / 'missing-config-target'
+
+
+def test_setup_removes_only_its_artifacts_after_late_write_failure_and_retries(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+
+    vault = tmp_path / 'vault'
+    vault.mkdir()
+    subprocess.run(['git', 'init', '-q', str(vault)], check=True)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    preserved = state / 'preserved.txt'
+    preserved.write_text('keep me')
+    real_write_status = service.write_status
+    fail_once = True
+
+    def interrupted_status(config, status, last_success, **kwargs):
+        nonlocal fail_once
+        real_write_status(config, status, last_success, **kwargs)
+        if fail_once:
+            fail_once = False
+            raise InterruptedError('synthetic setup interruption')
+
+    monkeypatch.setattr(service, 'write_status', interrupted_status)
+    with pytest.raises(InterruptedError, match='setup interruption'):
+        service.setup(state, vault, repo, 'Test', 'test@example.invalid')
+
+    assert preserved.read_text() == 'keep me'
+    assert not (state / 'config.json').exists()
+    assert not (state / 'OneOS.command').exists()
+    assert not (state / 'status/backup-status.json').exists()
+
+    config = service.setup(state, vault, repo, 'Test', 'test@example.invalid')
+    assert config['vault'] == str(vault)
+    assert (state / 'config.json').is_file()
+    assert (state / 'OneOS.command').is_file()
+    assert (state / 'status/backup-status.json').is_file()
 
 
 def test_compose_uses_explicit_context_and_ignores_ambient_overrides(monkeypatch):
@@ -322,6 +389,33 @@ def test_delayed_login_respects_new_stop_request(tmp_path, monkeypatch):
     service.write_json(tmp_path / 'manual-stop', {'stopped_at': 200})
     monkeypatch.setattr(service, 'start', lambda config: pytest.fail('new stop wins'))
     service.login_start({'state_dir': str(tmp_path)}, requested_at=100)
+
+
+def test_stop_reasserts_marker_after_acquiring_operation_lock(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from tools import local_service as service
+
+    config = {'state_dir': str(tmp_path)}
+    monkeypatch.setattr(service, 'load_config', lambda *args, **kwargs: config)
+
+    @contextmanager
+    def start_finishes_before_stop_gets_lock(state, **kwargs):
+        (state / 'manual-stop').unlink()
+        yield
+
+    monkeypatch.setattr(service, 'operation_lock', start_finishes_before_stop_gets_lock)
+
+    class Runtime:
+        def __init__(self, _config): pass
+        def compose(self, *args):
+            assert args == ('stop',)
+            marker = json.loads((tmp_path / 'manual-stop').read_text())
+            assert marker['stopped'] is True
+            assert isinstance(marker['stopped_at'], float)
+
+    monkeypatch.setattr(service, 'Runtime', Runtime)
+    assert service.main(['--state-dir', str(tmp_path), 'stop']) == 0
+    assert (tmp_path / 'manual-stop').is_file()
 
 
 def diagnostic_config(tmp_path):

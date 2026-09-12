@@ -65,7 +65,7 @@ then run:
 
 ```sh
 docker compose config --quiet
-docker compose build --pull app
+docker compose build --pull app caddy
 docker compose up --wait
 curl --fail --cacert /path/to/copied/root.crt https://localhost:8443/healthz
 docker compose stop

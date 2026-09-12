@@ -74,7 +74,7 @@ from .registry import (
 )
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
-from .auth_web import OwnerAuthMiddleware
+from .auth_web import AuthenticatedFormRoute, OwnerAuthMiddleware
 from .deployment_health import install_health
 
 BASE = Path(__file__).resolve().parent.parent
@@ -123,6 +123,7 @@ def _require_issue(value: str | None) -> str:
 templates.env.globals["new_issue"] = _new_issue
 
 app = FastAPI(title="OneOS")
+app.router.route_class = AuthenticatedFormRoute
 app.add_middleware(OwnerAuthMiddleware)
 install_health(app)
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")

@@ -39,6 +39,15 @@ def validate_volume(config):
     return mount
 
 
+def validate_backup_location(config, mount):
+    """Keep encrypted storage separate from both plaintext sources and the key."""
+    mount = safe_path(mount)
+    for name in ('vault', 'state_dir'):
+        private = safe_path(Path(config[name]))
+        if private.is_relative_to(mount) or mount.is_relative_to(private):
+            raise ValueError('backup volume must be separate from vault and private state')
+
+
 @contextmanager
 def external_session(config):
     """Pin writes to an open external directory, even if its mount disappears.
@@ -161,6 +170,19 @@ def check_git_layout(source):
                             capture_output=True, text=True)
     if result.returncode != 1:
         raise ValueError('explicit Git worktree redirection is unsupported')
+    hooks = subprocess.run(['git', '-C', str(source), 'config', '--path', '--get', 'core.hooksPath'],
+                           capture_output=True, text=True)
+    if hooks.returncode == 0:
+        configured = Path(hooks.stdout.rstrip('\n'))
+        captured = subprocess.run(['git', '-C', str(source), 'config', '--local', '--no-includes',
+                                   '--path', '--get', 'core.hooksPath'], capture_output=True, text=True)
+        if captured.returncode != 0 or captured.stdout != hooks.stdout:
+            raise ValueError('Git hooks configuration must be captured in the local repository')
+        # Absolute paths still point at the original checkout after recovery.
+        if configured.is_absolute() or not (source / configured).resolve().is_relative_to(source):
+            raise ValueError('external or absolute Git hooks path is unsupported')
+    elif hooks.returncode != 1:
+        raise ValueError('Git hooks configuration is unavailable')
 
 
 def sqlite_files(root):
@@ -235,6 +257,7 @@ def verify_snapshot(target):
 
 def restic(config, *args, cwd=None):
     backup_config = config['backup']
+    validate_backup_location(config, Path(backup_config['mount']))
     key = private_file(Path(backup_config['password_file']))
     env = {k: v for k, v in os.environ.items() if not k.startswith('RESTIC_')}
     env['RESTIC_PASSWORD_FILE'] = str(key)
@@ -273,6 +296,7 @@ def setup_backup(config, mount, offline_confirmed):
     backup_config = dict(mount=str(mount), volume_uuid=info.get('VolumeUUID'),
                          password_file=str(Path(config['state_dir']) / 'backup-key'))
     validate_volume(backup_config)
+    validate_backup_location(config, mount)
     key = Path(backup_config['password_file'])
     if not key.exists():
         fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -282,7 +306,34 @@ def setup_backup(config, mount, offline_confirmed):
     if not offline_confirmed:
         raise ValueError('copy the private backup key offline before confirming setup')
     proposed = {**config, 'backup': backup_config}
-    restic(proposed, 'init')
+    # A crash can leave an initialized repository without the host config update.
+    # Reuse it only after authenticating with the retained offline-backed key;
+    # never remove or reinitialize existing encrypted data to recover setup.
+    initialized = False
+    with external_session(backup_config) as external:
+        try:
+            repository = os.open('repository', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                 dir_fd=external)
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                if os.fstat(repository).st_dev != os.fstat(external).st_dev:
+                    raise ValueError('repository is on another filesystem')
+                try:
+                    existing = os.stat('config', dir_fd=repository, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if not stat.S_ISREG(existing.st_mode):
+                        raise ValueError('unsafe repository configuration')
+                    initialized = True
+            finally:
+                os.close(repository)
+    if initialized:
+        restic(proposed, 'cat', 'config')
+    else:
+        restic(proposed, 'init')
     write_json(Path(config['state_dir']) / 'config.json', proposed)
     config.update(proposed)
 
@@ -313,6 +364,7 @@ def backup(config, runtime, due_only=False):
     try:
         from app.git_transaction import action_lock
         validate_volume(config['backup'])
+        validate_backup_location(config, Path(config['backup']['mount']))
         state = safe_path(Path(config['state_dir']))
         needed = sum(entry.get('size', 0) + sum(len(value) // 2 for value in entry.get('xattrs', {}).values())
                      for root in (Path(config['vault']), state / 'caddy', state / 'auth')
