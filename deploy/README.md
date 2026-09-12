@@ -3,7 +3,8 @@
 This packaging runs OneOS behind Caddy at the single browser origin
 `https://localhost:8443`. Only Caddy publishes a host port, and that port is
 bound to IPv4 loopback. The application is reachable only on the private
-Compose network.
+Compose network. Requests that complete TLS for `localhost` but supply another
+HTTP `Host` are rejected by Caddy with 421 before reaching the application.
 
 Use `python -m tools.local_service` for owner setup and routine operations once
 that command is installed. It reads the private `config.json` from the state
@@ -37,7 +38,11 @@ when all container capabilities are dropped with `no-new-privileges` enabled.
 The image installs production dependencies exactly from `uv.lock`, carries Git
 for audited vault transactions, and keeps the environment's Python first on
 `PATH` so vault policy hooks use the same locked Python dependencies. Hooks are
-not bypassed or disabled. The server runs without source reload.
+not bypassed or disabled. The Python 3.12 slim-trixie base supplies Git 2.47 or
+newer because the transaction boundary deliberately requests 64-character
+object abbreviations for SHA-256 compatibility; Bookworm's Git 2.39 rejects
+that valid runtime contract before commit. The server runs without source
+reload.
 
 ## Local certificate trust
 

@@ -100,7 +100,11 @@ def test_services_have_bounded_logs_healthchecks_and_explicit_stop_semantics():
 def test_image_build_is_locked_non_root_and_keeps_git_hooks_available():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-    assert "FROM python:3.12" in dockerfile
+    assert (
+        "FROM python:3.12.14-slim-trixie@sha256:"
+        "78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
+        in dockerfile
+    )
     assert "COPY --from=ghcr.io/astral-sh/uv:" in dockerfile
     assert dockerfile.count("@sha256:") == 3
     assert "uv sync --locked --no-dev --no-editable" in dockerfile
@@ -153,3 +157,10 @@ def test_caddy_terminates_internal_tls_on_the_declared_origin():
     assert "https://localhost:8443" in caddyfile
     assert "tls internal" in caddyfile
     assert "reverse_proxy app:8000" in caddyfile
+
+
+def test_caddy_rejects_requests_for_an_unmatched_http_host():
+    caddyfile = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
+
+    assert "https://:8443" in caddyfile
+    assert "respond 421" in caddyfile
