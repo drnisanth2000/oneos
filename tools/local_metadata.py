@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import ctypes
+from functools import cache
 import os
 from pathlib import Path
 import stat
@@ -33,6 +34,7 @@ def metadata_fd(path):
         os.close(fd)
 
 
+@cache
 def mac_api():
     api = ctypes.CDLL(None, use_errno=True)
     api.flistxattr.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]

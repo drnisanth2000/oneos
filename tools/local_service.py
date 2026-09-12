@@ -132,22 +132,23 @@ def setup(state, vault, repo, name, email):
     safe_path(state)
     if state.stat().st_mode & 0o077:
         raise ValueError('state directory must be private')
-    if (state / 'config.json').exists():
-        raise ValueError('configuration already exists')
-    for child in ('auth', 'status', 'logs', 'caddy', 'caddy/data', 'caddy/config'):
-        (state / child).mkdir(mode=0o700, exist_ok=True)
-        safe_path(state / child)
-    config = dict(state_dir=str(state), vault=str(vault), repo_dir=str(repo), git_name=name,
-                  git_email=email, uid=os.getuid(), gid=os.getgid())
-    write_json(state / 'config.json', config)
-    launcher = state / 'OneOS.command'
-    fd = os.open(launcher, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
-    with os.fdopen(fd, 'w') as output:
-        output.write('#!/bin/sh\nset -eu\ncd ' + shlex.quote(str(repo)) + '\n'
-                     'if [ "$#" -eq 0 ]; then set -- open; fi\nexec ' + shlex.quote(sys.executable)
-                     + ' -m tools.local_service --state-dir ' + shlex.quote(str(state)) + ' "$@"\n')
-    write_status(config, 'never', None)
-    return config
+    with operation_lock(state):
+        if (state / 'config.json').exists():
+            raise ValueError('configuration already exists')
+        for child in ('auth', 'status', 'logs', 'caddy', 'caddy/data', 'caddy/config'):
+            (state / child).mkdir(mode=0o700, exist_ok=True)
+            safe_path(state / child)
+        config = dict(state_dir=str(state), vault=str(vault), repo_dir=str(repo), git_name=name,
+                      git_email=email, uid=os.getuid(), gid=os.getgid())
+        write_json(state / 'config.json', config)
+        launcher = state / 'OneOS.command'
+        fd = os.open(launcher, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+        with os.fdopen(fd, 'w') as output:
+            output.write('#!/bin/sh\nset -eu\ncd ' + shlex.quote(str(repo)) + '\n'
+                         'if [ "$#" -eq 0 ]; then set -- open; fi\nexec ' + shlex.quote(sys.executable)
+                         + ' -m tools.local_service --state-dir ' + shlex.quote(str(state)) + ' "$@"\n')
+        write_status(config, 'never', None)
+        return config
 
 
 def write_status(config, status, last_success, *, reason=None):
@@ -188,7 +189,7 @@ def safe_failure(error):
 def start(config):
     subprocess.run(['colima', 'start', '--profile', 'oneos', '--activate=false', '--ssh-config=false', '--mount', config['vault'] + ':w',
                     '--mount', config['state_dir'] + ':w', '--mount', config['repo_dir']], check=True, capture_output=True)
-    Runtime(config).compose('up', '-d', '--build', '--wait')
+    Runtime(config).compose('up', '-d', '--build', '--wait', '--wait-timeout', '120')
     (Path(config['state_dir']) / 'manual-stop').unlink(missing_ok=True)
 
 
@@ -300,16 +301,17 @@ def install_login(config):
     (library / 'LaunchAgents').mkdir(mode=0o700, exist_ok=True)
     destination = safe_path(library / 'LaunchAgents')
     python = sys.executable  # Preserve the venv entrypoint, not its base interpreter.
-    for suffix, command in [('login', 'login-start'), ('backup', 'backup-due')]:
+    jobs = [('login', 'login-start'), ('backup', 'backup-due')]
+    paths = [destination / ('local.oneos.' + suffix + '.plist') for suffix, _ in jobs]
+    if any(path.exists() or path.is_symlink() for path in paths):
+        raise ValueError('login job already exists; inspect before replacing')
+    for (suffix, command), path in zip(jobs, paths, strict=True):
         value = {'Label': 'local.oneos.' + suffix,
                  'ProgramArguments': [python, '-m', 'tools.local_service', '--state-dir', config['state_dir'], command],
                  'WorkingDirectory': config['repo_dir'], 'RunAtLoad': True,
                  'EnvironmentVariables': {'PATH': os.environ.get('PATH', '')}}
         if suffix == 'backup':
             value['StartInterval'] = 3600
-        path = destination / ('local.oneos.' + suffix + '.plist')
-        if path.exists() or path.is_symlink():
-            raise ValueError('login job already exists; inspect before replacing')
         with path.open('xb') as output:
             output.write(plistlib.dumps(value))
         subprocess.run(['launchctl', 'bootstrap', 'gui/' + str(os.getuid()), str(path)], check=True, capture_output=True)

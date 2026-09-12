@@ -26,11 +26,22 @@ def test_private_config_rejects_symlink_and_public_permissions(tmp_path):
 
 def test_login_starts_after_a_previous_manual_stop(tmp_path, monkeypatch):
     from tools import local_service as service
-    (tmp_path / 'manual-stop').write_text('')
+    service.write_json(tmp_path / 'manual-stop', {'stopped_at': 100})
     started = []
     monkeypatch.setattr(service, 'start', lambda *args: started.append(True))
-    service.login_start({'state_dir': str(tmp_path)})
+    service.login_start({'state_dir': str(tmp_path)}, requested_at=200)
     assert started == [True]
+
+
+def test_start_bounds_compose_health_wait(tmp_path, monkeypatch):
+    from tools import local_service as service
+    calls = []
+    config = dict(state_dir=str(tmp_path), vault='/synthetic/vault', repo_dir='/synthetic/repo',
+                  uid=501, gid=20, git_name='Test', git_email='test@example.invalid')
+    monkeypatch.setattr(service.subprocess, 'run', lambda *args, **kwargs: None)
+    monkeypatch.setattr(service.Runtime, 'compose', lambda self, *args: calls.append(args))
+    service.start(config)
+    assert calls == [('up', '-d', '--build', '--wait', '--wait-timeout', '120')]
 
 
 @pytest.mark.parametrize('running', [True, False])
@@ -95,6 +106,60 @@ def test_login_waits_for_backup_lock(tmp_path, monkeypatch):
     worker.join(2)
     assert not worker.is_alive()
     assert started.is_set()
+
+
+def test_setup_holds_operation_lock_until_all_private_state_exists(tmp_path, monkeypatch):
+    import subprocess
+    import threading
+    from tools import local_service as service
+
+    vault = tmp_path / 'vault'
+    vault.mkdir()
+    subprocess.run(['git', 'init', '-q', str(vault)], check=True)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    state = tmp_path / 'state'
+    config_written = threading.Event()
+    release_setup = threading.Event()
+    login_started = threading.Event()
+    original_write_json = service.write_json
+
+    def delayed_config_write(path, value):
+        original_write_json(path, value)
+        if path.name == 'config.json':
+            config_written.set()
+            assert release_setup.wait(2)
+
+    monkeypatch.setattr(service, 'write_json', delayed_config_write)
+    monkeypatch.setattr(service, 'start', lambda config: login_started.set())
+    worker = threading.Thread(target=service.setup,
+                              args=(state, vault, repo, 'Test', 'test@example.invalid'))
+    worker.start()
+    assert config_written.wait(1)
+    login = threading.Thread(target=service.run_login, args=({'state_dir': str(state)},))
+    login.start()
+    assert not login_started.wait(0.05)
+    release_setup.set()
+    worker.join(2)
+    login.join(2)
+    assert not worker.is_alive()
+    assert not login.is_alive()
+    assert login_started.is_set()
+
+
+def test_install_login_preflights_all_destinations_before_writing(tmp_path, monkeypatch):
+    from tools import local_service as service
+
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    (launch_agents / 'local.oneos.backup.plist').write_bytes(b'preserve')
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(service.subprocess, 'run', lambda *args, **kwargs: pytest.fail('must preflight before bootstrap'))
+    config = {'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'}
+    with pytest.raises(ValueError, match='already exists'):
+        service.install_login(config)
+    assert not (launch_agents / 'local.oneos.login.plist').exists()
+    assert (launch_agents / 'local.oneos.backup.plist').read_bytes() == b'preserve'
 
 
 def test_delayed_login_respects_new_stop_request(tmp_path, monkeypatch):

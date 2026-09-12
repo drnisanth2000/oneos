@@ -30,11 +30,17 @@ image includes a compatible distribution Git, and public Caddy configuration
 is embedded in the image. Transaction safety code and policy hooks are retained.
 
 Independent review also corrected hidden-form attribute escaping and a login
-startup race with scheduled backups. Expanded regression tests cover both.
+startup race with scheduled backups. Pull-request review then tightened session
+transaction ordering, setup/login concurrency, bounded startup waits, pinned
+external-repository validation and read-only extended-attribute recovery.
+Expanded regression tests cover these boundaries, including failure-path file
+descriptor cleanup. Internal app traffic remains on the unpublished dedicated
+Compose network; HTTPS terminates at Caddy as approved for this localhost-only
+deployment.
 
 ## Closing implementation verification
 
-- Locked Python 3.12 public suite: **2,312 passed, 1 skipped**.
+- Locked Python 3.12 public suite: **2,319 passed, 1 skipped**.
 - Trusted-local private suite: **39 passed**; structural validation: **0 errors,
   0 warnings**. Opaque before/after Git evidence preserved pre-existing state.
 - Actual synthetic HTTPS verified password/TOTP login, secure cookies, protected

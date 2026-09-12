@@ -61,7 +61,7 @@ def external_session(config):
         if os.fstat(root).st_dev != os.fstat(volume).st_dev:
             raise ValueError('backup directory is on another filesystem')
         os.fchdir(root)
-        yield Path('.')
+        yield root
     finally:
         os.fchdir(original)
         for fd in (root, volume, original):
@@ -119,8 +119,8 @@ def copy_regular(source, destination):
     fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as incoming, destination.open('xb') as outgoing:
         shutil.copyfileobj(incoming, outgoing)
-    shutil.copystat(source, destination, follow_symlinks=False)
     write_xattrs(destination, attributes)
+    shutil.copystat(source, destination, follow_symlinks=False)
     if read_xattrs(source) != attributes:
         raise ValueError('extended attributes changed during copy')
     if digest(source) != digest(destination):
@@ -240,13 +240,28 @@ def restic(config, *args, cwd=None):
     # Any temporary files remain inside private host state; only encrypted
     # repository contents are written to the external drive.
     env['TMPDIR'] = config['state_dir']
-    with external_session(backup_config):
-        repository = Path('repository')
-        if repository.is_symlink(): raise ValueError('unsafe repository')
-        if cwd is not None:
-            raise ValueError('restic must retain the pinned external working directory')
-        return subprocess.run(['restic', '--no-cache', '--repo', str(repository), *args],
-                              env=env, check=True, capture_output=True, text=True)
+    with external_session(backup_config) as external:
+        try:
+            repository = os.open('repository', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                 dir_fd=external)
+        except FileNotFoundError:
+            if not args or args[0] != 'init':
+                raise ValueError('backup repository is unavailable')
+            os.mkdir('repository', mode=0o700, dir_fd=external)
+            repository = os.open('repository', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                 dir_fd=external)
+        try:
+            if os.fstat(repository).st_dev != os.fstat(external).st_dev:
+                raise ValueError('repository is on another filesystem')
+            if cwd is not None:
+                raise ValueError('restic must retain the pinned external working directory')
+            # The child inherits this already-open directory as its working
+            # directory, so replacing the visible mount path cannot redirect it.
+            os.fchdir(repository)
+            return subprocess.run(['restic', '--no-cache', '--repo', '.', *args],
+                                  env=env, check=True, capture_output=True, text=True)
+        finally:
+            os.close(repository)
 
 
 def setup_backup(config, mount, offline_confirmed):

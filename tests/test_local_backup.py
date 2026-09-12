@@ -177,6 +177,102 @@ def test_pinned_external_directory_survives_mount_path_replacement(tmp_path, mon
     assert (tmp_path / 'detached/oneos-backup/proof').read_text() == 'pinned'
 
 
+def test_restic_refuses_repository_on_another_device(tmp_path, monkeypatch):
+    import os
+    from tools import local_backup as backup
+
+    config, mount = backup_config(tmp_path, monkeypatch)
+    repository = mount / 'oneos-backup/repository'
+    repository.mkdir(parents=True)
+    key = Path(config['state_dir']) / 'backup-key'
+    key.write_text('synthetic-key\n')
+    key.chmod(0o600)
+    config['backup'] = dict(mount=str(mount), volume_uuid='expected', password_file=str(key))
+    original_open = os.open
+    original_fstat = os.fstat
+    repository_fds = set()
+
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == 'repository':
+            repository_fds.add(descriptor)
+        return descriptor
+
+    def separate_device(descriptor):
+        info = original_fstat(descriptor)
+        if descriptor not in repository_fds:
+            return info
+        values = list(info)
+        values[2] += 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(backup.os, 'open', tracked_open)
+    monkeypatch.setattr(backup.os, 'fstat', separate_device)
+    monkeypatch.setattr(backup.subprocess, 'run',
+                        lambda *args, **kwargs: pytest.fail('wrong-device repository must be rejected first'))
+    with pytest.raises(ValueError, match='repository is on another filesystem'):
+        backup.restic(config, 'check')
+
+
+def test_restic_closes_repository_when_device_validation_fails(tmp_path, monkeypatch):
+    import os
+    from tools import local_backup as backup
+
+    config, mount = backup_config(tmp_path, monkeypatch)
+    (mount / 'oneos-backup/repository').mkdir(parents=True)
+    key = Path(config['state_dir']) / 'backup-key'
+    key.write_text('synthetic-key\n')
+    key.chmod(0o600)
+    config['backup'] = dict(mount=str(mount), volume_uuid='expected', password_file=str(key))
+    original_open = os.open
+    original_fstat = os.fstat
+    original_close = os.close
+    repository_fds = set()
+    closed_fds = set()
+
+    def tracked_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == 'repository':
+            repository_fds.add(descriptor)
+        return descriptor
+
+    def failed_validation(descriptor):
+        if descriptor in repository_fds:
+            raise OSError('synthetic device lookup failure')
+        return original_fstat(descriptor)
+
+    def tracked_close(descriptor):
+        if descriptor in repository_fds:
+            closed_fds.add(descriptor)
+        return original_close(descriptor)
+
+    monkeypatch.setattr(backup.os, 'open', tracked_open)
+    monkeypatch.setattr(backup.os, 'fstat', failed_validation)
+    monkeypatch.setattr(backup.os, 'close', tracked_close)
+    with pytest.raises(OSError, match='synthetic device lookup failure'):
+        backup.restic(config, 'check')
+    assert closed_fds == repository_fds
+
+
+def test_copy_regular_preserves_xattrs_on_a_read_only_file(tmp_path):
+    import sys
+    from tools.local_backup import copy_regular
+    from tools.local_metadata import read_xattrs, write_xattrs
+
+    source = tmp_path / 'source'
+    source.write_bytes(b'contents')
+    attribute = ('com.apple.test-oneos' if sys.platform == 'darwin' else 'user.oneos-test').encode().hex()
+    try:
+        write_xattrs(source, {attribute: b'preserved'.hex()})
+    except OSError:
+        pytest.skip('test filesystem does not support user extended attributes')
+    source.chmod(0o444)
+    destination = tmp_path / 'destination'
+    copy_regular(source, destination)
+    assert destination.stat().st_mode & 0o777 == 0o444
+    assert read_xattrs(destination) == {attribute: b'preserved'.hex()}
+
+
 def test_partial_restic_backup_never_prunes_or_claims_success(tmp_path, monkeypatch):
     from tools import local_backup as backup
     config, mount = backup_config(tmp_path, monkeypatch)

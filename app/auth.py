@@ -142,10 +142,12 @@ class AuthStore:
             return token
 
     def session(self, token, *, now=None):
-        now = time.time() if now is None else now
         if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
             return None
         with self.connect() as db:
+            # Order production timestamps by the write transaction, not by
+            # concurrent requests reaching this method.
+            now = time.time() if now is None else now
             row = db.execute("SELECT csrf,created,seen FROM sessions WHERE token=?", (digest(token),)).fetchone()
             if not row:
                 return None

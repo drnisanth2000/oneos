@@ -1,6 +1,6 @@
 """Owner boundary tests use only temporary synthetic authentication state."""
 import re
-from contextlib import closing
+from contextlib import closing, contextmanager
 from html.parser import HTMLParser
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -105,6 +105,36 @@ def test_session_expiry_logout_and_throttle(owner):
     for _ in range(5):
         assert store.login("wrong", "000000", now=5100) is None
     assert store.login("synthetic owner password", pyotp.TOTP(secret).at(5100), now=5100) is None
+
+
+def test_session_samples_the_clock_inside_its_write_transaction(owner, monkeypatch):
+    """An in-flight request must not timestamp itself before transaction order is known."""
+    import pyotp
+    from app import auth
+    from types import SimpleNamespace
+
+    store, secret = owner
+    token = store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
+    original_connect = store.connect
+    transaction_active = False
+
+    @contextmanager
+    def tracked_connect():
+        nonlocal transaction_active
+        with original_connect() as database:
+            transaction_active = True
+            try:
+                yield database
+            finally:
+                transaction_active = False
+
+    def transaction_clock():
+        assert transaction_active, "clock sampled before BEGIN IMMEDIATE"
+        return 3031
+
+    monkeypatch.setattr(store, "connect", tracked_connect)
+    monkeypatch.setattr(auth, "time", SimpleNamespace(time=transaction_clock))
+    assert store.session(token)
 
 
 def test_browser_csrf_cookie_host_and_origin(owner):
