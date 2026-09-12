@@ -21,7 +21,10 @@
         {% set delete_preview_values = {"slug": slug} %}
         <div id="delete-preview-{{ loop.index0 }}">
           <div class="prop-actions">
+            {% from "_auth_forms.html" import action_form with context %}
+            {{ action_form('delete-form-' ~ loop.index0, delete_preview_values, '/registry/' ~ entity ~ '/product/delete-preview') }}
             <button class="reject"
+                    type="submit" form="delete-form-{{ loop.index0 }}"
                     hx-post="/registry/{{ entity }}/product/delete-preview"
                     hx-vals='{{ delete_preview_values | tojson }}'
                     hx-target="#delete-preview-{{ loop.index0 }}" hx-swap="outerHTML">Delete…</button>

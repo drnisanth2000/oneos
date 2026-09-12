@@ -1,4 +1,11 @@
 <meta charset="utf-8">
+<meta name="csrf-token" content="{{ request.state.csrf_token | default('') }}">
+<script>
+document.addEventListener('htmx:configRequest', (event) => {
+  const token = document.querySelector('meta[name="csrf-token"]')?.content;
+  if (token) event.detail.headers['X-CSRF-Token'] = token;
+});
+</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ page_title | default("OneOS") }}</title>
 <link rel="stylesheet" href="/static/app.css?v={{ stylesheet_version }}">

@@ -74,6 +74,7 @@ from .registry import (
 )
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
+from .auth_web import OwnerAuthMiddleware
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
@@ -121,6 +122,7 @@ def _require_issue(value: str | None) -> str:
 templates.env.globals["new_issue"] = _new_issue
 
 app = FastAPI(title="OneOS")
+app.add_middleware(OwnerAuthMiddleware)
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 
 catalog = build_catalog()
