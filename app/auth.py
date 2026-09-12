@@ -59,7 +59,7 @@ class AuthStore:
     def connect(self):
         self._check()
         try:
-            connection = sqlite3.connect(f"file:{self.path}?mode=rw", uri=True, timeout=5)
+            connection = sqlite3.connect(f"{self.path.as_uri()}?mode=rw", uri=True, timeout=5)
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 yield connection

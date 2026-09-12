@@ -209,3 +209,17 @@ def test_health_alone_public_and_real_form_and_htmx_bodies(owner):
         store.path.chmod(0o644)
         assert client.get("/healthz").status_code == 200
         assert client.post("/mutate", data={"value":"forbidden"}).status_code == 503
+
+
+def test_private_directory_uri_punctuation_is_literal(tmp_path):
+    import pyotp
+    from app.auth import AuthStore
+    directory = tmp_path / "private?#state"
+    directory.mkdir(mode=0o700)
+    store = AuthStore(directory)
+    secret = pyotp.random_base32()
+    store.enroll("synthetic owner password", secret, pyotp.TOTP(secret).at(3000), now=3000)
+    store.available()
+    assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
+    assert not (tmp_path / "private").exists()
+    assert store.path.stat().st_size > 0
