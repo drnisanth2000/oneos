@@ -101,6 +101,7 @@ def backup_config(tmp_path, monkeypatch):
 
 def test_real_restic_encrypted_backup_and_isolated_restore(tmp_path, monkeypatch):
     import shutil
+    import sys
     from tools import local_backup as backup
     if not shutil.which('restic'):
         pytest.skip('restic executable unavailable')
@@ -109,6 +110,9 @@ def test_real_restic_encrypted_backup_and_isolated_restore(tmp_path, monkeypatch
     caddy.mkdir(exist_ok=True)
     (caddy / 'authority').write_text('synthetic TLS identity')
     (Path(config['state_dir']) / 'auth/credentials').write_text('synthetic credentials')
+    if sys.platform == 'darwin':
+        for path in (Path(config['vault']), Path(config['vault']) / 'note', caddy):
+            subprocess.run(['/usr/bin/xattr', '-wx', 'com.apple.test-oneos', 'ff000a', str(path)], check=True)
     backup.setup_backup(config, mount, True)
     class StoppedRuntime:
         def running_services(self): return []
@@ -127,6 +131,10 @@ def test_real_restic_encrypted_backup_and_isolated_restore(tmp_path, monkeypatch
     assert not list((mount / 'oneos-backup').glob('snapshot-*'))
     assert restored.is_relative_to(Path(config['state_dir']))
     assert not (restored / 'snapshot/deployment/backup-key').exists()
+    if sys.platform == 'darwin':
+        for path in (restored / 'snapshot/vault', restored / 'snapshot/vault/note', restored / 'snapshot/deployment/caddy'):
+            value = subprocess.run(['/usr/bin/xattr', '-px', 'com.apple.test-oneos', str(path)], check=True, capture_output=True).stdout
+            assert bytes.fromhex(value.decode()) == b'\xff\x00\x0a'
 
 
 def test_interrupted_backup_restores_service_and_retains_last_success(tmp_path, monkeypatch):
@@ -190,17 +198,50 @@ def test_partial_restic_backup_never_prunes_or_claims_success(tmp_path, monkeypa
     assert list(mount.iterdir()) == []
 
 
-@pytest.mark.parametrize('metadata', ['xattr', 'acl'])
-def test_unsupported_mac_metadata_refused(tmp_path, metadata):
-    import os
+def test_unsupported_mac_acl_refused(tmp_path):
     import sys
     from tools.local_backup import inventory
     if sys.platform != 'darwin': pytest.skip('macOS metadata')
     note = tmp_path / 'note'
     note.write_text('keep metadata')
-    if metadata == 'xattr':
-        subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.test-oneos', 'keep', str(note)], check=True)
-    else:
-        subprocess.run(['chmod', '+a', 'everyone allow read', str(note)], check=True)
+    subprocess.run(['chmod', '+a', 'everyone allow read', str(note)], check=True)
     with pytest.raises(ValueError):
         inventory(tmp_path)
+
+
+def test_mac_xattrs_preserved_including_root_and_tamper_detected(tmp_path):
+    import sys
+    from tools.local_backup import snapshot, verify_snapshot
+    if sys.platform != 'darwin': pytest.skip('macOS metadata')
+    source = tmp_path / 'source'
+    source.mkdir()
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    (source / 'folder').mkdir()
+    note = source / 'folder/note'
+    note.write_text('keep all metadata')
+    for path in (source, source / 'folder', note):
+        subprocess.run(['/usr/bin/xattr', '-wx', 'com.apple.test-oneos', '0001ff80', str(path)], check=True)
+    target = tmp_path / 'snapshot'
+    snapshot(source, target)
+    verify_snapshot(target)
+    for relative in ('.', 'folder', 'folder/note'):
+        value = subprocess.run(['/usr/bin/xattr', '-px', 'com.apple.test-oneos', str(target / 'vault' / relative)], check=True, capture_output=True).stdout
+        assert bytes.fromhex(value.decode()) == b'\x00\x01\xff\x80'
+    subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.test-oneos', 'changed', str(target / 'vault/folder/note')], check=True)
+    with pytest.raises(ValueError):
+        verify_snapshot(target)
+
+
+def test_mac_xattrs_symlink_metadata_does_not_follow_target(tmp_path):
+    import sys
+    from tools.local_metadata import read_xattrs, write_xattrs
+    if sys.platform != 'darwin': pytest.skip('macOS metadata')
+    target = tmp_path / 'target'
+    target.write_text('keep')
+    link = tmp_path / 'link'
+    link.symlink_to('target')
+    name = b'com.apple.test-oneos'.hex()
+    write_xattrs(target, {name: b'target'.hex()})
+    write_xattrs(link, {name: b'link'.hex()})
+    assert read_xattrs(target) == {name: b'target'.hex()}
+    assert read_xattrs(link) == {name: b'link'.hex()}

@@ -18,7 +18,8 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 
-from tools.local_service import private_file, safe_path, write_json, write_status, paused
+from tools.local_service import private_file, safe_path, write_json, write_status, paused, safe_failure
+from tools.local_metadata import read_xattrs, write_xattrs
 
 
 def disk_info(path):
@@ -77,9 +78,7 @@ def digest(path):
 
 def inventory(root):
     root = safe_path(root)
-    if hasattr(os, 'listxattr') and os.listxattr(root, follow_symlinks=False):
-        raise ValueError('directory extended attributes require a separate backup plan')
-    result = {}
+    result = {'.': {'kind': 'directory', 'mode': stat.S_IMODE(root.stat().st_mode), 'xattrs': read_xattrs(root)}}
     def walk(directory):
         for item in sorted(directory.iterdir()):
             relative = str(item.relative_to(root))
@@ -90,8 +89,6 @@ def inventory(root):
                     raise ValueError('external or absolute symlink cannot be backed up')
                 result[relative] = {'kind': 'link', 'target': target}
             elif stat.S_ISDIR(info.st_mode):
-                if hasattr(os, 'listxattr') and os.listxattr(item, follow_symlinks=False):
-                    raise ValueError('directory extended attributes require a separate backup plan')
                 if info.st_dev != root.stat().st_dev:
                     raise ValueError('nested filesystem cannot be backed up')
                 result[relative] = {'kind': 'directory', 'mode': stat.S_IMODE(info.st_mode)}
@@ -99,23 +96,18 @@ def inventory(root):
             elif stat.S_ISREG(info.st_mode):
                 if info.st_nlink != 1:
                     raise ValueError('hardlinked files require a separate backup plan')
-                # Refuse metadata we cannot reproduce, rather than silently losing it.
-                if hasattr(os, 'listxattr') and os.listxattr(item, follow_symlinks=False):
-                    raise ValueError('extended attributes require a metadata-aware backup plan')
                 result[relative] = {'kind': 'file', 'sha256': digest(item), 'mode': stat.S_IMODE(info.st_mode),
                                     'size': info.st_size}
             else:
                 raise ValueError('non-regular filesystem entry cannot be backed up')
+            result[relative]['xattrs'] = read_xattrs(item)
     walk(root)
     if sys.platform == 'darwin':
         # Never invoke recursive native utilities: xattr recursion can follow
         # directory links. Check only the already inventoried entries in batches.
-        paths = [str(root), *(str(root / relative) for relative in result)]
+        paths = [str(root / relative) for relative in result]
         for offset in range(0, len(paths), 100):
             batch = paths[offset:offset + 100]
-            attributes = subprocess.run(['/usr/bin/xattr', '-s', *batch], capture_output=True, check=True)
-            if attributes.stdout.strip():
-                raise ValueError('macOS extended attributes require a metadata-aware backup plan')
             listing = subprocess.run(['/bin/ls', '-lde', *batch], capture_output=True, check=True)
             if re.search(rb'^\s*\d+:\s', listing.stdout, re.MULTILINE):
                 raise ValueError('macOS ACLs require a metadata-aware backup plan')
@@ -123,10 +115,14 @@ def inventory(root):
 
 
 def copy_regular(source, destination):
+    attributes = read_xattrs(source)
     fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as incoming, destination.open('xb') as outgoing:
         shutil.copyfileobj(incoming, outgoing)
     shutil.copystat(source, destination, follow_symlinks=False)
+    write_xattrs(destination, attributes)
+    if read_xattrs(source) != attributes:
+        raise ValueError('extended attributes changed during copy')
     if digest(source) != digest(destination):
         raise ValueError('copy hash mismatch')
 
@@ -135,13 +131,20 @@ def copy_tree(source, target):
     before = inventory(source)
     target.mkdir(mode=0o700)
     for relative, entry in before.items():
+        if relative == '.':
+            continue
         destination = target / relative
         if entry['kind'] == 'directory':
-            destination.mkdir(mode=entry['mode'])
+            destination.mkdir(mode=0o700)
         elif entry['kind'] == 'link':
             destination.symlink_to(entry['target'])
         else:
             copy_regular(source / relative, destination)
+    for relative, entry in reversed(list(before.items())):
+        destination = target / relative
+        write_xattrs(destination, entry['xattrs'])
+        if entry['kind'] == 'directory':
+            destination.chmod(entry['mode'])
     if inventory(source) != before or inventory(target) != before:
         raise ValueError('source changed during snapshot')
 
@@ -198,15 +201,7 @@ def snapshot(source, target):
             check_git_layout((source / relative).parent)
     target.mkdir(mode=0o700)
     vault = target / 'vault'
-    vault.mkdir(mode=0o700)
-    for relative, entry in before.items():
-        destination = vault / relative
-        if entry['kind'] == 'directory':
-            destination.mkdir(mode=entry['mode'])
-        elif entry['kind'] == 'link':
-            destination.symlink_to(entry['target'])
-        else:
-            copy_regular(source / relative, destination)
+    copy_tree(source, vault)
     if inventory(source) != before or inventory(vault) != before:
         raise ValueError('source changed during snapshot')
     normalized = target / 'sqlite'
@@ -217,7 +212,7 @@ def snapshot(source, target):
     if inventory(source) != before:
         raise ValueError('source changed during snapshot verification')
     manifest = inventory(target)
-    write_json(target / 'manifest.json', {'version': 1, 'files': manifest})
+    write_json(target / 'manifest.json', {'version': 2, 'files': manifest})
     verify_snapshot(target)
 
 
@@ -226,7 +221,7 @@ def verify_snapshot(target):
     manifest = json.loads((target / 'manifest.json').read_text())
     actual = inventory(target)
     actual.pop('manifest.json', None)
-    if manifest.get('version') != 1 or actual != manifest['files']:
+    if manifest.get('version') != 2 or actual != manifest['files']:
         raise ValueError('snapshot manifest mismatch')
     check_git_layout(target / 'vault')
     subprocess.run(['git', '-C', str(target / 'vault'), 'fsck', '--full'],
@@ -293,7 +288,8 @@ def backup(config, runtime, due_only=False):
         from app.git_transaction import action_lock
         validate_volume(config['backup'])
         state = safe_path(Path(config['state_dir']))
-        needed = sum(entry.get('size', 0) for root in (Path(config['vault']), state / 'caddy', state / 'auth')
+        needed = sum(entry.get('size', 0) + sum(len(value) // 2 for value in entry.get('xattrs', {}).values())
+                     for root in (Path(config['vault']), state / 'caddy', state / 'auth')
                      for entry in inventory(root).values())
         if shutil.disk_usage(state).free < needed * 3 + 64 * 1024 * 1024:
             raise ValueError('insufficient private staging capacity')
@@ -312,7 +308,7 @@ def backup(config, runtime, due_only=False):
                 copy_regular(private_file(state / 'config.json'), deployment / 'config.json')
                 manifest = inventory(payload)
                 manifest.pop('manifest.json')
-                write_json(payload / 'manifest.json', {'version': 1, 'files': manifest})
+                write_json(payload / 'manifest.json', {'version': 2, 'files': manifest})
                 verify_snapshot(payload)
         # Never claim success on partial-backup exit codes or interruption.
         restic(config, 'backup', '--tag', 'oneos', '--', str(payload))
@@ -321,8 +317,8 @@ def backup(config, runtime, due_only=False):
                '--keep-weekly', '4', '--keep-monthly', '6', '--prune')
         shutil.rmtree(stage)  # Exact generated private staging directory, after success.
         write_status(config, 'ok', time.time())
-    except BaseException:
-        write_status(config, 'failed', last)
+    except BaseException as error:
+        write_status(config, 'failed', last, reason=safe_failure(error)['message'])
         raise
 
 

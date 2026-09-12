@@ -178,3 +178,14 @@ def test_diagnostics_report_backup_freshness(tmp_path, monkeypatch, state, last,
     result = service.diagnostics(config)
     assert result['backup']['state'] == expected
     assert 'Run backup' in result['backup']['action']
+
+
+def test_safe_error_reasons_never_echo_unrecognized_private_text():
+    import subprocess
+    from tools.local_service import safe_failure
+    assert safe_failure(ValueError('copy the private backup key offline before confirming setup'))['code'] == 'offline_key_required'
+    assert safe_failure(ValueError('macOS ACLs require a metadata-aware backup plan'))['code'] == 'unsupported_acl'
+    partial = subprocess.CalledProcessError(3, ['restic', '/private/sensitive-path'], stderr='private secret')
+    assert safe_failure(partial)['code'] == 'partial_backup'
+    assert 'private' not in json.dumps(safe_failure(ValueError('private secret path')))
+    assert 'sensitive-path' not in json.dumps(safe_failure(partial))

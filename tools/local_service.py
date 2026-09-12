@@ -150,11 +150,39 @@ def setup(state, vault, repo, name, email):
     return config
 
 
-def write_status(config, status, last_success):
+def write_status(config, status, last_success, *, reason=None):
     write_json(Path(config['state_dir']) / 'status/backup-status.json',
                dict(state=status, last_success=last_success, checked_at=time.time(),
-                    message={'ok': 'Encrypted backup verified.', 'never': 'Backup has not completed.',
+                    message=reason or {'ok': 'Encrypted backup verified.', 'never': 'Backup has not completed.',
                              'missed': 'Backup is overdue.', 'failed': 'Backup failed; inspect local operations.'}[status]))
+
+
+def safe_failure(error):
+    """Allowlisted reasons only: exception strings and command output stay local."""
+    known = {
+        'copy the private backup key offline before confirming setup': ('offline_key_required', 'Copy the backup key to your offline recovery store, then rerun setup-backup with --offline-key-confirmed.'),
+        'macOS ACLs require a metadata-aware backup plan': ('unsupported_acl', 'ACL metadata requires an owner-reviewed backup plan. Do not strip source permissions.'),
+        'external or absolute symlink cannot be backed up': ('external_link', 'The source includes an external or absolute link. Review its backup scope before retrying.'),
+        'hardlinked files require a separate backup plan': ('hardlinked_source', 'The source includes hardlinked files requiring an owner-reviewed backup plan.'),
+        'non-regular filesystem entry cannot be backed up': ('unsupported_entry', 'The source includes an unsupported special filesystem entry. Review its backup scope.'),
+        'expected external physical volume is unavailable': ('drive_unavailable', 'Connect the configured external physical drive and verify its identity.'),
+        'another service or backup operation is running': ('operation_busy', 'Wait for the active service operation, then retry.'),
+        'source changed during snapshot': ('source_changed', 'Pause external editors and workers, then retry the backup.'),
+        'source changed during snapshot verification': ('source_changed', 'Pause external editors and workers, then retry the backup.'),
+        'insufficient private staging capacity': ('capacity_required', 'Free enough host storage for private snapshot staging, then retry.'),
+        'insufficient isolated recovery capacity': ('capacity_required', 'Free enough host storage for isolated recovery, then retry.'),
+        'snapshot manifest mismatch': ('verification_failed', 'Recovered data or metadata failed verification. Keep the isolated copy for inspection; do not activate it.'),
+        'extended attribute copy verification failed': ('metadata_failed', 'Extended attribute preservation failed. Keep source metadata intact and inspect filesystem support.'),
+    }
+    if isinstance(error, ValueError) and str(error) in known:
+        code, message = known[str(error)]
+    elif isinstance(error, OSError) and error.strerror == 'extended attribute operation failed':
+        code, message = 'metadata_failed', 'Extended attribute access or preservation was refused. Keep source metadata intact and inspect filesystem support.'
+    elif isinstance(error, subprocess.CalledProcessError) and isinstance(error.cmd, (list, tuple)) and error.cmd and Path(error.cmd[0]).name == 'restic' and error.returncode == 3:
+        code, message = 'partial_backup', 'Restic reported an incomplete backup. No retention was run; inspect source availability and retry.'
+    else:
+        code, message = 'operation_failed', 'Operation could not complete. Run doctor for safe diagnostics and retry after resolving unavailable components.'
+    return {'code': code, 'message': message}
 
 
 def start(config):
@@ -309,7 +337,7 @@ def main(argv=None):
         if args.command in ('doctor', 'status'):
             report = diagnostics(config)
             print(json.dumps(report))
-            return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'disconnected'} for item in report.values()))
+            return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'disconnected', 'not_enrolled', 'not_configured'} for item in report.values()))
         if args.command == 'login-start':
             run_login(config)
             return 0
@@ -339,11 +367,11 @@ def main(argv=None):
                 elif args.command == 'restore-check': print(restore_check(config))
                 else: backup(config, runtime, due_only=args.command == 'backup-due')
         return 0
-    except (ValueError, TypeError, OSError, KeyError, subprocess.SubprocessError):
+    except (ValueError, TypeError, OSError, KeyError, subprocess.SubprocessError) as error:
         if args.command in ('doctor', 'status'):
             print(json.dumps({'configuration': finding('unavailable', 'Check that private state and config.json exist, are owner-only, and use canonical paths. Restore the intended configuration; do not replace the vault.')}))
         else:
-            print('Operation could not complete. Run doctor for safe configuration, runtime, enrollment and backup diagnostics. If another operation is running, retry after it finishes.', file=sys.stderr)
+            print(json.dumps(safe_failure(error)), file=sys.stderr)
         return 1
 
 

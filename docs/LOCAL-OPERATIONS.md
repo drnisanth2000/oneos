@@ -70,8 +70,11 @@ vault accessibility, owner enrollment presence, and backup configuration/drive/
 freshness. They do not acquire the mutation lock or reveal subprocess output,
 paths, credentials, or volume identities. Authentication inspection does not
 write to its database; active journal sidecars report busy. The app still
-performs full credential-state validation. `doctor` exits nonzero for unavailable
-or failed checks; `status` succeeds when it can provide the report.
+performs full credential-state validation. `doctor` exits nonzero for unavailable,
+failed, or incomplete enrollment/backup setup; `status` succeeds when it can
+provide the report. CLI failures include an allowlisted reason code and next
+action; failed-backup status retains the corresponding safe message. Raw command
+errors, paths, and credential data are never forwarded.
 
 ```sh
 python -m tools.local_service --state-dir "$ONEOS_STATE_DIR" install-login
@@ -107,7 +110,8 @@ python -m tools.local_service --state-dir "$ONEOS_STATE_DIR" restore-check
 ```
 
 Backups preserve the vault's Git history, index, dirty and untracked content,
-directories, file modes, relative internal links, and complete raw SQLite
+directories, file modes, relative internal links, exact extended attributes
+(including source root and link metadata), and complete raw SQLite
 files including sidecars. The recovery payload also includes Caddy's private
 TLS authority/state, owner authentication state, and the private deployment
 configuration under `deployment/`; the offline backup key is excluded.
@@ -129,8 +133,11 @@ start, stop, scheduled backup, and recovery commands.
 
 Unsupported layouts fail rather than lose data: external/absolute symlinks,
 linked Git worktrees, alternate Git object stores, explicit Git worktree
-redirection, nested filesystems, hardlinks, special files, extended attributes,
-and macOS ACLs. Inventory refusal requires an owner-reviewed metadata-aware backup
+redirection, nested filesystems, hardlinks, special files, and macOS ACLs.
+Extended attributes are captured through descriptor-based native APIs, stored
+losslessly in the encrypted version-2 manifest, copied to staging, and verified
+again after restore. A filesystem refusing an attribute write is a hard failure,
+never permission to strip the source attribute. Inventory refusal requires an owner-reviewed metadata-aware backup
 plan; do not delete source attributes or links merely to make backup succeed.
 Git environment overrides must be unset. A process kill or power loss cannot
 execute restoration cleanup; inspect status and start the service explicitly.
