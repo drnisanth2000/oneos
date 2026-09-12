@@ -124,7 +124,9 @@ def test_caddy_image_is_digest_pinned_and_built_for_selected_non_root_ids():
     assert caddy["build"]["target"] == "caddy"
     assert caddy["user"] == "${ONEOS_UID:?ONEOS_UID is required}:${ONEOS_GID:?ONEOS_GID is required}"
     assert "FROM caddy:2.11.4-alpine@sha256:" in dockerfile
+    assert "COPY deploy/Caddyfile /etc/caddy/Caddyfile" in dockerfile
     assert "chown -R ${ONEOS_UID}:${ONEOS_GID} /data /config" in dockerfile
+    assert "/etc/caddy/Caddyfile" not in _mounts(caddy)
 
 
 def test_caddy_drops_unneeded_low_port_file_capability_before_cap_drop():

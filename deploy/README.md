@@ -34,6 +34,9 @@ restarts crashes without undoing an explicit stop. No Docker socket is mounted.
 Caddy's inherited low-port file capability is removed in the derived image:
 port 8443 does not need it, and retaining it would make Linux refuse execution
 when all container capabilities are dropped with `no-new-privileges` enabled.
+The public Caddyfile is baked into that image rather than bind-mounted as a
+single host file. This makes a Caddyfile edit change the image build and avoids
+stale or detached VirtioFS file mounts after atomic source-file replacement.
 
 The image installs production dependencies exactly from `uv.lock`, carries Git
 for audited vault transactions, and keeps the environment's Python first on
@@ -76,3 +79,6 @@ probe. Owner-facing vault and backup diagnostics belong to authenticated
 The image tags are deliberately exact instead of floating tags. Update them in
 a reviewed change, rebuild with `--pull`, and rerun the synthetic runtime tests.
 The Python dependency resolution remains governed by the committed `uv.lock`.
+Caddyfile changes likewise require rebuilding and recreating the Caddy service;
+the owner operation wrapper performs that lifecycle rather than reloading a
+potentially stale container.

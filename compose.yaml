@@ -94,12 +94,6 @@ services:
         protocol: tcp
     volumes:
       - type: bind
-        source: ./deploy/Caddyfile
-        target: /etc/caddy/Caddyfile
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
         source: ${ONEOS_STATE_DIR:?ONEOS_STATE_DIR is required}/caddy/data
         target: /data
         read_only: false

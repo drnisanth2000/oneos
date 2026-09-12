@@ -41,6 +41,8 @@ FROM caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4
 ARG ONEOS_UID=10001
 ARG ONEOS_GID=10001
 
+COPY deploy/Caddyfile /etc/caddy/Caddyfile
+
 RUN test "${ONEOS_UID}" -gt 0 \
     && test "${ONEOS_GID}" -gt 0 \
     && setcap -r /usr/bin/caddy \
