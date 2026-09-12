@@ -605,6 +605,7 @@ def test_delayed_login_respects_new_stop_request(tmp_path, monkeypatch):
     {'stopped_at': True},
     {'stopped_at': -1},
     {'stopped_at': float('inf')},
+    {'stopped_at': 10 ** 400},
     {'stopped_at': 1e300},
 ])
 def test_login_start_rejects_malformed_stop_record_without_traceback(

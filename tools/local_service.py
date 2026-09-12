@@ -242,7 +242,8 @@ def login_start(config, *, requested_at=None):
             if not isinstance(stopped, dict):
                 raise ValueError('invalid manual stop record')
             stopped_at = stopped.get('stopped_at')
-            if (type(stopped_at) not in (int, float) or not math.isfinite(stopped_at)
+            if (type(stopped_at) not in (int, float)
+                    or isinstance(stopped_at, float) and not math.isfinite(stopped_at)
                     or not 0 <= stopped_at <= time.time()):
                 raise ValueError('invalid manual stop record')
             if stopped_at >= requested_at:
