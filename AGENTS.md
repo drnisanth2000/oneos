@@ -68,10 +68,20 @@ external evidence verified one sanctioned approval of a real adapter-created
 receipt and one revert commit. The revert exactly inverted the approval paths,
 returned the tracked receipt to triage, restored the pre-approval committed
 tree, required no manual cleanup, and preserved all pre-existing dirty state
-byte-identically. Gate 2 passed. Gate 1 timed triage is the remaining live exit
-trial; Gates 2, 3, 4, and 5 pass. Phase 2 remains unauthorized, and deployment
-stays blocked until every Phase 1 gate passes and the owner separately approves
-it.
+byte-identically. Gate 2 passed; at that point Gate 1 timed triage was the
+remaining live exit trial. A subsequent trusted-local Gate 1 trial at
+exact fetched `origin/main` `aa1eafdc6047debb9698a32099889665eda1c40b`
+measured 20 real inbox items in 157.8 seconds (7.89 seconds per item), versus
+217.0 seconds (10.85 seconds per item) in Obsidian: 59.2 seconds, or 27.3%,
+less elapsed time. The timed pass persisted exactly 20 review proposals without
+moving content. Separate owner review then produced 20 sanctioned approval
+commits; triage and Outbox both closed at zero. The closing Gate 3 audit passed
+with those 20 sanctioned commits, 20 sanctioned dirty writes, and no violation
+across 414 observed filesystem entries. The private suite passed 39 tests,
+`check_v2` remained at 0 errors/0 warnings, and all pre-existing worktree and
+index differences were preserved byte-identically. Gate 1 passed; all five
+Phase 1 exit gates now pass. Phase 2 remains unauthorized, and deployment still
+requires separate owner approval.
 A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
