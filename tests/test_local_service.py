@@ -108,6 +108,28 @@ def test_backup_git_lock_timeout_is_sanitized_and_releases_operation_lock(
         pass
 
 
+def test_backup_cyclic_symlink_failure_is_sanitized(tmp_path, monkeypatch, capsys):
+    from pathlib import Path
+    from tools import local_backup, local_service as service
+
+    config = diagnostic_config(tmp_path)
+    state = tmp_path / 'state'
+    service.write_json(state / 'config.json', config)
+    (Path(config['vault']) / 'cycle').symlink_to('cycle')
+
+    def inventory_vault(runtime_config, _runtime, due_only=False):
+        assert due_only is False
+        local_backup.inventory(Path(runtime_config['vault']))
+
+    monkeypatch.setattr(local_backup, 'backup', inventory_vault)
+
+    assert service.main(['--state-dir', str(state), 'backup']) == 1
+    output = capsys.readouterr()
+    assert output.out == ''
+    assert json.loads(output.err)['code'] == 'operation_failed'
+    assert 'Traceback' not in output.err
+
+
 def test_direct_compose_validation_rebuilds_both_images():
     from pathlib import Path
 

@@ -97,7 +97,11 @@ def inventory(root):
             info = item.lstat()
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(item)
-                if os.path.isabs(target) or not item.resolve().is_relative_to(root):
+                try:
+                    resolved = item.resolve()
+                except RuntimeError as exc:
+                    raise ValueError('cyclic symlink cannot be backed up') from exc
+                if os.path.isabs(target) or not resolved.is_relative_to(root):
                     raise ValueError('external or absolute symlink cannot be backed up')
                 result[relative] = {'kind': 'link', 'target': target}
             elif stat.S_ISDIR(info.st_mode):

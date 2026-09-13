@@ -93,7 +93,7 @@ def test_hash_replay_concurrency_and_recovery(owner):
     assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3090), now=3090) is None
 
 
-@pytest.mark.parametrize("blocked", [float("inf"), float("-inf"), -1])
+@pytest.mark.parametrize("blocked", [float("inf"), float("-inf"), -1, 1e300])
 def test_invalid_throttle_deadline_is_unavailable(owner, blocked):
     from app.auth import AuthUnavailable
     store, _ = owner

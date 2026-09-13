@@ -21,6 +21,7 @@ from .console_routing import structured_reader
 HASHER = PasswordHasher()
 IDLE_SECONDS = 1800
 ABSOLUTE_SECONDS = 43200
+MAX_BLOCK_SECONDS = 900
 
 
 class AuthUnavailable(Exception):
@@ -105,7 +106,8 @@ class AuthStore:
             throttle = db.execute("SELECT failures, blocked FROM throttle WHERE id=1").fetchone()
             if (not throttle or not isinstance(throttle[0], int) or throttle[0] < 0
                     or not isinstance(throttle[1], (int, float))
-                    or not math.isfinite(throttle[1]) or throttle[1] < 0):
+                    or not math.isfinite(throttle[1]) or throttle[1] < 0
+                    or throttle[1] > time.time() + MAX_BLOCK_SECONDS):
                 raise AuthUnavailable()
             for session in db.execute("SELECT token,csrf,created,seen FROM sessions"):
                 _validate_session(session)
@@ -173,7 +175,7 @@ class AuthStore:
             counter = int(now // 30)
             if not valid or counter <= row[2] or not pyotp.TOTP(row[1]).verify(code, for_time=now):
                 failures += 1
-                db.execute("UPDATE throttle SET failures=?,blocked=? WHERE id=1", (failures, now + min(900, 30 * 2 ** min(failures - 5, 5)) if failures >= 5 else 0))
+                db.execute("UPDATE throttle SET failures=?,blocked=? WHERE id=1", (failures, now + min(MAX_BLOCK_SECONDS, 30 * 2 ** min(failures - 5, 5)) if failures >= 5 else 0))
                 return None
             # Password verification and counter advance share the write transaction.
             db.execute("UPDATE owner SET counter=? WHERE id=1", (counter,))
