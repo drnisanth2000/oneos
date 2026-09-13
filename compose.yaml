@@ -1,0 +1,122 @@
+name: oneos-local
+
+x-runtime-defaults: &runtime-defaults
+  restart: unless-stopped
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "3"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  app:
+    <<: *runtime-defaults
+    image: oneos-local:local
+    build:
+      context: .
+      target: runtime
+      args:
+        ONEOS_UID: ${ONEOS_UID:?ONEOS_UID is required}
+        ONEOS_GID: ${ONEOS_GID:?ONEOS_GID is required}
+    user: "${ONEOS_UID:?ONEOS_UID is required}:${ONEOS_GID:?ONEOS_GID is required}"
+    read_only: true
+    environment:
+      GIT_AUTHOR_EMAIL: ${ONEOS_GIT_EMAIL:?ONEOS_GIT_EMAIL is required}
+      GIT_AUTHOR_NAME: ${ONEOS_GIT_NAME:?ONEOS_GIT_NAME is required}
+      GIT_COMMITTER_EMAIL: ${ONEOS_GIT_EMAIL:?ONEOS_GIT_EMAIL is required}
+      GIT_COMMITTER_NAME: ${ONEOS_GIT_NAME:?ONEOS_GIT_NAME is required}
+      HOME: /tmp
+      ONEOS_AUTH_STATE_DIR: /state/auth
+      ONEOS_BACKUP_STATUS_FILE: /state/status/backup-status.json
+      ONEOS_DEPLOYMENT: local
+      ONEOS_GIT_EMAIL: ${ONEOS_GIT_EMAIL:?ONEOS_GIT_EMAIL is required}
+      ONEOS_GIT_NAME: ${ONEOS_GIT_NAME:?ONEOS_GIT_NAME is required}
+      ONEOS_ORIGIN: https://localhost:8443
+      ONEOS_VAULT: /vault
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - type: bind
+        source: ${ONEOS_VAULT:?ONEOS_VAULT is required}
+        target: /vault
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONEOS_STATE_DIR:?ONEOS_STATE_DIR is required}/auth
+        target: /state/auth
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONEOS_STATE_DIR:?ONEOS_STATE_DIR is required}/status
+        target: /state/status
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp
+      - /run
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 30s
+
+  caddy:
+    <<: *runtime-defaults
+    image: oneos-caddy-local:local
+    build:
+      context: .
+      target: caddy
+      args:
+        ONEOS_UID: ${ONEOS_UID:?ONEOS_UID is required}
+        ONEOS_GID: ${ONEOS_GID:?ONEOS_GID is required}
+    user: "${ONEOS_UID:?ONEOS_UID is required}:${ONEOS_GID:?ONEOS_GID is required}"
+    read_only: true
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - target: 8443
+        published: "8443"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ${ONEOS_STATE_DIR:?ONEOS_STATE_DIR is required}/caddy/data
+        target: /data
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ONEOS_STATE_DIR:?ONEOS_STATE_DIR is required}/caddy/config
+        target: /config
+        read_only: false
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp
+      - /run
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --no-check-certificate
+        - --quiet
+        - --spider
+        - https://localhost:8443/healthz
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

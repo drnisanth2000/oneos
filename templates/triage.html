@@ -71,7 +71,10 @@
           {% if c.confident and destination %}
           {% set proposal_values = {"filename": it.path.name, "module": destination.module, "sub": destination.sub or ""} %}
           <div class="ti-actions">
+            {% from "_auth_forms.html" import action_form with context %}
+            {{ action_form('propose-form-' ~ loop.index0, proposal_values, '/triage/' ~ entity ~ '/propose') }}
             <button class="accept"
+                    type="submit" form="propose-form-{{ loop.index0 }}"
                     hx-post="/triage/{{ entity }}/propose"
                     hx-vals='{{ proposal_values | tojson }}'
                     hx-target="#diff-{{ loop.index0 }}" hx-swap="innerHTML">
@@ -90,6 +93,9 @@
                   hx-target="#diff-{{ loop.index0 }}" hx-swap="innerHTML"
                   x-data="{ module: '', sub: '', choices: TRIAGE_DESTINATIONS }">
               <input type="hidden" name="filename" value="{{ it.path.name }}">
+              {% if request.state.csrf_token | default('') %}
+              <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+              {% endif %}
               <fieldset class="destination-fields">
                 <legend class="sr-only">Destination for {{ it.title }}</legend>
                 <label for="module-{{ loop.index0 }}">Folder
@@ -110,7 +116,7 @@
                     </template>
                   </select>
                 </label>
-                <button class="manual-submit" type="submit" disabled :disabled="!module">
+                <button class="manual-submit" type="submit" :disabled="!module">
                   Preview proposal
                 </button>
               </fieldset>

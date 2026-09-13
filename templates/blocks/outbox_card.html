@@ -68,8 +68,12 @@
     <input type="hidden" name="review_issue" value="{{ issue }}">
   </div>
   <div class="prop-actions" id="review-controls-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
+    {% from "_auth_forms.html" import action_form with context %}
+    {% set form_id = 'action-form-' ~ row.proposal.id ~ '-' ~ row.review_sha256 ~ '-' ~ issue %}
+    {{ action_form(form_id, dict(outbox_values, reviewed_values=reviewed_values | tojson, review_issue=issue), '/outbox/' ~ entity ~ '/approve') }}
     {% if row.can_approve %}
     <button class="approve"
+            type="submit" form="{{ form_id }}" formaction="/outbox/{{ entity }}/approve"
             hx-post="/outbox/{{ entity }}/approve"
             hx-vals='{{ outbox_values | tojson }}'
             hx-target="#outbox-list" hx-swap="outerHTML"
@@ -77,6 +81,7 @@
     {% endif %}
     {% if row.can_reject %}
     <button class="reject"
+            type="submit" form="{{ form_id }}" formaction="/outbox/{{ entity }}/reject"
             hx-post="/outbox/{{ entity }}/reject"
             hx-vals='{{ outbox_values | tojson }}'
             hx-target="#outbox-list" hx-swap="outerHTML"

@@ -48,7 +48,7 @@ def _pinned_vault_root_identity(root: Path) -> tuple[Path, int, int]:
 def vault_root() -> Path:
     raw = os.environ.get(ENV_VAULT)
     if not raw:
-        raise RuntimeError(
+        raise VaultRootUnavailable(
             f"{ENV_VAULT} is not set — point it at the vault root before starting."
         )
     root = Path(raw).expanduser().absolute()
@@ -57,8 +57,11 @@ def vault_root() -> Path:
     return root
 
 
-def build_catalog() -> EntityCatalog:
-    return EntityCatalog.load(vault_root())
+def build_catalog(cached: EntityCatalog | None = None) -> EntityCatalog:
+    root = vault_root().resolve()
+    # Revalidate the configured root before reusing its startup manifest.
+    # Reload from that same root, without rereading the environment.
+    return cached if cached is not None and cached.root == root else EntityCatalog.load(root)
 
 
 @failure_contract(

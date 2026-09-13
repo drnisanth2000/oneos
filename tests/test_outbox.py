@@ -1155,6 +1155,36 @@ def test_approval_transaction_error_is_an_outbox_error(tmp_path, monkeypatch):
     assert isinstance(raised.value.__cause__, GitTransactionFailure)
 
 
+def test_approval_normalizes_action_lock_lookup_timeout_before_mutation(
+    tmp_path, monkeypatch
+):
+    vault = _vault(tmp_path)
+    scope, prop = _propose(vault)
+    source = vault / prop.src
+    destination = vault / prop.dst
+    source_bytes = source.read_bytes()
+    proposal_bytes = prop.path.read_bytes()
+    head_before = git_head(vault)
+    original_run = git_transaction.subprocess.run
+
+    def timeout_lock_lookup(command, **kwargs):
+        if command == ["git", "rev-parse", "--path-format=absolute", "--git-dir"]:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(git_transaction.subprocess, "run", timeout_lock_lookup)
+
+    with pytest.raises(outbox.OutboxTransactionError) as raised:
+        approve(scope, prop.id, _fp(scope, prop.id))
+
+    assert isinstance(raised.value.__cause__, GitTransactionFailure)
+    assert isinstance(raised.value.__cause__.__cause__, subprocess.TimeoutExpired)
+    assert git_head(vault) == head_before
+    assert source.read_bytes() == source_bytes
+    assert destination.exists() is False
+    assert prop.path.read_bytes() == proposal_bytes
+
+
 def test_approval_refuses_race_after_verified_snapshot_without_overwriting_source(
     tmp_path, monkeypatch
 ):

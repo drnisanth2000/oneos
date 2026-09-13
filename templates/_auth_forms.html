@@ -1,0 +1,8 @@
+{% macro action_form(form_id, values, action) -%}
+<form id="{{ form_id }}" method="post" action="{{ action }}">
+  <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token | default('') }}">
+  {% for name, value in values.items() %}
+  <input type="hidden" name="{{ name }}" value="{{ value | forceescape }}">
+  {% endfor %}
+</form>
+{%- endmacro %}

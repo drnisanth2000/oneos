@@ -6,6 +6,8 @@ readme = "AGENTS.md"
 requires-python = ">=3.12"
 license = { text = "AGPL-3.0-or-later" }
 dependencies = [
+    "argon2-cffi>=25.1.0",
+    "pyotp>=2.9.0",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
     "jinja2>=3.1",

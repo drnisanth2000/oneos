@@ -4001,6 +4001,17 @@ def test_route_totality_from_declared_catches(tmp_path, monkeypatch):
     main = _load_main(tmp_path, monkeypatch, ENTITIES)
     plan = _route_totality_plan(main)
 
+    # Deployment diagnostics have a distinct safe response, but still take
+    # part in declared-family injection rather than being skipped by this
+    # totality sweep. Liveness declares no service failures.
+    for route in main.app.routes:
+        if route.path in {"/healthz", "/readyz"}:
+            plan[route.endpoint] = {
+                "request": lambda c, submitted=None, url=route.path: c.get(url),
+                "patch_targets": [(main.Vault, "bundles")] if route.path == "/readyz" else [],
+                "diagnostic": True,
+            }
+
     endpoints = list(_registered_console_endpoints(main.app))
     assert len(endpoints) >= 11, f"the sweep saw only {endpoints}"
     missing = [
@@ -4049,6 +4060,10 @@ def test_route_totality_from_declared_catches(tmp_path, monkeypatch):
                         f"{endpoint.__qualname__}: {exc_class.__name__} via "
                         f"{owner!r}.{attr} reached the global fallback"
                     )
+                    if spec.get("diagnostic"):
+                        assert response.status_code == 503
+                        assert response.json()["vault"] == "unavailable"
+                        assert "injected for route totality" not in response.text
                     if endpoint is main.registry_delete_review_fragment:
                         assert 'role="alert"' in response.text
                         assert not _rendered_control_ids(response.text), response.text
@@ -4175,6 +4190,7 @@ def test_shell_and_triage_default_declared_family_never_reaches_the_global_fallb
     # (the same vehicle `test_pulse_declares_no_family` uses) and
     # `triage_default`'s own `RedirectResponse(...)` call.
     monkeypatch.undo()
+    monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
     monkeypatch.setitem(main.app.exception_handlers, Exception, _spy)
 
     class _BoomDatetime:

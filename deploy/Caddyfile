@@ -1,0 +1,14 @@
+{
+	admin off
+}
+
+https://localhost:8443 {
+	tls internal
+	encode zstd gzip
+	reverse_proxy app:8000
+}
+
+https://:8443 {
+	tls internal
+	respond 421
+}

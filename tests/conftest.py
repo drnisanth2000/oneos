@@ -14,6 +14,16 @@ import textwrap
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def explicit_development_auth():
+    """Legacy synthetic route tests intentionally exercise the development mode."""
+    # A separate context survives tests that call their own monkeypatch.undo().
+    with pytest.MonkeyPatch.context() as environment:
+        environment.setenv("ONEOS_AUTH_MODE", "disabled")
+        environment.delenv("ONEOS_DEPLOYMENT", raising=False)
+        yield
+
 # A minimal but faithful archetypes.yaml: one module gated behind a flag
 # (`zz-extra` needs `special`), the rest unconditional — mirroring how the real
 # registry gates only `15-self` behind `personal`.

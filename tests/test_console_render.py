@@ -43,6 +43,63 @@ class _StubRequest:
         self.headers = dict(headers or {})
 
 
+@pytest.mark.parametrize("template_name", ["delete_impact.html", "lifecycle_card.html"])
+def test_repeated_issue_keeps_each_review_button_bound_to_its_own_form(template_name):
+    from html.parser import HTMLParser
+    from pathlib import Path
+    from types import SimpleNamespace
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+    class Forms(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.forms = []
+            self.buttons = []
+            self.current = None
+
+        def handle_starttag(self, tag, attributes):
+            attributes = dict(attributes)
+            if tag == "form":
+                self.current = {"id": attributes["id"], "fields": {}}
+                self.forms.append(self.current)
+            elif tag == "input" and self.current is not None:
+                self.current["fields"][attributes["name"]] = attributes["value"]
+            elif tag == "button" and "form" in attributes:
+                self.buttons.append(attributes["form"])
+
+        def handle_endtag(self, tag):
+            if tag == "form":
+                self.current = None
+
+    environment = Environment(loader=FileSystemLoader(Path(__file__).resolve().parents[1] / "templates"),
+                              autoescape=select_autoescape())
+    environment.globals["new_issue"] = lambda: "123456abcdef"
+    template = environment.get_template("blocks/" + template_name)
+    reviews = [("proposal-a", "a" * 64), ("proposal-b", "a" * 64), ("proposal-a", "b" * 64)]
+    parser = Forms()
+    for proposal_id, digest in reviews:
+        proposal = SimpleNamespace(id=proposal_id, total=0, slug="example", kind="product",
+                                   action="lifecycle_repair", manifest=[], reviewed_fields={"entity": "alpha"})
+        row = SimpleNamespace(proposal=proposal, review_sha256=digest, can_approve=True,
+                              can_reject=True, diff="")
+        parser.feed(template.render(prop=proposal, row=row, review_sha256=digest,
+                                    issue="123456abcdef", impact_signature="none", entity="alpha",
+                                    request=SimpleNamespace(state=SimpleNamespace(csrf_token="token"))))
+
+    assert len(parser.forms) == 3
+    form_ids = [form["id"] for form in parser.forms]
+    assert len(set(form_ids)) == 3, "repeated issue values must not alias different reviews"
+    buttons_per_card = 1 if template_name == "delete_impact.html" else 2
+    assert len(parser.buttons) == 3 * buttons_per_card
+    for index, (proposal_id, digest) in enumerate(reviews):
+        for form_id in parser.buttons[index * buttons_per_card:(index + 1) * buttons_per_card]:
+            # HTML associates an external submit button with its form by id.
+            associated = next(form for form in parser.forms if form["id"] == form_id)
+            assert associated["fields"]["id"] == proposal_id
+            assert associated["fields"]["review_sha256"] == digest
+            assert associated["fields"]["review_issue"] == "123456abcdef"
+
+
 def test_fragment_refusal_status_is_200():
     from app.console_errors import _CODES
     from app.console_render import status_for
@@ -234,6 +291,12 @@ def _full_page_route_paths(main) -> list[str]:
         if meta is None or meta.surface != "page":
             continue
         if endpoint is main.triage_default:
+            continue
+        # Process/readiness diagnostics do not use HTMX or console templates.
+        # Their JSON schema, authenticated HTML and no-leak failure responses
+        # have separate tests; do not require client mutation scripts there.
+        if route.path in {"/healthz", "/readyz"}:
+            assert endpoint.__module__ == "app.deployment_health"
             continue
         if "GET" not in (getattr(route, "methods", None) or set()):
             continue

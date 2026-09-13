@@ -1,6 +1,13 @@
 <nav class="sidebar" aria-label="Entity bundles"
      x-data="{ open: $persist({}).as('oneos.sidebar.open') }">
   <div class="brand"><a href="/" class="brandlink">OneOS</a> <small>· read &amp; approve</small></div>
+  {% if request.state.owner_authenticated | default(false) %}
+  <a href="/readyz">Service status</a>
+  <form method="post" action="/logout">
+    <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+    <button type="submit">Sign out</button>
+  </form>
+  {% endif %}
 
   {% for b in bundles %}
   <div class="bundle" data-slug="{{ b.slug }}">

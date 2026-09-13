@@ -53,7 +53,11 @@
     <input type="hidden" name="review_issue" value="{{ issue }}">
   </div>
   <div class="prop-actions" id="review-controls-{{ prop.id }}-{{ review_sha256 }}-{{ issue }}">
+    {% from "_auth_forms.html" import action_form with context %}
+    {% set form_id = 'action-form-' ~ prop.id ~ '-' ~ review_sha256 ~ '-' ~ issue %}
+    {{ action_form(form_id, dict(delete_execute_values, reviewed_values=reviewed_values | tojson, review_issue=issue), '/registry/' ~ entity ~ '/product/delete-execute') }}
     <button class="reject"
+            type="submit" form="{{ form_id }}"
             hx-post="/registry/{{ entity }}/product/delete-execute"
             hx-vals='{{ delete_execute_values | tojson }}'
             hx-target="closest .delete-impact" hx-swap="innerHTML"
