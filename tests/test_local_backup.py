@@ -148,6 +148,23 @@ def test_snapshot_refuses_external_git_hooks(tmp_path, hooks_path):
     assert not (tmp_path / 'snapshot').exists()
 
 
+def test_snapshot_refuses_cyclic_git_hooks_as_validation_error(tmp_path):
+    from tools.local_backup import snapshot
+
+    source = tmp_path / 'source'
+    source.mkdir()
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    (source / 'loop').symlink_to('loop')
+    subprocess.run(
+        ['git', '-C', str(source), 'config', 'core.hooksPath', 'loop/hooks'],
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match='hooks'):
+        snapshot(source, tmp_path / 'snapshot')
+    assert not (tmp_path / 'snapshot').exists()
+
+
 def test_snapshot_keeps_relative_internal_git_policy_hook(tmp_path):
     from tools.local_backup import snapshot
     source = tmp_path / 'source'

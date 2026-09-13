@@ -49,6 +49,7 @@ class AuthStore:
 
     def _check(self, *, creating=False):
         try:
+            database_identity = None
             # Reject redirected components, including a redirected state root.
             for part in (self.directory, *self.directory.parents):
                 if part.is_symlink():
@@ -68,16 +69,21 @@ class AuthStore:
                     continue
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid() or info.st_mode & 0o077:
                     raise AuthUnavailable()
+                if path == self.path:
+                    database_identity = (info.st_dev, info.st_ino)
+            return database_identity
         except OSError as exc:
             raise AuthUnavailable() from exc
 
     @contextmanager
     @structured_reader(category="admin-db")
     def connect(self):
-        self._check()
+        expected_identity = self._check()
         try:
             connection = sqlite3.connect(f"{self.path.as_uri()}?mode=rw", uri=True, timeout=5)
             try:
+                if self._check() != expected_identity:
+                    raise AuthUnavailable()
                 connection.execute("BEGIN IMMEDIATE")
                 yield connection
                 connection.commit()

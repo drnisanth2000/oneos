@@ -473,6 +473,25 @@ def test_authentication_refuses_main_database_removed_during_safety_check(owner,
         store.available()
 
 
+def test_authentication_refuses_database_replaced_while_opening(owner, monkeypatch, tmp_path):
+    import sqlite3
+    from app.auth import AuthUnavailable
+
+    store, _ = owner
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement.write_bytes(store.path.read_bytes())
+    replacement.chmod(0o600)
+    original_connect = sqlite3.connect
+
+    def replace_then_connect(*args, **kwargs):
+        replacement.replace(store.path)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", replace_then_connect)
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
 @pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
 def test_authentication_refuses_sidecar_permission_error(owner, monkeypatch, suffix):
     from pathlib import Path

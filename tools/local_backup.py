@@ -185,7 +185,11 @@ def check_git_layout(source):
         if captured.returncode != 0 or captured.stdout != hooks.stdout:
             raise ValueError('Git hooks configuration must be captured in the local repository')
         # Absolute paths still point at the original checkout after recovery.
-        if configured.is_absolute() or not (source / configured).resolve().is_relative_to(source):
+        try:
+            resolved_hooks = (source / configured).resolve()
+        except RuntimeError as exc:
+            raise ValueError('cyclic Git hooks path is unsupported') from exc
+        if configured.is_absolute() or not resolved_hooks.is_relative_to(source):
             raise ValueError('external or absolute Git hooks path is unsupported')
     elif hooks.returncode != 1:
         raise ValueError('Git hooks configuration is unavailable')
