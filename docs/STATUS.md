@@ -95,7 +95,8 @@ manual cleanup. A subsequent trusted-local Gate 1 comparison completed 20 real
 inbox items measurably faster in OneOS than in Obsidian, then closed every
 reviewed item through sanctioned approvals with no Gate 3 violation. All five
 Phase 1 exit gates pass. Phase 2 is not authorized, and deployment still
-requires separate owner approval.
+requires separate owner approval. Phase 3 email and PDF intake is recorded
+and is not authorized.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -354,7 +355,9 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 All five Phase 1 exit gates pass. The next authorized expansion decision is
 whether to deploy Step 11; deployment still requires separate owner approval.
-Phase 2 remains unauthorized, and deferred UI remains out of scope.
+Phase 2 remains unauthorized, and deferred UI remains out of scope. Phase 3
+is recorded below and is also unauthorized; recording it does not replace
+this decision.
 
 ---
 
@@ -367,6 +370,32 @@ service remains gated through an outbox proposal and explicit approval.
 
 Specific parsers and integration targets are instance data and remain in the
 vault's `decisions.md`, not this repository.
+
+## Phase 3 — design recorded, not authorized
+
+Email and PDF intake is recorded in
+`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
+Hermes monitors IMAP mailboxes. OneOS keeps review, learned rules, summaries,
+and Trash approval. A successfully handled PDF retains a verified unlocked
+file in a restricted external archive, one redacted inbox receipt, an approved
+short summary when one is useful, and a redacted audit trail. A full email
+copy and a full extracted transcript are not retained.
+
+Recording the design does not authorize implementation, a screen, a dependency,
+a live mailbox, or a change to S7. Phase 3 is not blocked on building Phase 2.
+Neither phase may be implemented from this record. The current email adapter
+still only records attachment names, and the current folder adapter may retain
+extracted PDF text; those paths stay unchanged until a separate implementation
+authorization.
+
+External archive copies and provider Trash moves cannot be undone by
+`git revert`. That recovery interpretation belongs only to a future authorized
+Phase 3. Until then, every current side effect still requires a revertible Git
+diff. A later connector note, covering a browser extension, a local companion,
+an optional hosted service, and other communication channels, is recorded
+separately in
+`docs/superpowers/specs/2026-10-25-later-connector-notes.md` and is not part
+of Phase 3.
 
 ## Inherited follow-ups from S6 — completion record
 
