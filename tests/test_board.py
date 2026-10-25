@@ -125,6 +125,7 @@ def test_symlinked_active_directory_is_refused(tmp_path, monkeypatch):
 def test_review_drop_targets_are_registry_destinations(tmp_path, monkeypatch):
     _main, client = _client(tmp_path, monkeypatch)
     _note(tmp_path, "alpha", "00-inbox", "Intake", sub="triage", title="Intake")
+    (tmp_path / "alpha" / "02-work" / "active").mkdir()
 
     response = client.get("/board/alpha", params={"group": "review"})
 
@@ -227,6 +228,64 @@ def test_attention_counts_recent_filed_notes(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "This week" in response.text
     assert ">1<" in response.text
+
+
+def test_gallery_chips_follow_the_filed_notes(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Filedtag", sub="records")
+    _note(tmp_path, "alpha", "00-inbox", "Inboxtag", sub="triage", title="Inboxtag")
+
+    response = client.get("/board/alpha", params={"view": "gallery", "group": "review"})
+
+    assert "records 1" in response.text
+    assert "triage 1" not in response.text
+
+
+def test_calendar_sorts_cards_inside_a_day(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Beta", due="2026-04-02", updated="2026-04-02")
+    _note(tmp_path, "alpha", "02-work", "Alpha", due="2026-04-02", updated="2020-01-01")
+
+    response = client.get(
+        "/board/alpha",
+        params={"view": "calendar", "month": "2026-04", "sort": "title"},
+    )
+
+    assert response.text.index("Alpha") < response.text.index("Beta")
+
+
+def test_missing_active_directory_is_not_a_drop_target(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "00-inbox", "Intake", sub="triage", title="Intake")
+    (tmp_path / "alpha" / "01-core" / "active").mkdir()
+
+    response = client.get("/board/alpha", params={"group": "review"})
+
+    assert 'data-module="01-core"' in response.text
+    assert 'data-module="02-work"' not in response.text
+
+
+def test_capture_quotes_a_title_that_contains_a_colon(tmp_path, monkeypatch):
+    from app.inbox import read_inbox
+    from app.scope import Scope
+    from tests.conftest import _git
+
+    _main, client = _client(tmp_path, monkeypatch)
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "test@example.invalid")
+    _git(tmp_path, "config", "user.name", "test")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "init")
+
+    response = client.post(
+        "/board/alpha/capture",
+        data={"title": "Meet: tomorrow", "text": "bring the notebook"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    found = read_inbox(Scope(tmp_path, "alpha"))
+    assert [item.title for item in found] == ["Meet: tomorrow"]
 
 
 def test_capture_writes_one_inbox_receipt(tmp_path, monkeypatch):

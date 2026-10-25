@@ -254,6 +254,12 @@ def _evaluate(formula: str | None, status: str, related: list[BoardCard]) -> str
     return None
 
 
+def _needs_related(formula: str | None) -> bool:
+    return bool(formula) and (
+        _COUNT.fullmatch(formula) is not None or _COUNT_WHERE.fullmatch(formula) is not None
+    )
+
+
 def _related(card: BoardCard, filed: list[BoardCard]) -> list[BoardCard]:
     if not card.product:
         return []
@@ -301,7 +307,8 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
             )
     evaluated: list[BoardCard] = []
     for card in cards:
-        result = _evaluate(card.formula, card.status, _related(card, cards))
+        related = _related(card, cards) if _needs_related(card.formula) else []
+        result = _evaluate(card.formula, card.status, related)
         evaluated.append(
             BoardCard(**{**card.__dict__, "formula_result": result})
         )
@@ -573,6 +580,7 @@ def _review_columns(
                 if card.module == module and card.sub == sub
             ]
             placed.update(card.relative_path for card in matched)
+            active = _require_real_directory(scope, module, "active")
             columns.append(
                 _column(
                     key,
@@ -581,7 +589,7 @@ def _review_columns(
                     module=module,
                     sub=sub,
                     missing=missing,
-                    droppable=droppable and not missing,
+                    droppable=droppable and active is not None,
                     sort=sort,
                 )
             )
@@ -710,14 +718,21 @@ def _library_columns(
     return tuple(columns)
 
 
-def _weeks(filed: list[BoardCard], month_start: date) -> tuple[tuple[CalendarDay, ...], ...]:
-    cal = calendar.Calendar(firstweekday=0)
+def _by_day(filed: list[BoardCard], sort: str) -> dict[date, list[BoardCard]]:
     by_day: dict[date, list[BoardCard]] = {}
     for card in filed:
         placed = _day(card.due) or _day(card.updated)
         if placed is None:
             continue
         by_day.setdefault(placed, []).append(card)
+    return {day: _sort_cards(cards, sort) for day, cards in by_day.items()}
+
+
+def _weeks(
+    filed: list[BoardCard], month_start: date, sort: str
+) -> tuple[tuple[CalendarDay, ...], ...]:
+    cal = calendar.Calendar(firstweekday=0)
+    by_day = _by_day(filed, sort)
     weeks = []
     for week in cal.monthdatescalendar(month_start.year, month_start.month):
         weeks.append(
@@ -842,10 +857,18 @@ def load_board(
     inbox = _inbox_cards(scope, vault, read_inbox(scope))
     proposed, blocked = _proposal_cards(scope, project_outbox(scope))
     filed = _read_filed(scope, vault)
-    if selected_group == "review":
-        population = inbox + proposed
-    else:
-        population = list(filed)
+    shows_filed = selected_view in {"gallery", "calendar", "planner", "map"} or selected_group != "review"
+    shows_inbox = selected_view == "planner" or (
+        selected_view in {"board", "list"} and selected_group == "review"
+    )
+    shows_proposed = selected_view in {"board", "list"} and selected_group == "review"
+    population: list[BoardCard] = []
+    if shows_inbox:
+        population.extend(inbox)
+    if shows_proposed:
+        population.extend(proposed)
+    if shows_filed:
+        population.extend(filed)
     filtered = [card for card in population if _matches(card, subs, products)]
     filed_filtered = [card for card in filed if _matches(card, subs, products)]
     inbox_filtered = [card for card in inbox if _matches(card, subs, products)]
@@ -917,8 +940,8 @@ def load_board(
         undated=undated,
         unscheduled=tuple(_sort_cards(inbox_filtered, selected_sort)),
         habits=tuple(card for card in _sort_cards(filed_filtered, selected_sort) if card.cadence),
-        weeks=_weeks(filed_filtered, month_start),
-        days=_span(filed_filtered, week_start, 7),
+        weeks=_weeks(filed_filtered, month_start, selected_sort),
+        days=_span(filed_filtered, week_start, 7, selected_sort),
         map_rows=_map_rows(vault, scope, filed_filtered),
         view_links=view_links,
         group_links=group_links,
@@ -972,12 +995,8 @@ def load_board(
     )
 
 
-def _span(filed: list[BoardCard], start: date, count: int) -> tuple[CalendarDay, ...]:
-    by_day: dict[date, list[BoardCard]] = {}
-    for card in filed:
-        placed = _day(card.due) or _day(card.updated)
-        if placed is not None:
-            by_day.setdefault(placed, []).append(card)
+def _span(filed: list[BoardCard], start: date, count: int, sort: str) -> tuple[CalendarDay, ...]:
+    by_day = _by_day(filed, sort)
     days = []
     for offset in range(count):
         day = start + timedelta(days=offset)
