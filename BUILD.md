@@ -105,7 +105,14 @@ triage and Outbox empty. Closing Gate 3 passed with no violation; 39 private
 tests passed, `check_v2` reported 0 errors/0 warnings, and pre-existing
 worktree and index differences were preserved byte-identically. Gate 1 passed;
 all five Phase 1 exit gates now pass. Phase 2 remains unauthorized, and Step 11
-deployment still requires separate owner approval.
+deployment still requires separate owner approval. Phase 3 email and PDF intake
+is a recorded design in
+`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
+Recording it does not authorize implementation, a new screen, a live mailbox,
+a dependency, or a change to S7, and it is not a new row in the Step 3–11
+table. Phase 3 is not blocked on building Phase 2. The later connector note in
+`docs/superpowers/specs/2026-10-25-later-connector-notes.md` is not part of
+Phase 3.
 
 Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
 inside this hardening sequence. The OneOS shell may adopt the approved

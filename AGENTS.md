@@ -82,6 +82,14 @@ across 414 observed filesystem entries. The private suite passed 39 tests,
 index differences were preserved byte-identically. Gate 1 passed; all five
 Phase 1 exit gates now pass. Phase 2 remains unauthorized, and deployment still
 requires separate owner approval.
+Phase 3 email and PDF intake is a recorded design in
+`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
+Recording it does not authorize implementation, a new screen, a live mailbox,
+a dependency, or a change to S7. Phase 2 finance ingest remains separately
+unauthorized, and Phase 3 is not blocked on building Phase 2. The later
+connector note in
+`docs/superpowers/specs/2026-10-25-later-connector-notes.md` is not part of
+Phase 3.
 A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
