@@ -19,9 +19,8 @@ external encrypted backup, restore-check, local certificate trust, and login
 startup are complete. The owner signed in and the home screen loaded. No
 passwords, authenticator codes, or backup keys are recorded here.
 
-Board views, email and PDF intake, and finance work were not started. Those
-remain unmerged: `cursor/board-views-08f0` and
-`cursor/record-phase3-email-pdf-design-6e2b`.
+The Board screen is included. Phase 3 email and PDF intake is recorded in
+this copy and does not authorize building it. Finance parsers are not included.
 
 Backup needed two macOS compatibility fixes, now in the tree and described in
 `LOCAL-OPERATIONS.md`. Failed staging directories from the attempts that
@@ -384,8 +383,9 @@ copy and a full extracted transcript are not retained.
 Recording the design does not authorize implementation, a screen, a dependency,
 a live mailbox, or a change to S7. Phase 3 is not blocked on building Phase 2.
 Neither phase may be implemented from this record. The current email adapter
-still only records attachment names, and the current folder adapter may retain
-extracted PDF text; those paths stay unchanged until a separate implementation
+commits a redacted summary of the message text and does not write attachment
+filenames into the receipt. The current folder adapter may retain extracted
+PDF text. Those paths stay unchanged until a separate implementation
 authorization.
 
 External archive copies and provider Trash moves cannot be undone by

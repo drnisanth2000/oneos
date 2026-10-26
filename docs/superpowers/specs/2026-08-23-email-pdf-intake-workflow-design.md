@@ -422,11 +422,13 @@ This design is Phase 3. It is not blocked on building Phase 2, and recording it
 does not start either phase. The current next expansion decision remains the
 separate Step 11 deployment approval.
 
-The current email adapter records attachment names and does not unlock or
-archive PDFs. The current folder adapter may retain extracted PDF text on the
-receipt path. This design keeps a full transcript temporary. Those adapters
-stay as they are until Phase 3 implementation is separately authorized. Official
-IMAP, monitored by Hermes, is the connector in this design.
+The current email adapter commits a redacted summary of the message text and
+a body reference. It collects attachment filenames and does not write them
+into the receipt. It does not unlock or archive PDFs. The current folder
+adapter may retain extracted PDF text on the receipt path. This design keeps a
+full transcript temporary. Those adapters stay as they are until Phase 3
+implementation is separately authorized. Official IMAP, monitored by Hermes,
+is the connector in this design.
 
 ## Completion criteria
 
