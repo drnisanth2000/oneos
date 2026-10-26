@@ -49,6 +49,11 @@ class PasswordUnlockError(Phase3Error):
         return "document could not be unlocked"
 
 
+class PasswordStoreCleanupError(Phase3Error):
+    def __str__(self) -> str:
+        return "password store cleanup failed"
+
+
 class CleanupError(Phase3Error):
     def __str__(self) -> str:
         return "cleanup action was refused"
@@ -204,12 +209,13 @@ class ProtectedPasswordStore:
             vault_identity = _identity(os.stat(self.vault, follow_symlinks=True))
             self._write_new(archive_fd, temporary, payload)
             if _directory_is_within(archive_fd, vault_identity):
+                self._discard(archive_fd, temporary)
                 raise PasswordUnlockError()
             os.rename(temporary, name, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
             published = True
             if _directory_is_within(archive_fd, vault_identity):
-                self._unlink(archive_fd, name)
                 published = False
+                self._discard(archive_fd, name)
                 raise PasswordUnlockError()
         finally:
             if not published:
@@ -260,11 +266,14 @@ class ProtectedPasswordStore:
                 os.close(fd)
 
     @staticmethod
-    def _unlink(directory_fd: int, name: str) -> None:
+    def _discard(directory_fd: int, name: str) -> None:
+        """Remove a password copy that landed in the vault, or fail hard."""
         try:
             os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
         except OSError as exc:
-            raise PasswordUnlockError() from exc
+            raise PasswordStoreCleanupError() from exc
 
 
 def _open_pdf(payload: bytes) -> PdfReader:

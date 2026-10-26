@@ -5,6 +5,7 @@ import importlib
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from pypdf import PdfWriter
 from starlette.testclient import TestClient
 
@@ -13,6 +14,7 @@ from app.phase3 import (
     LearnedRule,
     MailDocument,
     ParserHook,
+    PasswordStoreCleanupError,
     PasswordUnlockError,
     ProtectedPasswordStore,
     ProviderMessage,
@@ -27,6 +29,7 @@ from app.phase3 import (
     unlock_for_rule,
     unlocked_pdf_bytes,
 )
+from app import phase3
 from app.scope import Scope
 from tests.conftest import git_entity_vault, git_history_contains, scaffold_modules, write_vault
 
@@ -356,3 +359,59 @@ def test_corrupt_pdf_refuses_without_exposing_the_payload_or_password():
         assert "synthetic-password" not in text
     else:
         raise AssertionError("a corrupt file must be a safe unlock refusal")
+
+
+def _trip_containment(monkeypatch, trip_on: int) -> dict[str, bool]:
+    """Report the store as inside the vault on the given containment check."""
+    state = {"inside": False}
+    checks = 0
+
+    def fake_within(directory_fd, vault_identity):
+        nonlocal checks
+        checks += 1
+        if checks == trip_on:
+            state["inside"] = True
+        return state["inside"]
+
+    monkeypatch.setattr(phase3, "_directory_is_within", fake_within)
+    return state
+
+
+@pytest.mark.parametrize("trip_on", [1, 2])
+def test_password_that_lands_in_the_vault_is_removed(tmp_path, monkeypatch, trip_on):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    secrets = tmp_path / "secrets"
+    store = ProtectedPasswordStore(vault, secrets)
+    sender = sender_fingerprint("synthetic-sender@example.invalid")
+    _trip_containment(monkeypatch, trip_on)
+
+    with pytest.raises(PasswordUnlockError):
+        store.remember(sender, "invoice", "synthetic-password")
+
+    assert list(secrets.iterdir()) == []
+
+
+@pytest.mark.parametrize("trip_on", [1, 2])
+def test_password_cleanup_failure_in_the_vault_is_a_hard_failure(tmp_path, monkeypatch, trip_on):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    secrets = tmp_path / "secrets"
+    store = ProtectedPasswordStore(vault, secrets)
+    sender = sender_fingerprint("synthetic-sender@example.invalid")
+    state = _trip_containment(monkeypatch, trip_on)
+    real_unlink = phase3.os.unlink
+
+    def fail_cleanup(path, *args, dir_fd=None, **kwargs):
+        if state["inside"] and dir_fd is not None:
+            raise OSError("synthetic cleanup failure")
+        return real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(phase3.os, "unlink", fail_cleanup)
+
+    with pytest.raises(PasswordStoreCleanupError) as raised:
+        store.remember(sender, "invoice", "synthetic-password")
+
+    assert not isinstance(raised.value, PasswordUnlockError)
+    assert "synthetic-password" not in str(raised.value)
+    assert len(list(secrets.iterdir())) == 1

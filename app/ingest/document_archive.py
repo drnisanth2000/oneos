@@ -11,6 +11,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -28,10 +29,18 @@ from .adapters.folder import (
     _open_regular_source,
     _source_is_current,
 )
-from .base import IngestError, IngestResult, commit_inbox_item
+from .base import (
+    IngestError,
+    IngestResult,
+    commit_inbox_item,
+    find_tracked_receipt,
+    prepare_inbox_item,
+)
 
 _SOURCE_ID = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,63})")
-_RECEIVED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}")
+_RECEIVED_AT = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:Z|[+-][0-9]{2}:[0-9]{2})?"
+)
 _STEM = re.compile(r"[^a-z0-9]+")
 _RECEIPT_TEXT = "Verified unlocked document is stored in the external archive."
 
@@ -89,13 +98,26 @@ def ingest_unlocked_bytes(
     """Archive verified unlocked bytes. The caller supplies no password."""
     if not _SOURCE_ID.fullmatch(source_id):
         raise DocumentArchiveError("document source identity is invalid")
-    if not _RECEIVED_AT.fullmatch(received_at):
+    if not _valid_received_at(received_at):
         raise DocumentArchiveError("document receipt time is invalid")
     if not payload:
         raise DocumentArchiveError("document is empty")
     archive_name = _archive_name(filename)
     fingerprint = hashlib.sha256(payload).hexdigest()
     _require_unlocked(payload)
+    reference = f"archive:{fingerprint}"
+    # A conflicting receipt must stop the ingest before the archive is touched.
+    _, envelope, _ = prepare_inbox_item(
+        scope,
+        text=_RECEIPT_TEXT,
+        title=archive_name,
+        source="document",
+        source_id=source_id,
+        received_at=received_at,
+        source_ref=reference,
+        sha256=fingerprint,
+    )
+    find_tracked_receipt(scope, envelope)
 
     anchor = _open_external_archive_anchor(scope.root, Path(archive_root))
     archive_fd: int | None = None
@@ -113,7 +135,6 @@ def ingest_unlocked_bytes(
                 objects_fd, quarantine_fd, fingerprint, payload, vault_identity
             )
             chosen_name = _assign_name(names_fd, archive_name, fingerprint)
-            reference = f"archive:{fingerprint}"
             result = commit_inbox_item(
                 scope,
                 text=_RECEIPT_TEXT,
@@ -146,6 +167,16 @@ def ingest_unlocked_bytes(
         archive_name=chosen_name,
         reused=reused,
     )
+
+
+def _valid_received_at(value: str) -> bool:
+    if not _RECEIVED_AT.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _archive_name(filename: str) -> str:

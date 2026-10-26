@@ -10,7 +10,9 @@ from pypdf import PdfWriter
 
 from app.ingest import document_archive
 from app.ingest.adapters.folder import RawArchiveContainmentError, RawArchiveWriteError
+from app.ingest.base import IngestIdentityConflict
 from app.ingest.document_archive import (
+    DocumentArchiveError,
     DocumentChecksumError,
     DocumentEncryptedError,
     ingest_unlocked_pdf,
@@ -289,3 +291,69 @@ def test_encrypted_pdf_is_refused_without_a_password_attempt(tmp_path):
 
     assert not archive.exists()
     assert git_head_message(vault) == "init"
+
+
+@pytest.mark.parametrize(
+    "received_at",
+    ["2026-10-26T09:30:00Z", "2026-10-26T09:30:00+00:00", "2026-10-26T09:30:00-05:30"],
+)
+def test_received_time_with_a_timezone_offset_is_accepted(tmp_path, received_at):
+    vault = _vault(tmp_path)
+    source = _write_pdf(tmp_path / "incoming", "statement.pdf", _pdf(_MARKER))
+
+    archived = ingest_unlocked_pdf(
+        Scope(vault, "synthetic"),
+        source,
+        archive_root=tmp_path / "archive",
+        source_id="case-one",
+        received_at=received_at,
+    )
+
+    assert archived.result.created is True
+    ok, problems = validate_file(archived.result.path)
+    assert ok, problems
+
+
+@pytest.mark.parametrize(
+    "received_at",
+    ["2026-13-40T09:30:00", "2026-10-26T25:30:00", "2026-10-26T09:30:00+0500", "2026-10-26"],
+)
+def test_invalid_received_time_is_refused_before_the_archive(tmp_path, received_at):
+    vault = _vault(tmp_path)
+    source = _write_pdf(tmp_path / "incoming", "statement.pdf", _pdf(_MARKER))
+    archive = tmp_path / "archive"
+
+    with pytest.raises(DocumentArchiveError, match="receipt time"):
+        ingest_unlocked_pdf(
+            Scope(vault, "synthetic"),
+            source,
+            archive_root=archive,
+            source_id="case-one",
+            received_at=received_at,
+        )
+
+    assert not archive.exists()
+    assert git_head_message(vault) == "init"
+
+
+def test_conflicting_receipt_identity_leaves_no_new_archive_object(tmp_path):
+    vault = _vault(tmp_path)
+    first = _write_pdf(tmp_path / "one", "statement.pdf", _pdf("first"))
+    second = _write_pdf(tmp_path / "two", "other.pdf", _pdf("second"))
+    archive = tmp_path / "archive"
+    scope = Scope(vault, "synthetic")
+    ingest_unlocked_pdf(
+        scope, first, archive_root=archive, source_id="case-one", received_at=_RECEIVED_AT,
+    )
+    objects_before = sorted(path.name for path in (archive / "objects").iterdir())
+    names_before = sorted(path.name for path in (archive / "names").iterdir())
+    head_before = git_head_message(vault)
+
+    with pytest.raises(IngestIdentityConflict):
+        ingest_unlocked_pdf(
+            scope, second, archive_root=archive, source_id="case-one", received_at=_RECEIVED_AT,
+        )
+
+    assert sorted(path.name for path in (archive / "objects").iterdir()) == objects_before
+    assert sorted(path.name for path in (archive / "names").iterdir()) == names_before
+    assert git_head_message(vault) == head_before
