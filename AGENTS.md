@@ -318,6 +318,11 @@ The main canvas is the **Command Center** screen. It may summarize scoped data
 and surface triage, proposals, errors, and approvals, but every value comes from
 runtime registries or vault state. Never copy instance values from a mockup.
 
+The **Board** screen reads one entity: a filed note opens as a read-only
+outline, an inbox card dropped on a column posts to the existing
+classification-proposal route and moves nothing, and quick capture writes
+through the shared ingest path.
+
 ## Gotchas
 
 - `alpine-morph` is mandatory — a default HTMX swap destroys Alpine state on
