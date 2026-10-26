@@ -275,7 +275,6 @@ def test_mailbox_screen_shows_tabs_and_cleanup_requires_confirmation(tmp_path, m
     import app.phase3 as phase3
     import app.main as main
 
-    importlib.reload(phase3)
     main = importlib.reload(main)
     scope = Scope(tmp_path, "alpha")
     phase3.configure_workspace(
@@ -301,6 +300,7 @@ def test_mailbox_screen_shows_tabs_and_cleanup_requires_confirmation(tmp_path, m
     cleanup = client.get("/mail/alpha/cleanup")
     assert cleanup.status_code == 200
     assert "Ready to delete" in cleanup.text
+    assert cleanup.text.count('name="csrf_token"') == 3
     assert "Deleted" in cleanup.text
     assert "case-one" in cleanup.text
     refused = client.post("/mail/alpha/cleanup/confirm", data={"confirmed": "no"})
@@ -319,4 +319,40 @@ def test_mailbox_screen_shows_tabs_and_cleanup_requires_confirmation(tmp_path, m
 
 def test_unlocked_bytes_round_trip_helper():
     payload = _pdf("plain")
-    assert unlocked_pdf_bytes(payload, None) == payload
+    assert unlocked_pdf_bytes(payload, None) == (payload, False)
+
+
+def test_unencrypted_pdf_does_not_replace_a_remembered_password(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    store = ProtectedPasswordStore(vault, tmp_path / "secrets")
+    sender = sender_fingerprint("synthetic-sender@example.invalid")
+    store.remember(sender, "invoice", "synthetic-old-password")
+    from app.phase3 import RuleMatch
+
+    try:
+        unlock_for_rule(
+            _pdf("plain"),
+            store=store,
+            sender_fingerprint=sender,
+            document_type="invoice",
+            match=RuleMatch("matched", ("rule-a",)),
+            verified=True,
+            replacement="synthetic-new-password",
+        )
+    except PasswordUnlockError as exc:
+        assert "synthetic-new-password" not in str(exc)
+    else:
+        raise AssertionError("an unencrypted file must not replace the stored password")
+    assert store.password_for(sender, "invoice") == "synthetic-old-password"
+
+
+def test_corrupt_pdf_refuses_without_exposing_the_payload_or_password():
+    try:
+        unlocked_pdf_bytes(b"not-a-pdf-secret-marker", "synthetic-password")
+    except PasswordUnlockError as exc:
+        text = str(exc)
+        assert "not-a-pdf-secret-marker" not in text
+        assert "synthetic-password" not in text
+    else:
+        raise AssertionError("a corrupt file must be a safe unlock refusal")

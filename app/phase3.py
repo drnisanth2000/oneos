@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
+import warnings
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -18,6 +20,8 @@ from pypdf import PdfReader, PdfWriter
 
 from .console_routing import failure_contract
 from .ingest.adapters.folder import (
+    _directory_is_within,
+    _identity,
     _open_archive_directory,
     _open_external_archive_anchor,
 )
@@ -141,13 +145,18 @@ class ProtectedPasswordStore:
     def __init__(self, vault: Path | str, root: Path | str) -> None:
         self.vault = Path(vault)
         self.root = Path(root)
-        self._check_root()
-
-    def _check_root(self) -> None:
-        anchor = _open_external_archive_anchor(self.vault, self.root)
-        archive_fd = _open_archive_directory(anchor, self.vault)
+        anchor, archive_fd = self._open_store()
         os.close(archive_fd)
         os.close(anchor.fd)
+
+    def _open_store(self) -> tuple[object, int]:
+        anchor = _open_external_archive_anchor(self.vault, self.root)
+        try:
+            archive_fd = _open_archive_directory(anchor, self.vault)
+        except BaseException:
+            os.close(anchor.fd)
+            raise
+        return anchor, archive_fd
 
     def _name(self, sender_fingerprint: str, document_type: str) -> str:
         if not _HEX.fullmatch(sender_fingerprint) or not _TOKEN.fullmatch(document_type):
@@ -157,41 +166,137 @@ class ProtectedPasswordStore:
         ).hexdigest()
 
     def password_for(self, sender_fingerprint: str, document_type: str) -> str | None:
-        self._check_root()
-        path = self.root / self._name(sender_fingerprint, document_type)
-        if not path.is_file():
-            return None
-        return path.read_text(encoding="utf-8")
+        name = self._name(sender_fingerprint, document_type)
+        anchor, archive_fd = self._open_store()
+        file_fd: int | None = None
+        try:
+            try:
+                file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=archive_fd)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise PasswordUnlockError() from exc
+            info = os.fstat(file_fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise PasswordUnlockError()
+            chunks: list[bytes] = []
+            while True:
+                block = os.read(file_fd, 65536)
+                if not block:
+                    break
+                chunks.append(block)
+            return b"".join(chunks).decode("utf-8")
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            os.close(archive_fd)
+            os.close(anchor.fd)
 
     def remember(self, sender_fingerprint: str, document_type: str, password: str) -> None:
-        self._check_root()
         if not password:
             raise PasswordUnlockError()
-        path = self.root / self._name(sender_fingerprint, document_type)
-        temporary = path.with_name(path.name + ".new")
-        temporary.write_text(password, encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-        os.chmod(path, 0o600)
+        name = self._name(sender_fingerprint, document_type)
+        temporary = name + ".new"
+        payload = password.encode("utf-8")
+        anchor, archive_fd = self._open_store()
+        published = False
+        try:
+            vault_identity = _identity(os.stat(self.vault, follow_symlinks=True))
+            self._write_new(archive_fd, temporary, payload)
+            if _directory_is_within(archive_fd, vault_identity):
+                raise PasswordUnlockError()
+            os.rename(temporary, name, src_dir_fd=archive_fd, dst_dir_fd=archive_fd)
+            published = True
+            if _directory_is_within(archive_fd, vault_identity):
+                self._unlink(archive_fd, name)
+                published = False
+                raise PasswordUnlockError()
+        finally:
+            if not published:
+                try:
+                    os.unlink(temporary, dir_fd=archive_fd)
+                except OSError:
+                    pass
+            os.close(archive_fd)
+            os.close(anchor.fd)
+
+    @staticmethod
+    def _write_new(directory_fd: int, name: str, payload: bytes) -> None:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise PasswordUnlockError() from exc
+        previous_mask = os.umask(0o077)
+        fd: int | None = None
+        try:
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            os.fchmod(fd, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise PasswordUnlockError()
+                view = view[written:]
+            os.fsync(fd)
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+                fd = None
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.umask(previous_mask)
+            if fd is not None:
+                os.close(fd)
+
+    @staticmethod
+    def _unlink(directory_fd: int, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError as exc:
+            raise PasswordUnlockError() from exc
 
 
-def unlocked_pdf_bytes(payload: bytes, password: str | None) -> bytes:
-    reader = PdfReader(BytesIO(payload))
+def _open_pdf(payload: bytes) -> PdfReader:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return PdfReader(BytesIO(payload))
+    except Exception as exc:
+        raise PasswordUnlockError() from None
+
+
+def unlocked_pdf_bytes(payload: bytes, password: str | None) -> tuple[bytes, bool]:
+    """Return unlocked bytes and whether a password actually decrypted them."""
+    reader = _open_pdf(payload)
     if not reader.is_encrypted:
-        return payload
+        return payload, False
     if password is None:
         raise PasswordUnlockError()
     try:
         status = reader.decrypt(password)
     except Exception as exc:
-        raise PasswordUnlockError() from exc
+        raise PasswordUnlockError() from None
     if status == 0:
         raise PasswordUnlockError()
-    writer = PdfWriter()
-    writer.append(reader)
-    output = BytesIO()
-    writer.write(output)
-    return output.getvalue()
+    try:
+        writer = PdfWriter()
+        writer.append(reader)
+        output = BytesIO()
+        writer.write(output)
+    except Exception as exc:
+        raise PasswordUnlockError() from None
+    return output.getvalue(), True
 
 
 def unlock_for_rule(
@@ -205,15 +310,22 @@ def unlock_for_rule(
     replacement: str | None = None,
 ) -> bytes:
     """Try a remembered password only after trust and a single rule match."""
+    encrypted = _open_pdf(payload).is_encrypted
     if not may_use_password(match, verified=verified):
-        if PdfReader(BytesIO(payload)).is_encrypted:
+        if encrypted:
+            raise PasswordUnlockError()
+        return payload
+    if not encrypted:
+        if replacement is not None:
             raise PasswordUnlockError()
         return payload
     password = replacement if replacement is not None else store.password_for(
         sender_fingerprint, document_type
     )
-    unlocked = unlocked_pdf_bytes(payload, password)
+    unlocked, decrypted = unlocked_pdf_bytes(payload, password)
     if replacement is not None:
+        if not decrypted:
+            raise PasswordUnlockError()
         store.remember(sender_fingerprint, document_type, replacement)
     return unlocked
 
