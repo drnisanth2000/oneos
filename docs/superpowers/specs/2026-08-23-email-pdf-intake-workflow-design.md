@@ -2,9 +2,8 @@
 
 Date: 2026-08-23
 
-Status: slice 1 authorized for an unlocked PDF archive and redacted receipt.
-Mailbox connection, password storage, provider Trash, recovery, screens,
-new dependencies, and private parsers remain unauthorized.
+Status: public slices implemented with synthetic fixtures. Live mailboxes,
+private parsers, and Grey Matter secrets remain outside this repository.
 
 Recorded in this repository as Phase 3. Slice 1 does not authorize a screen,
 a dependency, a live mailbox, or a change to the Safety Foundation.
@@ -401,9 +400,9 @@ passing suite written only by the implementer is not sufficient evidence.
 
 ## Non-goals
 
-- Slice 1 authorizes only an unlocked PDF archive and the existing redacted
-  receipt. No other implementation, dependency, screen, or live mailbox
-  connection is authorized by this document.
+- The public implementation uses synthetic fixtures. A live mailbox
+  connection, a private parser, and a Grey Matter secret are not authorized
+  by this document.
 - The workflow does not belong to S7 and does not widen the current Safety
   Foundation.
 - Learned rules never move messages to Trash automatically.

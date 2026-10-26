@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  {% set page_title = "OneOS · Mail" %}
+  {% include "_head.html" %}
+</head>
+<body class="review-surface" hx-ext="alpine-morph">
+  {% include "_sidebar.html" %}
+  <main class="main">
+    <h1 class="triage-h">Mail · {{ entity }}</h1>
+    <p class="muted">
+      Each receiving address has its own tab.
+      <a href="/mail/{{ entity }}/cleanup">Email cleanup →</a>
+    </p>
+    <nav class="mail-tabs" aria-label="Mailboxes">
+      {% for mailbox in page.mailboxes %}
+      <a class="mail-tab{% if mailbox == page.selected %} is-selected{% endif %}"
+         href="/mail/{{ entity }}?mailbox={{ mailbox }}">{{ mailbox }}</a>
+      {% endfor %}
+    </nav>
+    {% if not page.mailboxes %}
+    <p class="muted">No mailbox is configured for this entity.</p>
+    {% endif %}
+    <section>
+      <h2>Needs attention</h2>
+      {% if not page.attention %}
+      <p class="muted">Nothing in this mailbox needs attention.</p>
+      {% else %}
+      <ul class="triage-list">
+        {% for case_id, reason in page.attention %}
+        <li class="triage-item"><span class="ti-title">{{ case_id }}</span> {{ reason }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+    <section>
+      <h2>Documents</h2>
+      {% for case_id, title, reference in page.documents %}
+      <article class="doc-card">
+        <h3>{{ title }}</h3>
+        <p class="muted">{{ reference }}</p>
+        <p>
+          <a href="/mail/{{ entity }}?mailbox={{ page.selected }}&amp;open=file&amp;case={{ case_id }}">Open file</a>
+          <a href="/mail/{{ entity }}?mailbox={{ page.selected }}&amp;open=folder&amp;case={{ case_id }}">Open folder</a>
+        </p>
+      </article>
+      {% endfor %}
+    </section>
+  </main>
+</body>
+</html>

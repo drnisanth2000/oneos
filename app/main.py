@@ -43,6 +43,14 @@ from .entities import (
     EntitySelectionError,
 )
 from .inbox import read_inbox
+from .phase3 import (
+    CleanupError,
+    confirm_frozen,
+    freeze_visible,
+    recover_selected,
+    render_cleanup,
+    render_mailbox,
+)
 from .outbox import (
     OutboxDestinationError,
     OutboxError,
@@ -438,6 +446,141 @@ def pulse(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request, "blocks/pulse.html", {"now": datetime.now().strftime("%H:%M:%S")}
     )
+
+
+_MAIL_CATCHES = (
+    CleanupError,
+    DestinationError,
+    DestinationRegistryError,
+    CrossScopeError,
+    EntityManifestError,
+    EntitySelectionError,
+)
+
+
+def _mail_context(scope: Scope, page) -> dict:
+    return {
+        "bundles": Vault(current_catalog()).bundles(),
+        "entity": scope.current_entity(),
+        "page": page,
+    }
+
+
+@app.get("/mail/{entity}", response_class=HTMLResponse)
+@console_route(
+    catches=_MAIL_CATCHES,
+    surface="page",
+    services=(render_mailbox, Vault.bundles),
+)
+def mail_screen(request: Request, scope: EntityScope, mailbox: str = "") -> HTMLResponse:
+    try:
+        page = render_mailbox(scope, mailbox)
+        return templates.TemplateResponse(
+            request, "mail.html", _mail_context(scope, page)
+        )
+    except CleanupError:
+        return HTMLResponse(
+            "<p class=\"unsure\">That mailbox action was refused.</p>",
+            status_code=400,
+        )
+    except _MAIL_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+
+
+@app.get("/mail/{entity}/cleanup", response_class=HTMLResponse)
+@console_route(
+    catches=_MAIL_CATCHES,
+    surface="page",
+    services=(render_cleanup, Vault.bundles),
+)
+def mail_cleanup(request: Request, scope: EntityScope) -> HTMLResponse:
+    try:
+        page = render_cleanup(scope)
+        return templates.TemplateResponse(
+            request, "mail_cleanup.html", _mail_context(scope, page)
+        )
+    except CleanupError:
+        return HTMLResponse(
+            "<p class=\"unsure\">That mailbox action was refused.</p>",
+            status_code=400,
+        )
+    except _MAIL_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+
+
+@app.post("/mail/{entity}/cleanup/freeze", response_class=HTMLResponse)
+@console_route(
+    catches=_MAIL_CATCHES,
+    surface="page",
+    services=(freeze_visible, Vault.bundles),
+)
+def mail_freeze(
+    request: Request,
+    scope: EntityScope,
+    message_id: Annotated[list[str] | None, Form()] = None,
+) -> HTMLResponse:
+    try:
+        page = freeze_visible(scope, tuple(message_id or ()))
+        return templates.TemplateResponse(
+            request, "mail_cleanup.html", _mail_context(scope, page)
+        )
+    except CleanupError:
+        return HTMLResponse(
+            "<p class=\"unsure\">That mailbox action was refused.</p>",
+            status_code=400,
+        )
+    except _MAIL_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+
+
+@app.post("/mail/{entity}/cleanup/confirm", response_class=HTMLResponse)
+@console_route(
+    catches=_MAIL_CATCHES,
+    surface="page",
+    services=(confirm_frozen, Vault.bundles),
+)
+def mail_confirm(
+    request: Request,
+    scope: EntityScope,
+    confirmed: str = Form(""),
+) -> HTMLResponse:
+    try:
+        page = confirm_frozen(scope, confirmed == "yes")
+        return templates.TemplateResponse(
+            request, "mail_cleanup.html", _mail_context(scope, page)
+        )
+    except CleanupError:
+        return HTMLResponse(
+            "<p class=\"unsure\">That mailbox action was refused.</p>",
+            status_code=400,
+        )
+    except _MAIL_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+
+
+@app.post("/mail/{entity}/cleanup/recover", response_class=HTMLResponse)
+@console_route(
+    catches=_MAIL_CATCHES,
+    surface="page",
+    services=(recover_selected, Vault.bundles),
+)
+def mail_recover(
+    request: Request,
+    scope: EntityScope,
+    message_id: Annotated[list[str] | None, Form()] = None,
+) -> HTMLResponse:
+    try:
+        page = recover_selected(scope, tuple(message_id or ()))
+        return templates.TemplateResponse(
+            request, "mail_cleanup.html", _mail_context(scope, page)
+        )
+    except CleanupError:
+        return HTMLResponse(
+            "<p class=\"unsure\">That mailbox action was refused.</p>",
+            status_code=400,
+        )
+    except _MAIL_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
 
 
 @app.get("/triage", response_class=HTMLResponse)

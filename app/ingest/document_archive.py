@@ -66,14 +66,34 @@ def ingest_unlocked_pdf(
     received_at: str,
 ) -> DocumentIngest:
     """Copy one unlocked PDF into the external archive and commit its receipt."""
+    source_path = Path(source)
+    return ingest_unlocked_bytes(
+        scope,
+        _read_current_pdf(source_path),
+        source_path.name,
+        archive_root=archive_root,
+        source_id=source_id,
+        received_at=received_at,
+    )
+
+
+def ingest_unlocked_bytes(
+    scope: Scope,
+    payload: bytes,
+    filename: str,
+    *,
+    archive_root: Path | str,
+    source_id: str,
+    received_at: str,
+) -> DocumentIngest:
+    """Archive verified unlocked bytes. The caller supplies no password."""
     if not _SOURCE_ID.fullmatch(source_id):
         raise DocumentArchiveError("document source identity is invalid")
     if not _RECEIVED_AT.fullmatch(received_at):
         raise DocumentArchiveError("document receipt time is invalid")
-
-    source_path = Path(source)
-    archive_name = _archive_name(source_path.name)
-    payload = _read_current_pdf(source_path)
+    if not payload:
+        raise DocumentArchiveError("document is empty")
+    archive_name = _archive_name(filename)
     fingerprint = hashlib.sha256(payload).hexdigest()
     _require_unlocked(payload)
 

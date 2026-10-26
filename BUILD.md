@@ -108,11 +108,11 @@ all five Phase 1 exit gates now pass. Phase 2 remains unauthorized, and Step 11
 deployment still requires separate owner approval. Phase 3 email and PDF intake
 is a recorded design in
 `docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
-Slice 1 may archive an unlocked PDF outside the vault and commit the existing
-redacted inbox receipt. A live mailbox, password storage, provider Trash,
-recovery, a new screen, a new dependency, a private parser, and a change to
-S7 remain unauthorized. It is not a new row in the Step 3–11 table. Phase 3
-is not blocked on building Phase 2. The later connector note in
+The public Phase 3 slices cover archive, redacted parser fields, learned
+rules, encrypted unlock, frozen cleanup, and the mailbox screens. Live
+mailboxes, private parsers, Grey Matter secrets, and a change to S7 remain
+unauthorized. This is not a new row in the Step 3–11 table. Phase 3 is not
+blocked on building Phase 2. The later connector note in
 `docs/superpowers/specs/2026-10-25-later-connector-notes.md` is not part of
 Phase 3.
 

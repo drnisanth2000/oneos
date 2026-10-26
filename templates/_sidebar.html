@@ -34,6 +34,7 @@
           {% if m.missing %}title="required by flags but absent on disk (E4)"{% endif %}>
         {% if m.name == '00-inbox' %}
           <a class="mod-name" href="/triage/{{ b.slug }}">{{ m.name }}</a>
+          <a class="mod-name" href="/mail/{{ b.slug }}">mailboxes</a>
         {% else %}
           <span class="mod-name">{{ m.name }}</span>
         {% endif %}

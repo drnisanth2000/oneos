@@ -77,8 +77,8 @@ manual cleanup. A subsequent trusted-local Gate 1 comparison completed 20 real
 inbox items measurably faster in OneOS than in Obsidian, then closed every
 reviewed item through sanctioned approvals with no Gate 3 violation. All five
 Phase 1 exit gates pass. Phase 2 is not authorized, and deployment still
-requires separate owner approval. Phase 3 slice 1 may archive an unlocked
-PDF. The rest of Phase 3 is not authorized.
+requires separate owner approval. Phase 3 public slices are implemented
+with synthetic fixtures. Live mailboxes and private parsers are not included.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -338,8 +338,8 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 All five Phase 1 exit gates pass. The next authorized expansion decision is
 whether to deploy Step 11; deployment still requires separate owner approval.
 Phase 2 remains unauthorized, and deferred UI remains out of scope. Phase 3
-slice 1 may archive an unlocked PDF. The rest of Phase 3 remains unauthorized
-and does not replace this decision.
+public slices do not replace this deployment decision. Live mailboxes and
+private parsers remain outside this repository.
 
 ---
 
@@ -353,7 +353,7 @@ service remains gated through an outbox proposal and explicit approval.
 Specific parsers and integration targets are instance data and remain in the
 vault's `decisions.md`, not this repository.
 
-## Phase 3 — slice 1 started
+## Phase 3 — public slices implemented
 
 Email and PDF intake is recorded in
 `docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
@@ -363,19 +363,20 @@ file in a restricted external archive, one redacted inbox receipt, an approved
 short summary when one is useful, and a redacted audit trail. A full email
 copy and a full extracted transcript are not retained.
 
-Slice 1 may archive an unlocked PDF outside the vault and commit the existing
-redacted inbox receipt. A live mailbox, password storage, provider Trash,
-recovery, a new screen, a new dependency, and a private parser remain
-unauthorized. Phase 3 is not blocked on building Phase 2.
+The public slices archive an unlocked PDF, redact parser fields, stop
+unverified and conflicting rules before any password use, unlock an encrypted
+PDF only through a store outside the vault, freeze an exact cleanup list, and
+show mailbox tabs plus Email cleanup. A learned rule still cannot move mail
+to Trash. Live mailboxes, private parsers, and Grey Matter secrets stay
+outside this repository. Phase 3 is not blocked on building Phase 2.
 Phase 2 may not be implemented from this record. The current email adapter
 still only records attachment names, and the current folder adapter may retain
-extracted PDF text. Slice 1 adds a separate unlocked-PDF archive path and
-leaves those adapters unchanged.
+extracted PDF text. The Phase 3 archive path leaves those adapters unchanged.
 
-External archive copies and provider Trash moves cannot be undone by
-`git revert`. That recovery interpretation belongs only to a future authorized
-Phase 3. Until then, every current side effect still requires a revertible Git
-diff. A later connector note, covering a browser extension, a local companion,
+An external archive copy is not undone by `git revert`. The synthetic cleanup
+provider records Trash and recovery as separate actions. Vault receipt commits
+remain revertible. A live provider is not connected. A later connector note,
+covering a browser extension, a local companion,
 an optional hosted service, and other communication channels, is recorded
 separately in
 `docs/superpowers/specs/2026-10-25-later-connector-notes.md` and is not part

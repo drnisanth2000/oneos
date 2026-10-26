@@ -257,6 +257,15 @@ button.reject:hover { border-color: var(--err-ink); color: var(--err-ink); }
   .review-route > div:last-child { grid-column: auto; }
   .classification-review .prop-actions > button { flex: 1 1 auto; }
 }
+.mail-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
+.mail-tab, .doc-card, .cleanup-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.mail-tab { padding: 8px 12px; text-decoration: none; color: var(--ink); }
+.mail-tab.is-selected { border-color: var(--accent); font-weight: 600; }
+.doc-card, .cleanup-row { display: block; padding: 12px 14px; margin: 8px 0; }
 @media (prefers-reduced-motion: reduce) {
   .review-surface .chev { transition: none; }
 }

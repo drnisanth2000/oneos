@@ -148,6 +148,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         git_transaction,
         identifiers,
         outbox,
+        phase3,
         proposal_identity,
         registry,
         rename,
@@ -235,6 +236,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         review_tokens.ReviewContractViolation: "E-INTERNAL",
         review_tokens.ReviewTokenError: "E-INTERNAL",
         ingest_base.IngestError: "E-INGEST",
+        phase3.Phase3Error: "E-INGEST",
         rename.RenameCommittedError: "E-COMMITTED",
         rename.RenameError: "E-ADMIN",
         # Short-identifier cutover — administrative refusals, except a
@@ -1524,6 +1526,11 @@ EXPECTED_CONTRACTED_BOUNDARIES = (
     ("app.action_receipts", "resolve_head_receipt"),
     ("app.proposal_identity", "require_proposal_id"),
     ("app.review_tokens", "require_review_sha256"),
+    ("app.phase3", "render_mailbox"),
+    ("app.phase3", "render_cleanup"),
+    ("app.phase3", "freeze_visible"),
+    ("app.phase3", "confirm_frozen"),
+    ("app.phase3", "recover_selected"),
 )
 
 
@@ -1551,7 +1558,7 @@ def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypat
 
     main = _load_console_app(tmp_path, monkeypatch)
     qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
-    assert len(qualified) == 20
+    assert len(qualified) == 25
     assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
 
     missing = []
@@ -1582,6 +1589,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         RecipientConfigurationError,
         SystemRegistryPathError,
     )
+    from app.phase3 import CleanupError
     from app.outbox import (
         OutboxError,
         UnreadableProposalRecord,
@@ -1705,6 +1713,11 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
             (InvalidReviewToken, ReviewContractViolation),
             (),
         ),
+        "app.phase3.render_mailbox": ((CleanupError,), ()),
+        "app.phase3.render_cleanup": ((CleanupError,), ()),
+        "app.phase3.freeze_visible": ((CleanupError,), ()),
+        "app.phase3.confirm_frozen": ((CleanupError,), ()),
+        "app.phase3.recover_selected": ((CleanupError,), ()),
     }
 
     boundaries = _inventory_objects(main)
@@ -2067,6 +2080,11 @@ def _expected_route_services(main):
             main.pending_proposal_entry_exists,
             main.require_proposal_id,
         ),
+        main.mail_screen: (main.render_mailbox, main.Vault.bundles),
+        main.mail_cleanup: (main.render_cleanup, main.Vault.bundles),
+        main.mail_freeze: (main.freeze_visible, main.Vault.bundles),
+        main.mail_confirm: (main.confirm_frozen, main.Vault.bundles),
+        main.mail_recover: (main.recover_selected, main.Vault.bundles),
     }
 
 
@@ -2075,9 +2093,9 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
-    assert sum(len(services) for services in expected.values()) == 36
+    assert sum(len(services) for services in expected.values()) == 46
     endpoints = list(_registered_console_endpoints(main.app))
-    assert len(endpoints) == 15, endpoints
+    assert len(endpoints) == 20, endpoints
     assert set(endpoints) == set(expected), (
         "registered route/service inventory mismatch: "
         f"missing={set(endpoints) - set(expected)}, "

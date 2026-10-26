@@ -85,10 +85,12 @@ requires separate owner approval.
 Phase 3 email and PDF intake is a recorded design in
 `docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
 Phase 2 finance ingest remains separately unauthorized, and Phase 3 is not
-blocked on building Phase 2. Slice 1 may archive an unlocked PDF outside the
-vault and commit the existing redacted inbox receipt. A live mailbox, password
-storage, provider Trash, recovery, a new screen, a new dependency, a private
-parser, and a change to S7 remain unauthorized. The later connector note in
+blocked on building Phase 2. The public Phase 3 slices archive an unlocked
+PDF, redact parser fields, match learned rules without Trash authority, unlock
+encrypted PDFs through a store outside the vault, freeze exact cleanup lists,
+and render mailbox tabs plus Email cleanup. Live mailboxes, private parsers,
+Grey Matter secrets, and a change to S7 remain unauthorized. The later
+connector note in
 `docs/superpowers/specs/2026-10-25-later-connector-notes.md` is not part of
 Phase 3.
 A branch's merge/PR state is
