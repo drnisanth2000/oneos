@@ -106,6 +106,7 @@ All routes except `GET /healthz` pass owner authentication first.
 | POST | `/mail/{entity}/cleanup/recover` | explicit recovery of selected messages |
 | GET | `/registry/{entity}/products` | product registry |
 | POST | `/registry/{entity}/product/delete-preview` | reference count and proposal |
+| GET | `/registry/{entity}/product/review/{proposal_id}` | review a pending deletion or its receipt |
 | POST | `/registry/{entity}/product/delete-execute` | reviewed deletion, one commit |
 | GET, POST | `/login` | owner sign-in |
 | POST | `/logout` | owner sign-out |

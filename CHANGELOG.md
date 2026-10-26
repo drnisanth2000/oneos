@@ -50,8 +50,10 @@ landed and when. The published history starts at the 2026-08-07 baseline.
 - #18–#22 (08-27 to 08-28) Short-identifier cutover: design, Stage A,
   structured reference migration, and the post-cutover identifier floor.
 - #17 (08-26) Plan inherited safety items 2 to 4.
-- #16 (08-26) Safety Foundation S7: bind actions to reviewed proposal bytes.
+- #16 (08-25) Safety Foundation S7: bind actions to reviewed proposal bytes.
 - #15 (08-23) Safety Foundation S6: visible Console failures.
+- #12, #13 (08-16) CI: add the Claude GitHub Actions workflow and
+  authenticate it with a subscription OAuth token.
 - #11 (08-16) Reconcile Safety Foundation S1–S5 documentation.
 - #10 (08-16) Safety Foundation S5: isolated Git approval transactions and
   path-aware Gate 3.
