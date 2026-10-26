@@ -19,9 +19,8 @@ external encrypted backup, restore-check, local certificate trust, and login
 startup are complete. The owner signed in and the home screen loaded. No
 passwords, authenticator codes, or backup keys are recorded here.
 
-Board views, email and PDF intake, and finance work were not started. Those
-remain unmerged: `cursor/board-views-08f0` and
-`cursor/record-phase3-email-pdf-design-6e2b`.
+The Board screen is included. Phase 3 email and PDF intake is recorded in
+this copy and does not authorize building it. Finance parsers are not included.
 
 Backup needed two macOS compatibility fixes, now in the tree and described in
 `LOCAL-OPERATIONS.md`. Failed staging directories from the attempts that
@@ -95,7 +94,8 @@ manual cleanup. A subsequent trusted-local Gate 1 comparison completed 20 real
 inbox items measurably faster in OneOS than in Obsidian, then closed every
 reviewed item through sanctioned approvals with no Gate 3 violation. All five
 Phase 1 exit gates pass. Phase 2 is not authorized, and deployment still
-requires separate owner approval.
+requires separate owner approval. Phase 3 email and PDF intake is recorded
+and is not authorized.
 
 | Safety step | State | Outcome |
 |---|---|---|
@@ -354,7 +354,9 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 All five Phase 1 exit gates pass. The next authorized expansion decision is
 whether to deploy Step 11; deployment still requires separate owner approval.
-Phase 2 remains unauthorized, and deferred UI remains out of scope.
+Phase 2 remains unauthorized, and deferred UI remains out of scope. Phase 3
+is recorded below and is also unauthorized; recording it does not replace
+this decision.
 
 ---
 
@@ -367,6 +369,33 @@ service remains gated through an outbox proposal and explicit approval.
 
 Specific parsers and integration targets are instance data and remain in the
 vault's `decisions.md`, not this repository.
+
+## Phase 3 — design recorded, not authorized
+
+Email and PDF intake is recorded in
+`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
+Hermes monitors IMAP mailboxes. OneOS keeps review, learned rules, summaries,
+and Trash approval. A successfully handled PDF retains a verified unlocked
+file in a restricted external archive, one redacted inbox receipt, an approved
+short summary when one is useful, and a redacted audit trail. A full email
+copy and a full extracted transcript are not retained.
+
+Recording the design does not authorize implementation, a screen, a dependency,
+a live mailbox, or a change to S7. Phase 3 is not blocked on building Phase 2.
+Neither phase may be implemented from this record. The current email adapter
+commits a redacted summary of the message text and does not write attachment
+filenames into the receipt. The current folder adapter may retain extracted
+PDF text. Those paths stay unchanged until a separate implementation
+authorization.
+
+External archive copies and provider Trash moves cannot be undone by
+`git revert`. That recovery interpretation belongs only to a future authorized
+Phase 3. Until then, every current side effect still requires a revertible Git
+diff. A later connector note, covering a browser extension, a local companion,
+an optional hosted service, and other communication channels, is recorded
+separately in
+`docs/superpowers/specs/2026-10-25-later-connector-notes.md` and is not part
+of Phase 3.
 
 ## Inherited follow-ups from S6 — completion record
 

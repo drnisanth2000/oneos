@@ -2,7 +2,7 @@
 
 **Status:** frozen product direction
 
-**Updated:** 2026-08-07
+**Updated:** 2026-10-25
 
 This document explains **why OneOS exists and what problem it must solve**.
 `AGENTS.md` remains authoritative for implementation constraints, `BUILD.md`
@@ -137,6 +137,24 @@ acknowledgement suite, universal typed-schema system, SaaS packaging,
 auto-replanning, or a large catalogue of agent skills until the intake loop
 proves the need. Email routing, retention, and audit-event expansion must also
 preserve the same envelope, outbox, scope, and revert guarantees.
+
+## Recorded future phases
+
+This thesis stays frozen for current work and still does not authorize features
+outside the current phase. Phase 2 remains the unauthorized finance-ingest
+pipeline. Phase 3 email and PDF intake is recorded in
+`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md` and is
+not authorized to build. It is not blocked on building Phase 2.
+
+Inside a future authorized Phase 3, email retention still uses the shared
+intake envelope, the outbox for Grey Matter summaries, and server-owned scope.
+An external archive copy or provider Trash move cannot be undone by reverting
+its Git record. Recovery of that external state is a new audited action, and
+that interpretation does not apply before Phase 3 implementation is separately
+authorized. A browser extension, local companion, optional hosted service, and
+broader communications router are later notes in
+`docs/superpowers/specs/2026-10-25-later-connector-notes.md`. They do not amend
+Phase 3, and SaaS packaging remains deferred.
 
 ## Proof of value
 
