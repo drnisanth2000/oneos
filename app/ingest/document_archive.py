@@ -19,6 +19,7 @@ from pypdf import PdfReader
 from ..scope import Scope
 from .adapters.folder import (
     RawArchiveContainmentError,
+    RawArchiveWriteError,
     _directory_flags,
     _directory_is_within,
     _identity,
@@ -201,8 +202,18 @@ def _store_object(
             _quarantine(objects_fd, quarantine_fd, name)
         raise DocumentChecksumError("archive checksum mismatch")
     if _directory_is_within(objects_fd, vault_identity):
+        _discard_new_object(objects_fd, name)
         raise RawArchiveContainmentError("raw archive must be outside the vault")
     return False
+
+
+def _discard_new_object(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except OSError as exc:
+        raise RawArchiveWriteError(
+            "raw document archival failed; cleanup failed"
+        ) from exc
 
 
 def _assign_name(names_fd: int, archive_name: str, fingerprint: str) -> str:

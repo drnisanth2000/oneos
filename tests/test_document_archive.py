@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 from pypdf import PdfWriter
 
-from app.ingest.adapters.folder import RawArchiveContainmentError
+from app.ingest import document_archive
+from app.ingest.adapters.folder import RawArchiveContainmentError, RawArchiveWriteError
 from app.ingest.document_archive import (
     DocumentChecksumError,
     DocumentEncryptedError,
@@ -193,6 +194,77 @@ def test_archive_inside_the_vault_is_refused(tmp_path):
             received_at=_RECEIVED_AT,
         )
 
+    assert git_head_message(vault) == "init"
+
+
+def test_archive_reparented_during_write_does_not_keep_the_pdf(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    payload = _pdf(_MARKER)
+    source = _write_pdf(tmp_path / "incoming", "statement.pdf", payload)
+    archive = tmp_path / "archive"
+    moved = vault / "synthetic" / "moved-archive"
+    real_fsync = document_archive.os.fsync
+    reparented = False
+
+    def reparent_after_write(fd):
+        nonlocal reparented
+        real_fsync(fd)
+        if not reparented:
+            archive.rename(moved)
+            reparented = True
+
+    monkeypatch.setattr(document_archive.os, "fsync", reparent_after_write)
+
+    with pytest.raises(RawArchiveContainmentError, match="outside the vault"):
+        ingest_unlocked_pdf(
+            Scope(vault, "synthetic"),
+            source,
+            archive_root=archive,
+            source_id="case-one",
+            received_at=_RECEIVED_AT,
+        )
+
+    assert reparented is True
+    assert source.read_bytes() == payload
+    assert list(moved.rglob("*.pdf")) == []
+    assert git_head_message(vault) == "init"
+
+
+def test_reparented_archive_cleanup_failure_is_a_hard_failure(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    payload = _pdf(_MARKER)
+    source = _write_pdf(tmp_path / "incoming", "statement.pdf", payload)
+    archive = tmp_path / "archive"
+    moved = vault / "synthetic" / "moved-archive"
+    real_fsync = document_archive.os.fsync
+    real_unlink = document_archive.os.unlink
+
+    def reparent_after_write(fd):
+        real_fsync(fd)
+        if archive.exists():
+            archive.rename(moved)
+
+    def fail_archive_cleanup(path, *args, dir_fd=None, **kwargs):
+        if dir_fd is not None:
+            raise OSError("synthetic cleanup failure")
+        return real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(document_archive.os, "fsync", reparent_after_write)
+    monkeypatch.setattr(document_archive.os, "unlink", fail_archive_cleanup)
+
+    with pytest.raises(RawArchiveWriteError, match="cleanup failed"):
+        ingest_unlocked_pdf(
+            Scope(vault, "synthetic"),
+            source,
+            archive_root=archive,
+            source_id="case-one",
+            received_at=_RECEIVED_AT,
+        )
+
+    assert source.read_bytes() == payload
+    stored = list(moved.rglob("*.pdf"))
+    assert len(stored) == 1
+    assert stored[0].read_bytes() == payload
     assert git_head_message(vault) == "init"
 
 
