@@ -5,8 +5,8 @@ Date: 2026-08-23
 Status: public slices implemented with synthetic fixtures. Live mailboxes,
 private parsers, and Grey Matter secrets remain outside this repository.
 
-Recorded in this repository as Phase 3. Slice 1 does not authorize a screen,
-a dependency, a live mailbox, or a change to the Safety Foundation.
+Recorded in this repository as Phase 3. The public slices do not authorize a
+live mailbox, a private parser, or a change to the Safety Foundation.
 
 ## Purpose
 
