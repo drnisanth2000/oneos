@@ -28,12 +28,28 @@ def disk_info(path):
     return plistlib.loads(result.stdout)
 
 
+def physical_external_disk(info):
+    """macOS labels the whole disk physical, and often omits that label on a volume."""
+    kind = info.get('VirtualOrPhysical')
+    if kind is not None:
+        return kind == 'Physical' and info.get('Internal') is False
+    parent = info.get('ParentWholeDisk')
+    if not isinstance(parent, str) or re.fullmatch(r'disk\d+', parent) is None:
+        return False
+    parent_info = disk_info('/dev/' + parent)
+    return parent_info.get('VirtualOrPhysical') == 'Physical' and parent_info.get('Internal') is False
+
+
 def validate_volume(config):
     mount = safe_path(Path(config['mount']))
     info = disk_info(mount)
+    mounted = info.get('Mounted')
+    # Current macOS omits Mounted on a volume queried by its mount path.
+    if mounted is None:
+        mounted = isinstance(info.get('MountPoint'), str) and info.get('MountPoint') == str(mount)
     if (not isinstance(config['volume_uuid'], str) or not config['volume_uuid']
             or info.get('VolumeUUID') != config['volume_uuid'] or info.get('Internal') is not False
-            or info.get('VirtualOrPhysical') != 'Physical' or info.get('Mounted') is not True
+            or not physical_external_disk(info) or mounted is not True
             or info.get('MountPoint') != str(mount)):
         raise ValueError('expected external physical volume is unavailable')
     return mount

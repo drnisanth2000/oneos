@@ -8,8 +8,26 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-09-11, after the successful trusted-local live Gate 1
-timed-triage and approval session.
+Last reconciled: 2026-10-26, after local deployment acceptance on the installed
+Mac. The previous reconciliation was 2026-09-11, after the successful
+trusted-local live Gate 1 timed-triage and approval session.
+
+## Local deployment acceptance (2026-10-26)
+
+The running install started from `origin/main` `e1481e5`. Owner enrollment,
+external encrypted backup, restore-check, local certificate trust, and login
+startup are complete. The owner signed in and the home screen loaded. No
+passwords, authenticator codes, or backup keys are recorded here.
+
+Board views, email and PDF intake, and finance work were not started. Those
+remain unmerged: `cursor/board-views-08f0` and
+`cursor/record-phase3-email-pdf-design-6e2b`.
+
+Backup needed two macOS compatibility fixes, now in the tree and described in
+`LOCAL-OPERATIONS.md`. Failed staging directories from the attempts that
+stopped early remain in private state, as does the isolated restore-check
+directory. The successful backup removed its own staging directory. Do not
+treat those private leftovers as a second live vault.
 
 ---
 

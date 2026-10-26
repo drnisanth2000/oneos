@@ -174,3 +174,27 @@ to a new isolated directory and verify with
 `tools.local_backup.verify_snapshot` before any promotion. The physical-drive
 trial remains an explicit deployment acceptance check; synthetic tests cannot
 prove USB removal behavior or the owner's actual disk identity.
+
+## Acceptance on 2026-10-26
+
+The installed Mac copy completed owner enrollment, encrypted backup to the
+external data volume (not the Time Machine volume on the same disk),
+restore-check, local CA trust, and login startup. The owner then signed in
+and reached the home screen. The owner confirmed an offline copy of the backup
+key before `setup-backup --offline-key-confirmed`. The key itself is not in
+git.
+
+Current macOS `diskutil` info for a mounted volume often omits
+`VirtualOrPhysical` and `Mounted`. Volume checks now accept a matching mount
+path, and when the volume itself has no physical label they require the parent
+whole disk to be physical and external. A virtual parent, such as an APFS
+container used for Time Machine, is still refused.
+
+macOS also stamps every new file with `com.apple.provenance` and does not let
+a program remove it. Snapshot copies ignore that stamp. Other extended
+attributes are still required to round-trip. A change to `.git/index` during
+the copy still fails the backup; retry after other Git activity is quiet.
+
+The user `LaunchAgents` directory on this Mac had been left owned by root.
+Ownership was returned to the owner so `install-login` could write
+`local.oneos.login` and `local.oneos.backup`. Both jobs are loaded.
