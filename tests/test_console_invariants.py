@@ -1531,6 +1531,8 @@ EXPECTED_CONTRACTED_BOUNDARIES = (
     ("app.phase3", "freeze_visible"),
     ("app.phase3", "confirm_frozen"),
     ("app.phase3", "recover_selected"),
+    ("app.board", "load_board"),
+    ("app.board", "capture_note"),
 )
 
 
@@ -1558,7 +1560,7 @@ def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypat
 
     main = _load_console_app(tmp_path, monkeypatch)
     qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
-    assert len(qualified) == 25
+    assert len(qualified) == 27
     assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
 
     missing = []
@@ -1589,6 +1591,8 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         RecipientConfigurationError,
         SystemRegistryPathError,
     )
+    from app.inbox import read_inbox
+    from app.ingest.base import IngestError
     from app.phase3 import CleanupError
     from app.outbox import (
         OutboxError,
@@ -1718,6 +1722,11 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         "app.phase3.freeze_visible": ((CleanupError,), ()),
         "app.phase3.confirm_frozen": ((CleanupError,), ()),
         "app.phase3.recover_selected": ((CleanupError,), ()),
+        "app.board.load_board": (
+            (DestinationRegistryError, RedirectedPathError),
+            (read_inbox, project_outbox),
+        ),
+        "app.board.capture_note": ((IngestError, CrossScopeError), ()),
     }
 
     boundaries = _inventory_objects(main)
@@ -1932,6 +1941,10 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
         "app.action_receipts.resolve_head_receipt": {
             "app.proposal_identity.require_proposal_id"
         },
+        "app.board.load_board": {
+            "app.inbox.read_inbox",
+            "app.outbox.project_outbox",
+        },
     }
 
     actual = {}
@@ -1964,6 +1977,10 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
         },
         "app.action_receipts.resolve_head_receipt": {
             "app.proposal_identity.require_proposal_id"
+        },
+        "app.board.load_board": {
+            "app.inbox.read_inbox",
+            "app.outbox.project_outbox",
         },
     }
     summarized_or_contained_edges = {
@@ -2035,6 +2052,9 @@ def _expected_route_services(main):
         health_endpoints["/readyz"]: (main.Vault.bundles,),
         main.shell: (main.Vault.bundles,),
         main.pulse: (),
+        main.board_default: (main.Vault.bundles,),
+        main.board: (main.load_board, main.Vault.bundles),
+        main.capture: (main.capture_note,),
         main.triage_default: (main.Vault.bundles,),
         main.triage: (
             main.read_inbox,
@@ -2093,9 +2113,9 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
-    assert sum(len(services) for services in expected.values()) == 46
+    assert sum(len(services) for services in expected.values()) == 50
     endpoints = list(_registered_console_endpoints(main.app))
-    assert len(endpoints) == 20, endpoints
+    assert len(endpoints) == 23, endpoints
     assert set(endpoints) == set(expected), (
         "registered route/service inventory mismatch: "
         f"missing={set(endpoints) - set(expected)}, "

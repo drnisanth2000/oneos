@@ -776,8 +776,8 @@ def test_bundles_shape_failures_never_blank_any_sidebar_route(tmp_path, monkeypa
         client = TestClient(main.app, raise_server_exceptions=False)
 
         for url in (
-            "/", "/triage", "/triage/alpha", "/outbox/alpha",
-            "/registry/alpha/products",
+            "/", "/triage", "/triage/alpha", "/board", "/board/alpha",
+            "/outbox/alpha", "/registry/alpha/products",
         ):
             response = client.get(url)
             assert response.status_code == 500, f"{name} {url}: {response.status_code}"
@@ -3894,6 +3894,21 @@ def _route_totality_plan(main) -> dict:
             "request": lambda c, submitted=None: c.get("/"),
             "patch_targets": [(main.Vault, "bundles")],
         },
+        main.board_default: {
+            "request": lambda c, submitted=None: c.get("/board"),
+            "patch_targets": [(main.Vault, "bundles")],
+        },
+        main.board: {
+            "request": lambda c, submitted=None: c.get("/board/alpha"),
+            "patch_targets": [(main, "load_board")],
+        },
+        main.capture: {
+            "request": lambda c, submitted=None: c.post(
+                "/board/alpha/capture",
+                data={"title": submitted or "note", "text": ""},
+            ),
+            "patch_targets": [(main, "capture_note")],
+        },
         main.triage_default: {
             "request": lambda c, submitted=None: c.get("/triage"),
             "patch_targets": [(main.Vault, "bundles")],
@@ -3974,6 +3989,26 @@ def _route_totality_plan(main) -> dict:
         main.pulse: {
             "request": lambda c, submitted=None: c.get("/blocks/pulse"),
             "patch_targets": [],
+        },
+        main.mail_screen: {
+            "request": lambda c, submitted=None: c.get("/mail/alpha"),
+            "patch_targets": [(main, "render_mailbox")],
+        },
+        main.mail_cleanup: {
+            "request": lambda c, submitted=None: c.get("/mail/alpha/cleanup"),
+            "patch_targets": [(main, "render_cleanup")],
+        },
+        main.mail_freeze: {
+            "request": lambda c, submitted=None: c.post("/mail/alpha/cleanup/freeze"),
+            "patch_targets": [(main, "freeze_visible")],
+        },
+        main.mail_confirm: {
+            "request": lambda c, submitted=None: c.post("/mail/alpha/cleanup/confirm"),
+            "patch_targets": [(main, "confirm_frozen")],
+        },
+        main.mail_recover: {
+            "request": lambda c, submitted=None: c.post("/mail/alpha/cleanup/recover"),
+            "patch_targets": [(main, "recover_selected")],
         },
     }
 
