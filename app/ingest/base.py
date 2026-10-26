@@ -66,9 +66,15 @@ def _scalar(v) -> str:
 
 
 def _front_matter_line(key: str, value: str) -> str:
-    """One YAML mapping line. Plain when it is safe, quoted when a colon or
-    other scalar marker would make the receipt unreadable."""
-    return yaml.safe_dump({key: value}, sort_keys=False).strip()
+    """One double-quoted YAML mapping line.
+
+    A plain scalar would turn titles such as ``Yes``, ``No``, ``null``, and
+    ``~`` into booleans or null, and a line of dashes would be read as the
+    closing front-matter fence. Quoting keeps the title text.
+    """
+    return yaml.safe_dump(
+        {key: value}, default_style='"', sort_keys=False
+    ).strip()
 
 
 def render_note(env: Envelope, entity: str) -> str:

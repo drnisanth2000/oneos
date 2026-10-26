@@ -306,6 +306,69 @@ def test_capture_quotes_a_title_that_contains_a_colon(tmp_path, monkeypatch):
     assert [item.title for item in found] == ["Meet: tomorrow"]
 
 
+def test_capture_keeps_reserved_words_and_dashes_in_the_title(tmp_path, monkeypatch):
+    from app.inbox import read_inbox
+    from app.scope import Scope
+    from tests.conftest import _git
+
+    _main, client = _client(tmp_path, monkeypatch)
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "test@example.invalid")
+    _git(tmp_path, "config", "user.name", "test")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "init")
+
+    for title in ("Yes", "Meet --- later"):
+        response = client.post(
+            "/board/alpha/capture",
+            data={"title": title, "text": "bring the notebook"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303, title
+
+    found = read_inbox(Scope(tmp_path, "alpha"))
+    assert sorted(item.title for item in found) == ["Meet --- later", "Yes"]
+
+
+def test_life_map_skips_inbox_and_modules_without_a_lifecycle(tmp_path, monkeypatch):
+    archetypes = """
+version: "2.0"
+flags: {}
+modules:
+  00-inbox: { block: system }
+  02-work: { block: build }
+  03-hold: { block: build, lifecycle_pattern: false }
+"""
+    write_vault(tmp_path, entities_yaml("alpha"), archetypes)
+    scaffold_modules(tmp_path, "alpha", ["00-inbox", "02-work", "03-hold"])
+    _note(tmp_path, "alpha", "02-work", "Visible")
+    monkeypatch.setenv("ONEOS_VAULT", str(tmp_path))
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    response = client.get("/board/alpha", params={"view": "map"})
+
+    assert response.status_code == 200
+    assert "<h2>02-work" in response.text
+    assert "<h2>00-inbox" not in response.text
+    assert "<h2>03-hold" not in response.text
+
+
+def test_opening_a_paragraph_shows_the_outline_panel(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Plain", body="Just a paragraph.")
+
+    response = client.get(
+        "/board/alpha",
+        params={"note": "alpha/02-work/active/Plain.md"},
+    )
+
+    assert "Plain" in response.text
+    assert "Close" in response.text
+    assert "No headings or lists." in response.text
+
+
 def test_capture_writes_one_inbox_receipt(tmp_path, monkeypatch):
     from tests.conftest import _git
 
