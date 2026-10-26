@@ -90,12 +90,13 @@
       <div id="board-drop-result"></div>
       {% endif %}
 
-      {% if page.outline %}
+      {% if page.note_open %}
       <section class="outline-panel">
         <div class="outline-head">
           <h2>{{ page.outline_title }}</h2>
           <a href="{{ page.clear_outline_href }}">Close</a>
         </div>
+        {% if page.outline %}
         {% macro tree(nodes) %}
         <ul class="outline">
           {% for node in nodes %}
@@ -110,6 +111,9 @@
         </ul>
         {% endmacro %}
         {{ tree(page.outline) }}
+        {% else %}
+        <p class="muted">No headings or lists.</p>
+        {% endif %}
       </section>
       {% endif %}
 

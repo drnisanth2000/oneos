@@ -133,6 +133,7 @@ class BoardPage:
     attention: Attention
     outline: tuple[OutlineNode, ...]
     outline_title: str
+    note_open: bool
     clear_outline_href: str
     self_href: str
 
@@ -752,6 +753,11 @@ def _weeks(
 def _map_rows(vault: Vault, scope: Scope, filed: list[BoardCard]) -> tuple[MapRow, ...]:
     rows = []
     for module in sorted(vault.active_modules_for(scope)):
+        if module == _INBOX_MODULE:
+            continue
+        spec = vault.module_spec(module)
+        if spec.get("lifecycle_pattern", True) is False:
+            continue
         notes = [card for card in filed if card.module == module]
         if notes:
             score = 0.0
@@ -989,6 +995,7 @@ def load_board(
         attention=_attention(inbox, proposed, filed, current),
         outline=outline,
         outline_title=opened.title if opened else "",
+        note_open=opened is not None,
         clear_outline_href=_query(entity, month=month_token, week=week_token, **common),
         self_href=_query(
             entity,
