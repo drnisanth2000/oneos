@@ -48,7 +48,9 @@ def split_front_matter(text: str) -> tuple[dict, str]:
     return {}, text
 
 
-def _require_real_directory(scope: Scope, *parts: str) -> Path | None:
+def _require_real_directory(
+    scope: Scope, *parts: str, label: str = "inbox lifecycle directory"
+) -> Path | None:
     lexical = scope.root / scope.current_entity() / Path(*parts)
     if not lexical.exists() and not lexical.is_symlink():
         return None
@@ -58,21 +60,23 @@ def _require_real_directory(scope: Scope, *parts: str) -> Path | None:
     # outside the entity root would otherwise let `scope.resolve()` raise
     # `OutOfScopeError` (-> E-SCOPE) for what is a redirection (-> E-TAMPER).
     if lexical.is_symlink():
-        raise RedirectedPathError("inbox lifecycle directory is redirected")
+        raise RedirectedPathError(f"{label} is redirected")
     resolved = scope.resolve(*parts)
     if resolved != lexical or not lexical.is_dir():
-        raise RedirectedPathError("inbox lifecycle directory is redirected")
+        raise RedirectedPathError(f"{label} is redirected")
     return lexical
 
 
-def _require_real_receipt(directory: Path, discovered: Path) -> Path:
+def _require_real_receipt(
+    directory: Path, discovered: Path, label: str = "inbox receipt"
+) -> Path:
     if (
         discovered.parent != directory
         or discovered.is_symlink()
         or not discovered.is_file()
         or discovered.resolve() != discovered
     ):
-        raise RedirectedPathError("inbox receipt is redirected")
+        raise RedirectedPathError(f"{label} is redirected")
     return discovered
 
 

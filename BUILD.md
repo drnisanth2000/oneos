@@ -4,8 +4,9 @@ Companion to `AGENTS.md`. That file says what the system *is*; this one says
 how to advance it. Read both.
 
 Authority: `$ONEOS_VAULT/_system/docs/oneos-spec.md` §10 is the build order.
-This file adds the loop, the self-checks, and the four points where you must
-stop and ask a human.
+This file adds the loop, the self-checks, and the hard stops where you must
+stop and ask a human (§4). Build state and gate evidence live in
+`docs/STATUS.md`; this file does not repeat them.
 
 ---
 
@@ -29,17 +30,29 @@ done-when to match what you built.
 
 ## 2. Steps 3–11, one line each
 
-| # | Step | Done when |
-|---|---|---|
-| 3 | `schema.py` — **extract** the Pydantic front-matter model from `policy_enforcer.py` + `check_v2.py`; the enforcer then imports it | Both validators agree on 100 real vault files. It is a refactor of tested code, not a rewrite |
-| 4 | Rename command — dry-run default, one atomic commit | Throwaway entity renames cleanly **and** a `.sensitive/` read is still denied afterwards. **Read the warning in §4 first** |
-| 5 | Folder-drop adapter — `watchdog` on `_dropbox/`, text extraction, `source_ref` + `sha256`, **PII filter** | A PDF dropped in appears in `00-inbox/active/` within a minute, with PII stripped before anything is written |
-| 6 | Triage screen — list unsorted, show parsed fields + proposed `block:`/`sub:`, keys `j`/`k`/`a`. Creates `_system/classifier/rules.yaml` | Faster than Obsidian + Dataview on 20 real items, measured with a clock |
-| 7 | Outbox write path — confirming a classification writes a **proposal**, never a file move. Render the git diff | Diff renders; no file has moved |
-| 8 | Approve / reject | One commit per approval; `git revert` undoes it with zero manual cleanup |
-| 9 | Registry CRUD — add/edit direct, **delete via outbox** with a reference count | Deleting a product shows what breaks before it runs |
-| 10 | Email adapter — IMAP poll into the step-5 envelope | Same envelope, same PII filter, no second code path |
-| 11 | Deploy — Compose + Caddy on the VPS beside Hermes | **Only after all Phase 1 gates in spec §11 pass and the owner separately approves deployment.** Stop and ask |
+| # | State | Step | Done when |
+|---|---|---|---|
+| 3 | **COMPLETE** | `schema.py` — **extract** the Pydantic front-matter model from `policy_enforcer.py` + `check_v2.py`; the enforcer then imports it | Both validators agree on 100 real vault files. It is a refactor of tested code, not a rewrite |
+| 4 | **COMPLETE** | Rename command — dry-run default, one atomic commit | Throwaway entity renames cleanly **and** a `.sensitive/` read is still denied afterwards. **Read the warning in §4 first** |
+| 5 | **COMPLETE** | Folder-drop adapter — `watchdog` on `_dropbox/`, text extraction, `source_ref` + `sha256`, **PII filter** | A PDF dropped in appears in `00-inbox/active/` within a minute, with PII stripped before anything is written |
+| 6 | **COMPLETE** | Triage screen — list unsorted, show parsed fields + proposed `block:`/`sub:`, keys `j`/`k`/`a`. Creates `_system/classifier/rules.yaml` | Faster than Obsidian + Dataview on 20 real items, measured with a clock |
+| 7 | **COMPLETE** | Outbox write path — confirming a classification writes a **proposal**, never a file move. Render the git diff | Diff renders; no file has moved |
+| 8 | **COMPLETE** | Approve / reject | One commit per approval; `git revert` undoes it with zero manual cleanup |
+| 9 | **COMPLETE** | Registry CRUD — add/edit direct, **delete via outbox** with a reference count | Deleting a product shows what breaks before it runs |
+| 10 | **COMPLETE** | Email adapter — IMAP poll into the step-5 envelope | Same envelope, same PII filter, no second code path |
+| 11 | **NOT STARTED** | Deploy — Compose + Caddy on the VPS beside Hermes | **Only after all Phase 1 gates in spec §11 pass and the owner separately approves deployment.** Stop and ask |
+
+As built, three rows differ from their original wording; the done-when of each
+was met:
+
+- **Step 3:** `policy_enforcer.py` does not import `app/schema.py`. The
+  enforcer is stdlib-only by design, so the model mirrors it and the 100-file
+  agreement check (Gate 4) guards drift.
+- **Step 6:** the triage screen reads `_system/classifier/rules.yaml` when it
+  exists but does not create it, and no route writes it.
+- **Step 9:** only product deletion (reference count, outbox proposal, approval)
+  is exposed in the Console. `app/registry.py::add_workspace` exists without a
+  route; there is no Console add/edit screen.
 
 ---
 
@@ -66,47 +79,16 @@ execution plans are historical records and must not be run again.
 S7 is complete. Exact-byte review snapshots bind all three reviewed actions;
 quarantine-last prevents destructive rollback; tracked HEAD receipts prevent a
 proposal id from completing twice; receipt-first projection never parses a
-spent record. Supported writers use OneOS interfaces and the shared action
-lock; deliberate ancestor-directory relocation after the final identity check
-is outside that cooperative-writer boundary. Independent reviews and the
-mutation ledger record the correction rounds. The macOS no-overwrite path was
-exercised. Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
-user/platform limitation. The separately sequenced inherited items 2, 4, and 3
-are complete; `docs/STATUS.md` records their published evidence. The next work
-is a continuation of the live Phase 1 exit trials. The first live session
-exposed a Gate 3 defect, not a new transaction contract: the exact valid S7
-quarantine record needed receipt-correlated sanctioning. Independent review of
-that correction then exposed Git-invisible directories and non-regular entries
-outside the discovery boundary; deterministic no-follow filesystem evidence
-now covers them. Both corrections are integrated and their closing public,
-private, publication, and preservation gates pass. A later fresh
-owner-reviewed, trusted-local live session at the exact fetched `origin/main`
-`bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action
-commit, two sanctioned dirty-write transitions, and zero violating commits or
-writes across all observed filesystem entries: Gate 3 passed. Its
-preflight recorded 2,054 public tests passing with four platform skips, 39
-private tests, `check_v2` 0/0, and clean policy, Gitleaks, public, and combined
-history audits; opaque closing preimages and the protected snapshot evidence
-remained byte-identical across the read-only audit, preserving all pre-existing
-dirty entries recorded at the session baseline. A subsequent owner-authorized,
-trusted-local Gate 2 proof at the exact fetched `origin/main` recorded in its
-external evidence verified one sanctioned approval of a real adapter-created
-receipt and one revert commit. The revert exactly inverted the approval paths,
-returned the tracked receipt to triage, restored the pre-approval committed
-tree, required no manual cleanup, and preserved all pre-existing dirty state
-byte-identically. Gate 2 passed; at that point Gate 1 timed triage was the
-remaining live exit trial. A later trusted-local Gate 1 trial at exact
-fetched `origin/main` `aa1eafdc6047debb9698a32099889665eda1c40b`
-completed 20 real inbox items in 157.8 seconds (7.89 seconds per item), compared
-with 217.0 seconds (10.85 seconds per item) in Obsidian: 59.2 seconds, or 27.3%,
-less elapsed time. It created exactly 20 review proposals before any content
-moved. Separate owner review produced 20 sanctioned approval commits and left
-triage and Outbox empty. Closing Gate 3 passed with no violation; 39 private
-tests passed, `check_v2` reported 0 errors/0 warnings, and pre-existing
-worktree and index differences were preserved byte-identically. Gate 1 passed;
-all five Phase 1 exit gates now pass. Phase 2 remains unauthorized, and Step 11
-deployment still requires separate owner approval. Phase 3 email and PDF intake
-is a recorded design in
+spent record. The separately sequenced inherited items 2, 4, and 3 are also
+complete, and all five Phase 1 exit gates pass. Their evidence — test counts,
+exact SHAs, trial timings, and preservation proofs — is recorded once, in
+`docs/STATUS.md`.
+
+A single-owner, localhost-only deployment was approved and accepted separately
+from Step 11; see `docs/LOCAL-DEPLOYMENT-PLAN.md` and
+`docs/LOCAL-DEPLOYMENT-ACCEPTANCE.md`. Step 11 (VPS beside Hermes) is not
+started and still requires separate owner approval. Phase 2 remains
+unauthorized. Phase 3 email and PDF intake is a recorded design in
 `docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
 The owner authorized the public Phase 3 slices on 2026-10-26;
 `docs/STATUS.md` records the scope and the external-action exception.
@@ -118,10 +100,11 @@ blocked on building Phase 2. The later connector note in
 `docs/superpowers/specs/2026-10-25-later-connector-notes.md` is not part of
 Phase 3.
 
-Do not add dashboard cards, drag-drop UI, general workflows, or new agent skills
-inside this hardening sequence. The OneOS shell may adopt the approved
-workspace switcher and **Blocks / Modules** terminology only where required to
-surface scoped safety state.
+The hardening sequence carried this restriction: no dashboard cards,
+drag-drop UI, general workflows, or new agent skills inside it. The sequence is
+complete. The Board screen merged afterwards and is described, with its
+limits, in `AGENTS.md` "Console terminology"; that record does not authorize
+extending it.
 
 ---
 

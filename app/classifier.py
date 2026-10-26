@@ -1,13 +1,13 @@
 """classifier.py — deterministic, rule-based triage routing (spec §8.5).
 
 No LLM in the request path (invariant 3). A rule matches on keyword substrings
-(and optionally source); the first match wins. Corrections persist as new rules
-via add_rule, so the next similar item arrives pre-classified — the correction
-loop is the product, not day-one accuracy.
+(and optionally source); the first match wins.
 
-Reads `_system/classifier/rules.yaml` — created here, in step 6 (spec §2.2a
-lists it as "STILL TO BUILD"). Absent file => everything is unclassified, which
-is a safe default, not an error.
+Reads `_system/classifier/rules.yaml`. Absent file => everything is
+unclassified, which is a safe default, not an error. No Console route writes
+this file: a manual triage correction writes only a proposal. `add_rule` is a
+direct-write helper used by tests; wiring corrections into rules is unbuilt and
+would need its own outbox-governed design.
 """
 from __future__ import annotations
 
