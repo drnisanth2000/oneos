@@ -2,11 +2,12 @@
 
 Date: 2026-08-23
 
-Status: conversational design approved; implementation not authorized
+Status: slice 1 authorized for an unlocked PDF archive and redacted receipt.
+Mailbox connection, password storage, provider Trash, recovery, screens,
+new dependencies, and private parsers remain unauthorized.
 
-Recorded in this repository as Phase 3. Recording the design does not authorize
-implementation, a screen, a dependency, a live mailbox, or a change to the
-Safety Foundation.
+Recorded in this repository as Phase 3. Slice 1 does not authorize a screen,
+a dependency, a live mailbox, or a change to the Safety Foundation.
 
 ## Purpose
 
@@ -400,7 +401,8 @@ passing suite written only by the implementer is not sufficient evidence.
 
 ## Non-goals
 
-- No implementation, implementation plan, dependency, screen, or live mailbox
+- Slice 1 authorizes only an unlocked PDF archive and the existing redacted
+  receipt. No other implementation, dependency, screen, or live mailbox
   connection is authorized by this document.
 - The workflow does not belong to S7 and does not widen the current Safety
   Foundation.
@@ -418,15 +420,15 @@ passing suite written only by the implementer is not sufficient evidence.
 ## Phase placement
 
 Phase 2 remains the finance-ingest pipeline and is separately unauthorized.
-This design is Phase 3. It is not blocked on building Phase 2, and recording it
-does not start either phase. The current next expansion decision remains the
-separate Step 11 deployment approval.
+This design is Phase 3. It is not blocked on building Phase 2. Slice 1 is the
+unlocked PDF archive. The current next expansion decision for deployment
+remains the separate Step 11 approval.
 
 The current email adapter records attachment names and does not unlock or
 archive PDFs. The current folder adapter may retain extracted PDF text on the
-receipt path. This design keeps a full transcript temporary. Those adapters
-stay as they are until Phase 3 implementation is separately authorized. Official
-IMAP, monitored by Hermes, is the connector in this design.
+receipt path. Slice 1 keeps a full transcript out of its own receipt and leaves
+those adapters unchanged. Official IMAP, monitored by Hermes, remains the
+connector for a later mailbox slice.
 
 ## Completion criteria
 

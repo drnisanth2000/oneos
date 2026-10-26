@@ -143,8 +143,10 @@ preserve the same envelope, outbox, scope, and revert guarantees.
 This thesis stays frozen for current work and still does not authorize features
 outside the current phase. Phase 2 remains the unauthorized finance-ingest
 pipeline. Phase 3 email and PDF intake is recorded in
-`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md` and is
-not authorized to build. It is not blocked on building Phase 2.
+`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
+Slice 1 may archive an unlocked PDF outside the vault through the existing
+redacted receipt. The rest of Phase 3 is not authorized to build. Phase 3 is
+not blocked on building Phase 2.
 
 Inside a future authorized Phase 3, email retention still uses the shared
 intake envelope, the outbox for Grey Matter summaries, and server-owned scope.
