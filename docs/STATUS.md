@@ -8,8 +8,25 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-09-11, after the successful trusted-local live Gate 1
-timed-triage and approval session.
+Last reconciled: 2026-10-26, after local deployment acceptance on the installed
+Mac. The previous reconciliation was 2026-09-11, after the successful
+trusted-local live Gate 1 timed-triage and approval session.
+
+## Local deployment acceptance (2026-10-26)
+
+The running install started from `origin/main` `e1481e5`. Owner enrollment,
+external encrypted backup, restore-check, local certificate trust, and login
+startup are complete. The owner signed in and the home screen loaded. No
+passwords, authenticator codes, or backup keys are recorded here.
+
+The Board screen is included. Phase 3 email and PDF intake is recorded in
+this copy and does not authorize building it. Finance parsers are not included.
+
+Backup needed two macOS compatibility fixes, now in the tree and described in
+`LOCAL-OPERATIONS.md`. Failed staging directories from the attempts that
+stopped early remain in private state, as does the isolated restore-check
+directory. The successful backup removed its own staging directory. Do not
+treat those private leftovers as a second live vault.
 
 ---
 
@@ -370,8 +387,10 @@ show mailbox tabs plus Email cleanup. A learned rule still cannot move mail
 to Trash. Live mailboxes, private parsers, and Grey Matter secrets stay
 outside this repository. Phase 3 is not blocked on building Phase 2.
 Phase 2 may not be implemented from this record. The current email adapter
-still only records attachment names, and the current folder adapter may retain
-extracted PDF text. The Phase 3 archive path leaves those adapters unchanged.
+commits a redacted summary of the message text and a body reference. It
+collects attachment filenames and does not write them into the receipt. The
+current folder adapter may retain extracted PDF text. The Phase 3 archive
+path leaves those adapters unchanged.
 
 An external archive copy is not undone by `git revert`. The synthetic cleanup
 provider records Trash and recovery as separate actions. Vault receipt commits

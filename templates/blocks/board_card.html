@@ -1,0 +1,26 @@
+<article class="board-card lane-{{ card.lane }}"
+         {% if card.draggable %}draggable="true" data-filename="{{ card.filename }}"
+         @dragstart="event.dataTransfer.setData('text/plain', $el.dataset.filename)"{% endif %}>
+  <h3>
+    {% if card.lane == 'filed' %}
+    <a href="{{ page.clear_outline_href }}&amp;note={{ card.relative_path | urlencode }}">{{ card.title }}</a>
+    {% else %}
+    {{ card.title }}
+    {% endif %}
+  </h3>
+  <p class="board-meta">
+    {% if card.lane == 'proposed' %}<span class="board-badge">Proposed</span>{% endif %}
+    {% if card.sub %}<span class="board-chip">{{ card.sub }}</span>{% endif %}
+    {% if card.product %}<span class="board-chip">{{ card.product }}</span>{% endif %}
+    {% if card.member %}<span class="board-chip">{{ card.member }}</span>{% endif %}
+    {% if card.status %}<span class="board-chip">{{ card.status }}</span>{% endif %}
+    <span class="mod-name">{{ card.module }}</span>
+    {% if card.block %}<span class="block-tag">{{ card.block }}</span>{% endif %}
+    {% if card.formula %}
+    <span class="board-chip">{% if card.formula_result is not none %}{{ card.formula_result }}{% else %}{{ card.formula }}{% endif %}</span>
+    {% endif %}
+  </p>
+  {% if card.lane == 'proposed' %}
+  <a class="review-link" href="/outbox/{{ entity }}">Review proposal</a>
+  {% endif %}
+</article>

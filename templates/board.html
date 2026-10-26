@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  {% set page_title = "OneOS · Board" %}
+  {% include "_head.html" %}
+</head>
+<body class="review-surface" hx-ext="alpine-morph">
+  {% include "_sidebar.html" %}
+
+  <main class="main">
+    <div id="board" class="board"
+         data-href="{{ page.self_href }}"
+         hx-get="{{ page.self_href }}"
+         hx-trigger="console:proposal-persisted from:body"
+         hx-target="#board"
+         hx-select="#board"
+         hx-swap="morph"
+         x-data="{ over: '', drop(event, module, sub) {
+           const filename = event.dataTransfer.getData('text/plain');
+           const form = this.$root.querySelector('#board-drop');
+           if (!filename || !form) return;
+           form.querySelector('[name=filename]').value = filename;
+           form.querySelector('[name=module]').value = module;
+           form.querySelector('[name=sub]').value = sub;
+           form.requestSubmit();
+         } }">
+      <h1 class="triage-h">Board · {{ entity }}</h1>
+
+      <div class="board-toolbar" role="toolbar" aria-label="Board view">
+        <div class="board-controls">
+          {% for link in page.view_links %}
+          <a class="board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
+          {% endfor %}
+        </div>
+        <div class="board-controls">
+          {% for link in page.group_links %}
+          <a class="board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
+          {% endfor %}
+          {% for link in page.sort_links %}
+          <a class="board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}">Sort: {{ link.label }}</a>
+          {% endfor %}
+        </div>
+        {% if page.chips %}
+        <div class="board-chips">
+          {% for chip in page.chips %}
+          <a class="board-chip{% if chip.active %} is-active{% endif %}" href="{{ chip.href }}">{{ chip.label }} {{ chip.count }}</a>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+
+      <div class="board-tools">
+        <form class="capture" method="post" action="/board/{{ entity }}/capture">
+          <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token | default('') }}">
+          <label class="sr-only" for="capture-title">Quick note</label>
+          <input id="capture-title" name="title" type="text" maxlength="200" required placeholder="Quick note">
+          <label class="sr-only" for="capture-text">Details</label>
+          <input id="capture-text" name="text" type="text" maxlength="8000" placeholder="Details">
+          <button type="submit">Add to inbox</button>
+        </form>
+        <aside class="attention" aria-label="This week">
+          <h2>This week</h2>
+          <dl>
+            <div><dt>Inbox</dt><dd>{{ page.attention.inbox }}</dd></div>
+            <div><dt>Proposed</dt><dd>{{ page.attention.proposed }}</dd></div>
+            <div><dt>Updated</dt><dd>{{ page.attention.updated }}</dd></div>
+            {% for label, count in page.attention.by_status %}
+            <div><dt>{{ label }}</dt><dd>{{ count }}</dd></div>
+            {% endfor %}
+          </dl>
+        </aside>
+      </div>
+
+      {% if page.blocked %}
+      <p class="alert" role="alert">
+        <span class="alert-code">E-UNREADABLE</span>
+        A proposal record could not be read. Drag is off until that record is repaired.
+      </p>
+      {% endif %}
+
+      {% if page.group == 'review' and not page.blocked %}
+      <form id="board-drop" method="post" action="/triage/{{ entity }}/propose"
+            hx-post="/triage/{{ entity }}/propose"
+            hx-target="#board-drop-result" hx-swap="innerHTML">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token | default('') }}">
+        <input type="hidden" name="filename" value="">
+        <input type="hidden" name="module" value="">
+        <input type="hidden" name="sub" value="">
+      </form>
+      <div id="board-drop-result"></div>
+      {% endif %}
+
+      {% if page.note_open %}
+      <section class="outline-panel">
+        <div class="outline-head">
+          <h2>{{ page.outline_title }}</h2>
+          <a href="{{ page.clear_outline_href }}">Close</a>
+        </div>
+        {% if page.outline %}
+        {% macro tree(nodes) %}
+        <ul class="outline">
+          {% for node in nodes %}
+          <li>
+            {% if node.children %}
+            <details open><summary>{{ node.text }}</summary>{{ tree(node.children) }}</details>
+            {% else %}
+            {{ node.text }}
+            {% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+        {% endmacro %}
+        {{ tree(page.outline) }}
+        {% else %}
+        <p class="muted">No headings or lists.</p>
+        {% endif %}
+      </section>
+      {% endif %}
+
+      {% if page.view == 'board' %}
+      <div class="board-columns">
+        {% for column in page.columns %}
+        <section class="board-column{% if column.missing %} missing{% endif %}"
+                 {% if column.droppable %}
+                 data-module="{{ column.module }}"
+                 data-sub="{{ column.sub or '' }}"
+                 @dragover.prevent="over = '{{ column.key }}'"
+                 @dragleave="over = ''"
+                 @drop.prevent="drop($event, $el.dataset.module, $el.dataset.sub)"
+                 :class="{ 'drop-over': over === '{{ column.key }}' }"
+                 {% endif %}>
+          <h2>{{ column.label }} <span class="muted">{{ column.cards|length }}</span></h2>
+          {% if column.missing %}<p class="bundle-warn">required by flags, missing on disk</p>{% endif %}
+          {% for card in column.cards %}
+          {% include "blocks/board_card.html" %}
+          {% endfor %}
+          {% if not column.cards and not column.missing %}<p class="muted">No notes</p>{% endif %}
+        </section>
+        {% endfor %}
+      </div>
+
+      {% elif page.view == 'list' or page.view == 'gallery' %}
+      <div class="board-{{ page.view }}">
+        {% for card in page.cards %}
+        {% include "blocks/board_card.html" %}
+        {% endfor %}
+        {% if not page.cards %}<p class="muted">No notes</p>{% endif %}
+      </div>
+
+      {% elif page.view == 'calendar' %}
+      <div class="period-nav">
+        <a href="{{ page.previous_href }}">Previous</a>
+        <strong>{{ page.period_label }}</strong>
+        <a href="{{ page.next_href }}">Next</a>
+      </div>
+      <div class="calendar">
+        {% for week in page.weeks %}
+        <div class="calendar-week">
+          {% for day in week %}
+          <section class="calendar-day{% if not day.in_month %} is-outside{% endif %}">
+            <h2>{{ day.number }}</h2>
+            {% for card in day.cards %}
+            {% include "blocks/board_card.html" %}
+            {% endfor %}
+          </section>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+      {% if page.undated %}
+      <section class="undated">
+        <h2>No date</h2>
+        {% for card in page.undated %}
+        {% include "blocks/board_card.html" %}
+        {% endfor %}
+      </section>
+      {% endif %}
+
+      {% elif page.view == 'planner' %}
+      <div class="period-nav">
+        <a href="{{ page.previous_href }}">Previous</a>
+        <strong>{{ page.period_label }}</strong>
+        <a href="{{ page.next_href }}">Next</a>
+      </div>
+      <div class="planner">
+        <section class="unscheduled">
+          <h2>Unscheduled <span class="muted">{{ page.unscheduled|length }}</span></h2>
+          {% for card in page.unscheduled %}
+          {% include "blocks/board_card.html" %}
+          {% endfor %}
+          {% if not page.unscheduled %}<p class="muted">Inbox is empty</p>{% endif %}
+        </section>
+        <div class="planner-days">
+          {% for day in page.days %}
+          <section class="calendar-day">
+            <h2>{{ day.iso[5:] }}</h2>
+            {% for card in day.cards %}
+            {% include "blocks/board_card.html" %}
+            {% endfor %}
+          </section>
+          {% endfor %}
+        </div>
+      </div>
+      {% if page.habits %}
+      <table class="habits">
+        <caption>Habits</caption>
+        <thead>
+          <tr>
+            <th>Note</th><th>Cadence</th>
+            {% for day in page.days %}<th>{{ day.iso[8:] }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for card in page.habits %}
+          <tr>
+            <td>{{ card.title }}</td>
+            <td>{{ card.cadence }}</td>
+            {% for day in page.days %}<td class="habit-cell"></td>{% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+
+      {% elif page.view == 'map' %}
+      <div class="life-map">
+        {% for row in page.map_rows %}
+        <section class="map-row{% if row.missing %} missing{% endif %}">
+          <h2>{{ row.module }} <span class="block-tag">{{ row.block }}</span></h2>
+          <p class="muted">{{ row.count }} note{{ '' if row.count == 1 else 's' }}</p>
+          {% if row.missing %}<p class="bundle-warn">required by flags, missing on disk</p>{% endif %}
+          <div class="map-bar" aria-hidden="true"><span style="width: {{ row.percent }}%"></span></div>
+        </section>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </main>
+</body>
+</html>

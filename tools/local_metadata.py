@@ -48,6 +48,11 @@ def mac_api():
     return api
 
 
+# macOS adds this stamp to every new file and will not let a program remove it.
+# It is not part of the note. Leaving it out keeps the backup from failing closed.
+_IGNORED_XATTRS = {b'com.apple.provenance'}
+
+
 def checked(result):
     if result < 0:
         raise OSError(ctypes.get_errno(), 'extended attribute operation failed')
@@ -65,7 +70,7 @@ def _read(fd):
         raise ValueError('extended attributes changed during capture')
     result = {}
     for name in names.raw[:actual].split(b'\x00'):
-        if not name:
+        if not name or name in _IGNORED_XATTRS:
             continue
         size = checked(api.fgetxattr(fd, name, None, 0, 0, 0))
         value = ctypes.create_string_buffer(size)

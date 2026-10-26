@@ -392,6 +392,42 @@ def test_external_identity_rejected_before_write(tmp_path, monkeypatch, change):
     assert list(mount.iterdir()) == []
 
 
+def test_volume_without_physical_label_accepts_a_physical_parent_disk(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+    mount = tmp_path / 'drive'
+    mount.mkdir()
+    volume = dict(VolumeUUID='expected', Internal=False, Mounted=True, MountPoint=str(mount), ParentWholeDisk='disk9')
+    parent = dict(VirtualOrPhysical='Physical', Internal=False)
+
+    def fake(path):
+        if str(path).endswith('disk9'):
+            return parent
+        return volume
+
+    monkeypatch.setattr(backup, 'disk_info', fake)
+    assert backup.validate_volume({'mount': str(mount), 'volume_uuid': 'expected'}) == mount.absolute()
+
+
+def test_missing_mounted_flag_accepts_the_matching_mount_point(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+    mount = tmp_path / 'drive'
+    mount.mkdir()
+    info = dict(VolumeUUID='expected', Internal=False, VirtualOrPhysical='Physical', MountPoint=str(mount))
+    monkeypatch.setattr(backup, 'disk_info', lambda path: info)
+    assert backup.validate_volume({'mount': str(mount), 'volume_uuid': 'expected'}) == mount.absolute()
+
+
+def test_volume_without_physical_label_rejects_a_virtual_parent_disk(tmp_path, monkeypatch):
+    from tools import local_backup as backup
+    mount = tmp_path / 'drive'
+    mount.mkdir()
+    volume = dict(VolumeUUID='expected', Internal=False, Mounted=True, MountPoint=str(mount), ParentWholeDisk='disk5')
+    parent = dict(VirtualOrPhysical='Virtual', Internal=False)
+    monkeypatch.setattr(backup, 'disk_info', lambda path: parent if str(path).endswith('disk5') else volume)
+    with pytest.raises(ValueError):
+        backup.validate_volume({'mount': str(mount), 'volume_uuid': 'expected'})
+
+
 def test_backup_lock_refuses_second_job(tmp_path):
     from tools.local_service import operation_lock
     with operation_lock(tmp_path):

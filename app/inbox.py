@@ -25,18 +25,27 @@ class InboxItem:
 
 @structured_reader(category="front-matter")
 def split_front_matter(text: str) -> tuple[dict, str]:
+    """Split a leading front-matter fence from the body.
+
+    The closing fence is a line whose only content is ``---``. A quoted title
+    may contain that character sequence without ending the block.
+    """
     if not text.startswith("---"):
         return {}, text
-    end = text.find("---", 3)
-    if end == -1:
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
         return {}, text
-    try:
-        fm = yaml.safe_load(text[3:end]) or {}
-    except yaml.YAMLError:
-        fm = {}
-    if not isinstance(fm, dict):
-        fm = {}
-    return fm, text[end + 3:].lstrip("\n")
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() != "---":
+            continue
+        try:
+            fm = yaml.safe_load("".join(lines[1:index])) or {}
+        except yaml.YAMLError:
+            fm = {}
+        if not isinstance(fm, dict):
+            fm = {}
+        return fm, "".join(lines[index + 1:]).lstrip("\n")
+    return {}, text
 
 
 def _require_real_directory(scope: Scope, *parts: str) -> Path | None:

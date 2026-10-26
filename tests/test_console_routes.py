@@ -776,8 +776,8 @@ def test_bundles_shape_failures_never_blank_any_sidebar_route(tmp_path, monkeypa
         client = TestClient(main.app, raise_server_exceptions=False)
 
         for url in (
-            "/", "/triage", "/triage/alpha", "/outbox/alpha",
-            "/registry/alpha/products",
+            "/", "/triage", "/triage/alpha", "/board", "/board/alpha",
+            "/outbox/alpha", "/registry/alpha/products",
         ):
             response = client.get(url)
             assert response.status_code == 500, f"{name} {url}: {response.status_code}"
@@ -3893,6 +3893,21 @@ def _route_totality_plan(main) -> dict:
         main.shell: {
             "request": lambda c, submitted=None: c.get("/"),
             "patch_targets": [(main.Vault, "bundles")],
+        },
+        main.board_default: {
+            "request": lambda c, submitted=None: c.get("/board"),
+            "patch_targets": [(main.Vault, "bundles")],
+        },
+        main.board: {
+            "request": lambda c, submitted=None: c.get("/board/alpha"),
+            "patch_targets": [(main, "load_board")],
+        },
+        main.capture: {
+            "request": lambda c, submitted=None: c.post(
+                "/board/alpha/capture",
+                data={"title": submitted or "note", "text": ""},
+            ),
+            "patch_targets": [(main, "capture_note")],
         },
         main.triage_default: {
             "request": lambda c, submitted=None: c.get("/triage"),

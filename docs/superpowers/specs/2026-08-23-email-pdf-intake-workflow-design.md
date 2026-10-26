@@ -419,15 +419,16 @@ passing suite written only by the implementer is not sufficient evidence.
 ## Phase placement
 
 Phase 2 remains the finance-ingest pipeline and is separately unauthorized.
-This design is Phase 3. It is not blocked on building Phase 2. Slice 1 is the
-unlocked PDF archive. The current next expansion decision for deployment
-remains the separate Step 11 approval.
+This design is Phase 3. It is not blocked on building Phase 2. The current
+next expansion decision for deployment remains the separate Step 11 approval.
 
-The current email adapter records attachment names and does not unlock or
-archive PDFs. The current folder adapter may retain extracted PDF text on the
-receipt path. Slice 1 keeps a full transcript out of its own receipt and leaves
-those adapters unchanged. Official IMAP, monitored by Hermes, remains the
-connector for a later mailbox slice.
+The current email adapter commits a redacted summary of the message text and
+a body reference. It collects attachment filenames and does not write them
+into the receipt. It does not unlock or archive PDFs. The current folder
+adapter may retain extracted PDF text on the receipt path. The public Phase 3
+archive path keeps a full transcript out of its own receipt and leaves those
+adapters unchanged. Official IMAP, monitored by Hermes, remains the connector
+for a later live-mailbox slice.
 
 ## Completion criteria
 
