@@ -84,6 +84,8 @@ Phase 1 exit gates now pass. Phase 2 remains unauthorized, and deployment still
 requires separate owner approval.
 Phase 3 email and PDF intake is a recorded design in
 `docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
+The owner authorized the public Phase 3 slices on 2026-10-26;
+`docs/STATUS.md` records the scope and the external-action exception.
 Phase 2 finance ingest remains separately unauthorized, and Phase 3 is not
 blocked on building Phase 2. The public Phase 3 slices archive an unlocked
 PDF, redact parser fields, match learned rules without Trash authority, unlock
@@ -214,7 +216,11 @@ The vault is never public.
    `sub: triage`; ingestion immediately commits only that receipt as one
    `ingest:` commit. Raw source content never enters the vault. Approval moves
    the tracked receipt and commits the curated change.
-2. **Git is the audit trail.** No side effect without a revertible diff.
+2. **Git is the audit trail.** No side effect without a revertible diff. The
+   sole exception is the owner-authorized Phase 3 external archive copy and
+   provider Trash move recorded in `docs/STATUS.md`: each needs an exact
+   authorization and a verified outcome, and is reversed by an explicit,
+   audited recovery action.
 3. **No LLM call in the request path.** Classification is rule-based. Judgement
    belongs to Hermes, asynchronously, via the outbox.
 4. **`scope.current_entity()` wraps every query and path resolution**, from the

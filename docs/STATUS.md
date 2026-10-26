@@ -371,7 +371,32 @@ service remains gated through an outbox proposal and explicit approval.
 Specific parsers and integration targets are instance data and remain in the
 vault's `decisions.md`, not this repository.
 
-## Phase 3 — public slices implemented
+## Phase 3 — owner-authorized; public slices implemented
+
+### Owner authorization (2026-10-26)
+
+The owner authorized Phase 3 implementation on 2026-10-26 for the public
+slices in this change: the unlocked PDF archive, redacted parser fields,
+learned rules without Trash authority, encrypted PDF unlock through a store
+outside the vault, frozen exact-message cleanup with separate confirmation and
+recovery, and the mailbox and Email cleanup screens. All of them run against
+synthetic fixtures.
+
+The authorization does not cover a live mailbox, a private parser, Grey Matter
+secrets, a new dependency, a change to S7, Phase 2, or Step 11 deployment.
+Each still needs its own owner approval. Merge still requires the local
+private integration gate in `BUILD.md`.
+
+From this authorization, the design's safety interpretation for external
+actions applies to Phase 3 only. An external archive copy and a provider Trash
+move are not undone by `git revert`. Each needs an exact, redacted
+authorization before it runs and a verified outcome afterward, and is reversed
+by an explicit recovery action with its own audit record. Every vault change,
+including the receipt commit, still has a revertible Git diff. Outside Phase
+3, every side effect still requires a revertible Git diff.
+
+### Scope and current adapters
+
 
 Email and PDF intake is recorded in
 `docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.

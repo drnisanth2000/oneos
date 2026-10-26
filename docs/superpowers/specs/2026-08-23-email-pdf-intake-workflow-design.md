@@ -2,8 +2,9 @@
 
 Date: 2026-08-23
 
-Status: public slices implemented with synthetic fixtures. Live mailboxes,
-private parsers, and Grey Matter secrets remain outside this repository.
+Status: owner-authorized on 2026-10-26 for the public slices, implemented with
+synthetic fixtures. Live mailboxes, private parsers, and Grey Matter secrets
+remain outside this repository.
 
 Recorded in this repository as Phase 3. The public slices do not authorize a
 live mailbox, a private parser, or a change to the Safety Foundation.
@@ -60,7 +61,8 @@ to the provider message or archive operation.
 
 This external-action interpretation applies only after a separate implementation
 authorization. Until then, every current side effect still requires a revertible
-Git diff.
+Git diff. The owner recorded that authorization for the public Phase 3 slices on
+2026-10-26 in `docs/STATUS.md`.
 
 ## Responsibilities
 
