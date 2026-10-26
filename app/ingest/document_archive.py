@@ -49,6 +49,10 @@ class DocumentArchiveError(IngestError):
     pass
 
 
+class RawArchiveCleanupError(RawArchiveWriteError):
+    """A new archive object could not be removed after a containment failure."""
+
+
 class DocumentChecksumError(DocumentArchiveError):
     pass
 
@@ -262,7 +266,7 @@ def _discard_new_object(directory_fd: int, name: str) -> None:
     try:
         os.unlink(name, dir_fd=directory_fd)
     except OSError as exc:
-        raise RawArchiveWriteError(
+        raise RawArchiveCleanupError(
             "raw document archival failed; cleanup failed"
         ) from exc
 

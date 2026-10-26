@@ -9,10 +9,11 @@ import pytest
 from pypdf import PdfWriter
 
 from app.ingest import document_archive
-from app.ingest.adapters.folder import RawArchiveContainmentError, RawArchiveWriteError
+from app.ingest.adapters.folder import RawArchiveContainmentError
 from app.ingest.base import IngestIdentityConflict
 from app.ingest.document_archive import (
     DocumentArchiveError,
+    RawArchiveCleanupError,
     DocumentChecksumError,
     DocumentEncryptedError,
     ingest_unlocked_pdf,
@@ -254,7 +255,7 @@ def test_reparented_archive_cleanup_failure_is_a_hard_failure(tmp_path, monkeypa
     monkeypatch.setattr(document_archive.os, "fsync", reparent_after_write)
     monkeypatch.setattr(document_archive.os, "unlink", fail_archive_cleanup)
 
-    with pytest.raises(RawArchiveWriteError, match="cleanup failed"):
+    with pytest.raises(RawArchiveCleanupError, match="cleanup failed"):
         ingest_unlocked_pdf(
             Scope(vault, "synthetic"),
             source,

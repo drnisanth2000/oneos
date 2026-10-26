@@ -39,10 +39,6 @@
       <article class="doc-card">
         <h3>{{ title }}</h3>
         <p class="muted">{{ reference }}</p>
-        <p>
-          <a href="/mail/{{ entity }}?mailbox={{ page.selected }}&amp;open=file&amp;case={{ case_id }}">Open file</a>
-          <a href="/mail/{{ entity }}?mailbox={{ page.selected }}&amp;open=folder&amp;case={{ case_id }}">Open folder</a>
-        </p>
       </article>
       {% endfor %}
     </section>

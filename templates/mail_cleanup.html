@@ -10,6 +10,22 @@
     <h1 class="triage-h">Email cleanup · {{ entity }}</h1>
     <p class="muted"><a href="/mail/{{ entity }}">← mailbox tabs</a></p>
 
+    {% if page.outcomes %}
+    <section>
+      <h2>Last action</h2>
+      <ul class="triage-list">
+        {% for case_id, status in page.outcomes %}
+        <li class="triage-item"><span class="ti-title">{{ case_id }}</span>
+          {% if status == "trashed" %}Moved to Trash.
+          {% elif status == "recovered" %}Returned to the inbox.
+          {% elif status == "unavailable" %}Could not be recovered. It may already be removed from Trash.
+          {% else %}Needs attention: it was not moved to Trash.{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
     <section>
       <h2>Ready to delete</h2>
       <p class="muted">Unusual cases are listed first. Ranking does not delete anything.</p>
@@ -30,6 +46,7 @@
       <form method="post" action="/mail/{{ entity }}/cleanup/confirm">
         <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token | default('') }}">
         <input type="hidden" name="confirmed" value="yes">
+        <input type="hidden" name="frozen" value="{{ page.frozen_digest }}">
         <button type="submit">Confirm frozen list</button>
       </form>
     </section>

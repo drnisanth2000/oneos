@@ -428,7 +428,8 @@ deployment remains the separate Step 11 approval.
 The current email adapter commits a redacted summary of the message text and
 a body reference. It collects attachment filenames and does not write them
 into the receipt. It does not unlock or archive PDFs. The current folder
-adapter may retain extracted PDF text on the receipt path. The public Phase 3
+adapter may retain a bounded, redacted summary of extracted PDF text on the
+receipt path; raw extracted text stays outside the vault. The public Phase 3
 archive path keeps a full transcript out of its own receipt and leaves those
 adapters unchanged. Official IMAP, monitored by Hermes, remains the connector
 for a later live-mailbox slice, which is outside the public slices.

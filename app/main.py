@@ -545,9 +545,10 @@ def mail_confirm(
     request: Request,
     scope: EntityScope,
     confirmed: str = Form(""),
+    frozen: str = Form(""),
 ) -> HTMLResponse:
     try:
-        page = confirm_frozen(scope, confirmed == "yes")
+        page = confirm_frozen(scope, confirmed == "yes", frozen)
         return templates.TemplateResponse(
             request, "mail_cleanup.html", _mail_context(scope, page)
         )

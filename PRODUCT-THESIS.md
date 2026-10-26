@@ -2,7 +2,7 @@
 
 **Status:** frozen product direction
 
-**Updated:** 2026-10-25
+**Updated:** 2026-10-26
 
 This document explains **why OneOS exists and what problem it must solve**.
 `AGENTS.md` remains authoritative for implementation constraints, `BUILD.md`

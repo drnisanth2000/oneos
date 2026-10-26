@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 
 from app.phase3 import (
     CleanupBook,
+    CleanupError,
     LearnedRule,
     MailDocument,
     ParserHook,
@@ -19,6 +20,7 @@ from app.phase3 import (
     ProtectedPasswordStore,
     ProviderMessage,
     RecoveryChoice,
+    RuleMatch,
     SyntheticProvider,
     archive_prepared_pdf,
     configure_workspace,
@@ -98,9 +100,9 @@ def test_unverified_sender_and_conflicting_rules_stop_before_password_use(tmp_pa
         LearnedRule("rule-a", "mailbox-a", fingerprint, "invoice", True),
         LearnedRule("rule-b", "mailbox-a", fingerprint, "invoice", False),
     )
-    unverified = match_rules(rules[:1], mailbox_id="mailbox-a", sender=sender, verified=False)
-    conflict = match_rules(rules, mailbox_id="mailbox-a", sender=sender, verified=True)
-    matched = match_rules(rules[:1], mailbox_id="mailbox-a", sender=sender, verified=True)
+    unverified = match_rules(rules[:1], mailbox_id="mailbox-a", sender=sender, document_type="invoice", verified=False)
+    conflict = match_rules(rules, mailbox_id="mailbox-a", sender=sender, document_type="invoice", verified=True)
+    matched = match_rules(rules[:1], mailbox_id="mailbox-a", sender=sender, document_type="invoice", verified=True)
     assert unverified.status == "manual"
     assert conflict.status == "conflict"
     assert matched.status == "matched"
@@ -141,7 +143,7 @@ def test_password_is_replaced_only_after_unlock_and_stays_outside_the_receipt(tm
             store=store,
             sender_fingerprint=sender,
             document_type="invoice",
-            match=type("Match", (), {"status": "matched"})(),
+            match=RuleMatch("matched", ("rule-a",), sender, "invoice"),
             verified=True,
             replacement=new,
         )
@@ -158,7 +160,7 @@ def test_password_is_replaced_only_after_unlock_and_stays_outside_the_receipt(tm
         store=store,
         sender_fingerprint=sender,
         document_type="invoice",
-        match=type("Match", (), {"status": "matched"})(),
+        match=RuleMatch("matched", ("rule-a",), sender, "invoice"),
         verified=True,
         replacement=old,
     )
@@ -188,7 +190,6 @@ def test_wrong_replacement_does_not_overwrite_the_remembered_password(tmp_path):
     sender = sender_fingerprint("synthetic-sender@example.invalid")
     store.remember(sender, "invoice", "synthetic-old-password")
     payload = _pdf("marker", "synthetic-old-password")
-    from app.phase3 import RuleMatch
 
     try:
         unlock_for_rule(
@@ -196,7 +197,7 @@ def test_wrong_replacement_does_not_overwrite_the_remembered_password(tmp_path):
             store=store,
             sender_fingerprint=sender,
             document_type="invoice",
-            match=RuleMatch("matched", ("rule-a",)),
+            match=RuleMatch("matched", ("rule-a",), sender, "invoice"),
             verified=True,
             replacement="synthetic-new-password",
         )
@@ -234,7 +235,7 @@ def test_cleanup_freezes_exact_messages_and_recovery_keeps_the_archive(tmp_path)
     assert [item.case_id for item in book.ranked_ready()] == ["case-rare", "case-routine"]
     frozen = book.freeze(("case-rare",))
     provider.messages["case-later"] = ProviderMessage("case-later", "mailbox-a", "synthetic")
-    outcomes = book.confirm(True)
+    outcomes = book.confirm(True, book.frozen_digest())
     assert frozen == ("case-rare",)
     assert outcomes[0].status == "trashed"
     assert provider.messages["case-later"].location == "inbox"
@@ -266,7 +267,7 @@ def test_partial_trash_records_each_message():
         "case-gone": MailDocument("case-gone", "mailbox-a", "Gone", "archive:b", "", True, "approved", 1),
     }
     book.freeze(("case-ok", "case-gone"))
-    outcomes = {item.message_id: item.status for item in book.confirm(True)}
+    outcomes = {item.message_id: item.status for item in book.confirm(True, book.frozen_digest())}
     assert outcomes == {"case-ok": "trashed", "case-gone": "attention"}
     assert provider.messages["case-ok"].location == "trash"
 
@@ -298,7 +299,7 @@ def test_mailbox_screen_shows_tabs_and_cleanup_requires_confirmation(tmp_path, m
     assert "mailbox-a" in mail.text
     assert "mailbox-b" in mail.text
     assert "first-time naming" in mail.text
-    assert "Open file" in mail.text
+    assert "Open file" not in mail.text
     assert "archive:abc" in mail.text
     cleanup = client.get("/mail/alpha/cleanup")
     assert cleanup.status_code == 200
@@ -311,12 +312,17 @@ def test_mailbox_screen_shows_tabs_and_cleanup_requires_confirmation(tmp_path, m
     frozen = client.post("/mail/alpha/cleanup/freeze", data={"message_id": "case-one"})
     assert frozen.status_code == 200
     assert "case-one" in frozen.text
-    confirmed = client.post("/mail/alpha/cleanup/confirm", data={"confirmed": "yes"})
+    digest = phase3.workspace_for(scope).book.frozen_digest()
+    confirmed = client.post(
+        "/mail/alpha/cleanup/confirm", data={"confirmed": "yes", "frozen": digest}
+    )
     assert confirmed.status_code == 200
+    assert "Moved to Trash." in confirmed.text
     assert phase3.workspace_for(scope).book.provider.messages["case-one"].location == "trash"
     recovered = client.post("/mail/alpha/cleanup/recover", data={"message_id": "case-one"})
     assert recovered.status_code == 200
     assert phase3.workspace_for(scope).book.provider.messages["case-one"].location == "inbox"
+    assert "Returned to the inbox." in recovered.text
     reset_workspaces()
 
 
@@ -331,7 +337,6 @@ def test_unencrypted_pdf_does_not_replace_a_remembered_password(tmp_path):
     store = ProtectedPasswordStore(vault, tmp_path / "secrets")
     sender = sender_fingerprint("synthetic-sender@example.invalid")
     store.remember(sender, "invoice", "synthetic-old-password")
-    from app.phase3 import RuleMatch
 
     try:
         unlock_for_rule(
@@ -339,7 +344,7 @@ def test_unencrypted_pdf_does_not_replace_a_remembered_password(tmp_path):
             store=store,
             sender_fingerprint=sender,
             document_type="invoice",
-            match=RuleMatch("matched", ("rule-a",)),
+            match=RuleMatch("matched", ("rule-a",), sender, "invoice"),
             verified=True,
             replacement="synthetic-new-password",
         )
@@ -415,3 +420,72 @@ def test_password_cleanup_failure_in_the_vault_is_a_hard_failure(tmp_path, monke
     assert not isinstance(raised.value, PasswordUnlockError)
     assert "synthetic-password" not in str(raised.value)
     assert len(list(secrets.iterdir())) == 1
+
+
+def test_rules_for_different_document_types_do_not_conflict():
+    sender = "synthetic-sender@example.invalid"
+    fingerprint = sender_fingerprint(sender)
+    rules = (
+        LearnedRule("rule-invoice", "mailbox-a", fingerprint, "invoice", True),
+        LearnedRule("rule-statement", "mailbox-a", fingerprint, "statement", True),
+    )
+
+    match = match_rules(
+        rules, mailbox_id="mailbox-a", sender=sender, document_type="invoice", verified=True
+    )
+
+    assert match == RuleMatch("matched", ("rule-invoice",), fingerprint, "invoice")
+
+
+@pytest.mark.parametrize("other", ["document-type", "sender"])
+def test_a_match_does_not_unlock_another_sender_or_document_type(tmp_path, other):
+    (tmp_path / "vault").mkdir()
+    store = _CountingStore(tmp_path / "vault", tmp_path / "secrets")
+    sender = sender_fingerprint("synthetic-sender@example.invalid")
+    store.remember(sender, "statement", "synthetic-password")
+    store.remember(
+        sender_fingerprint("other-sender@example.invalid"), "invoice", "synthetic-password"
+    )
+    match = RuleMatch("matched", ("rule-invoice",), sender, "invoice")
+    if other == "document-type":
+        target = (sender, "statement")
+    else:
+        target = (sender_fingerprint("other-sender@example.invalid"), "invoice")
+    reads_before = store.reads
+
+    with pytest.raises(PasswordUnlockError):
+        unlock_for_rule(
+            _pdf("locked", "synthetic-password"),
+            store=store,
+            sender_fingerprint=target[0],
+            document_type=target[1],
+            match=match,
+            verified=True,
+        )
+
+    assert store.reads == reads_before
+
+
+def test_confirmation_is_refused_when_the_frozen_list_changed_after_review():
+    provider = SyntheticProvider((
+        ProviderMessage("case-one", "mailbox-a", "synthetic"),
+        ProviderMessage("case-two", "mailbox-a", "synthetic"),
+    ))
+    book = CleanupBook("synthetic", provider)
+    book.documents = {
+        "case-one": MailDocument("case-one", "mailbox-a", "One", "archive:a", "", True, "approved", 0),
+        "case-two": MailDocument("case-two", "mailbox-a", "Two", "archive:b", "", True, "approved", 0),
+    }
+    book.freeze(("case-one",))
+    reviewed = book.frozen_digest()
+    book.freeze(("case-two",))
+
+    with pytest.raises(CleanupError):
+        book.confirm(True, reviewed)
+    with pytest.raises(CleanupError):
+        book.confirm(True, "")
+
+    assert provider.messages["case-one"].location == "inbox"
+    assert provider.messages["case-two"].location == "inbox"
+    assert book.frozen == ("case-two",)
+

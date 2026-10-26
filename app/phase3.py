@@ -111,6 +111,8 @@ class LearnedRule:
 class RuleMatch:
     status: str
     rule_ids: tuple[str, ...]
+    sender_fingerprint: str = ""
+    document_type: str = ""
 
 
 def match_rules(
@@ -118,26 +120,31 @@ def match_rules(
     *,
     mailbox_id: str,
     sender: str,
+    document_type: str,
     verified: bool,
 ) -> RuleMatch:
     """Unverified senders and conflicting rules stop automation."""
+    if not _TOKEN.fullmatch(document_type):
+        raise Phase3Error()
     if not verified:
         return RuleMatch("manual", ())
     fingerprint = sender_fingerprint(sender)
     hits = tuple(
         rule.rule_id
         for rule in rules
-        if rule.mailbox_id == mailbox_id and rule.sender_fingerprint == fingerprint
+        if rule.mailbox_id == mailbox_id
+        and rule.sender_fingerprint == fingerprint
+        and rule.document_type == document_type
     )
     if not hits:
         return RuleMatch("manual", ())
     if len(hits) > 1:
         return RuleMatch("conflict", hits)
-    return RuleMatch("matched", hits)
+    return RuleMatch("matched", hits, fingerprint, document_type)
 
 
 def may_use_password(match: RuleMatch, *, verified: bool) -> bool:
-    return verified and match.status == "matched"
+    return verified and isinstance(match, RuleMatch) and match.status == "matched"
 
 
 def preparation_allowed(match: RuleMatch) -> bool:
@@ -320,7 +327,11 @@ def unlock_for_rule(
 ) -> bytes:
     """Try a remembered password only after trust and a single rule match."""
     encrypted = _open_pdf(payload).is_encrypted
-    if not may_use_password(match, verified=verified):
+    # A match authorizes only the sender and document type it was made for.
+    if not may_use_password(match, verified=verified) or (
+        match.sender_fingerprint != sender_fingerprint
+        or match.document_type != document_type
+    ):
         if encrypted:
             raise PasswordUnlockError()
         return payload
@@ -418,8 +429,14 @@ class CleanupBook:
         self.frozen = tuple(chosen)
         return self.frozen
 
-    def confirm(self, confirmed: bool) -> tuple[CleanupOutcome, ...]:
-        if self.frozen is None or not confirmed:
+    def frozen_digest(self) -> str:
+        if self.frozen is None:
+            return ""
+        return hashlib.sha256("\n".join(self.frozen).encode("ascii")).hexdigest()
+
+    def confirm(self, confirmed: bool, digest: str) -> tuple[CleanupOutcome, ...]:
+        """Trash only the frozen list whose digest the owner reviewed."""
+        if self.frozen is None or not confirmed or digest != self.frozen_digest():
             raise CleanupError()
         outcomes: list[CleanupOutcome] = []
         for message_id in self.frozen:
@@ -470,6 +487,8 @@ class CleanupPage:
     ready: tuple[tuple[str, str, int], ...]
     frozen: tuple[str, ...]
     deleted: tuple[str, ...]
+    frozen_digest: str = ""
+    outcomes: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -491,7 +510,7 @@ class MailboxWorkspace:
         )
         return MailboxPage(self.book.entity, self.mailboxes, mailbox, attention, documents)
 
-    def cleanup_page(self) -> CleanupPage:
+    def cleanup_page(self, outcomes: tuple[tuple[str, str], ...] = ()) -> CleanupPage:
         ready = tuple(
             (item.case_id, item.title, item.prior_confirms)
             for item in self.book.ranked_ready()
@@ -501,6 +520,8 @@ class MailboxWorkspace:
             ready,
             self.book.frozen or (),
             tuple(self.book.deleted),
+            self.book.frozen_digest(),
+            outcomes,
         )
 
 
@@ -565,15 +586,22 @@ def freeze_visible(scope: Scope, message_ids: tuple[str, ...]) -> CleanupPage:
 
 
 @failure_contract(raises=(CleanupError,))
-def confirm_frozen(scope: Scope, confirmed: bool) -> CleanupPage:
-    workspace_for(scope).book.confirm(confirmed)
-    return workspace_for(scope).cleanup_page()
+def confirm_frozen(scope: Scope, confirmed: bool, digest: str) -> CleanupPage:
+    outcomes = workspace_for(scope).book.confirm(confirmed, digest)
+    return workspace_for(scope).cleanup_page(
+        tuple((item.message_id, item.status) for item in outcomes)
+    )
 
 
 @failure_contract(raises=(CleanupError,))
 def recover_selected(scope: Scope, message_ids: tuple[str, ...]) -> CleanupPage:
-    workspace_for(scope).book.recover(message_ids)
-    return workspace_for(scope).cleanup_page()
+    choices = workspace_for(scope).book.recover(message_ids)
+    return workspace_for(scope).cleanup_page(
+        tuple(
+            (item.message_id, "unavailable" if item.choices == ("unavailable",) else "recovered")
+            for item in choices
+        )
+    )
 
 
 def archive_prepared_pdf(

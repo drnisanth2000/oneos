@@ -415,7 +415,8 @@ outside this repository. Phase 3 is not blocked on building Phase 2.
 Phase 2 may not be implemented from this record. The current email adapter
 commits a redacted summary of the message text and a body reference. It
 collects attachment filenames and does not write them into the receipt. The
-current folder adapter may retain extracted PDF text. The Phase 3 archive
+current folder adapter may retain a bounded, redacted summary of extracted
+PDF text; raw extracted text stays outside the vault. The Phase 3 archive
 path leaves those adapters unchanged.
 
 An external archive copy is not undone by `git revert`. The synthetic cleanup
