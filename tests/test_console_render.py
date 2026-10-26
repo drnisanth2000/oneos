@@ -290,7 +290,7 @@ def _full_page_route_paths(main) -> list[str]:
         meta = getattr(endpoint, "__console_route__", None)
         if meta is None or meta.surface != "page":
             continue
-        if endpoint is main.triage_default:
+        if endpoint in (main.triage_default, main.board_default):
             continue
         # Process/readiness diagnostics do not use HTMX or console templates.
         # Their JSON schema, authenticated HTML and no-leak failure responses

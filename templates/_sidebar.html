@@ -29,6 +29,7 @@
     {% endif %}
 
     <ul class="modules" x-show="open['{{ b.slug }}']" x-cloak>
+      <li><a class="mod-name" href="/board/{{ b.slug }}">Board</a></li>
       {% for m in b.modules %}
       <li class="{{ 'missing' if m.missing else '' }}"
           {% if m.missing %}title="required by flags but absent on disk (E4)"{% endif %}>

@@ -24,6 +24,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .board import capture_note, load_board
 from .action_receipts import (
     ActionReceipt,
     InvalidActionReceipt,
@@ -43,6 +44,7 @@ from .entities import (
     EntitySelectionError,
 )
 from .inbox import read_inbox
+from .ingest.base import IngestError
 from .outbox import (
     OutboxDestinationError,
     OutboxError,
@@ -438,6 +440,92 @@ def pulse(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
         request, "blocks/pulse.html", {"now": datetime.now().strftime("%H:%M:%S")}
     )
+
+
+_BOARD_CATCHES = (
+    OutboxError,
+    CrossScopeError,
+    DestinationRegistryError,
+    EntityManifestError,
+    EntitySelectionError,
+    InvalidActionReceipt,
+    ReceiptStoreIntegrityError,
+    ReceiptStoreUnavailable,
+)
+
+
+@app.get("/board", response_class=HTMLResponse)
+@console_route(
+    catches=_SIDEBAR_CATCHES,
+    surface="page",
+    services=(Vault.bundles,),
+)
+def board_default(request: Request):
+    """Same boundary as triage's entity picker."""
+    try:
+        bundles = Vault(current_catalog()).bundles()
+    except _SIDEBAR_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+    if not bundles:
+        return templates.TemplateResponse(request, "blocks/no_bundles.html", {})
+    return RedirectResponse(url=f"/board/{bundles[0].slug}", status_code=307)
+
+
+def _board_page(request: Request, scope: Scope) -> HTMLResponse:
+    params = request.query_params
+    vault = Vault(current_catalog())
+    page = load_board(
+        scope,
+        vault,
+        view=params.get("view") or "",
+        group=params.get("group") or "",
+        sort=params.get("sort") or "",
+        subs=tuple(params.getlist("sub")),
+        products=tuple(params.getlist("product")),
+        month=params.get("month") or "",
+        week=params.get("week") or "",
+        note=params.get("note") or "",
+    )
+    return templates.TemplateResponse(
+        request,
+        "board.html",
+        {"bundles": vault.bundles(), "entity": scope.current_entity(), "page": page},
+    )
+
+
+@app.get("/board/{entity}", response_class=HTMLResponse)
+@console_route(
+    catches=_BOARD_CATCHES,
+    surface="page",
+    services=(load_board, Vault.bundles),
+)
+def board(request: Request, scope: EntityScope) -> HTMLResponse:
+    try:
+        return _board_page(request, scope)
+    except _BOARD_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+
+
+_CAPTURE_CATCHES = (IngestError, CrossScopeError)
+
+
+@app.post("/board/{entity}/capture", response_class=HTMLResponse)
+@console_route(
+    catches=_CAPTURE_CATCHES,
+    surface="page",
+    services=(capture_note,),
+)
+def capture(
+    request: Request,
+    scope: EntityScope,
+    title: str = Form(""),
+    text: str = Form(""),
+) -> Response:
+    try:
+        capture_note(scope, title=title, text=text)
+    except _CAPTURE_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+    return RedirectResponse(url=f"/board/{scope.current_entity()}", status_code=303)
 
 
 @app.get("/triage", response_class=HTMLResponse)

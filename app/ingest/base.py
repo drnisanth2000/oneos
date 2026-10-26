@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import yaml
+
 from ..console_routing import structured_reader
 from ..scope import Scope
 from ..inbox import split_front_matter
@@ -63,12 +65,18 @@ def _scalar(v) -> str:
     return str(v)
 
 
+def _front_matter_line(key: str, value: str) -> str:
+    """One YAML mapping line. Plain when it is safe, quoted when a colon or
+    other scalar marker would make the receipt unreadable."""
+    return yaml.safe_dump({key: value}, sort_keys=False).strip()
+
+
 def render_note(env: Envelope, entity: str) -> str:
     today = date.today().isoformat()
     lines = [
         "---",
         "type: inbox-item",
-        f"title: {env.title}",
+        _front_matter_line("title", env.title),
         f"entity: {entity}",
         "product: null",
         "status: active",
