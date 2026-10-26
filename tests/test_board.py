@@ -140,6 +140,24 @@ def test_review_drop_targets_are_registry_destinations(tmp_path, monkeypatch):
     assert 'data-module="zz-extra"' not in response.text
 
 
+def test_list_and_planner_do_not_start_a_drag_without_a_drop_column(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "00-inbox", "Intake", sub="triage", title="Intake")
+    (tmp_path / "alpha" / "02-work" / "active").mkdir()
+
+    listing = client.get("/board/alpha", params={"view": "list", "group": "review"})
+    planner = client.get("/board/alpha", params={"view": "planner", "group": "review"})
+
+    assert listing.status_code == 200
+    assert planner.status_code == 200
+    assert "Intake" in listing.text
+    assert "Intake" in planner.text
+    assert 'draggable="true"' not in listing.text
+    assert 'draggable="true"' not in planner.text
+    assert "@drop.prevent" not in listing.text
+    assert "@drop.prevent" not in planner.text
+
+
 def test_blocked_outbox_hides_drag_and_keeps_filed_notes(tmp_path, monkeypatch):
     from tests.conftest import _git
 

@@ -873,7 +873,11 @@ def load_board(
     filed_filtered = [card for card in filed if _matches(card, subs, products)]
     inbox_filtered = [card for card in inbox if _matches(card, subs, products)]
     proposed_filtered = [card for card in proposed if _matches(card, subs, products)]
-    draggable = selected_group == "review" and not blocked
+    draggable = (
+        selected_view == "board"
+        and selected_group == "review"
+        and not blocked
+    )
     if draggable:
         inbox_filtered = [
             BoardCard(**{**card.__dict__, "draggable": True}) for card in inbox_filtered
