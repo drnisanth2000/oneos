@@ -88,7 +88,11 @@ backups; see `docs/LOCAL-OPERATIONS.md`).
 
 ## HTTP routes
 
-All routes except `GET /healthz` pass owner authentication first.
+Owner authentication (`app/auth_web.py`) runs before routing. It lets
+`GET /healthz` and the `/login` sign-in exchange through without a session.
+With `ONEOS_AUTH_MODE=disabled` and `ONEOS_DEPLOYMENT` not `local`, it lets
+every route through unauthenticated; use that only for loopback development
+and tests.
 
 | Method | Path | Effect |
 |---|---|---|
