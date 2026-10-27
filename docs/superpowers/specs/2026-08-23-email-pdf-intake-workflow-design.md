@@ -2,11 +2,12 @@
 
 Date: 2026-08-23
 
-Status: conversational design approved; implementation not authorized
+Status: owner-authorized on 2026-10-26 for the public slices, implemented with
+synthetic fixtures. Live mailboxes, private parsers, and Grey Matter secrets
+remain outside this repository.
 
-Recorded in this repository as Phase 3. Recording the design does not authorize
-implementation, a screen, a dependency, a live mailbox, or a change to the
-Safety Foundation.
+Recorded in this repository as Phase 3. The public slices do not authorize a
+live mailbox, a private parser, or a change to the Safety Foundation.
 
 ## Purpose
 
@@ -60,7 +61,8 @@ to the provider message or archive operation.
 
 This external-action interpretation applies only after a separate implementation
 authorization. Until then, every current side effect still requires a revertible
-Git diff.
+Git diff. The owner recorded that authorization for the public Phase 3 slices on
+2026-10-26 in `docs/STATUS.md`.
 
 ## Responsibilities
 
@@ -400,8 +402,9 @@ passing suite written only by the implementer is not sufficient evidence.
 
 ## Non-goals
 
-- No implementation, implementation plan, dependency, screen, or live mailbox
-  connection is authorized by this document.
+- The public implementation uses synthetic fixtures. A live mailbox
+  connection, a private parser, and a Grey Matter secret are not authorized
+  by this document.
 - The workflow does not belong to S7 and does not widen the current Safety
   Foundation.
 - Learned rules never move messages to Trash automatically.
@@ -418,17 +421,18 @@ passing suite written only by the implementer is not sufficient evidence.
 ## Phase placement
 
 Phase 2 remains the finance-ingest pipeline and is separately unauthorized.
-This design is Phase 3. It is not blocked on building Phase 2, and recording it
-does not start either phase. The current next expansion decision remains the
-separate Step 11 deployment approval.
+This design is Phase 3. It is not blocked on building Phase 2. The public
+slices are in this repository. The current next expansion decision for
+deployment remains the separate Step 11 approval.
 
 The current email adapter commits a redacted summary of the message text and
 a body reference. It collects attachment filenames and does not write them
 into the receipt. It does not unlock or archive PDFs. The current folder
-adapter may retain extracted PDF text on the receipt path. This design keeps a
-full transcript temporary. Those adapters stay as they are until Phase 3
-implementation is separately authorized. Official IMAP, monitored by Hermes,
-is the connector in this design.
+adapter may retain a bounded, redacted summary of extracted PDF text on the
+receipt path; raw extracted text stays outside the vault. The public Phase 3
+archive path keeps a full transcript out of its own receipt and leaves those
+adapters unchanged. Official IMAP, monitored by Hermes, remains the connector
+for a later live-mailbox slice, which is outside the public slices.
 
 ## Completion criteria
 

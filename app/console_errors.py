@@ -301,6 +301,7 @@ from . import cutover_locations as _cutover_locations  # noqa: E402
 from . import cutover_manifest as _cutover_manifest  # noqa: E402
 from . import identifiers as _identifiers  # noqa: E402
 from .ingest import base as _ingest_base  # noqa: E402
+from . import phase3 as _phase3  # noqa: E402
 
 #: Rule 2 — `GitTransactionError` is a closed family: within it, MRO
 #: inheritance does not apply, and a subclass without its own exact entry
@@ -382,6 +383,7 @@ _MRO: dict[type[BaseException], ConsoleError] = {
     # OneOS, not a problem with the operator's data.
     _review_tokens.ReviewTokenError: _CODES["E-INTERNAL"],
     _ingest_base.IngestError: _CODES["E-INGEST"],
+    _phase3.Phase3Error: _CODES["E-INGEST"],
     _rename.RenameError: _CODES["E-ADMIN"],
 }
 

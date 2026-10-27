@@ -3990,6 +3990,26 @@ def _route_totality_plan(main) -> dict:
             "request": lambda c, submitted=None: c.get("/blocks/pulse"),
             "patch_targets": [],
         },
+        main.mail_screen: {
+            "request": lambda c, submitted=None: c.get("/mail/alpha"),
+            "patch_targets": [(main, "render_mailbox")],
+        },
+        main.mail_cleanup: {
+            "request": lambda c, submitted=None: c.get("/mail/alpha/cleanup"),
+            "patch_targets": [(main, "render_cleanup")],
+        },
+        main.mail_freeze: {
+            "request": lambda c, submitted=None: c.post("/mail/alpha/cleanup/freeze"),
+            "patch_targets": [(main, "freeze_visible")],
+        },
+        main.mail_confirm: {
+            "request": lambda c, submitted=None: c.post("/mail/alpha/cleanup/confirm"),
+            "patch_targets": [(main, "confirm_frozen")],
+        },
+        main.mail_recover: {
+            "request": lambda c, submitted=None: c.post("/mail/alpha/cleanup/recover"),
+            "patch_targets": [(main, "recover_selected")],
+        },
     }
 
 
