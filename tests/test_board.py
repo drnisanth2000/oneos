@@ -235,17 +235,16 @@ def test_gallery_calendar_planner_map_outline_and_formula(tmp_path, monkeypatch)
     assert "1+1" in counted.text
 
 
-def test_attention_counts_recent_filed_notes(tmp_path, monkeypatch):
+def test_board_header_has_no_weekly_attention_card(tmp_path, monkeypatch):
+    # Owner decision (2026-10-28): the Board header carries no "This week" card.
     _main, client = _client(tmp_path, monkeypatch)
     _note(tmp_path, "alpha", "02-work", "Recent", updated=date.today().isoformat(), status="open")
-    _note(tmp_path, "alpha", "02-work", "Old", updated="2020-01-01", status="open")
-    _note(tmp_path, "alpha", "00-inbox", "Waiting", sub="triage", title="Waiting")
 
     response = client.get("/board/alpha")
 
     assert response.status_code == 200
-    assert "This week" in response.text
-    assert ">1<" in response.text
+    assert "This week" not in response.text
+    assert 'class="attention"' not in response.text
 
 
 def test_gallery_chips_follow_the_filed_notes(tmp_path, monkeypatch):

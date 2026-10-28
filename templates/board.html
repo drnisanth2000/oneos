@@ -30,17 +30,6 @@
           <p class="eyebrow">{{ icon("board") }}Board</p>
           <h1 class="triage-h">{{ entity }}</h1>
         </div>
-        <aside class="attention" aria-label="This week">
-          <h2>This week</h2>
-          <dl>
-            <div><dt>Inbox</dt><dd>{{ page.attention.inbox }}</dd></div>
-            <div><dt>Proposed</dt><dd>{{ page.attention.proposed }}</dd></div>
-            <div><dt>Updated</dt><dd>{{ page.attention.updated }}</dd></div>
-            {% for label, count in page.attention.by_status %}
-            <div><dt>{{ label }}</dt><dd>{{ count }}</dd></div>
-            {% endfor %}
-          </dl>
-        </aside>
       </header>
 
       {% set view_icons = {"Board": "board", "List": "list", "Gallery": "gallery", "Calendar": "calendar", "Planner": "planner", "Map": "map"} %}
