@@ -4,9 +4,20 @@
 <svg class="icon{% if cls %} {{ cls }}{% endif %}" aria-hidden="true" focusable="false"><use href="#i-{{ name }}"/></svg>
 {%- endmacro %}
 
+{# A module's own name picks its icon (knowledge, legal, analytics, ... all sit
+   in the "govern" block but mean different things); the block icon is the
+   fallback for names this list does not know. #}
+{% set module_icons = [
+  ("inbox", "inbox"), ("archive", "archive"), ("foundation", "block-govern"),
+  ("pipeline", "branch"), ("asset", "block-build"), ("operation", "wrench"),
+  ("communication", "message"), ("people", "block-people"), ("finance", "block-finance"),
+  ("sales", "block-growth"), ("marketing", "megaphone"), ("support", "lifebuoy"),
+  ("knowledge", "book"), ("analytic", "chart"), ("legal", "scale"), ("self", "user"),
+] %}
 {% macro block_icon(block, module="") -%}
-{%- if module == "00-inbox" -%}{{ icon("inbox") }}
-{%- elif module.endswith("-archive") -%}{{ icon("archive") }}
+{%- set name = module.split("-", 1)[-1] if module[:1].isdigit() else module -%}
+{%- set matches = module_icons | selectattr(0, "in", name) | list -%}
+{%- if matches -%}{{ icon(matches[0][1]) }}
 {%- elif block in ("system", "govern", "build", "deliver", "retain", "people", "finance", "growth") -%}{{ icon("block-" ~ block) }}
 {%- else -%}{{ icon("folder") }}
 {%- endif -%}
