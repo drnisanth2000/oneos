@@ -33,68 +33,33 @@ $ONEOS_VAULT/_system/docs/oneos-spec.md              what to build, in order
 **Where `conventions.md` v2 and anything in `docs/` disagree, v2 wins.**
 Where v2 is silent and `conventions-v2.1-additions.md` speaks, v2.1 wins.
 
-The **Safety Foundation S1-S7 is complete** at its gate-certified branch tip.
-The final rename-root correction checkpoint's public suite recorded 1,476
-passed; all 48 campaign rows went RED then GREEN; its restored closing suite
-recorded 1,476 passed in 107.32s; Gitleaks found no leaks; and current-tree and
-history public audits were clean. The final private-gate evidence was
-`check_v2` 0/0, 37 tests in 0.174s, a clean combined repo-plus-vault history
-audit, and byte-identical Grey Matter HEAD, status, worktree diff, and cached
-diff preserving pre-existing edits. Independent scoped review PASS found no
-Critical, Important, or Minor findings on the final rename-root correction.
-The macOS no-overwrite path was exercised;
-Linux `renameat2(RENAME_NOREPLACE)` remains an accepted unexercised
-user/platform limitation. The separately sequenced inherited items 2, 4, and 3
-are also complete; `docs/STATUS.md` records their published public and
-trusted-local evidence. The first live exit trial exposed a Gate 3 defect: an
-exact valid S7 quarantine record was misclassified. Independent review of that
-correction then exposed Git-invisible filesystem entries outside the discovery
-boundary. Both corrections are integrated. Their closing evidence recorded
-2,028 public tests and 306 focused
-Gate 3 tests passing with one platform skip in each suite; 39 private tests;
-`check_v2` 0/0; clean policy, Gitleaks, public, and combined history audits;
-and byte-identical protected vault state. A later fresh owner-reviewed,
-trusted-local live session at the exact fetched `origin/main`
-`bb317451133aba7f419a6b360138bc379f32a5ec` recorded one sanctioned action
-commit, two sanctioned dirty-write transitions, and zero violating commits or
-writes across all observed filesystem entries: Gate 3 passed. Its preflight
-recorded 2,054 public tests passing with four platform skips, 39 private tests,
-`check_v2` 0/0, and clean policy, Gitleaks, public, and combined history audits;
-opaque closing preimages and the protected snapshot evidence remained
-byte-identical across the read-only audit, preserving all pre-existing
-dirty entries recorded at the session baseline. A subsequent owner-authorized,
-trusted-local Gate 2 proof at the exact fetched `origin/main` recorded in its
-external evidence verified one sanctioned approval of a real adapter-created
-receipt and one revert commit. The revert exactly inverted the approval paths,
-returned the tracked receipt to triage, restored the pre-approval committed
-tree, required no manual cleanup, and preserved all pre-existing dirty state
-byte-identically. Gate 2 passed; at that point Gate 1 timed triage was the
-remaining live exit trial. A subsequent trusted-local Gate 1 trial at
-exact fetched `origin/main` `aa1eafdc6047debb9698a32099889665eda1c40b`
-measured 20 real inbox items in 157.8 seconds (7.89 seconds per item), versus
-217.0 seconds (10.85 seconds per item) in Obsidian: 59.2 seconds, or 27.3%,
-less elapsed time. The timed pass persisted exactly 20 review proposals without
-moving content. Separate owner review then produced 20 sanctioned approval
-commits; triage and Outbox both closed at zero. The closing Gate 3 audit passed
-with those 20 sanctioned commits, 20 sanctioned dirty writes, and no violation
-across 414 observed filesystem entries. The private suite passed 39 tests,
-`check_v2` remained at 0 errors/0 warnings, and all pre-existing worktree and
-index differences were preserved byte-identically. Gate 1 passed; all five
-Phase 1 exit gates now pass. Phase 2 remains unauthorized, and deployment still
-requires separate owner approval.
-Phase 3 email and PDF intake is a recorded design in
-`docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`.
-The owner authorized the public Phase 3 slices on 2026-10-26;
-`docs/STATUS.md` records the scope and the external-action exception.
-Phase 2 finance ingest remains separately unauthorized, and Phase 3 is not
-blocked on building Phase 2. The public Phase 3 slices archive an unlocked
-PDF, redact parser fields, match learned rules without Trash authority, unlock
-encrypted PDFs through a store outside the vault, freeze exact cleanup lists,
-and render mailbox tabs plus Email cleanup. Live mailboxes, private parsers,
-Grey Matter secrets, and a change to S7 remain unauthorized. The later
-connector note in
-`docs/superpowers/specs/2026-10-25-later-connector-notes.md` is not part of
-Phase 3.
+## Current state
+
+`docs/STATUS.md` is the single record of build state and gate evidence. Do not
+copy its test counts, SHAs, or trial measurements into this file. In summary:
+
+- Phase 1 steps 1–10, Safety Foundation S1–S7, and inherited items 2, 4, and 3
+  are complete. All five Phase 1 exit gates pass.
+- A single-owner, localhost-only deployment on the owner's Mac is accepted, as
+  recorded in `docs/LOCAL-DEPLOYMENT-ACCEPTANCE.md` and operated through
+  `docs/LOCAL-OPERATIONS.md`. Step 11 (VPS beside Hermes), remote access, and
+  multi-user accounts still require separate owner approval.
+- The Board screen (see "Console terminology") is merged. Whether a running
+  install includes it is recorded in `docs/STATUS.md`, not assumed.
+- Phase 3 email and PDF intake is designed in
+  `docs/superpowers/specs/2026-08-23-email-pdf-intake-workflow-design.md`. The
+  owner authorized the public Phase 3 slices on 2026-10-26; `docs/STATUS.md`
+  records the scope and the external-action exception. The slices archive an
+  unlocked PDF, redact parser fields, match learned rules without Trash
+  authority, unlock encrypted PDFs through a store outside the vault, freeze
+  exact cleanup lists, and render mailbox tabs plus Email cleanup. Live
+  mailboxes, private parsers, Grey Matter secrets, and a change to S7 remain
+  unauthorized.
+- Phase 2 finance ingest remains separately unauthorized, and Phase 3 is not
+  blocked on building Phase 2. The later connector note in
+  `docs/superpowers/specs/2026-10-25-later-connector-notes.md` is not part of
+  Phase 3.
+
 A branch's merge/PR state is
 never recorded here as a point-in-time fact: this file ships inside every pull
 request opened from that branch, so any such claim written here is stale the
@@ -102,21 +67,21 @@ moment the request exists. Check it live instead: `git log
 origin/main..<branch>` and the hosting UI's pull-request list name the actual
 state.
 
-S7 was developed sequentially from the fresh merged-S6 baseline recorded in its
-plan. It binds every reviewed action to exact proposal bytes; transactional
-actions retain committed receipts, while reject safely quarantines its record.
+S7 binds every reviewed action to exact proposal bytes; transactional actions
+retain committed receipts, while reject safely quarantines its record.
 Supported writers cooperate through OneOS interfaces and the shared action
 lock. Deliberate ancestor-directory relocation after the final check is outside
-that cooperative-writer boundary. Spent ids are refused. Its inherited
-follow-ups were completed later as separately sequenced work; their completion
-records in `docs/STATUS.md` do not rewrite S7's historical evidence.
+that cooperative-writer boundary. Spent ids are refused. Linux
+`renameat2(RENAME_NOREPLACE)` remains an accepted unexercised platform
+limitation.
 
 The satisfied historical sequence rule remains part of the audit record:
 **Do not begin S7 until S6 is merged into `origin/main` and a fresh
-merged-`main` baseline passes.** Future Safety Foundation steps follow the same
-sequential-integration rule in "Repository and task hygiene" below.
+merged-`main` baseline passes.** Any future sequenced safety work follows the
+same sequential-integration rule in "Repository and task hygiene" below.
 
-This hardening does not unlock a new phase or authorize deferred screens.
+Completing the hardening did not unlock a new phase or authorize deferred
+screens.
 
 Product direction and naming are frozen in `PRODUCT-THESIS.md`.
 
@@ -199,9 +164,9 @@ _system/scripts/action-policy.yaml  actor and action rules
 Note the path on the last one — `action-policy.yaml` lives under `scripts/`,
 not directly under `_system/`. An earlier version of this file had it wrong.
 
-`_system/classifier/rules.yaml` is referenced by the spec but **does not exist
-yet** — it is created in step 6. Do not read it before then, and do not treat
-its absence as a fault.
+`_system/classifier/rules.yaml` holds the deterministic triage rules. It may be
+absent; absence means every item is unclassified, which is not a fault. No
+Console route writes it — a manual triage correction writes only a proposal.
 
 **Test:** swap in a different `entities.yaml` and you get a different system with
 no code change. If that is not true, it is wrong.
@@ -306,9 +271,17 @@ cannot report an absent module.
 
 ## Stack — decided, do not substitute
 
-Python 3.12 · `uv` · FastAPI · Jinja2 · HTMX · Alpine.js · `alpine-morph`
-(required) · `alpine-persist` · Pydantic v2 · `python-frontmatter` · GitPython ·
-SQLite · Caddy · Docker Compose
+Python 3.12 · `uv` · FastAPI + Uvicorn · Jinja2 · HTMX · Alpine.js ·
+`alpine-morph` (required) · `alpine-persist` · Pydantic v2 · PyYAML · SQLite
+(stdlib) · the `git` CLI via `subprocess` · Caddy · Docker Compose
+
+Runtime libraries beyond the core: `watchdog` and `pypdf` (folder intake),
+`python-multipart` (forms), `argon2-cffi` and `pyotp` (owner login). The
+authoritative list is `pyproject.toml` plus `uv.lock`; this paragraph describes
+it and is not a second source. Front-matter is parsed with PyYAML (for
+example `app/inbox.py::split_front_matter`, and `app/schema.py`, which mirrors
+`policy_enforcer` byte-for-byte); neither `python-frontmatter` nor GitPython is
+used.
 
 Excluded, with reasons in the spec: React, Next, Postgres, Supabase, Redis,
 Celery, Kubernetes, Tailwind build step, n8n.

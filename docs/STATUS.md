@@ -8,9 +8,10 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-10-26, after local deployment acceptance on the installed
-Mac. The previous reconciliation was 2026-09-11, after the successful
-trusted-local live Gate 1 timed-triage and approval session.
+Last reconciled: 2026-10-26, against `origin/main` after the Board screen
+(PR #39) and its rules line (PR #42) merged. The previous reconciliations were
+earlier on 2026-10-26, after local deployment acceptance, and 2026-09-11, after
+the trusted-local live Gate 1 session.
 
 ## Local deployment acceptance (2026-10-26)
 
@@ -19,9 +20,11 @@ external encrypted backup, restore-check, local certificate trust, and login
 startup are complete. The owner signed in and the home screen loaded. No
 passwords, authenticator codes, or backup keys are recorded here.
 
-The Board screen is included. Phase 3 public slices are implemented with
-synthetic fixtures. Live mailboxes and private parsers are not included.
-Finance parsers are not included.
+The running install started at `e1481e5`, which contains no `app/board.py`
+and no Phase 3 code. The Board (PR #39) and the Phase 3 public slices (PR #41)
+merged into `origin/main` afterwards. No later deploy commit or update approval
+is recorded here. Live mailboxes, private parsers, and finance parsers are not
+included.
 
 Backup needed two macOS compatibility fixes, now in the tree and described in
 `LOCAL-OPERATIONS.md`. Failed staging directories from the attempts that
@@ -32,6 +35,31 @@ treat those private leftovers as a second live vault.
 ---
 
 ## Phase 1 triage
+
+### Board screen (merged 2026-10-26, PR #39)
+
+`/board/{entity}` reads one entity's inbox, pending classification proposals,
+and Markdown in the `active/` directory of each lifecycle module switched on by
+`flags:`. It draws them as a list, board, gallery, month calendar, weekly
+planner, or life map, with `sub` and `product` filter chips, grouping by review
+state, `status`, `sub`, or module, and sorting by updated date or title.
+
+It writes nothing directly. A filed note opens as a read-only outline. An
+inbox card dropped on a board column posts to the existing
+`/triage/{entity}/propose` route, so it creates a proposal and moves nothing.
+Quick capture (`POST /board/{entity}/capture`) commits one redacted inbox
+receipt through `app/ingest/base.commit_inbox_item`. A small formula
+evaluates at render time and is never stored; it supports
+`count(related)`, `count(related where status == "…")`, and
+`if(status == "…", "…", "…")`, where "related" means other filed notes with the
+same `product`. A symlinked module, `active/` directory, or note refuses the
+page rather than being followed. The Board does not read or write `books.db`,
+call a model, or open a shell.
+
+Not built: saved-view registry, field-type registry, note-level stable ids,
+links between notes, edits to filed notes, and a separate index (the Board
+scans `active/` on each request). Each is a schema or product decision, and an
+edit to a filed note would reverse a deliberate PR #39 limit.
 
 ### Readable classification reviews (2026-09-05)
 
@@ -287,6 +315,18 @@ unless they demonstrate a reproducible defect in those guarantees.
   authority.
 - **Console navigation** — the workspace switcher selects an entity or saved
   scope. `Blocks / Modules` are registry-backed views inside that scope.
+- **Board scope (2026-10-26)** — recorded as built, not as an approval: one
+  entity, read-only outline, inbox drops through the existing proposal route,
+  capture through ingest. No recorded owner approval exists for the screen.
+- **Local deployment is not Step 11 (2026-10-26)** — the accepted single-owner
+  localhost deployment has its own approved scope in
+  `LOCAL-DEPLOYMENT-PLAN.md`. Step 11 (VPS beside Hermes) is not started.
+- **Dependencies as built** — `pyproject.toml` and `uv.lock` are the only
+  dependency record. Git is driven through the `git` CLI, and front-matter is
+  parsed with PyYAML; GitPython and `python-frontmatter` are not used.
+- **Classifier rules are read-only at runtime** — `_system/classifier/rules.yaml`
+  may be absent; no route writes it. `Classifier.add_rule` is a direct-write
+  helper exercised only by tests.
 
 ### Found while designing S6 — historical defect record
 
@@ -340,24 +380,31 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 
 ## Deferred and intentionally not built
 
-- Frontend drag-drop upload to ingest follows completion of S6 and live
-  gates. It must call the existing folder-ingest boundary, not create another
-  write path.
+- Frontend file upload to ingest. The Board's text quick capture exists; file
+  upload does not. Upload must call the existing ingest boundary, not create
+  another write path.
 - Email adapter credentials/configuration and scheduling remain deployment
   work. Cadence belongs to Hermes scheduling, not the request path.
 - ADR-008 escapee lint (re-scan committed content for missed patterns).
-- Full Command Center dashboard cards and workspace CRUD beyond current Phase
-  1 screens.
+- Full Command Center dashboard cards and workspace CRUD beyond current
+  screens. The Board's weekly attention card is the only summary card built.
+- Board extensions listed under "Board screen" above.
 
 ---
 
 ## Next step
 
-All five Phase 1 exit gates pass. The next authorized expansion decision is
-whether to deploy Step 11; deployment still requires separate owner approval.
+All five Phase 1 exit gates pass, and the single-owner local deployment is
+accepted. Open owner decisions, none of which is authorized by this record:
+
+- whether to update the running install to a commit that includes the Board;
+- whether to deploy Step 11 (VPS beside Hermes);
+- the repository licence, because `README.md` and `pyproject.toml` disagree
+  and no `LICENSE` file exists.
+
 Phase 2 remains unauthorized, and deferred UI remains out of scope. Phase 3
-public slices do not replace this deployment decision. Live mailboxes and
-private parsers remain outside this repository.
+public slices are authorized and merged; they do not replace these decisions.
+Live mailboxes and private parsers remain outside this repository.
 
 ---
 

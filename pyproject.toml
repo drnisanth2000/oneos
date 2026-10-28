@@ -18,8 +18,8 @@ dependencies = [
     "python-multipart>=0.0.9",
 ]
 
-# Deps for later build steps (schema, ingest, outbox) are added in their own
-# steps, per spec §10 — "do not build outside the current step".
+# Dependency changes are a hard stop for agents (AGENTS.md, "Cloud and
+# pull-request boundary"); `uv.lock` pins the resolved set.
 [dependency-groups]
 dev = [
     "pytest>=8.0",

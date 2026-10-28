@@ -17,6 +17,8 @@ from urllib.parse import urlencode
 
 from .console_routing import failure_contract, structured_reader
 from .inbox import InboxItem, read_inbox, split_front_matter
+from .inbox import _require_real_directory as _require_real_lifecycle_directory
+from .inbox import _require_real_receipt as _require_real_entry
 from .ingest.base import IngestError, IngestResult, commit_inbox_item
 from .outbox import Proposal, project_outbox
 from .scope import CrossScopeError, RedirectedPathError, Scope
@@ -180,26 +182,11 @@ def _choice(value: str, allowed: frozenset[str], default: str) -> str:
 
 
 def _require_real_directory(scope: Scope, *parts: str) -> Path | None:
-    lexical = scope.root / scope.current_entity() / Path(*parts)
-    if not lexical.exists() and not lexical.is_symlink():
-        return None
-    if lexical.is_symlink():
-        raise RedirectedPathError("module directory is redirected")
-    resolved = scope.resolve(*parts)
-    if resolved != lexical or not lexical.is_dir():
-        raise RedirectedPathError("module directory is redirected")
-    return lexical
+    return _require_real_lifecycle_directory(scope, *parts, label="module directory")
 
 
 def _require_real_note(directory: Path, discovered: Path) -> Path:
-    if (
-        discovered.parent != directory
-        or discovered.is_symlink()
-        or not discovered.is_file()
-        or discovered.resolve() != discovered
-    ):
-        raise RedirectedPathError("module note is redirected")
-    return discovered
+    return _require_real_entry(directory, discovered, label="module note")
 
 
 def _scalar_card(
