@@ -8,29 +8,47 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-10-26, against `origin/main` after the Board screen
-(PR #39) and its rules line (PR #42) merged. The previous reconciliations were
-earlier on 2026-10-26, after local deployment acceptance, and 2026-09-11, after
-the trusted-local live Gate 1 session.
+Last reconciled: 2026-10-28, after the running install was updated to
+`85afa63`. Earlier reconciliations: 2026-10-26 (Board, rules line, and local
+deployment acceptance) and 2026-09-11 (trusted-local live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
 
-The running install started from `origin/main` `e1481e5`. Owner enrollment,
-external encrypted backup, restore-check, local certificate trust, and login
-startup are complete. The owner signed in and the home screen loaded. No
+The install accepted that day started from `origin/main` `e1481e5`. Owner
+enrollment, external encrypted backup, restore-check, local certificate trust,
+and login startup are complete. The owner signed in and the home screen loaded. No
 passwords, authenticator codes, or backup keys are recorded here.
-
-The running install started at `e1481e5`, which contains no `app/board.py`
-and no Phase 3 code. The Board (PR #39) and the Phase 3 public slices (PR #41)
-merged into `origin/main` afterwards. No later deploy commit or update approval
-is recorded here. Live mailboxes, private parsers, and finance parsers are not
-included.
 
 Backup needed two macOS compatibility fixes, now in the tree and described in
 `LOCAL-OPERATIONS.md`. Failed staging directories from the attempts that
 stopped early remain in private state, as does the isolated restore-check
 directory. The successful backup removed its own staging directory. Do not
 treat those private leftovers as a second live vault.
+
+## Running install update (2026-10-28)
+
+With owner approval, the running install was updated to `origin/main`
+`85afa63`, which includes the Board (PR #39), the Phase 3 public slices
+(PR #41), and the documentation sync (PR #43). The install checkout moved from
+`f884a94` by fast-forward. The app image running before the update had been
+built on 2026-10-26, before the Board merged; it is kept locally as the image
+tag `oneos-local:pre-85afa63`. Live mailboxes, private parsers, and finance
+parsers are not included.
+
+Procedure, as in `LOCAL-OPERATIONS.md`: `doctor`, an encrypted backup to the
+external drive, `restore-check`, fast-forward of the install checkout, and
+`start`, which rebuilt only the app image. The update changed no dependency,
+Dockerfile, Compose, or Caddy file. Afterwards `status` reported every check
+healthy, `/healthz` answered, protected routes redirected to sign-in, the app
+logs showed no errors, and the vault's HEAD, status, worktree diff, and cached
+diff were byte-identical before and after. The restore-check copy from this
+update remains in private state.
+
+The owner then signed in and opened the Board for one entity. It loads. The
+review layout shows no inbox items or proposals, and its weekly attention card
+shows none updated. Filed notes appear in the list view grouped by module, with
+their product chips. The quick-capture box is present. The Mail screens have
+not been checked in the running install.
 
 ---
 
@@ -397,7 +415,6 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
 All five Phase 1 exit gates pass, and the single-owner local deployment is
 accepted. Open owner decisions, none of which is authorized by this record:
 
-- whether to update the running install to a commit that includes the Board;
 - whether to deploy Step 11 (VPS beside Hermes);
 - the repository licence, because `README.md` and `pyproject.toml` disagree
   and no `LICENSE` file exists.
