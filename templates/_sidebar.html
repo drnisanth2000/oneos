@@ -18,9 +18,17 @@ function oneosNav(open) {
   const body = document.body;
   open = open ?? !body.classList.contains('nav-open');
   body.classList.toggle('nav-open', open);
-  document.querySelector('.nav-toggle')?.setAttribute('aria-expanded', String(open));
+  const toggle = document.querySelector('.nav-toggle');
+  toggle?.setAttribute('aria-expanded', String(open));
+  if (open) document.querySelector('#oneos-nav a')?.focus();
+  else if (toggle && document.activeElement?.closest('#oneos-nav')) toggle.focus();
 }
-document.addEventListener('keydown', (event) => { if (event.key === 'Escape') oneosNav(false); });
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !document.querySelector('dialog[open]')) oneosNav(false);
+});
+document.addEventListener('click', (event) => {
+  if (event.target.closest('#oneos-nav a')) oneosNav(false);
+});
 </script>
 <nav class="sidebar" id="oneos-nav" aria-label="Entity bundles"
      x-data="{ open: $persist({}).as('oneos.sidebar.open') }">
@@ -71,7 +79,8 @@ document.addEventListener('keydown', (event) => { if (event.key === 'Escape') on
         <li class="module-row{{ ' missing' if m.missing else '' }}{% if m.name == '00-inbox' and request.url.path == triage_href %} is-current{% endif %}"
             {% if m.missing %}title="required by flags but absent on disk (E4)"{% endif %}>
           {% if m.name == '00-inbox' %}
-            <a class="mod-link" href="{{ triage_href }}">
+            <a class="mod-link" href="{{ triage_href }}"
+               {% if request.url.path == triage_href %}aria-current="page"{% endif %}>
               {{ block_icon(m.block, m.name) }}<span class="mod-name">{{ m.name }}</span>
             </a>
             <a class="mod-aux" href="/mail/{{ b.slug }}" title="Mailboxes">
@@ -103,24 +112,11 @@ document.addEventListener('keydown', (event) => { if (event.key === 'Escape') on
                  accent: $persist('blue').as('oneos.accent') }"
        x-init="$watch('theme', v => document.documentElement.dataset.theme = v);
                $watch('accent', v => document.documentElement.dataset.accent = v)"
-       @keydown.escape="menu = false"
+       @keydown.escape="if (menu) { menu = false; $refs.footButton.focus() }"
        @click.outside="menu = false">
-    <div class="foot-menu" role="menu" x-show="menu" x-cloak x-transition.opacity.duration.120ms>
-      <button type="button" role="menuitem" class="menu-item"
-              @click="menu = false; $refs.settings.showModal()">
-        {{ icon("settings") }}<span>Settings…</span>
-      </button>
-      {% if request.state.owner_authenticated | default(false) %}
-      <a role="menuitem" class="menu-item" href="/readyz">{{ icon("activity") }}<span>Service status</span></a>
-      <div class="menu-sep" role="separator"></div>
-      <form method="post" action="/logout">
-        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
-        <button type="submit" role="menuitem" class="menu-item">{{ icon("logout") }}<span>Sign out</span></button>
-      </form>
-      {% endif %}
-    </div>
-    <button type="button" class="foot-button" :aria-expanded="menu ? 'true' : 'false'"
-            aria-haspopup="menu" @click="menu = !menu">
+    <button type="button" class="foot-button" x-ref="footButton"
+            aria-controls="oneos-foot-menu" :aria-expanded="menu ? 'true' : 'false'"
+            @click="menu = !menu; if (menu) $nextTick(() => $refs.footMenu.querySelector('.menu-item').focus())">
       <span class="avatar" aria-hidden="true">{{ icon("user") }}</span>
       <span class="foot-text">
         <span class="foot-title">Owner</span>
@@ -128,6 +124,22 @@ document.addEventListener('keydown', (event) => { if (event.key === 'Escape') on
       </span>
       {{ icon("settings", "foot-gear") }}
     </button>
+    {# Disclosure, not role=menu: plain buttons and links in Tab order. #}
+    <div class="foot-menu" id="oneos-foot-menu" x-ref="footMenu" x-show="menu" x-cloak
+         x-transition.opacity.duration.120ms>
+      <button type="button" class="menu-item"
+              @click="menu = false; $refs.settings.showModal()">
+        {{ icon("settings") }}<span>Settings…</span>
+      </button>
+      {% if request.state.owner_authenticated | default(false) %}
+      <a class="menu-item" href="/readyz">{{ icon("activity") }}<span>Service status</span></a>
+      <div class="menu-sep" aria-hidden="true"></div>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" class="menu-item">{{ icon("logout") }}<span>Sign out</span></button>
+      </form>
+      {% endif %}
+    </div>
 
     <dialog class="settings-sheet" x-ref="settings" aria-labelledby="settings-title"
             @click.self="$el.close()">

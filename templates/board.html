@@ -44,7 +44,7 @@
       </header>
 
       {% set view_icons = {"Board": "board", "List": "list", "Gallery": "gallery", "Calendar": "calendar", "Planner": "planner", "Map": "map"} %}
-      <div class="board-toolbar" role="toolbar" aria-label="Board view">
+      <div class="board-toolbar" role="group" aria-label="Board view">
         <nav class="segmented board-views" aria-label="View">
           {% for link in page.view_links %}
           <a class="segment board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}"
@@ -72,7 +72,7 @@
           </div>
         </div>
         {% if page.chips %}
-        <div class="board-chips" aria-label="Filters">
+        <div class="board-chips" role="group" aria-label="Filters">
           {% for chip in page.chips %}
           <a class="board-chip{% if chip.active %} is-active{% endif %}" href="{{ chip.href }}">{{ chip.label }} {{ chip.count }}</a>
           {% endfor %}
