@@ -1,13 +1,13 @@
-{% from "_icon.html" import file_icon, display_title %}
+{% from "_icon.html" import file_icon %}
 <article class="board-card lane-{{ card.lane }}"
          {% if card.draggable %}draggable="true" data-filename="{{ card.filename }}"
          @dragstart="event.dataTransfer.setData('text/plain', $el.dataset.filename)"{% endif %}>
   <h3>
     <span class="card-icon">{{ file_icon(card.title) }}</span>
     {% if card.lane == 'filed' %}
-    <a class="card-link" href="{{ page.clear_outline_href }}&amp;note={{ card.relative_path | urlencode }}" title="{{ card.title }}">{{ display_title(card.title) }}</a>
+    <a class="card-link" href="{{ page.clear_outline_href }}&amp;note={{ card.relative_path | urlencode }}" >{{ card.title }}</a>
     {% else %}
-    <span title="{{ card.title }}">{{ display_title(card.title) }}</span>
+    <span>{{ card.title }}</span>
     {% endif %}
   </h3>
   <p class="board-meta">
@@ -19,8 +19,8 @@
     {% if card.formula %}
     <span class="board-chip">{% if card.formula_result is not none %}{{ card.formula_result }}{% else %}{{ card.formula }}{% endif %}</span>
     {% endif %}
-    {# Grouped by module, the column already names the module. #}
-    {% if page.group != 'module' %}
+    {# On the module-grouped board the column already names the module. #}
+    {% if not (page.view == 'board' and page.group == 'module') %}
     <span class="card-module"><span class="mod-name">{{ card.module }}</span>
     {% if card.block %}<span class="block-tag">{{ card.block }}</span>{% endif %}</span>
     {% endif %}

@@ -18,6 +18,7 @@ function oneosNav(open) {
   const body = document.body;
   open = open ?? !body.classList.contains('nav-open');
   body.classList.toggle('nav-open', open);
+  document.querySelectorAll('body > main, .mobile-bar').forEach((el) => { el.inert = open; });
   const toggle = document.querySelector('.nav-toggle');
   toggle?.setAttribute('aria-expanded', String(open));
   if (open) document.querySelector('#oneos-nav a')?.focus();
@@ -110,7 +111,7 @@ document.addEventListener('click', (event) => {
        x-data="{ menu: false,
                  theme: $persist('system').as('oneos.theme'),
                  accent: $persist('blue').as('oneos.accent') }"
-       x-init="$watch('theme', v => document.documentElement.dataset.theme = v);
+       x-init="$watch('theme', v => { document.documentElement.dataset.theme = v; oneosThemeColor(v) });
                $watch('accent', v => document.documentElement.dataset.accent = v)"
        @keydown.escape="if (menu) { menu = false; $refs.footButton.focus() }"
        @click.outside="menu = false">

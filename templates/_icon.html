@@ -29,11 +29,3 @@
 {%- else -%}{{ icon("file-text") }}
 {%- endif -%}
 {%- endmacro %}
-
-{# The extension is carried by the file icon, so the title drops it. #}
-{% macro display_title(title) -%}
-{%- set lower = title | lower -%}
-{%- if lower.endswith((".eml", ".pdf", ".jpg", ".jpeg", ".png", ".heic", ".gif", ".webp", ".md")) and "." in title[1:] -%}
-{{ title.rsplit(".", 1)[0] }}
-{%- else -%}{{ title }}{%- endif -%}
-{%- endmacro %}
