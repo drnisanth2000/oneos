@@ -9,7 +9,8 @@ Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
 Last reconciled: 2026-10-28, after the running install was updated to
-`85afa63`. Earlier reconciliations: 2026-10-26 (Board, rules line, and local
+`d3dd761` (Console visual refresh). Earlier reconciliations: 2026-10-28
+(install update to `85afa63`), 2026-10-26 (Board, rules line, and local
 deployment acceptance) and 2026-09-11 (trusted-local live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
@@ -25,7 +26,33 @@ stopped early remain in private state, as does the isolated restore-check
 directory. The successful backup removed its own staging directory. Do not
 treat those private leftovers as a second live vault.
 
-## Running install update (2026-10-28)
+## Running install update to `d3dd761` (2026-10-28)
+
+With owner approval, the running install was updated to `origin/main`
+`d3dd761`, the merge of the Console visual refresh (PR #45). The install
+checkout moved from `564fbf2` by fast-forward. The app image running before
+the update is kept locally as the image tag `oneos-local:pre-d3dd761`. The
+refresh changes templates, the stylesheet, and tests only. Live mailboxes,
+private parsers, and finance parsers are still not included.
+
+Procedure, as in `LOCAL-OPERATIONS.md`: `doctor`, an encrypted backup to the
+external drive, `restore-check`, fast-forward of the install checkout, and
+`start`, which rebuilt only the app image. The update changed no dependency,
+Dockerfile, Compose, or Caddy file. The first backup attempt was refused
+before copying because the operator shell exported a `GIT_` variable
+(`GIT_EDITOR`); backup requires Git environment overrides to be unset, and the
+retry without it verified. That refused attempt left one empty `snapshot-*`
+staging directory in private state. Afterwards `status` reported every check
+healthy, `/healthz` answered, protected routes redirected to sign-in, the app
+logs showed no errors, the rebuilt container serves the new stylesheet, and
+the vault's HEAD, status, worktree diff, and cached diff were byte-identical
+before and after. The restore-check copy from this update remains in private
+state.
+
+The owner has not yet signed in to check the refreshed screens in the running
+install. The sign-in page itself is unchanged and unstyled.
+
+## Running install update to `85afa63` (2026-10-28)
 
 With owner approval, the running install was updated to `origin/main`
 `85afa63`, which includes the Board (PR #39), the Phase 3 public slices
