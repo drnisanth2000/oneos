@@ -321,13 +321,13 @@ def diagnostics(config):
         result['vault'] = finding('unavailable', 'Reconnect the configured vault and check private path permissions; do not create an empty replacement.')
     result['authentication'] = authentication_diagnostic(config)
     if 'backup' not in config:
-        result['backup'] = finding('not_configured', 'Run setup-backup with the intended external drive and an offline key copy.')
+        result['backup'] = finding('not_configured', 'Optional: run setup-backup with an external drive and an offline key copy when you want backups.')
     else:
         from tools.local_backup import validate_volume
         try:
             validate_volume(config['backup'])
         except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-            result['backup'] = finding('disconnected', 'Connect the original external physical drive; verify its configured identity.')
+            result['backup'] = finding('disconnected', 'Backup drive not connected. Back up whenever you choose: connect it and run backup.')
         else:
             try:
                 status = json.loads(private_file(Path(config['state_dir']) / 'status/backup-status.json').read_text())
@@ -344,9 +344,9 @@ def diagnostics(config):
                             or (isinstance(last, float) and not math.isfinite(last))
                             or now - last >= 86400):
                         state = 'missed'
-                result['backup'] = finding(state, 'Backup is current.' if state == 'ok' else 'Run backup, then restore-check to verify recovery.')
+                result['backup'] = finding(state, 'Backup is current.' if state == 'ok' else 'Back up whenever you choose: run backup, then restore-check to verify recovery.')
             except (OSError, ValueError, TypeError):
-                result['backup'] = finding('unknown', 'Run backup to establish verified backup status.')
+                result['backup'] = finding('unknown', 'Back up whenever you choose: run backup to establish verified backup status.')
     return result
 
 
@@ -356,7 +356,8 @@ def install_login(config):
     (library / 'LaunchAgents').mkdir(mode=0o700, exist_ok=True)
     destination = safe_path(library / 'LaunchAgents')
     python = sys.executable  # Preserve the venv entrypoint, not its base interpreter.
-    jobs = [('login', 'login-start'), ('backup', 'backup-due')]
+    # Backups run only when the owner chooses (`backup`); no scheduled job.
+    jobs = [('login', 'login-start')]
     paths = [destination / ('local.oneos.' + suffix + '.plist') for suffix, _ in jobs]
     if any(path.exists() or path.is_symlink() for path in paths):
         raise ValueError('login job already exists; inspect before replacing')
@@ -376,8 +377,6 @@ def install_login(config):
                      'ProgramArguments': [python, '-m', 'tools.local_service', '--state-dir', config['state_dir'], command],
                      'WorkingDirectory': config['repo_dir'], 'RunAtLoad': True,
                      'EnvironmentVariables': {'PATH': os.environ.get('PATH', '')}}
-            if suffix == 'backup':
-                value['StartInterval'] = 3600
             output = path.open('xb')
             created.append(path)
             with output:
@@ -428,7 +427,9 @@ def main(argv=None):
         if args.command in ('doctor', 'status'):
             report = diagnostics(config)
             print(json.dumps(report))
-            return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'never', 'disconnected', 'not_enrolled', 'not_configured'} for item in report.values()))
+            # Backup is the owner's choice: its state is reported, never a failure.
+            return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'never', 'disconnected', 'not_enrolled', 'not_configured'}
+                                                        for name, item in report.items() if name != 'backup'))
         if args.command == 'login-start':
             run_login(config)
             return 0

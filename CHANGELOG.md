@@ -6,6 +6,8 @@ landed and when. The published history starts at the 2026-08-07 baseline.
 
 ## Unreleased
 
+- Backups run only when the owner runs `backup`: no scheduled backup job,
+  and `doctor` reports backup state without failing on it.
 - Documentation reconciled with the code: architecture map, configuration
   reference, README, build-step states, and the Board's place in the record.
 - The Board reuses the inbox's no-follow path guards instead of a copy.
