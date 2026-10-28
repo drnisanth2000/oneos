@@ -238,6 +238,45 @@ def test_morph_is_wired(client):
     assert 'hx-swap="morph"' in html
 
 
+def test_icons_are_an_inline_sprite_with_every_used_symbol(client):
+    html = client.get("/board/alpha").text
+    defined = set(re.findall(r'<symbol id="(i-[a-z-]+)"', html))
+    used = set(re.findall(r'<use href="#(i-[a-z-]+)"', html))
+    assert used, "no icons rendered"
+    assert used <= defined, used - defined
+    assert "<img" not in html
+
+
+def test_settings_live_in_the_sidebar_foot_without_credential_fields(client):
+    html = client.get("/").text
+    foot = html[html.index('class="sidebar-foot"'):]
+    assert 'class="settings-sheet"' in foot
+    assert "$persist('system').as('oneos.theme')" in foot
+    assert "$persist('blue').as('oneos.accent')" in foot
+    # Backup and recovery stay terminal-only: the sheet names the commands
+    # and never offers a password or authenticator field.
+    assert "OneOS.command backup" in foot
+    assert "OneOS.command recover" in foot
+    assert 'type="password"' not in html
+    # The saved appearance is applied before first paint.
+    head = html[: html.index("</head>")]
+    assert "localStorage.getItem('oneos.theme')" in head
+
+
+def test_phone_bar_opens_the_same_sidebar(client):
+    html = client.get("/").text
+    assert 'class="mobile-bar"' in html
+    assert 'aria-controls="oneos-nav"' in html
+    assert 'id="oneos-nav"' in html
+
+
+def test_sidebar_modules_link_to_their_board_column(client):
+    html = client.get("/").text
+    assert 'href="/board/alpha?group=module#col-02-work"' in html
+    board = client.get("/board/alpha", params={"group": "module"}).text
+    assert 'id="col-02-work"' in board
+
+
 def test_pulse_partial_renders_alpine_drawer(client):
     html = client.get("/blocks/pulse").text
     assert 'x-data="{ drawer: false }"' in html

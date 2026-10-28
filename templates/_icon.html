@@ -1,0 +1,31 @@
+{# Icon helpers over the sprite in _icon_sprite.html. Presentation only:
+   every name maps to a symbol there, unknown values fall back to a folder. #}
+{% macro icon(name, cls="") -%}
+<svg class="icon{% if cls %} {{ cls }}{% endif %}" aria-hidden="true" focusable="false"><use href="#i-{{ name }}"/></svg>
+{%- endmacro %}
+
+{% macro block_icon(block, module="") -%}
+{%- if module == "00-inbox" -%}{{ icon("inbox") }}
+{%- elif module.endswith("-archive") -%}{{ icon("archive") }}
+{%- elif block in ("system", "govern", "build", "deliver", "retain", "people", "finance", "growth") -%}{{ icon("block-" ~ block) }}
+{%- else -%}{{ icon("folder") }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro bundle_icon(flags) -%}
+{%- if "regulated" in flags -%}{{ icon("shield") }}
+{%- elif "personal" in flags -%}{{ icon("user") }}
+{%- elif "b2b" in flags -%}{{ icon("building") }}
+{%- elif "recurring" in flags -%}{{ icon("repeat") }}
+{%- else -%}{{ icon("folder") }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro file_icon(title) -%}
+{%- set lower = title | lower -%}
+{%- if lower.endswith(".eml") -%}{{ icon("mail") }}
+{%- elif lower.endswith((".jpg", ".jpeg", ".png", ".heic", ".gif", ".webp")) -%}{{ icon("image") }}
+{%- elif lower.endswith(".pdf") -%}{{ icon("file") }}
+{%- else -%}{{ icon("file-text") }}
+{%- endif -%}
+{%- endmacro %}

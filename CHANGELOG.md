@@ -9,6 +9,10 @@ landed and when. The published history starts at the 2026-08-07 baseline.
 - Documentation reconciled with the code: architecture map, configuration
   reference, README, build-step states, and the Board's place in the record.
 - The Board reuses the inbox's no-follow path guards instead of a copy.
+- Console visual refresh: one token set (system fonts, 4pt spacing, light and
+  dark), an inline icon sprite, a sidebar with per-module links and a
+  bottom-left Settings sheet (theme, accent, terminal-only backup and
+  recovery), a segmented Board toolbar, and phone and tablet layouts.
 
 ## 2026-10-27
 
