@@ -4,6 +4,7 @@
   {% set page_title = "OneOS · Board" %}
   {% include "_head.html" %}
 </head>
+{% from "_icon.html" import icon %}
 <body class="review-surface" hx-ext="alpine-morph">
   {% include "_sidebar.html" %}
 
@@ -24,40 +25,11 @@
            form.querySelector('[name=sub]').value = sub;
            form.requestSubmit();
          } }">
-      <h1 class="triage-h">Board · {{ entity }}</h1>
-
-      <div class="board-toolbar" role="toolbar" aria-label="Board view">
-        <div class="board-controls">
-          {% for link in page.view_links %}
-          <a class="board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
-          {% endfor %}
+      <header class="board-head">
+        <div class="board-title">
+          <p class="eyebrow">{{ icon("board") }}Board</p>
+          <h1 class="triage-h">{{ entity }}</h1>
         </div>
-        <div class="board-controls">
-          {% for link in page.group_links %}
-          <a class="board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
-          {% endfor %}
-          {% for link in page.sort_links %}
-          <a class="board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}">Sort: {{ link.label }}</a>
-          {% endfor %}
-        </div>
-        {% if page.chips %}
-        <div class="board-chips">
-          {% for chip in page.chips %}
-          <a class="board-chip{% if chip.active %} is-active{% endif %}" href="{{ chip.href }}">{{ chip.label }} {{ chip.count }}</a>
-          {% endfor %}
-        </div>
-        {% endif %}
-      </div>
-
-      <div class="board-tools">
-        <form class="capture" method="post" action="/board/{{ entity }}/capture">
-          <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token | default('') }}">
-          <label class="sr-only" for="capture-title">Quick note</label>
-          <input id="capture-title" name="title" type="text" maxlength="200" required placeholder="Quick note">
-          <label class="sr-only" for="capture-text">Details</label>
-          <input id="capture-text" name="text" type="text" maxlength="8000" placeholder="Details">
-          <button type="submit">Add to inbox</button>
-        </form>
         <aside class="attention" aria-label="This week">
           <h2>This week</h2>
           <dl>
@@ -69,7 +41,54 @@
             {% endfor %}
           </dl>
         </aside>
+      </header>
+
+      {% set view_icons = {"Board": "board", "List": "list", "Gallery": "gallery", "Calendar": "calendar", "Planner": "planner", "Map": "map"} %}
+      <div class="board-toolbar" role="toolbar" aria-label="Board view">
+        <nav class="segmented board-views" aria-label="View">
+          {% for link in page.view_links %}
+          <a class="segment board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}"
+             {% if link.active %}aria-current="page"{% endif %}>{{ icon(view_icons.get(link.label, "board")) }}<span>{{ link.label }}</span></a>
+          {% endfor %}
+        </nav>
+        <div class="board-options">
+          <div class="option-group">
+            <span class="option-label">{{ icon("group") }}Group</span>
+            <nav class="segmented" aria-label="Group by">
+              {% for link in page.group_links %}
+              <a class="segment board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}"
+                 {% if link.active %}aria-current="true"{% endif %}>{{ link.label }}</a>
+              {% endfor %}
+            </nav>
+          </div>
+          <div class="option-group">
+            <span class="option-label">{{ icon("sort") }}Sort</span>
+            <nav class="segmented" aria-label="Sort by">
+              {% for link in page.sort_links %}
+              <a class="segment board-control{% if link.active %} is-active{% endif %}" href="{{ link.href }}"
+                 {% if link.active %}aria-current="true"{% endif %}><span class="sr-only">Sort: </span>{{ link.label }}</a>
+              {% endfor %}
+            </nav>
+          </div>
+        </div>
+        {% if page.chips %}
+        <div class="board-chips" aria-label="Filters">
+          {% for chip in page.chips %}
+          <a class="board-chip{% if chip.active %} is-active{% endif %}" href="{{ chip.href }}">{{ chip.label }} {{ chip.count }}</a>
+          {% endfor %}
+        </div>
+        {% endif %}
       </div>
+
+      <form class="capture" method="post" action="/board/{{ entity }}/capture">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token | default('') }}">
+        <span class="capture-icon">{{ icon("plus") }}</span>
+        <label class="sr-only" for="capture-title">Quick note</label>
+        <input id="capture-title" name="title" type="text" maxlength="200" required placeholder="Quick note">
+        <label class="sr-only" for="capture-text">Details</label>
+        <input id="capture-text" name="text" type="text" maxlength="8000" placeholder="Details (optional)">
+        <button type="submit" class="button-primary">Add to inbox</button>
+      </form>
 
       {% if page.blocked %}
       <p class="alert" role="alert">
@@ -120,7 +139,8 @@
       {% if page.view == 'board' %}
       <div class="board-columns">
         {% for column in page.columns %}
-        <section class="board-column{% if column.missing %} missing{% endif %}"
+        <section class="board-column{% if column.missing %} missing{% endif %}{% if not column.cards %} is-empty{% endif %}"
+                 id="col-{{ column.key }}"
                  {% if column.droppable %}
                  data-module="{{ column.module }}"
                  data-sub="{{ column.sub or '' }}"
@@ -129,12 +149,12 @@
                  @drop.prevent="drop($event, $el.dataset.module, $el.dataset.sub)"
                  :class="{ 'drop-over': over === '{{ column.key }}' }"
                  {% endif %}>
-          <h2>{{ column.label }} <span class="muted">{{ column.cards|length }}</span></h2>
+          <h2><span class="column-label">{{ column.label }}</span> <span class="count">{{ column.cards|length }}</span></h2>
           {% if column.missing %}<p class="bundle-warn">required by flags, missing on disk</p>{% endif %}
           {% for card in column.cards %}
           {% include "blocks/board_card.html" %}
           {% endfor %}
-          {% if not column.cards and not column.missing %}<p class="muted">No notes</p>{% endif %}
+          {% if not column.cards and not column.missing %}<p class="empty-note">No notes</p>{% endif %}
         </section>
         {% endfor %}
       </div>
@@ -184,7 +204,7 @@
       </div>
       <div class="planner">
         <section class="unscheduled">
-          <h2>Unscheduled <span class="muted">{{ page.unscheduled|length }}</span></h2>
+          <h2>Unscheduled <span class="count">{{ page.unscheduled|length }}</span></h2>
           {% for card in page.unscheduled %}
           {% include "blocks/board_card.html" %}
           {% endfor %}

@@ -1,48 +1,193 @@
-<nav class="sidebar" aria-label="Entity bundles"
+{% from "_icon.html" import icon, block_icon, bundle_icon %}
+{% include "_icon_sprite.html" %}
+{# Phones and narrow windows: a top bar opens the sidebar as a drawer. Hidden
+   by CSS on wide screens, where the sidebar is always visible. #}
+<header class="mobile-bar">
+  <button type="button" class="icon-button nav-toggle" aria-controls="oneos-nav"
+          aria-expanded="false" onclick="oneosNav()">
+    <svg class="icon" aria-hidden="true"><use href="#i-list"/></svg><span class="sr-only">Open navigation</span>
+  </button>
+  <a href="/" class="brandlink"><span class="brand-mark" aria-hidden="true">O</span><span class="brand-name">OneOS</span></a>
+  <button type="button" class="icon-button" onclick="document.querySelector('.settings-sheet').showModal()">
+    {{ icon("settings") }}<span class="sr-only">Settings</span>
+  </button>
+</header>
+<div class="nav-scrim" onclick="oneosNav(false)" aria-hidden="true"></div>
+<script>
+function oneosNav(open) {
+  const body = document.body;
+  open = open ?? !body.classList.contains('nav-open');
+  body.classList.toggle('nav-open', open);
+  document.querySelector('.nav-toggle')?.setAttribute('aria-expanded', String(open));
+}
+document.addEventListener('keydown', (event) => { if (event.key === 'Escape') oneosNav(false); });
+</script>
+<nav class="sidebar" id="oneos-nav" aria-label="Entity bundles"
      x-data="{ open: $persist({}).as('oneos.sidebar.open') }">
-  <div class="brand"><a href="/" class="brandlink">OneOS</a> <small>· read &amp; approve</small></div>
-  {% if request.state.owner_authenticated | default(false) %}
-  <a href="/readyz">Service status</a>
-  <form method="post" action="/logout">
-    <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
-    <button type="submit">Sign out</button>
-  </form>
-  {% endif %}
-
-  {% for b in bundles %}
-  <div class="bundle" data-slug="{{ b.slug }}">
-    <div class="bundle-head" role="button" tabindex="0"
-         @click="open['{{ b.slug }}'] = !open['{{ b.slug }}']"
-         @keydown.enter.prevent="open['{{ b.slug }}'] = !open['{{ b.slug }}']">
-      <span class="chev" :class="{ open: open['{{ b.slug }}'] }">&#9654;</span>
-      <span class="label">{{ b.label }}</span>
-      <span class="flags">{{ b.flags | join(' ') }}</span>
-    </div>
-
-    {% if not b.on_disk %}
-      <div class="bundle-absent">listed in entities.yaml, not yet on disk</div>
-    {% endif %}
-    {% if b.errors %}
-      <div class="bundle-warn">
-        {{ b.errors | length }} module(s) required by flags, missing on disk
-      </div>
-    {% endif %}
-
-    <ul class="modules" x-show="open['{{ b.slug }}']" x-cloak>
-      <li><a class="mod-name" href="/board/{{ b.slug }}">Board</a></li>
-      {% for m in b.modules %}
-      <li class="{{ 'missing' if m.missing else '' }}"
-          {% if m.missing %}title="required by flags but absent on disk (E4)"{% endif %}>
-        {% if m.name == '00-inbox' %}
-          <a class="mod-name" href="/triage/{{ b.slug }}">{{ m.name }}</a>
-          <a class="mod-name" href="/mail/{{ b.slug }}">mailboxes</a>
-        {% else %}
-          <span class="mod-name">{{ m.name }}</span>
-        {% endif %}
-        <span class="block-tag">{{ m.block }}</span>
-      </li>
-      {% endfor %}
-    </ul>
+  <div class="brand">
+    <a href="/" class="brandlink">
+      <span class="brand-mark" aria-hidden="true">O</span>
+      <span class="brand-name">OneOS</span>
+    </a>
+    <small>Read &amp; approve</small>
   </div>
-  {% endfor %}
+
+  <div class="sidebar-scroll">
+    <p class="sidebar-heading">Workspaces</p>
+    {% for b in bundles %}
+    <div class="bundle" data-slug="{{ b.slug }}">
+      <div class="bundle-head" role="button" tabindex="0"
+           :aria-expanded="open['{{ b.slug }}'] ? 'true' : 'false'"
+           @click="open['{{ b.slug }}'] = !open['{{ b.slug }}']"
+           @keydown.enter.prevent="open['{{ b.slug }}'] = !open['{{ b.slug }}']"
+           @keydown.space.prevent="open['{{ b.slug }}'] = !open['{{ b.slug }}']">
+        <span class="bundle-icon">{{ bundle_icon(b.flags) }}</span>
+        <span class="bundle-text">
+          <span class="label">{{ b.label }}</span>
+          <span class="flags">{{ b.flags | join(' · ') }}</span>
+        </span>
+        <span class="chev" :class="{ open: open['{{ b.slug }}'] }">{{ icon("chevron") }}</span>
+      </div>
+
+      {% if not b.on_disk %}
+        <div class="bundle-absent">listed in entities.yaml, not yet on disk</div>
+      {% endif %}
+      {% if b.errors %}
+        <div class="bundle-warn">
+          {{ b.errors | length }} module(s) required by flags, missing on disk
+        </div>
+      {% endif %}
+
+      <ul class="modules" x-show="open['{{ b.slug }}']" x-cloak>
+        {% set board_href = "/board/" ~ b.slug %}
+        <li class="module-row{% if request.url.path == board_href %} is-current{% endif %}">
+          <a class="mod-link" href="{{ board_href }}"
+             {% if request.url.path == board_href %}aria-current="page"{% endif %}>
+            {{ icon("board") }}<span class="mod-name">Board</span>
+          </a>
+        </li>
+        {% for m in b.modules %}
+        {% set triage_href = "/triage/" ~ b.slug %}
+        <li class="module-row{{ ' missing' if m.missing else '' }}{% if m.name == '00-inbox' and request.url.path == triage_href %} is-current{% endif %}"
+            {% if m.missing %}title="required by flags but absent on disk (E4)"{% endif %}>
+          {% if m.name == '00-inbox' %}
+            <a class="mod-link" href="{{ triage_href }}">
+              {{ block_icon(m.block, m.name) }}<span class="mod-name">{{ m.name }}</span>
+            </a>
+            <a class="mod-aux" href="/mail/{{ b.slug }}" title="Mailboxes">
+              {{ icon("mail") }}<span class="sr-only">mailboxes</span>
+            </a>
+          {% elif m.missing %}
+            <span class="mod-link">
+              {{ block_icon(m.block, m.name) }}<span class="mod-name">{{ m.name }}</span>
+            </span>
+          {% else %}
+            <a class="mod-link" href="{{ board_href }}?group=module#col-{{ m.name }}">
+              {{ block_icon(m.block, m.name) }}<span class="mod-name">{{ m.name }}</span>
+            </a>
+          {% endif %}
+          <span class="block-tag">{{ m.block }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </div>
+
+  {# Settings live bottom-left. Appearance is a per-browser preference kept
+     in localStorage; backup and credential recovery stay terminal-only by
+     design (no credential ever travels through the browser). #}
+  <div class="sidebar-foot"
+       x-data="{ menu: false,
+                 theme: $persist('system').as('oneos.theme'),
+                 accent: $persist('blue').as('oneos.accent') }"
+       x-init="$watch('theme', v => document.documentElement.dataset.theme = v);
+               $watch('accent', v => document.documentElement.dataset.accent = v)"
+       @keydown.escape="menu = false"
+       @click.outside="menu = false">
+    <div class="foot-menu" role="menu" x-show="menu" x-cloak x-transition.opacity.duration.120ms>
+      <button type="button" role="menuitem" class="menu-item"
+              @click="menu = false; $refs.settings.showModal()">
+        {{ icon("settings") }}<span>Settings…</span>
+      </button>
+      {% if request.state.owner_authenticated | default(false) %}
+      <a role="menuitem" class="menu-item" href="/readyz">{{ icon("activity") }}<span>Service status</span></a>
+      <div class="menu-sep" role="separator"></div>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+        <button type="submit" role="menuitem" class="menu-item">{{ icon("logout") }}<span>Sign out</span></button>
+      </form>
+      {% endif %}
+    </div>
+    <button type="button" class="foot-button" :aria-expanded="menu ? 'true' : 'false'"
+            aria-haspopup="menu" @click="menu = !menu">
+      <span class="avatar" aria-hidden="true">{{ icon("user") }}</span>
+      <span class="foot-text">
+        <span class="foot-title">Owner</span>
+        <span class="foot-sub">Settings &amp; account</span>
+      </span>
+      {{ icon("settings", "foot-gear") }}
+    </button>
+
+    <dialog class="settings-sheet" x-ref="settings" aria-labelledby="settings-title"
+            @click.self="$el.close()">
+      <div class="sheet-body">
+        <header class="sheet-head">
+          <h2 id="settings-title">Settings</h2>
+          <button type="button" class="icon-button" @click="$refs.settings.close()">
+            {{ icon("close") }}<span class="sr-only">Close settings</span>
+          </button>
+        </header>
+
+        <section class="settings-group" aria-labelledby="set-appearance">
+          <h3 id="set-appearance">{{ icon("appearance") }}Appearance</h3>
+          <div class="settings-row">
+            <span class="row-label">Theme</span>
+            <div class="segmented" role="radiogroup" aria-label="Theme">
+              {% for value, label, glyph in [("system", "System", "monitor"), ("light", "Light", "sun"), ("dark", "Dark", "moon")] %}
+              <label class="segment" :class="{ 'is-active': theme === '{{ value }}' }">
+                <input type="radio" name="oneos-theme" value="{{ value }}" x-model="theme" class="sr-only">
+                {{ icon(glyph) }}<span>{{ label }}</span>
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="settings-row">
+            <span class="row-label">Accent colour</span>
+            <div class="swatches" role="radiogroup" aria-label="Accent colour">
+              {% for value in ["blue", "indigo", "purple", "pink", "orange", "green", "teal", "graphite"] %}
+              <label class="swatch swatch-{{ value }}" :class="{ 'is-active': accent === '{{ value }}' }" title="{{ value | capitalize }}">
+                <input type="radio" name="oneos-accent" value="{{ value }}" x-model="accent" class="sr-only">
+                <span class="sr-only">{{ value | capitalize }}</span>
+              </label>
+              {% endfor %}
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-group" aria-labelledby="set-backup">
+          <h3 id="set-backup">{{ icon("backup") }}Backup</h3>
+          <p class="settings-note">Encrypted snapshots go to your external drive once a day while the Mac is awake. To back up now, or to prove a snapshot restores, run the launcher in your OneOS state folder:</p>
+          <pre class="command">{{ icon("terminal") }}<code>OneOS.command backup
+OneOS.command restore-check</code></pre>
+        </section>
+
+        <section class="settings-group" aria-labelledby="set-security">
+          <h3 id="set-security">{{ icon("lock") }}Password &amp; two-factor</h3>
+          <p class="settings-note">Passwords and authenticator secrets are changed only in Terminal, so they never pass through the browser. Recovery sets a new password and a new authenticator code:</p>
+          <pre class="command">{{ icon("terminal") }}<code>OneOS.command recover</code></pre>
+        </section>
+
+        {% if request.state.owner_authenticated | default(false) %}
+        <section class="settings-group" aria-labelledby="set-service">
+          <h3 id="set-service">{{ icon("activity") }}Service</h3>
+          <div class="settings-row">
+            <span class="row-label">Health check</span>
+            <a class="row-link" href="/readyz">Open status {{ icon("chevron") }}</a>
+          </div>
+        </section>
+        {% endif %}
+      </div>
+    </dialog>
+  </div>
 </nav>
