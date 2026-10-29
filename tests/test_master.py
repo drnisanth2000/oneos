@@ -186,6 +186,55 @@ def test_unreadable_entity_is_reported_not_fatal(tmp_path, monkeypatch):
     assert isinstance(page.failures[0].error, CrossScopeError)
 
 
+def _break_note_encoding(path: Path) -> None:
+    path.write_bytes(b"---\ntitle: \xff\xfe broken\nstatus: draft\n---\n\xc3\x28\n")
+
+
+def test_note_with_invalid_utf8_fails_only_its_entity(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _break_note_encoding(_note(tmp_path, "alpha", "02-work", "Garbled", status="draft"))
+    _note(tmp_path, "beta1", "02-work", "Still here", status="draft")
+    page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
+                       now=datetime(2026, 10, 29, 9))
+    assert [f.entity_label for f in page.failures] == ["Alpha"]
+    assert isinstance(page.failures[0].error, UnicodeDecodeError)
+    assert [m.card.title for m in page.columns[0].cards] == ["Still here"]
+
+
+def test_oserror_reading_a_note_fails_only_its_entity(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    locked = _note(tmp_path, "alpha", "02-work", "Locked", status="draft")
+    _note(tmp_path, "beta1", "02-work", "Still here", status="draft")
+    real_read = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        if self == locked or self.resolve() == locked.resolve():
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
+                       now=datetime(2026, 10, 29, 9))
+    assert [f.entity_label for f in page.failures] == ["Alpha"]
+    assert isinstance(page.failures[0].error, PermissionError)
+    assert [m.card.title for m in page.columns[0].cards] == ["Still here"]
+
+
+def test_home_survives_an_unreadable_note_and_describes_it(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    _break_note_encoding(_note(tmp_path, "alpha", "02-work", "Garbled", status="draft"))
+    _note(tmp_path, "beta1", "02-work", "Filing", status="waiting")
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Filing" in response.text
+    blocks = re.findall(r'<section class="master-failure".*?</section>', response.text, re.S)
+    assert len(blocks) == 1
+    assert "Alpha" in blocks[0] and 'class="alert' in blocks[0] and "E-UNKNOWN" in blocks[0]
+    # Described by class only: no path, byte value or exception text reaches the page.
+    for leaked in (str(tmp_path), "Garbled.md", "codec", "0xff", "Traceback"):
+        assert leaked not in response.text
+
+
 def test_sort_by_title_and_done_stays_newest_first(tmp_path, monkeypatch):
     main, vault = _vault(tmp_path, monkeypatch)
     _note(tmp_path, "alpha", "02-work", "Zed", status="draft", updated="2026-10-01")

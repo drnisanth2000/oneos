@@ -34,7 +34,8 @@ _TONES = 6
 _DONE_LIMIT = 10
 
 #: Per-entity failures the page reports and survives. The same classes as the
-#: Board route catches, plus a redirected directory.
+#: Board route catches, plus a redirected directory, and an unreadable or
+#: non-UTF-8 note (`describe()` reports those as E-UNKNOWN, by class only).
 _ENTITY_FAILURES = (
     OutboxError,
     CrossScopeError,
@@ -45,6 +46,8 @@ _ENTITY_FAILURES = (
     ReceiptStoreIntegrityError,
     ReceiptStoreUnavailable,
     RedirectedPathError,
+    UnicodeDecodeError,
+    OSError,
 )
 
 
