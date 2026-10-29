@@ -816,7 +816,13 @@ a.board-chip:hover { background: var(--fill-strong); }
   border: 0; background: var(--panel); color: var(--ink);
   font: inherit; font-size: var(--text-base); text-align: left; cursor: pointer;
 }
-.review-surface .master-card:hover { background: var(--panel); }
+/* The same lift and shadow as `.board-card:hover` (inherited from that class), plus a
+   hairline ring so it also reads in the dark theme, where a shadow barely shows. The
+   shared `button:hover` fill stays off so the card keeps its own surface. */
+.review-surface .master-card:hover,
+.review-surface .master-card:focus-visible {
+  background: var(--panel); box-shadow: var(--shadow-md), 0 0 0 1px var(--line);
+}
 .master-card-title {
   display: flex; gap: var(--space-2); align-items: flex-start; margin-bottom: var(--space-2);
   font-weight: 600; line-height: 1.35; overflow-wrap: anywhere;
@@ -860,8 +866,10 @@ a.board-chip:hover { background: var(--fill-strong); }
   .master-chips { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
   .master-filters .segmented { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
   .master-filters .segment { justify-content: center; }
+  /* Each segment is at least as wide as its own label and count, so
+     "To review" is never cut; the spare width is shared out equally. */
   .master-stages {
-    display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr);
+    display: grid; grid-auto-flow: column; grid-auto-columns: minmax(max-content, 1fr);
     margin-bottom: var(--space-3);
   }
   .review-surface .master-stages .segment {

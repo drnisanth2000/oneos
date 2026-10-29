@@ -583,3 +583,20 @@ def test_card_link_encodes_the_entity_slug(tmp_path, monkeypatch):
     item = SimpleNamespace(card=card, entity="we ird/slug", entity_label="W", tone=1)
     html = main.templates.env.get_template("blocks/master_card.html").render(item=item)
     assert 'hx-get="/master/card/we%20ird/slug?path=a%20b/c.md"' in html
+
+
+_CSS = (Path(__file__).resolve().parent.parent / "static" / "app.css").read_text(encoding="utf-8")
+
+
+def test_phone_stage_switcher_sizes_each_segment_to_its_label():
+    # Equal minmax(0, 1fr) tracks cut "To review" at 375px; tracks must not shrink below content.
+    rule = re.search(r"  \.master-stages \{[^}]*\}", _CSS).group(0)  # the phone rule
+    assert "minmax(max-content, 1fr)" in rule and "minmax(0, 1fr)" not in rule
+
+
+def test_master_card_has_hover_and_keyboard_focus_feedback():
+    rule = re.search(
+        r"\.review-surface \.master-card:hover,\s*\.review-surface \.master-card:focus-visible \{[^}]*\}",
+        _CSS,
+    )
+    assert rule and "var(--shadow-md)" in rule.group(0)
