@@ -304,7 +304,7 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
 
 
 @structured_reader(category="front-matter")
-def _filed_body(scope: Scope, relative: str) -> str:
+def note_body(scope: Scope, relative: str) -> str:
     path = scope.resolve_stored(relative)
     if path.is_symlink() or not path.is_file() or path.resolve() != path:
         raise RedirectedPathError("module note is redirected")
@@ -365,6 +365,33 @@ def _proposal_cards(scope: Scope, listing_rows) -> tuple[list[BoardCard], bool]:
             )
         )
     return cards, blocked
+
+
+@dataclass(frozen=True)
+class EntityCards:
+    """One entity's cards by lane, as the Board and the master view read them."""
+
+    inbox: tuple[BoardCard, ...]
+    proposed: tuple[BoardCard, ...]
+    filed: tuple[BoardCard, ...]
+    blocked: bool
+
+
+@failure_contract(
+    raises=(DestinationRegistryError, RedirectedPathError),
+    calls=(read_inbox, project_outbox),
+)
+def entity_cards(scope: Scope, vault: Vault) -> EntityCards:
+    """Read one entity's inbox, proposed and filed cards. Reads only."""
+    inbox = _inbox_cards(scope, vault, read_inbox(scope))
+    proposed, blocked = _proposal_cards(scope, project_outbox(scope))
+    filed = _read_filed(scope, vault)
+    return EntityCards(
+        inbox=tuple(inbox),
+        proposed=tuple(proposed),
+        filed=tuple(filed),
+        blocked=blocked,
+    )
 
 
 def _sort_cards(cards: list[BoardCard], sort: str) -> list[BoardCard]:
@@ -826,7 +853,7 @@ def _shift_month(month_start: date, step: int) -> date:
 
 @failure_contract(
     raises=(DestinationRegistryError, RedirectedPathError),
-    calls=(read_inbox, project_outbox),
+    calls=(entity_cards,),
 )
 def load_board(
     scope: Scope,
@@ -847,9 +874,9 @@ def load_board(
     selected_view = _choice(view, _VIEWS, "board")
     selected_group = _choice(group, _GROUPS, "review")
     selected_sort = _choice(sort, _SORTS, "updated")
-    inbox = _inbox_cards(scope, vault, read_inbox(scope))
-    proposed, blocked = _proposal_cards(scope, project_outbox(scope))
-    filed = _read_filed(scope, vault)
+    cards = entity_cards(scope, vault)
+    inbox, proposed, filed = list(cards.inbox), list(cards.proposed), list(cards.filed)
+    blocked = cards.blocked
     shows_filed = selected_view in {"gallery", "calendar", "planner", "map"} or selected_group != "review"
     shows_inbox = selected_view == "planner" or (
         selected_view in {"board", "list"} and selected_group == "review"
@@ -912,7 +939,7 @@ def load_board(
         week=week_token,
     )
     opened = next((card for card in filed if card.relative_path == note), None)
-    outline = _outline(_filed_body(scope, opened.relative_path)) if opened else ()
+    outline = _outline(note_body(scope, opened.relative_path)) if opened else ()
     undated = tuple(
         card for card in _sort_cards(filed_filtered, selected_sort)
         if _day(card.due) is None and _day(card.updated) is None

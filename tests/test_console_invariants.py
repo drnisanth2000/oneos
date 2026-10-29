@@ -1531,6 +1531,7 @@ EXPECTED_CONTRACTED_BOUNDARIES = (
     ("app.phase3", "freeze_visible"),
     ("app.phase3", "confirm_frozen"),
     ("app.phase3", "recover_selected"),
+    ("app.board", "entity_cards"),
     ("app.board", "load_board"),
     ("app.board", "capture_note"),
 )
@@ -1560,7 +1561,7 @@ def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypat
 
     main = _load_console_app(tmp_path, monkeypatch)
     qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
-    assert len(qualified) == 27
+    assert len(qualified) == 28
     assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
 
     missing = []
@@ -1591,6 +1592,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         RecipientConfigurationError,
         SystemRegistryPathError,
     )
+    from app.board import entity_cards
     from app.inbox import read_inbox
     from app.ingest.base import IngestError
     from app.phase3 import CleanupError
@@ -1722,9 +1724,13 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         "app.phase3.freeze_visible": ((CleanupError,), ()),
         "app.phase3.confirm_frozen": ((CleanupError,), ()),
         "app.phase3.recover_selected": ((CleanupError,), ()),
-        "app.board.load_board": (
+        "app.board.entity_cards": (
             (DestinationRegistryError, RedirectedPathError),
             (read_inbox, project_outbox),
+        ),
+        "app.board.load_board": (
+            (DestinationRegistryError, RedirectedPathError),
+            (entity_cards,),
         ),
         "app.board.capture_note": ((IngestError, CrossScopeError), ()),
     }
@@ -1941,10 +1947,11 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
         "app.action_receipts.resolve_head_receipt": {
             "app.proposal_identity.require_proposal_id"
         },
-        "app.board.load_board": {
+        "app.board.entity_cards": {
             "app.inbox.read_inbox",
             "app.outbox.project_outbox",
         },
+        "app.board.load_board": {"app.board.entity_cards"},
     }
 
     actual = {}
@@ -1978,10 +1985,11 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
         "app.action_receipts.resolve_head_receipt": {
             "app.proposal_identity.require_proposal_id"
         },
-        "app.board.load_board": {
+        "app.board.entity_cards": {
             "app.inbox.read_inbox",
             "app.outbox.project_outbox",
         },
+        "app.board.load_board": {"app.board.entity_cards"},
     }
     summarized_or_contained_edges = {
         "app.outbox.project_outbox": {
