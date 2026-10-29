@@ -1,0 +1,16 @@
+{# One master-view card. A button, so it is reachable by keyboard; it loads the
+   read-only popup into the dialog outside #master (see home.html). Reads only. #}
+{% from "_icon.html" import file_icon %}
+<button type="button" class="board-card master-card"
+        hx-get="/master/card/{{ item.entity }}?path={{ item.card.relative_path | urlencode }}"
+        hx-target="#master-popup" hx-swap="innerHTML">
+  <span class="master-card-title">
+    <span class="card-icon">{{ file_icon(item.card.title) }}</span>
+    <span>{{ item.card.title }}</span>
+  </span>
+  <span class="board-meta">
+    <span class="ent ent-{{ item.tone }}">{{ item.entity_label }}</span>
+    {% if item.card.lane == 'proposed' %}<span class="board-badge">Proposed</span>{% endif %}
+    {% if item.card.updated %}<time class="master-date" datetime="{{ item.card.updated }}">{{ item.card.updated }}</time>{% endif %}
+  </span>
+</button>

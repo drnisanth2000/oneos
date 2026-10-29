@@ -114,6 +114,15 @@ links between notes, edits to filed notes, and a separate index (the Board
 scans `active/` on each request). Each is a schema or product decision, and an
 edit to a filed note would reverse a deliberate PR #39 limit.
 
+The master view at `/` (plan 1 of 4, read-only) puts every entity's cards from
+the same per-entity reader into four columns: Draft, Waiting, To review, and
+Done. It has entity chips, a sort control, a "Show all" link for Done, and a
+read-only popup (`GET /master/card/{entity}`) that shows a note's body as
+escaped text. It refreshes every minute. An entity that fails to read is
+reported on the page, and the other entities still render. It writes nothing.
+The Needs attention strip, dragging cards, popup stage buttons, comments, and
+editing come in plans 2–4.
+
 ### Readable classification reviews (2026-09-05)
 
 Outbox classification cards lead with the document title, source folder,

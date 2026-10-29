@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  {% set page_title = "OneOS" %}
+  {% include "_head.html" %}
+</head>
+{% from "_icon.html" import icon %}
+<body class="review-surface" hx-ext="alpine-morph">
+  <script>
+    document.addEventListener('alpine:init', () => {
+      const pad = (n) => String(n).padStart(2, '0')
+      const hhmm = (d) => pad(d.getHours()) + ':' + pad(d.getMinutes())
+      const isRefresh = (e) => e.detail && e.detail.target && e.detail.target.id === 'master'
+      Alpine.data('masterHead', () => ({
+        greeting: '', date: '', clock: '', loaded: '', stale: '',
+        init() {
+          this.tick()
+          this.loaded = this.clock
+          setInterval(() => this.tick(), 30000)
+        },
+        tick() {
+          const d = new Date()
+          this.greeting = d.getHours() < 12 ? 'Good morning' : d.getHours() < 17 ? 'Good afternoon' : 'Good evening'
+          this.date = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
+            .replace(/^(\w+),? /, '$1, ')
+          this.clock = hhmm(d)
+        },
+        // The morph puts the server's strings back; the browser's go on top.
+        refreshed(e) {
+          if (!isRefresh(e)) return
+          this.stale = ''
+          this.greeting = this.date = this.clock = ''
+          this.$nextTick(() => { this.tick(); this.loaded = this.clock })
+        },
+        refreshFailed(e) {
+          if (!isRefresh(e)) return
+          if (e.type === 'htmx:beforeSwap' || e.type === 'htmx:before-swap') {
+            if (!(e.detail.xhr && e.detail.xhr.status >= 400)) return
+            e.detail.shouldSwap = false
+          }
+          this.stale = "Couldn't refresh \u2014 showing data from " + this.loaded
+        },
+      }))
+    })
+  </script>
+  {% include "_sidebar.html" %}
+
+  <main class="main">
+    {# The master view, read-only. It refreshes itself every minute with a
+       morph that keeps Alpine state (the phone stage switcher, the clock).
+       The URL is relative so the refresh keeps the page's own scheme behind
+       a TLS proxy. hx-disinherit stops the cards inheriting the wrapper's
+       hx-select/hx-swap. #}
+    <div id="master" class="master"
+         hx-get="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}"
+         hx-trigger="every 60s"
+         hx-select="#master"
+         hx-swap="morph"
+         hx-disinherit="*"
+         x-data="{ stage: 'review' }">
+      {# The server strings are only the first paint: the server clock is UTC in
+         the container, so the browser sets the greeting, date and clock from
+         the owner's own time. A failed minute refresh keeps the page as it is
+         and says so here. #}
+      <header class="master-head"
+              x-data="masterHead"
+              @htmx:before-swap.window="refreshFailed($event)"
+              @htmx:send-error.window="refreshFailed($event)"
+              @htmx:timeout.window="refreshFailed($event)"
+              @htmx:after-swap.window="refreshed($event)">
+        <h1 x-text="greeting">{{ page.greeting }}</h1>
+        <p class="master-when"><span x-text="date">{{ page.date_label }}</span> · <time class="master-clock" x-text="clock">{{ page.time_label }}</time></p>
+        <p class="master-stale" id="master-stale" role="status" hidden :hidden="!stale" x-text="stale"></p>
+      </header>
+
+      <div class="master-filters">
+        <nav class="master-chips" aria-label="Entities">
+          {% set any_active = page.chips | selectattr("active") | list %}
+          <a class="board-chip{% if not any_active %} is-active{% endif %}"
+             href="/?sort={{ page.sort | urlencode }}{% if page.done_all %}&amp;done=all{% endif %}"
+             {% if not any_active %}aria-current="true"{% endif %}>
+            All
+          </a>
+          {% for chip in page.chips %}
+          <a class="board-chip master-chip{% if chip.active %} is-active{% endif %}" href="{{ chip.href }}"
+             {% if chip.active %}aria-current="true"{% endif %}>
+            <span class="ent-dot ent-{{ chip.tone }}" aria-hidden="true"></span>{{ chip.label }}
+          </a>
+          {% endfor %}
+        </nav>
+        <div class="option-group">
+          <span class="option-label">{{ icon("sort") }}Sort</span>
+          <nav class="segmented" aria-label="Sort by">
+            {% for link in page.sort_links %}
+            <a class="segment{% if link.active %} is-active{% endif %}" href="{{ link.href }}"
+               {% if link.active %}aria-current="true"{% endif %}><span class="sr-only">Sort: </span>{{ link.label }}</a>
+            {% endfor %}
+          </nav>
+        </div>
+      </div>
+
+      {% for entity_label, error in failures %}
+      <section class="master-failure" aria-label="{{ entity_label }}">
+        <p class="master-failure-entity">{{ entity_label }}</p>
+        {% include "blocks/alert.html" %}
+      </section>
+      {% endfor %}
+
+      {# Phones show one stage at a time; wider screens hide this switcher. #}
+      <div class="segmented master-stages" role="group" aria-label="Stage">
+        {% for column in page.columns %}
+        <button type="button" class="segment{% if column.key == 'review' %} is-active{% endif %}"
+                :class="{ 'is-active': stage === '{{ column.key }}' }"
+                :aria-pressed="stage === '{{ column.key }}' ? 'true' : 'false'"
+                aria-pressed="{{ 'true' if column.key == 'review' else 'false' }}"
+                @click="stage = '{{ column.key }}'">
+          <span>{{ column.label }}</span> <span class="count">{{ column.total }}</span>
+        </button>
+        {% endfor %}
+      </div>
+
+      {% set empty = {"draft": "No drafts", "waiting": "Nothing waiting", "review": "Nothing to review", "done": "Nothing done yet"} %}
+      <div class="master-cols">
+        {% for column in page.columns %}
+        <section class="board-column master-col{% if column.key == 'review' %} is-shown{% endif %}"
+                 id="col-{{ column.key }}" aria-labelledby="col-{{ column.key }}-label"
+                 :class="{ 'is-shown': stage === '{{ column.key }}' }">
+          <h2><span class="column-label" id="col-{{ column.key }}-label">{{ column.label }}</span> <span class="count">{{ column.total }}</span></h2>
+          {% for item in column.cards %}
+          {% include "blocks/master_card.html" %}
+          {% else %}
+          <p class="empty-note">{{ empty[column.key] }}</p>
+          {% endfor %}
+          {% if column.key == 'done' and column.total > column.cards | length %}
+          <a class="master-show-all" href="{{ page.done_all_href }}">Show all {{ column.total }}</a>
+          {% elif column.key == 'done' and page.done_all %}
+          <a class="master-show-all" href="{{ page.done_recent_href }}">Show recent</a>
+          {% endif %}
+        </section>
+        {% endfor %}
+      </div>
+
+      {% if page.other %}
+      <details class="master-other">
+        <summary>{{ page.other | length }} note{{ '' if page.other | length == 1 else 's' }} with another status</summary>
+        <div class="master-other-list">
+          {% for item in page.other %}
+          {% include "blocks/master_card.html" %}
+          {% endfor %}
+        </div>
+      </details>
+      {% endif %}
+    </div><!-- /master -->
+
+    {# Outside #master, so the minute refresh never closes an open popup. The
+       card's response swaps into #master-popup; the dialog then opens. Escape
+       and the close button close it. #}
+    <dialog id="master-popup-dialog" class="settings-sheet master-popup-sheet"
+            aria-labelledby="master-popup-title"
+            x-data @htmx:after-swap="if (!$el.open) $el.showModal()"
+            @click.self="$el.close()">
+      <div class="sheet-body" id="master-popup"></div>
+    </dialog>
+  </main>
+</body>
+</html>

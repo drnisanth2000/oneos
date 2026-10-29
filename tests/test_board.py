@@ -395,3 +395,17 @@ def test_capture_writes_one_inbox_receipt(tmp_path, monkeypatch):
     assert "Remember" in text
     assert git_head_message(tmp_path) == "ingest: add redacted receipt"
     assert not (tmp_path / "other" / "00-inbox").exists()
+
+
+def test_entity_cards_returns_each_lane(tmp_path, monkeypatch):
+    main, _client_ = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Filed")
+    _note(tmp_path, "alpha", "00-inbox", "Waiting", sub="triage", title="Waiting")
+    from app.board import entity_cards, note_body
+
+    scope = main.build_scope("alpha")
+    cards = entity_cards(scope, main.Vault(main.current_catalog()))
+    assert [c.title for c in cards.filed] == ["Filed"]
+    assert [c.title for c in cards.inbox] == ["Waiting"]
+    assert cards.proposed == () and cards.blocked is False
+    assert note_body(scope, cards.filed[0].relative_path).strip() == "Body"

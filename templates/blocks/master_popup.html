@@ -1,0 +1,24 @@
+{# Read-only card popup, swapped into #master-popup inside the dialog. No form
+   and no write control in plan 1. The body is escaped preformatted text. #}
+{% from "_icon.html" import icon %}
+<header class="sheet-head master-popup-head">
+  <h2 id="master-popup-title">{% if card %}{{ card.title }}{% else %}Card not found{% endif %}</h2>
+  <button type="button" class="icon-button" onclick="this.closest('dialog').close()">
+    {{ icon("close") }}<span class="sr-only">Close</span>
+  </button>
+</header>
+{% if card %}
+<article class="master-popup">
+  <p class="master-popup-meta">
+    <span class="ent{% if tone %} ent-{{ tone }}{% endif %}">{{ entity_label }}</span>
+    <span class="master-stage">{{ stage }}</span>
+  </p>
+  <p class="muted master-popup-where">
+    {% if card.lane == 'proposed' %}proposed for {{ card.module }}{% if card.sub %} / {{ card.sub }}{% endif %}
+    {% else %}{{ card.module }}{% if card.sub %} / {{ card.sub }}{% endif %}{% endif %}
+  </p>
+  <pre class="master-body">{{ body }}</pre>
+</article>
+{% else %}
+<p class="muted">This card is no longer here. Refresh the page.</p>
+{% endif %}
