@@ -8,9 +8,9 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-10-28, after the running install was updated to
-`d3dd761` (Console visual refresh). Earlier reconciliations: 2026-10-28
-(install update to `85afa63`), 2026-10-26 (Board, rules line, and local
+Last reconciled: 2026-10-29, after the running install was updated to
+`d28ea6b` (master view). Earlier reconciliations: 2026-10-28 (install
+updates to `d3dd761` and `85afa63`), 2026-10-26 (Board, rules line, and local
 deployment acceptance) and 2026-09-11 (trusted-local live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
@@ -33,6 +33,30 @@ The owner decided that backups happen only when they run `backup`.
 `doctor` reports backup state without failing on it. The job on the running
 Mac was unloaded and its plist moved out of `LaunchAgents`. Install updates no
 longer require a backup first; the owner may take one when they choose.
+
+## Running install update to `d28ea6b` (2026-10-29)
+
+With owner approval, the running install was updated to `origin/main`
+`d28ea6b`: the master view home page (PR #48) and its follow-up fixes
+(PR #49), plus manual-only backups (PR #47). The install checkout moved from
+`d3dd761` by fast-forward. The app image running before the update is kept
+locally as the image tag `oneos-local:pre-d28ea6b`. The update changed no
+dependency, Dockerfile, Compose, or Caddy file.
+
+Before the update the containers were running inside the Colima VM but the
+host-side forwards had dropped: nothing listened on port 8443 and the Docker
+socket did not answer, so `stop` failed and `start` alone would not have
+repaired it (`colima start` is a no-op on a running profile). The VM was
+stopped with `colima stop -p oneos`, then `start` restarted it and rebuilt
+only the app image. No backup was taken: backups run only when the owner
+chooses (2026-10-28 decision).
+
+Afterwards `status` reported every component available and services running
+(backup: drive not connected, which no longer fails anything), `/healthz`
+answered 200, `/` redirected to sign-in, the app log showed no errors, and the
+running container holds the new templates, stylesheet, and `NoteUnreadable`
+handling. The vault's HEAD, status, worktree diff, and cached diff were
+byte-identical before and after.
 
 ## Running install update to `d3dd761` (2026-10-28)
 
