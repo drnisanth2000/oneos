@@ -280,6 +280,7 @@ MAX_DEPTH = 4
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 
 from . import action_receipts as _action_receipts  # noqa: E402
+from . import board as _board  # noqa: E402
 from . import config as _config  # noqa: E402
 from . import destinations as _destinations  # noqa: E402
 from . import entities as _entities  # noqa: E402
@@ -334,6 +335,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _action_receipts.ReceiptStoreIntegrityError: _CODES["E-TAMPER"],
     _action_receipts.ReceiptStoreUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],
+    _board.NoteUnreadable: _CODES["E-UNAVAILABLE"],
     _outbox.StaleProposalSource: _CODES["E-STALE"],
     _outbox.MissingProposalSource: _CODES["E-MISSING"],
     _outbox.ProposalFreshnessError: _CODES["E-STALE"],

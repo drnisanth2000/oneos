@@ -17,7 +17,7 @@ from .action_receipts import (
     ReceiptStoreIntegrityError,
     ReceiptStoreUnavailable,
 )
-from .board import BoardCard, BoardLink, _sort_cards, entity_cards
+from .board import BoardCard, BoardLink, NoteUnreadable, _sort_cards, entity_cards
 from .config import VaultRootUnavailable
 from .console_routing import failure_contract
 from .entities import EntityManifestError, EntitySelectionError
@@ -33,9 +33,8 @@ _SORTS = (("updated", "Updated"), ("title", "Title"))
 _TONES = 6
 _DONE_LIMIT = 10
 
-#: Per-entity failures the page reports and survives. The same classes as the
-#: Board route catches, plus a redirected directory, and an unreadable or
-#: non-UTF-8 note (`describe()` reports those as E-UNKNOWN, by class only).
+#: Per-entity failures the page reports and survives: the same classes as the
+#: Board route catches, plus a redirected directory.
 _ENTITY_FAILURES = (
     OutboxError,
     CrossScopeError,
@@ -46,9 +45,15 @@ _ENTITY_FAILURES = (
     ReceiptStoreIntegrityError,
     ReceiptStoreUnavailable,
     RedirectedPathError,
-    UnicodeDecodeError,
-    OSError,
+    # `entity_cards` raises it for an unreadable inbox or filed note.
+    NoteUnreadable,
 )
+
+#: A raw OSError or UnicodeDecodeError that still escapes `entity_cards` (for
+#: example from listing a directory) is recorded
+#: as `NoteUnreadable` ("a file could not be read"), so the page does not say
+#: E-UNKNOWN. This is local to this page; no other route's message changes.
+_NOTE_READ_FAILURES = (UnicodeDecodeError, OSError)
 
 
 def stage_of(card: BoardCard) -> str:
@@ -155,6 +160,7 @@ def load_master(
     bundles = vault.bundles()
     on_disk = [(index, bundle) for index, bundle in enumerate(bundles) if bundle.on_disk]
     chosen = tuple(bundle.slug for _, bundle in on_disk if bundle.slug in entities)
+    # No selected slug is on disk (all unknown, or the only one went away): show every entity.
     reading = [(i, b) for i, b in on_disk if not chosen or b.slug in chosen]
 
     stages: dict[str, list[MasterCard]] = {key: [] for key in STAGES}
@@ -166,6 +172,11 @@ def load_master(
             cards = entity_cards(scope_for(bundle.slug), vault)
         except _ENTITY_FAILURES as exc:
             failures.append(EntityFailure(bundle.label, exc))
+            continue
+        except _NOTE_READ_FAILURES as exc:  # any file read in this entity
+            unreadable = NoteUnreadable("note could not be read")
+            unreadable.__cause__ = exc
+            failures.append(EntityFailure(bundle.label, unreadable))
             continue
 
         def wrap(card: BoardCard) -> MasterCard:

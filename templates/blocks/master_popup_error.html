@@ -1,0 +1,10 @@
+{# A described error shown in the master popup. Same header and close button as
+   master_popup.html; the error itself is the shared alert. #}
+{% from "_icon.html" import icon %}
+<header class="sheet-head master-popup-head">
+  <h2 id="master-popup-title">Card unavailable</h2>
+  <button type="button" class="icon-button" onclick="this.closest('dialog').close()">
+    {{ icon("close") }}<span class="sr-only">Close</span>
+  </button>
+</header>
+{% include "blocks/alert.html" %}

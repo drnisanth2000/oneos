@@ -24,7 +24,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .board import capture_note, entity_cards, load_board, note_body
+from .board import NoteUnreadable, capture_note, entity_cards, load_board, note_body
 from .action_receipts import (
     ActionReceipt,
     InvalidActionReceipt,
@@ -242,6 +242,7 @@ def _render_console_error(
     *,
     force_page_status: bool = False,
     action_error=None,
+    fragment_template: str = "blocks/alert.html",
 ) -> HTMLResponse:
     """Shared renderer for every described Console error (design §5): route
     shape first, then HX-Request, decides fragment vs. page; status follows
@@ -266,7 +267,7 @@ def _render_console_error(
                 status_code=status_for(action_error, fragment),
             )
         return templates.TemplateResponse(
-            request, "blocks/alert.html", {"error": error}, status_code=status,
+            request, fragment_template, {"error": error}, status_code=status,
         )
     # design §6: the error page cannot include the sidebar when the sidebar
     # itself is unreadable — `_sidebar.html` iterates bundles and
@@ -613,6 +614,7 @@ _BOARD_CATCHES = (
     InvalidActionReceipt,
     ReceiptStoreIntegrityError,
     ReceiptStoreUnavailable,
+    NoteUnreadable,
 )
 
 
@@ -702,7 +704,11 @@ def master_card(request: Request, scope: EntityScope, path: str = "") -> HTMLRes
                 "body": note_body(scope, card.relative_path),
             }
     except _BOARD_CATCHES as exc:
-        return _render_console_error(request, describe(exc))
+        # The popup dialog has no other way to close than Escape and the
+        # backdrop, so its error view carries the same close button.
+        return _render_console_error(
+            request, describe(exc), fragment_template="blocks/master_popup_error.html"
+        )
     return templates.TemplateResponse(request, "blocks/master_popup.html", context)
 
 

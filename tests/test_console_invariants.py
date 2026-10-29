@@ -1594,7 +1594,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         RecipientConfigurationError,
         SystemRegistryPathError,
     )
-    from app.board import entity_cards, note_body
+    from app.board import NoteUnreadable, entity_cards, note_body
     from app.inbox import read_inbox
     from app.ingest.base import IngestError
     from app.phase3 import CleanupError
@@ -1727,7 +1727,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         "app.phase3.confirm_frozen": ((CleanupError,), ()),
         "app.phase3.recover_selected": ((CleanupError,), ()),
         "app.board.entity_cards": (
-            (DestinationRegistryError, RedirectedPathError),
+            (DestinationRegistryError, RedirectedPathError, NoteUnreadable),
             (read_inbox, project_outbox),
         ),
         "app.board.load_board": (
@@ -1735,7 +1735,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
             (entity_cards, note_body),
         ),
         "app.board.capture_note": ((IngestError, CrossScopeError), ()),
-        "app.board.note_body": ((CrossScopeError,), ()),
+        "app.board.note_body": ((CrossScopeError, NoteUnreadable), ()),
         "app.master.load_master": (
             (DestinationRegistryError, EntityManifestError, VaultRootUnavailable),
             (),

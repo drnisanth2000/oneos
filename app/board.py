@@ -24,6 +24,13 @@ from .outbox import Proposal, project_outbox
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
+
+class NoteUnreadable(Exception):
+    """A note could not be read: its bytes are not UTF-8 text, or the read
+    itself failed. Raised ``from`` the original error, which is kept as
+    ``__cause__`` and never shown to the operator."""
+
+
 _INBOX_MODULE = "00-inbox"
 _VIEWS = frozenset({"board", "list", "gallery", "calendar", "planner", "map"})
 _GROUPS = frozenset({"review", "status", "sub", "module"})
@@ -276,7 +283,11 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
         block = vault.block_of(module)
         for discovered in sorted(directory.glob("*.md")):
             path = _require_real_note(directory, discovered)
-            fm, _body = split_front_matter(path.read_text(encoding="utf-8"))
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as exc:
+                raise NoteUnreadable("note could not be read") from exc
+            fm, _body = split_front_matter(text)
             title = _text(fm.get("title")) or path.stem
             relative = scope.vault_relative(path)
             cards.append(
@@ -304,12 +315,16 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
 
 
 @structured_reader(category="front-matter")
-@failure_contract(raises=(CrossScopeError,))
+@failure_contract(raises=(CrossScopeError, NoteUnreadable))
 def note_body(scope: Scope, relative: str) -> str:
     path = scope.resolve_stored(relative)
     if path.is_symlink() or not path.is_file() or path.resolve() != path:
         raise RedirectedPathError("module note is redirected")
-    _fm, body = split_front_matter(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as exc:
+        raise NoteUnreadable("note could not be read") from exc
+    _fm, body = split_front_matter(text)
     return body
 
 
@@ -379,12 +394,16 @@ class EntityCards:
 
 
 @failure_contract(
-    raises=(DestinationRegistryError, RedirectedPathError),
+    raises=(DestinationRegistryError, RedirectedPathError, NoteUnreadable),
     calls=(read_inbox, project_outbox),
 )
 def entity_cards(scope: Scope, vault: Vault) -> EntityCards:
     """Read one entity's inbox, proposed and filed cards. Reads only."""
-    inbox = _inbox_cards(scope, vault, read_inbox(scope))
+    try:
+        items = read_inbox(scope)
+    except (UnicodeDecodeError, OSError) as exc:
+        raise NoteUnreadable("note could not be read") from exc
+    inbox = _inbox_cards(scope, vault, items)
     proposed, blocked = _proposal_cards(scope, project_outbox(scope))
     filed = _read_filed(scope, vault)
     return EntityCards(
