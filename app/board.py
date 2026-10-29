@@ -283,7 +283,11 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
         block = vault.block_of(module)
         for discovered in sorted(directory.glob("*.md")):
             path = _require_real_note(directory, discovered)
-            fm, _body = split_front_matter(path.read_text(encoding="utf-8"))
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as exc:
+                raise NoteUnreadable("note could not be read") from exc
+            fm, _body = split_front_matter(text)
             title = _text(fm.get("title")) or path.stem
             relative = scope.vault_relative(path)
             cards.append(
@@ -390,12 +394,16 @@ class EntityCards:
 
 
 @failure_contract(
-    raises=(DestinationRegistryError, RedirectedPathError),
+    raises=(DestinationRegistryError, RedirectedPathError, NoteUnreadable),
     calls=(read_inbox, project_outbox),
 )
 def entity_cards(scope: Scope, vault: Vault) -> EntityCards:
     """Read one entity's inbox, proposed and filed cards. Reads only."""
-    inbox = _inbox_cards(scope, vault, read_inbox(scope))
+    try:
+        items = read_inbox(scope)
+    except (UnicodeDecodeError, OSError) as exc:
+        raise NoteUnreadable("note could not be read") from exc
+    inbox = _inbox_cards(scope, vault, items)
     proposed, blocked = _proposal_cards(scope, project_outbox(scope))
     filed = _read_filed(scope, vault)
     return EntityCards(

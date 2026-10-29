@@ -1727,7 +1727,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         "app.phase3.confirm_frozen": ((CleanupError,), ()),
         "app.phase3.recover_selected": ((CleanupError,), ()),
         "app.board.entity_cards": (
-            (DestinationRegistryError, RedirectedPathError),
+            (DestinationRegistryError, RedirectedPathError, NoteUnreadable),
             (read_inbox, project_outbox),
         ),
         "app.board.load_board": (

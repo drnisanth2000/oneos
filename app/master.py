@@ -45,12 +45,13 @@ _ENTITY_FAILURES = (
     ReceiptStoreIntegrityError,
     ReceiptStoreUnavailable,
     RedirectedPathError,
-    # Listed defensively: `entity_cards` does not call `note_body` today.
+    # `entity_cards` raises it for an unreadable inbox or filed note.
     NoteUnreadable,
 )
 
-#: Any OSError or UnicodeDecodeError while reading an entity is recorded as
-#: `NoteUnreadable` ("a file could not be read"), so the page does not say
+#: A raw OSError or UnicodeDecodeError that still escapes `entity_cards` (for
+#: example from listing a directory) is recorded
+#: as `NoteUnreadable` ("a file could not be read"), so the page does not say
 #: E-UNKNOWN. This is local to this page; no other route's message changes.
 _NOTE_READ_FAILURES = (UnicodeDecodeError, OSError)
 

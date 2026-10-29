@@ -605,3 +605,32 @@ def test_master_card_has_hover_and_keyboard_focus_feedback():
         _CSS,
     )
     assert rule and "var(--shadow-md)" in rule.group(0)
+
+
+def test_popup_for_a_good_note_survives_another_garbled_note(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Good", status="draft")
+    path = _card_path(main, "alpha", "Good")
+    _break_note_encoding(_note(tmp_path, "alpha", "02-work", "Garbled", status="draft"))
+    response = client.get("/master/card/alpha", params={"path": path})
+    assert response.status_code == 200
+    assert "E-UNAVAILABLE" in response.text and "E-UNKNOWN" not in response.text
+    assert re.search(r"this\.closest\('dialog'\)\.close\(\).*?sr-only\">Close<", response.text, re.S)
+    for leaked in (str(tmp_path), "Garbled.md", "codec", "0xff", "Traceback"):
+        assert leaked not in response.text
+
+
+def test_board_page_with_a_garbled_filed_note_is_described(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _break_note_encoding(_note(tmp_path, "alpha", "02-work", "Garbled", status="draft"))
+    response = client.get("/board/alpha")
+    assert "E-UNAVAILABLE" in response.text and "E-UNKNOWN" not in response.text
+    for leaked in (str(tmp_path), "Garbled.md", "codec", "0xff", "Traceback"):
+        assert leaked not in response.text
+
+
+def test_board_page_with_an_unreadable_inbox_note_is_described(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _break_note_encoding(_note(tmp_path, "alpha", "00-inbox", "Mail", sub="triage"))
+    response = client.get("/board/alpha")
+    assert "E-UNAVAILABLE" in response.text and "E-UNKNOWN" not in response.text
