@@ -25,11 +25,10 @@ from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
 
-
 class NoteUnreadable(Exception):
     """A note could not be read: its bytes are not UTF-8 text, or the read
     itself failed. Raised ``from`` the original error, which is kept as
-    ``__cause__`` for the log and never shown to the operator."""
+    ``__cause__`` and never shown to the operator."""
 
 
 _INBOX_MODULE = "00-inbox"

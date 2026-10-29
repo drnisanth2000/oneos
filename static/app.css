@@ -867,9 +867,12 @@ a.board-chip:hover { background: var(--fill-strong); }
   .master-filters .segmented { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
   .master-filters .segment { justify-content: center; }
   /* Each segment is at least as wide as its own label and count, so
-     "To review" is never cut; the spare width is shared out equally. */
+     "To review" is never cut; the spare width is shared out equally. If the
+     counts ever grow too wide, the switcher scrolls inside itself rather than
+     pushing the page sideways. */
   .master-stages {
     display: grid; grid-auto-flow: column; grid-auto-columns: minmax(max-content, 1fr);
+    overflow-x: auto; scrollbar-width: none;
     margin-bottom: var(--space-3);
   }
   .review-surface .master-stages .segment {

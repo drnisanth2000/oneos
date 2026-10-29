@@ -564,12 +564,17 @@ def test_popup_for_an_unreadable_note_is_described_with_a_close_button(tmp_path,
         assert response.status_code == 200
         assert "E-UNAVAILABLE" in response.text and "could not be read" in response.text
         assert "E-UNKNOWN" not in response.text
-        assert "sr-only\">Close<" in response.text and "dialog" in response.text
+        assert re.search(
+            r"<button type=\"button\" class=\"icon-button\" "
+            r"onclick=\"this\.closest\('dialog'\)\.close\(\)\">.*?"
+            r"<span class=\"sr-only\">Close</span>\s*</button>",
+            response.text, re.S,
+        )
         for leaked in (str(tmp_path), "Permission denied", "codec", "0xff", "Traceback"):
             assert leaked not in response.text
 
 
-def test_popup_not_found_and_error_views_both_close(tmp_path, monkeypatch):
+def test_popup_for_a_missing_card_has_a_close_button(tmp_path, monkeypatch):
     main, client = _client(tmp_path, monkeypatch)
     html = client.get("/master/card/alpha", params={"path": "nope.md"}).text
     assert "sr-only\">Close<" in html

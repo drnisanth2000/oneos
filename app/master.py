@@ -45,11 +45,13 @@ _ENTITY_FAILURES = (
     ReceiptStoreIntegrityError,
     ReceiptStoreUnavailable,
     RedirectedPathError,
+    # Listed defensively: `entity_cards` does not call `note_body` today.
     NoteUnreadable,
 )
 
-#: Raw read failures from a note. They are recorded as `NoteUnreadable`, so the
-#: page says "could not be read" rather than E-UNKNOWN, and only for this page.
+#: Any OSError or UnicodeDecodeError while reading an entity is recorded as
+#: `NoteUnreadable` ("a file could not be read"), so the page does not say
+#: E-UNKNOWN. This is local to this page; no other route's message changes.
 _NOTE_READ_FAILURES = (UnicodeDecodeError, OSError)
 
 
@@ -170,7 +172,7 @@ def load_master(
         except _ENTITY_FAILURES as exc:
             failures.append(EntityFailure(bundle.label, exc))
             continue
-        except _NOTE_READ_FAILURES as exc:
+        except _NOTE_READ_FAILURES as exc:  # any file read in this entity
             unreadable = NoteUnreadable("note could not be read")
             unreadable.__cause__ = exc
             failures.append(EntityFailure(bundle.label, unreadable))
