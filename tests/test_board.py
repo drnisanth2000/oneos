@@ -408,3 +408,158 @@ def test_entity_cards_returns_each_lane(tmp_path, monkeypatch):
     assert [c.title for c in cards.inbox] == ["Waiting"]
     assert cards.proposed == () and cards.blocked is False
     assert note_body(scope, cards.filed[0].relative_path).strip() == "Body"
+
+
+# --- List view follows the selected Group -----------------------------------
+
+def _list_groups(html: str) -> list[dict]:
+    """One dict per list-group section: label, count, missing flag and note titles."""
+    import re
+
+    groups = []
+    for match in re.finditer(
+        r'<section class="list-group([^"]*)"[^>]*aria-labelledby="([^"]+)"[^>]*>(.*?)</section>',
+        html,
+        re.S,
+    ):
+        classes, labelled_by, inner = match.groups()
+        heading = re.search(
+            r'<h2 id="%s">\s*<span class="column-label">(.*?)</span>\s*<span class="count">(\d+)</span>'
+            % re.escape(labelled_by),
+            inner,
+            re.S,
+        )
+        assert heading, f"section {labelled_by} lacks a labelled h2 with a count"
+        groups.append(
+            {
+                "label": heading.group(1).strip(),
+                "count": int(heading.group(2)),
+                "missing": "missing" in classes.split(),
+                "titles": re.findall(r'<article class="board-card[^>]*>.*?<h3>.*?>([A-Za-z]+)</(?:a|span)>', inner, re.S),
+                "html": inner,
+            }
+        )
+    return groups
+
+
+def test_list_view_groups_by_status_in_sort_order(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Olderopen", status="open", updated="2024-01-01")
+    _note(tmp_path, "alpha", "02-work", "Newestopen", status="open", updated="2024-09-01")
+    _note(tmp_path, "alpha", "02-work", "Finished", status="done", updated="2024-05-01")
+
+    response = client.get("/board/alpha", params={"view": "list", "group": "status"})
+    board = client.get("/board/alpha", params={"view": "board", "group": "status"})
+
+    assert response.status_code == 200
+    groups = _list_groups(response.text)
+    by_label = {g["label"].lower(): g for g in groups}
+    assert by_label["open"]["titles"] == ["Newestopen", "Olderopen"]
+    assert by_label["open"]["count"] == 2
+    assert by_label["done"]["titles"] == ["Finished"]
+    assert by_label["done"]["count"] == 1
+    # Same groups, same order, same labels as the Board view's columns.
+    import re
+
+    board_labels = re.findall(r'<h2><span class="column-label">(.*?)</span>', board.text)
+    assert [g["label"] for g in groups] == board_labels
+
+
+def test_list_view_groups_by_module_with_module_headings(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Workone")
+    _note(tmp_path, "alpha", "01-core", "Coreone")
+
+    response = client.get("/board/alpha", params={"view": "list", "group": "module"})
+
+    groups = {g["label"]: g for g in _list_groups(response.text)}
+    assert groups["02-work"]["titles"] == ["Workone"]
+    assert groups["01-core"]["titles"] == ["Coreone"]
+    assert 'aria-label="Group by"' in response.text  # toolbar still present
+    # The heading already names the module, so the rows do not repeat it.
+    assert all('class="mod-name"' not in g["html"] for g in groups.values())
+
+
+def test_list_view_groups_by_category(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Recordnote", sub="records")
+    _note(tmp_path, "alpha", "02-work", "Journalnote", sub="journal")
+
+    response = client.get("/board/alpha", params={"view": "list", "group": "sub"})
+
+    groups = {g["label"]: g for g in _list_groups(response.text)}
+    assert groups["records"]["titles"] == ["Recordnote"]
+    assert groups["journal"]["titles"] == ["Journalnote"]
+
+
+def test_list_view_review_group_shows_inbox_and_stays_undraggable(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "00-inbox", "Intake", sub="triage", title="Intake")
+    (tmp_path / "alpha" / "02-work" / "active").mkdir(exist_ok=True)
+
+    response = client.get("/board/alpha", params={"view": "list", "group": "review"})
+
+    groups = {g["label"]: g for g in _list_groups(response.text)}
+    assert groups["Inbox"]["titles"] == ["Intake"]
+    assert groups["Inbox"]["count"] == 1
+    assert 'draggable="true"' not in response.text
+    assert "@drop.prevent" not in response.text
+    assert "@dragover" not in response.text
+
+
+def test_list_view_skips_empty_groups_but_keeps_missing_warning(tmp_path, monkeypatch):
+    entities = """
+version: "1.0"
+entities:
+  alpha: {label: Alpha, flags: [special]}
+  other: {label: Other, flags: []}
+"""
+    _main, client = _client(tmp_path, monkeypatch, entities)
+    _note(tmp_path, "alpha", "02-work", "Onlyone")
+
+    response = client.get("/board/alpha", params={"view": "list", "group": "module"})
+    board = client.get("/board/alpha", params={"view": "board", "group": "module"})
+
+    groups = _list_groups(response.text)
+    labels = [g["label"] for g in groups]
+    assert "02-work" in labels
+    assert "01-core" not in labels  # present on disk but empty: no section
+    missing = [g for g in groups if g["missing"]]
+    assert missing, "a required-but-missing module keeps its section"
+    assert "required by flags, missing on disk" in missing[0]["html"]
+    assert "No notes" not in response.text
+    # The Board view still shows the empty column, unchanged.
+    assert "01-core" in board.text
+
+
+def test_list_view_with_no_notes_says_no_notes_once(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+
+    response = client.get("/board/alpha", params={"view": "list", "group": "status"})
+
+    assert response.status_code == 200
+    assert _list_groups(response.text) == []
+    assert response.text.count("No notes") == 1
+
+
+def test_gallery_stays_a_flat_grid_whatever_the_group(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Galone", status="open")
+    _note(tmp_path, "alpha", "02-work", "Galtwo", status="done")
+
+    response = client.get("/board/alpha", params={"view": "gallery", "group": "status"})
+
+    assert 'class="board-gallery"' in response.text
+    assert "list-group" not in response.text
+    assert "Galone" in response.text and "Galtwo" in response.text
+
+
+def test_board_view_is_unchanged_by_the_list_grouping(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Boardone", status="open")
+
+    response = client.get("/board/alpha", params={"view": "board", "group": "status"})
+
+    assert 'class="board-columns"' in response.text
+    assert 'class="board-column' in response.text
+    assert "list-group" not in response.text

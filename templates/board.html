@@ -148,8 +148,24 @@
         {% endfor %}
       </div>
 
-      {% elif page.view == 'list' or page.view == 'gallery' %}
-      <div class="board-{{ page.view }}">
+      {% elif page.view == 'list' %}
+      {# One section per group, in the Board view's column order. Empty groups stay out,
+         except a column required by flags but missing on disk. #}
+      <div class="board-list board-list-groups">
+        {% for column in page.columns if column.cards or column.missing %}
+        <section class="list-group{% if column.missing %} missing{% endif %}" aria-labelledby="list-group-{{ loop.index }}">
+          <h2 id="list-group-{{ loop.index }}"><span class="column-label">{{ column.label }}</span> <span class="count">{{ column.cards|length }}</span></h2>
+          {% if column.missing %}<p class="bundle-warn">required by flags, missing on disk</p>{% endif %}
+          {% for card in column.cards %}
+          {% include "blocks/board_card.html" %}
+          {% endfor %}
+        </section>
+        {% endfor %}
+        {% if not (page.columns | selectattr('cards') | list) and not (page.columns | selectattr('missing') | list) %}<p class="muted">No notes</p>{% endif %}
+      </div>
+
+      {% elif page.view == 'gallery' %}
+      <div class="board-gallery">
         {% for card in page.cards %}
         {% include "blocks/board_card.html" %}
         {% endfor %}

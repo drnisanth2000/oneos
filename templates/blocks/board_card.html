@@ -19,8 +19,8 @@
     {% if card.formula %}
     <span class="board-chip">{% if card.formula_result is not none %}{{ card.formula_result }}{% else %}{{ card.formula }}{% endif %}</span>
     {% endif %}
-    {# On the module-grouped board the column already names the module. #}
-    {% if not (page.view == 'board' and page.group == 'module') %}
+    {# On the module-grouped board and list the heading already names the module. #}
+    {% if not (page.view in ('board', 'list') and page.group == 'module') %}
     <span class="card-module"><span class="mod-name">{{ card.module }}</span>
     {% if card.block %}<span class="block-tag">{{ card.block }}</span>{% endif %}</span>
     {% endif %}
