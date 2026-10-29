@@ -24,6 +24,14 @@ from .outbox import Proposal, project_outbox
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
+
+
+class NoteUnreadable(Exception):
+    """A note could not be read: its bytes are not UTF-8 text, or the read
+    itself failed. Raised ``from`` the original error, which is kept as
+    ``__cause__`` for the log and never shown to the operator."""
+
+
 _INBOX_MODULE = "00-inbox"
 _VIEWS = frozenset({"board", "list", "gallery", "calendar", "planner", "map"})
 _GROUPS = frozenset({"review", "status", "sub", "module"})
@@ -304,12 +312,16 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
 
 
 @structured_reader(category="front-matter")
-@failure_contract(raises=(CrossScopeError,))
+@failure_contract(raises=(CrossScopeError, NoteUnreadable))
 def note_body(scope: Scope, relative: str) -> str:
     path = scope.resolve_stored(relative)
     if path.is_symlink() or not path.is_file() or path.resolve() != path:
         raise RedirectedPathError("module note is redirected")
-    _fm, body = split_front_matter(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as exc:
+        raise NoteUnreadable("note could not be read") from exc
+    _fm, body = split_front_matter(text)
     return body
 
 

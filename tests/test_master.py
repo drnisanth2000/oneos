@@ -9,6 +9,7 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
+from app.board import NoteUnreadable
 from app.master import load_master
 from app.scope import CrossScopeError
 from tests.conftest import entities_yaml, scaffold_modules, write_vault
@@ -161,6 +162,16 @@ def test_entity_filter_and_done_limit(tmp_path, monkeypatch):
     assert page.done_all_href == "/?entity=alpha&sort=updated&done=all"
 
 
+def test_an_unmatched_selection_shows_every_entity(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+    _note(tmp_path, "beta1", "02-work", "Filing", status="draft")
+    page = load_master(vault, main.build_scope, entities=("nope",), sort="", done_all=False,
+                       now=datetime(2026, 10, 29, 9))
+    assert {m.entity for m in page.columns[0].cards} == {"alpha", "beta1"}
+    assert [c.active for c in page.chips] == [False, False]
+
+
 def test_proposed_inbox_item_appears_once(tmp_path, monkeypatch):
     main, vault = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
     _inbox_with_proposal(tmp_path, "alpha", "marker.md")
@@ -197,7 +208,9 @@ def test_note_with_invalid_utf8_fails_only_its_entity(tmp_path, monkeypatch):
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
                        now=datetime(2026, 10, 29, 9))
     assert [f.entity_label for f in page.failures] == ["Alpha"]
-    assert isinstance(page.failures[0].error, UnicodeDecodeError)
+    error = page.failures[0].error
+    assert isinstance(error, NoteUnreadable)
+    assert isinstance(error.__cause__, UnicodeDecodeError)
     assert [m.card.title for m in page.columns[0].cards] == ["Still here"]
 
 
@@ -216,7 +229,9 @@ def test_oserror_reading_a_note_fails_only_its_entity(tmp_path, monkeypatch):
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
                        now=datetime(2026, 10, 29, 9))
     assert [f.entity_label for f in page.failures] == ["Alpha"]
-    assert isinstance(page.failures[0].error, PermissionError)
+    error = page.failures[0].error
+    assert isinstance(error, NoteUnreadable)
+    assert isinstance(error.__cause__, PermissionError)
     assert [m.card.title for m in page.columns[0].cards] == ["Still here"]
 
 
@@ -229,7 +244,8 @@ def test_home_survives_an_unreadable_note_and_describes_it(tmp_path, monkeypatch
     assert "Filing" in response.text
     blocks = re.findall(r'<section class="master-failure".*?</section>', response.text, re.S)
     assert len(blocks) == 1
-    assert "Alpha" in blocks[0] and 'class="alert' in blocks[0] and "E-UNKNOWN" in blocks[0]
+    assert "Alpha" in blocks[0] and 'class="alert' in blocks[0] and "E-UNAVAILABLE" in blocks[0]
+    assert "E-UNKNOWN" not in blocks[0] and "could not be read" in blocks[0]
     # Described by class only: no path, byte value or exception text reaches the page.
     for leaked in (str(tmp_path), "Garbled.md", "codec", "0xff", "Traceback"):
         assert leaked not in response.text
@@ -512,3 +528,58 @@ def test_done_all_offers_a_way_back_to_recent(tmp_path, monkeypatch):
     page = load_master(main.Vault(main.current_catalog()), main.build_scope, entities=("alpha",),
                        sort="title", done_all=True, now=datetime(2026, 10, 29, 9))
     assert page.done_recent_href == "/?entity=alpha&sort=title"
+
+
+def _arm_body_failure(main, monkeypatch, error):
+    """Let the listing read the note, then make only the popup's body read fail."""
+    state = {"armed": False}
+    real_cards, real_read = main.entity_cards, Path.read_text
+
+    def cards(*args, **kwargs):
+        try:
+            return real_cards(*args, **kwargs)
+        finally:
+            state["armed"] = True
+
+    def read_text(self, *args, **kwargs):
+        if state["armed"] and self.suffix == ".md":
+            raise error
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(main, "entity_cards", cards)
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+
+def test_popup_for_an_unreadable_note_is_described_with_a_close_button(tmp_path, monkeypatch):
+    for error in (
+        PermissionError(13, "Permission denied"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ):
+        main, client = _client(tmp_path, monkeypatch)
+        _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+        path = _card_path(main, "alpha", "Spec")
+        with monkeypatch.context() as patch:
+            _arm_body_failure(main, patch, error)
+            response = client.get("/master/card/alpha", params={"path": path})
+        assert response.status_code == 200
+        assert "E-UNAVAILABLE" in response.text and "could not be read" in response.text
+        assert "E-UNKNOWN" not in response.text
+        assert "sr-only\">Close<" in response.text and "dialog" in response.text
+        for leaked in (str(tmp_path), "Permission denied", "codec", "0xff", "Traceback"):
+            assert leaked not in response.text
+
+
+def test_popup_not_found_and_error_views_both_close(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    html = client.get("/master/card/alpha", params={"path": "nope.md"}).text
+    assert "sr-only\">Close<" in html
+
+
+def test_card_link_encodes_the_entity_slug(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    main, _vault_ = _vault(tmp_path, monkeypatch)
+    card = SimpleNamespace(title="T", relative_path="a b/c.md", lane="filed", updated="")
+    item = SimpleNamespace(card=card, entity="we ird/slug", entity_label="W", tone=1)
+    html = main.templates.env.get_template("blocks/master_card.html").render(item=item)
+    assert 'hx-get="/master/card/we%20ird/slug?path=a%20b/c.md"' in html

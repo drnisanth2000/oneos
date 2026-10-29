@@ -2,7 +2,7 @@
    read-only popup into the dialog outside #master (see home.html). Reads only. #}
 {% from "_icon.html" import file_icon %}
 <button type="button" class="board-card master-card"
-        hx-get="/master/card/{{ item.entity }}?path={{ item.card.relative_path | urlencode }}"
+        hx-get="/master/card/{{ item.entity | urlencode }}?path={{ item.card.relative_path | urlencode }}"
         hx-target="#master-popup" hx-swap="innerHTML">
   <span class="master-card-title">
     <span class="card-icon">{{ file_icon(item.card.title) }}</span>
