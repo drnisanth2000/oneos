@@ -51,13 +51,15 @@ security add-trusted-cert -r trustRoot -k "$HOME/Library/Keychains/login.keychai
 
 `stop` stops this Compose project. It remains stopped until `start` or the next
 login. `install-login` explicitly installs one user LaunchAgent, startup at
-login. It never starts a previously stopped app, runs only after login, and
-cannot promise service availability during sleep. Reinstallation refuses an
+login. It runs only after login and cannot promise service availability during
+sleep. A `stop` from before login does not prevent that startup; only a stop
+requested while it waits cancels it (see below). Reinstallation refuses an
 existing job file so an operator can inspect it. To disable it, unload the
 exact `local.oneos.login` plist with `launchctl bootout`.
 
 Backups run only when the owner chooses to run `backup` (owner decision,
-2026-10-28); nothing schedules them, and no task or update waits on one. An
+2026-10-28); nothing schedules them, and no task or update requires a backup
+first. The login job may still wait for a backup that is already running. An
 older install may still have the former hourly `local.oneos.backup` job: unload
 it with `launchctl bootout gui/$(id -u)/local.oneos.backup` and move its plist
 out of `~/Library/LaunchAgents` so it does not load at the next login. The
@@ -77,7 +79,7 @@ paths, credentials, or volume identities. Authentication inspection does not
 write to its database; active journal sidecars report busy. The app still
 performs full credential-state validation. `doctor` exits nonzero for unavailable,
 failed, or incomplete components or enrollment. Backup state (not configured,
-drive not connected, never run, older than a day, failed) is reported with its
+drive not connected or not verified, never run, older than a day, failed) is reported with its
 next action but never fails `doctor`, because backing up is the owner's choice.
 `status` succeeds when it can provide the report. CLI failures include an allowlisted reason code and next
 action; failed-backup status retains the corresponding safe message. Raw command

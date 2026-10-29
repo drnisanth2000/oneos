@@ -327,7 +327,7 @@ def diagnostics(config):
         try:
             validate_volume(config['backup'])
         except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-            result['backup'] = finding('disconnected', 'Backup drive not connected. Back up whenever you choose: connect it and run backup.')
+            result['backup'] = finding('disconnected', 'Backup drive not connected or not verified. Back up whenever you choose: connect the configured drive, check it is the same drive, and run backup.')
         else:
             try:
                 status = json.loads(private_file(Path(config['state_dir']) / 'status/backup-status.json').read_text())
