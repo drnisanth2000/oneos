@@ -43,6 +43,14 @@ document.addEventListener('click', (event) => {
 
   <div class="sidebar-scroll">
     <p class="sidebar-heading">Workspaces</p>
+    {% set on_home = request.url.path == "/" %}
+    <ul class="modules sidebar-home">
+      <li class="module-row{% if on_home %} is-current{% endif %}">
+        <a class="mod-link" href="/"{% if on_home %} aria-current="page"{% endif %}>
+          {{ icon("home") }}<span class="mod-name">Home</span>
+        </a>
+      </li>
+    </ul>
     {% for b in bundles %}
     <div class="bundle" data-slug="{{ b.slug }}">
       <div class="bundle-head" role="button" tabindex="0"

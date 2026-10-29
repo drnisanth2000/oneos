@@ -18,6 +18,7 @@ from .action_receipts import (
     ReceiptStoreUnavailable,
 )
 from .board import BoardCard, BoardLink, _sort_cards, entity_cards
+from .config import VaultRootUnavailable
 from .console_routing import failure_contract
 from .entities import EntityManifestError, EntitySelectionError
 from .outbox import OutboxError
@@ -27,6 +28,7 @@ from .vault import DestinationRegistryError, Vault
 STAGES = ("draft", "waiting", "review", "done")
 _LABELS = {"draft": "Draft", "waiting": "Waiting", "review": "To review", "done": "Done"}
 _FILED_STAGE = {"draft": "draft", "waiting": "waiting", "done": "done", "active": "done"}
+OTHER_STAGE = "other"
 _SORTS = (("updated", "Updated"), ("title", "Title"))
 _TONES = 6
 _DONE_LIMIT = 10
@@ -44,6 +46,22 @@ _ENTITY_FAILURES = (
     ReceiptStoreUnavailable,
     RedirectedPathError,
 )
+
+
+def stage_of(card: BoardCard) -> str:
+    """The STAGES key a card belongs to, or ``"other"`` for an unlisted status."""
+    if card.lane in ("inbox", "proposed"):
+        return "review"
+    return _FILED_STAGE.get(card.status.strip().lower(), OTHER_STAGE)
+
+
+def stage_label(stage: str) -> str:
+    return _LABELS.get(stage, "Another status")
+
+
+def entity_tone(index: int) -> int:
+    """The chip colour (1..6) for the entity at `index` in registry order."""
+    return index % _TONES + 1
 
 
 @dataclass(frozen=True)
@@ -90,6 +108,7 @@ class MasterPage:
     failures: tuple[EntityFailure, ...]
     done_all: bool
     done_all_href: str
+    done_recent_href: str
 
 
 def _greeting(now: datetime) -> str:
@@ -113,7 +132,12 @@ def _ordered(masters: list[MasterCard], sort: str) -> list[MasterCard]:
     return [by_card[id(card)] for card in _sort_cards([m.card for m in masters], sort)]
 
 
-@failure_contract(raises=(DestinationRegistryError,), calls=(entity_cards,))
+# Per-entity read failures are reported on the page, not raised, so
+# `entity_cards` is a contained call; only the bundle listing (via
+# `vault.bundles()`) and the vault root can fail the whole page.
+@failure_contract(
+    raises=(DestinationRegistryError, EntityManifestError, VaultRootUnavailable)
+)
 def load_master(
     vault: Vault,
     scope_for: Callable[[str], Scope],
@@ -134,7 +158,7 @@ def load_master(
     other: list[MasterCard] = []
     failures: list[EntityFailure] = []
     for index, bundle in reading:
-        tone = index % _TONES + 1
+        tone = entity_tone(index)
         try:
             cards = entity_cards(scope_for(bundle.slug), vault)
         except _ENTITY_FAILURES as exc:
@@ -151,8 +175,8 @@ def load_master(
             if card.relative_path not in proposed_paths:
                 stages["review"].append(wrap(card))
         for card in cards.filed:
-            stage = _FILED_STAGE.get(card.status.strip().lower())
-            (stages[stage] if stage else other).append(wrap(card))
+            stage = stage_of(card)
+            (other if stage == OTHER_STAGE else stages[stage]).append(wrap(card))
 
     columns = []
     for key in STAGES:
@@ -169,7 +193,7 @@ def load_master(
         EntityChip(
             slug=bundle.slug,
             label=bundle.label,
-            tone=index % _TONES + 1,
+            tone=entity_tone(index),
             active=bundle.slug in chosen,
             # Each chip links to the selection with that entity toggled.
             href=_href(
@@ -196,5 +220,6 @@ def load_master(
         failures=tuple(failures),
         done_all=done_all,
         done_all_href=_href(chosen, selected_sort, True),
+        done_recent_href=_href(chosen, selected_sort, False),
     )
 

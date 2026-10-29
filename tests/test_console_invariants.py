@@ -1534,6 +1534,8 @@ EXPECTED_CONTRACTED_BOUNDARIES = (
     ("app.board", "entity_cards"),
     ("app.board", "load_board"),
     ("app.board", "capture_note"),
+    ("app.board", "note_body"),
+    ("app.master", "load_master"),
 )
 
 
@@ -1561,7 +1563,7 @@ def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypat
 
     main = _load_console_app(tmp_path, monkeypatch)
     qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
-    assert len(qualified) == 28
+    assert len(qualified) == 30
     assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
 
     missing = []
@@ -1592,7 +1594,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         RecipientConfigurationError,
         SystemRegistryPathError,
     )
-    from app.board import entity_cards
+    from app.board import entity_cards, note_body
     from app.inbox import read_inbox
     from app.ingest.base import IngestError
     from app.phase3 import CleanupError
@@ -1730,9 +1732,14 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         ),
         "app.board.load_board": (
             (DestinationRegistryError, RedirectedPathError),
-            (entity_cards,),
+            (entity_cards, note_body),
         ),
         "app.board.capture_note": ((IngestError, CrossScopeError), ()),
+        "app.board.note_body": ((CrossScopeError,), ()),
+        "app.master.load_master": (
+            (DestinationRegistryError, EntityManifestError, VaultRootUnavailable),
+            (),
+        ),
     }
 
     boundaries = _inventory_objects(main)
@@ -1951,7 +1958,8 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
             "app.inbox.read_inbox",
             "app.outbox.project_outbox",
         },
-        "app.board.load_board": {"app.board.entity_cards"},
+        "app.board.load_board": {"app.board.entity_cards", "app.board.note_body"},
+        "app.master.load_master": {"app.board.entity_cards"},
     }
 
     actual = {}
@@ -1989,9 +1997,11 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
             "app.inbox.read_inbox",
             "app.outbox.project_outbox",
         },
-        "app.board.load_board": {"app.board.entity_cards"},
+        "app.board.load_board": {"app.board.entity_cards", "app.board.note_body"},
     }
     summarized_or_contained_edges = {
+        # Each entity's read failures are caught and reported on the page.
+        "app.master.load_master": {"app.board.entity_cards"},
         "app.outbox.project_outbox": {
             "app.outbox.pending_proposal_entry_exists",
             "app.proposal_identity.require_proposal_id",
@@ -2058,7 +2068,8 @@ def _expected_route_services(main):
     return {
         health_endpoints["/healthz"]: (),
         health_endpoints["/readyz"]: (main.Vault.bundles,),
-        main.shell: (main.Vault.bundles,),
+        main.shell: (main.load_master, main.Vault.bundles),
+        main.master_card: (main.entity_cards, main.note_body),
         main.pulse: (),
         main.board_default: (main.Vault.bundles,),
         main.board: (main.load_board, main.Vault.bundles),
@@ -2121,9 +2132,9 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
-    assert sum(len(services) for services in expected.values()) == 50
+    assert sum(len(services) for services in expected.values()) == 53
     endpoints = list(_registered_console_endpoints(main.app))
-    assert len(endpoints) == 23, endpoints
+    assert len(endpoints) == 24, endpoints
     assert set(endpoints) == set(expected), (
         "registered route/service inventory mismatch: "
         f"missing={set(endpoints) - set(expected)}, "

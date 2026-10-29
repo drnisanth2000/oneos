@@ -3894,6 +3894,12 @@ def _route_totality_plan(main) -> dict:
             "request": lambda c, submitted=None: c.get("/"),
             "patch_targets": [(main.Vault, "bundles")],
         },
+        main.master_card: {
+            "request": lambda c, submitted=None: c.get(
+                "/master/card/alpha", params={"path": submitted or "alpha/02-work/active/x.md"}
+            ),
+            "patch_targets": [(main, "entity_cards")],
+        },
         main.board_default: {
             "request": lambda c, submitted=None: c.get("/board"),
             "patch_targets": [(main.Vault, "bundles")],
@@ -4813,9 +4819,9 @@ def test_real_post_startup_entities_yaml_missing_shows_e_config_via_entity_scope
     `/` is driven too, and is pinned at 200: `shell` builds its sidebar from
     the module-scope `catalog` global (`build_catalog()`, evaluated once at
     import time) via `Vault(catalog).bundles()`, which never re-reads
-    `entities.yaml` — so this condition does not reach it at all. That is
-    long-standing, unrelated behaviour, not a target of this fix; asserting
-    it here pins that the fix does not accidentally change it.
+    `entities.yaml`. The master view does read each entity through
+    `build_scope`, which does, so the page survives and reports that failure
+    in an inline E-CONFIG alert instead of failing as a whole.
 
     `/triage` is driven through `TestClient`'s default `follow_redirects=True`:
     `triage_default` still redirects (307) to `/triage/alpha` using that same
@@ -4844,7 +4850,9 @@ def test_real_post_startup_entities_yaml_missing_shows_e_config_via_entity_scope
     reached.clear()
     root_response = client.get("/")
     assert root_response.status_code == 200, root_response.text
-    assert 'role="alert"' not in root_response.text
+    _assert_alert_discloses_nothing(
+        root_response, "E-CONFIG", ["entities manifest is missing"]
+    )
     assert reached == []
 
     for url in ("/triage", "/triage/alpha", "/outbox/alpha", "/registry/alpha/products"):

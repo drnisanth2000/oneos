@@ -6,6 +6,9 @@ landed and when. The published history starts at the 2026-08-07 baseline.
 
 ## Unreleased
 
+- Home is the master view (read-only, plan 1 of 4): every entity's notes in
+  Draft, Waiting, To review and Done, with entity chips, sort, a read-only card
+  popup, a sidebar Home row, and phone and tablet layouts.
 - Documentation reconciled with the code: architecture map, configuration
   reference, README, build-step states, and the Board's place in the record.
 - The Board reuses the inbox's no-follow path guards instead of a copy.

@@ -24,7 +24,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .board import capture_note, load_board
+from .board import capture_note, entity_cards, load_board, note_body
 from .action_receipts import (
     ActionReceipt,
     InvalidActionReceipt,
@@ -44,6 +44,7 @@ from .entities import (
     EntitySelectionError,
 )
 from .inbox import read_inbox
+from .master import entity_tone, load_master, stage_label, stage_of
 from .ingest.base import IngestError
 from .phase3 import (
     CleanupError,
@@ -407,23 +408,40 @@ async def _console_fallback_handler(request: Request, exc: Exception) -> HTMLRes
 @console_route(
     catches=_SIDEBAR_CATCHES,
     surface="page",
-    services=(Vault.bundles,),
+    services=(load_master, Vault.bundles),
 )
 def shell(request: Request) -> HTMLResponse:
-    """`Vault(catalog).bundles()` raises every declared member, and it runs
-    before any template exists — so the route answers them itself rather than
-    relying on the global fallback, which design §5 calls "a failure rather
-    than a silent default" and which `ServerErrorMiddleware` re-raises as a
-    logged traceback. Task 10 added the declaration; this adds the handler.
+    """The master view. `Vault(catalog).bundles()` raises every declared
+    member, and it runs before any template exists — so the route answers them
+    itself rather than relying on the global fallback, which design §5 calls
+    "a failure rather than a silent default" and which `ServerErrorMiddleware`
+    re-raises as a logged traceback. One entity failing to read is reported on
+    the page by `load_master`, not here.
     """
+    params = request.query_params
     try:
-        bundles = Vault(current_catalog()).bundles()
+        vault = Vault(current_catalog())
+        bundles = vault.bundles()
+        if not bundles:
+            return templates.TemplateResponse(request, "blocks/no_bundles.html", {})
+        page = load_master(
+            vault,
+            build_scope,
+            entities=tuple(params.getlist("entity")),
+            sort=params.get("sort") or "",
+            done_all=params.get("done") == "all",
+            now=datetime.now(),
+        )
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
         request,
-        "shell.html",
-        {"bundles": bundles, "now": datetime.now().strftime("%H:%M:%S")},
+        "home.html",
+        {
+            "bundles": bundles,
+            "page": page,
+            "failures": [(f.entity_label, describe(f.error)) for f in page.failures],
+        },
     )
 
 
@@ -648,6 +666,44 @@ def board(request: Request, scope: EntityScope) -> HTMLResponse:
         return _board_page(request, scope)
     except _BOARD_CATCHES as exc:
         return _render_console_error(request, describe(exc))
+
+
+@app.get("/master/card/{entity}", response_class=HTMLResponse)
+@console_route(
+    catches=_BOARD_CATCHES,
+    surface="fragment-only",
+    services=(entity_cards, note_body),
+)
+def master_card(request: Request, scope: EntityScope, path: str = "") -> HTMLResponse:
+    """Read-only popup for one card. `path` is only ever compared with the
+    paths the entity's own reader returned; it is resolved only after a match."""
+    try:
+        catalog = current_catalog()
+        cards = entity_cards(scope, Vault(catalog))
+        card = next(
+            # Proposed first, as `load_master` dedups: a proposal shares its
+            # inbox card's path, and only the proposed card knows its destination.
+            (c for c in (*cards.proposed, *cards.inbox, *cards.filed) if c.relative_path == path),
+            None,
+        )
+        context = {"card": None, "stage": "", "entity_label": "", "tone": 0, "body": ""}
+        if card is not None:
+            slug = scope.current_entity()
+            # Registry order, as `load_master` colours its chips.
+            index, label = next(
+                ((i, e.label) for i, e in enumerate(catalog.entities) if e.slug == slug),
+                (None, slug),
+            )
+            context = {
+                "card": card,
+                "stage": stage_label(stage_of(card)),
+                "entity_label": label,
+                "tone": entity_tone(index) if index is not None else 0,
+                "body": note_body(scope, card.relative_path),
+            }
+    except _BOARD_CATCHES as exc:
+        return _render_console_error(request, describe(exc))
+    return templates.TemplateResponse(request, "blocks/master_popup.html", context)
 
 
 _CAPTURE_CATCHES = (IngestError, CrossScopeError)

@@ -304,6 +304,7 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
 
 
 @structured_reader(category="front-matter")
+@failure_contract(raises=(CrossScopeError,))
 def note_body(scope: Scope, relative: str) -> str:
     path = scope.resolve_stored(relative)
     if path.is_symlink() or not path.is_file() or path.resolve() != path:
@@ -853,7 +854,7 @@ def _shift_month(month_start: date, step: int) -> date:
 
 @failure_contract(
     raises=(DestinationRegistryError, RedirectedPathError),
-    calls=(entity_cards,),
+    calls=(entity_cards, note_body),
 )
 def load_board(
     scope: Scope,
