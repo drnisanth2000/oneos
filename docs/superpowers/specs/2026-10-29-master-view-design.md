@@ -2,8 +2,9 @@
 
 Date: 2026-10-29
 
-Status: draft for owner approval. Nothing here may be built until the
-owner approves this document. Owner answers folded in on 2026-10-29:
+Status: owner-approved on 2026-10-29. Built in four plans, in order:
+(1) read-only master view, (2) reminders and Needs attention, (3) moves
+and edits, (4) Calendar sync. Each plan ships on its own. Owner answers folded in on 2026-10-29:
 Calendar permission on the Mac is OK; the popup edits the draft text.
 
 ## Why
