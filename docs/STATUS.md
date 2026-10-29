@@ -26,6 +26,14 @@ stopped early remain in private state, as does the isolated restore-check
 directory. The successful backup removed its own staging directory. Do not
 treat those private leftovers as a second live vault.
 
+## Backups are owner-run (2026-10-28)
+
+The owner decided that backups happen only when they run `backup`.
+`install-login` no longer installs the hourly `local.oneos.backup` job, and
+`doctor` reports backup state without failing on it. The job on the running
+Mac was unloaded and its plist moved out of `LaunchAgents`. Install updates no
+longer require a backup first; the owner may take one when they choose.
+
 ## Running install update to `d3dd761` (2026-10-28)
 
 With owner approval, the running install was updated to `origin/main`

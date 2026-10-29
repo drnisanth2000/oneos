@@ -461,19 +461,41 @@ def test_setup_holds_operation_lock_until_all_private_state_exists(tmp_path, mon
     assert login_started.is_set()
 
 
-def test_install_login_preflights_all_destinations_before_writing(tmp_path, monkeypatch):
+def test_install_login_preflights_destination_before_writing(tmp_path, monkeypatch):
     from tools import local_service as service
 
     launch_agents = tmp_path / 'Library/LaunchAgents'
     launch_agents.mkdir(parents=True)
-    (launch_agents / 'local.oneos.backup.plist').write_bytes(b'preserve')
+    (launch_agents / 'local.oneos.login.plist').write_bytes(b'preserve')
     monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(service.subprocess, 'run', lambda *args, **kwargs: pytest.fail('must preflight before bootstrap'))
     config = {'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'}
     with pytest.raises(ValueError, match='already exists'):
         service.install_login(config)
-    assert not (launch_agents / 'local.oneos.login.plist').exists()
-    assert (launch_agents / 'local.oneos.backup.plist').read_bytes() == b'preserve'
+    assert (launch_agents / 'local.oneos.login.plist').read_bytes() == b'preserve'
+
+
+def test_install_login_schedules_no_backup(tmp_path, monkeypatch):
+    import plistlib
+    import subprocess
+    from tools import local_service as service
+
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    calls = []
+
+    def launchctl(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 113 if command[1] == 'print' else 0)
+
+    monkeypatch.setattr(service.subprocess, 'run', launchctl)
+    service.install_login({'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'})
+    assert [path.name for path in launch_agents.iterdir()] == ['local.oneos.login.plist']
+    job = plistlib.loads((launch_agents / 'local.oneos.login.plist').read_bytes())
+    assert job['ProgramArguments'][-1] == 'login-start'
+    assert 'StartInterval' not in job
+    assert not any('backup' in part for command in calls for part in command)
 
 
 def test_install_login_rolls_back_jobs_and_plists_after_bootstrap_failure(tmp_path, monkeypatch):
@@ -491,7 +513,7 @@ def test_install_login_rolls_back_jobs_and_plists_after_bootstrap_failure(tmp_pa
         calls.append(command)
         if command[1] == 'print':
             return subprocess.CompletedProcess(command, 113)
-        if command[1] == 'bootstrap' and command[-1].endswith('backup.plist'):
+        if command[1] == 'bootstrap':
             raise subprocess.CalledProcessError(5, command)
         return subprocess.CompletedProcess(command, 0)
 
@@ -501,8 +523,7 @@ def test_install_login_rolls_back_jobs_and_plists_after_bootstrap_failure(tmp_pa
         service.install_login(config)
     assert not list(launch_agents.glob('local.oneos.*.plist'))
     bootouts = [command[-1] for command in calls if command[1] == 'bootout']
-    assert bootouts == ['gui/' + str(service.os.getuid()) + '/local.oneos.backup',
-                        'gui/' + str(service.os.getuid()) + '/local.oneos.login']
+    assert bootouts == ['gui/' + str(service.os.getuid()) + '/local.oneos.login']
 
 
 def test_login_rollback_timeout_still_removes_created_plists(tmp_path, monkeypatch):
@@ -788,7 +809,8 @@ def test_diagnostics_report_backup_freshness(tmp_path, monkeypatch, state, last,
     monkeypatch.setattr(local_backup, 'validate_volume', lambda config: None)
     result = service.diagnostics(config)
     assert result['backup']['state'] == expected
-    assert 'Run backup' in result['backup']['action']
+    assert 'run backup' in result['backup']['action']
+    assert 'whenever you choose' in result['backup']['action']
 
 
 @pytest.mark.parametrize(('last', 'expected'), [
@@ -814,7 +836,7 @@ def test_diagnostics_handles_backup_timestamp_types_and_bounds(tmp_path, monkeyp
     assert service.diagnostics(config)['backup']['state'] == expected
 
 
-def test_doctor_fails_when_backup_has_never_succeeded(tmp_path, monkeypatch, capsys):
+def test_doctor_reports_but_does_not_fail_on_owner_choice_backup(tmp_path, monkeypatch, capsys):
     import sqlite3
     import subprocess
     from tools import local_service as service
@@ -833,7 +855,7 @@ def test_doctor_fails_when_backup_has_never_succeeded(tmp_path, monkeypatch, cap
     monkeypatch.setattr(service.subprocess, 'run', lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=''))
     monkeypatch.setattr(service.Runtime, 'running_services', lambda self: ['app', 'caddy'])
     monkeypatch.setattr(local_backup, 'validate_volume', lambda config: None)
-    assert service.main(['--state-dir', str(state), 'doctor']) == 1
+    assert service.main(['--state-dir', str(state), 'doctor']) == 0
     output = capsys.readouterr()
     report = json.loads(output.out)
     assert report['backup']['state'] == 'never'
