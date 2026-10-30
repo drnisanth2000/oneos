@@ -6,6 +6,7 @@ rewrite BOTH halves of the fail-open action-policy rule atomically — the allow
 `paths:` and its `except:` for `.sensitive/` — with no residual old slug left.
 """
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import stat
 import subprocess
@@ -15,6 +16,7 @@ import pytest
 
 import app.git_transaction as git_transaction
 import app.rename as rename
+from app.reminders import Reminder, ReminderStore
 from app.rename import (
     RenameError,
     apply_rename,
@@ -169,6 +171,88 @@ def test_entity_rename_updates_both_halves_of_the_fail_open_rule(tmp_path):
     assert 'except: ["newentity/.sensitive/**"]' in pol      # the second half
     assert 'paths: ["newentity/00-inbox/**"]' in pol
     assert "oldentity" not in pol                            # no residual anywhere
+
+
+def _auth_state(tmp_path, monkeypatch):
+    directory = tmp_path / "auth-state"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    monkeypatch.setenv("ONEOS_AUTH_STATE_DIR", str(directory))
+    return directory
+
+
+def _due():
+    return datetime(2026, 11, 4, 11, 0, tzinfo=timezone(timedelta(hours=2)))
+
+
+def test_entity_rename_rekeys_reminders(tmp_path, monkeypatch):
+    vault = git_vault(tmp_path / "v", ENTITY_FILES)
+    store = ReminderStore(_auth_state(tmp_path, monkeypatch))
+    key = "oldentity/00-inbox/active/note.md"
+    store.save(Reminder(key, "oldentity", "Chase it", _due()))
+    store.save(Reminder("oldentityx/a.md", "oldentityx", "Other entity", _due()))
+
+    apply_rename(vault, plan_rename(vault, "entity", "oldentity", "newentity"))
+
+    found = store.all()
+    assert set(found) == {"newentity/00-inbox/active/note.md", "oldentityx/a.md"}
+    moved = found["newentity/00-inbox/active/note.md"]
+    assert (moved.entity, moved.subject, moved.due_at) == ("newentity", "Chase it", _due())
+    # Every reference resolves: the reminder's key names a card that exists.
+    assert (vault / moved.key).is_file()
+    assert not (vault / key).exists()
+    # The fail-open rule is unharmed: .sensitive/ is still excepted from read.
+    pol = (vault / "_system/action-policy.yaml").read_text()
+    assert 'except: ["newentity/.sensitive/**"]' in pol and "oldentity" not in pol
+    assert git_head_message(vault) == "rename: oldentity → newentity"
+    assert git_is_clean(vault)
+
+
+def test_entity_rename_without_a_store_still_succeeds(tmp_path, monkeypatch, capsys):
+    vault = git_vault(tmp_path, ENTITY_FILES)
+    monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
+    apply_rename(vault, plan_rename(vault, "entity", "oldentity", "newentity"))
+    assert git_head_message(vault) == "rename: oldentity → newentity"
+    assert (vault / "newentity").is_dir() and git_is_clean(vault)
+    lines = [line for line in capsys.readouterr().out.splitlines() if "Reminders were not updated" in line]
+    assert len(lines) == 1
+    assert "Card moved or removed" in lines[0] and "set them again" in lines[0] and "oldentity" in lines[0]
+
+
+def test_entity_rename_with_an_unsafe_store_still_succeeds(tmp_path, monkeypatch, capsys):
+    vault = git_vault(tmp_path / "v", ENTITY_FILES)
+    directory = _auth_state(tmp_path, monkeypatch)
+    key = "oldentity/00-inbox/active/note.md"
+    ReminderStore(directory).save(Reminder(key, "oldentity", "Chase it", _due()))
+    directory.chmod(0o755)
+    apply_rename(vault, plan_rename(vault, "entity", "oldentity", "newentity"))
+    assert git_head_message(vault) == "rename: oldentity → newentity" and git_is_clean(vault)
+    out = capsys.readouterr().out
+    assert out.count("Reminders were not updated") == 1
+    assert "Card moved or removed" in out and "set them again" in out and "oldentity" in out
+    directory.chmod(0o700)
+    assert set(ReminderStore(directory).all()) == {key}  # left as an orphan, not lost
+
+
+def test_dry_run_leaves_reminders_alone(tmp_path, monkeypatch):
+    vault = git_vault(tmp_path / "v", ENTITY_FILES)
+    directory = _auth_state(tmp_path, monkeypatch)
+    key = "oldentity/00-inbox/active/note.md"
+    store = ReminderStore(directory)
+    store.save(Reminder(key, "oldentity", "Chase it", _due()))
+    before = (directory / "reminders.sqlite3").read_bytes()
+    render_diff(plan_rename(vault, "entity", "oldentity", "newentity"))
+    assert rename.main(["entity", "oldentity", "newentity", "--vault-root", str(vault)]) == 0
+    assert (directory / "reminders.sqlite3").read_bytes() == before
+    assert set(store.all()) == {key}
+
+
+def test_rename_cli_apply_re_keys_reminders(tmp_path, monkeypatch):
+    vault = git_vault(tmp_path / "v", ENTITY_FILES)
+    store = ReminderStore(_auth_state(tmp_path, monkeypatch))
+    store.save(Reminder("oldentity/00-inbox/active/note.md", "oldentity", "Chase it", _due()))
+    assert rename.main(["entity", "oldentity", "newentity", "--vault-root", str(vault), "--apply"]) == 0
+    assert set(store.all()) == {"newentity/00-inbox/active/note.md"}
 
 
 def test_entity_rename_busy_shared_lock_refuses_before_any_mutation(

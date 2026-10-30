@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .console_routing import structured_reader
+from .reminders import ReminderStoreUnavailable, reminder_store
 from .identifiers import AXES as REGISTRY_AXES, meets_floor
 from .git_transaction import (
     ActionLockCleanupFailure,
@@ -502,6 +503,31 @@ def _validate_check_v2(vault: Path, plan: RenamePlan) -> None:
 DEFAULT_VALIDATORS = [_validate_check_v2]
 
 
+def _reminders_follow_rename(plan: RenamePlan) -> None:
+    """After an entity rename committed, re-key that entity's reminders.
+
+    Only the `entity` axis changes paths. This runs strictly after the vault
+    commit and never fails the rename: with no store, or an unsafe one, it
+    says so on one line and the owner's reminders show as "Card moved or
+    removed" until removed.
+    """
+    if plan.axis != "entity":
+        return
+    # One line: what happened, what the owner will see, and what to do about it.
+    remedy = (
+        f"reminders for {plan.old} will show as 'Card moved or removed' "
+        "- remove them on the home page and set them again."
+    )
+    try:
+        store = reminder_store()
+        if store is None:
+            print(f"Reminders were not updated (ONEOS_AUTH_STATE_DIR is not set): {remedy}")
+            return
+        store.rename_entity(plan.old, plan.new)
+    except ReminderStoreUnavailable:
+        print(f"Reminders were not updated (the reminder store is unavailable): {remedy}")
+
+
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
     execution_vault = Path(vault)
     try:
@@ -564,6 +590,7 @@ def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:
                 _git(vault, "reset", "-q", "--hard", "HEAD")
                 _git(vault, "clean", "-qfd")
                 raise
+            _reminders_follow_rename(plan)
             try:
                 commit_oid = _git(vault, "rev-parse", "HEAD").strip()
             except Exception as exc:

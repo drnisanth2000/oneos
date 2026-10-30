@@ -859,6 +859,88 @@ a.board-chip:hover { background: var(--fill-strong); }
   font: var(--text-md)/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+/* --- needs attention --- */
+.master-attention { margin-bottom: var(--space-4); min-width: 0; }
+.attention-head {
+  display: flex; align-items: center; gap: var(--space-2); margin: 0 0 var(--space-2);
+  font-size: var(--text-sm); font-weight: 600; color: var(--ink-dim);
+  text-transform: uppercase; letter-spacing: .05em;
+}
+.attention-head .icon { width: 16px; height: 16px; }
+.attention-note { margin: 0; }
+/* The strip scrolls sideways inside itself; the page never does. */
+.attention-strip {
+  display: flex; gap: var(--space-2); margin: 0; padding: 0 0 var(--space-2); list-style: none;
+  overflow-x: auto; overscroll-behavior-x: contain;
+}
+.attention-item { flex: 0 0 min(260px, 78vw); min-width: 0; display: flex; }
+.review-surface .attention-card {
+  display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1);
+  width: 100%; min-height: 0; padding: var(--space-3);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); color: var(--ink);
+  font: inherit; font-size: var(--text-base); text-align: left; box-shadow: var(--shadow-sm);
+}
+.review-surface button.attention-card { cursor: pointer; }
+.review-surface button.attention-card:hover,
+.review-surface button.attention-card:focus-visible {
+  background: var(--panel); box-shadow: var(--shadow-md), 0 0 0 1px var(--line);
+}
+.attention-card.is-overdue { background: var(--err-bg); border-color: var(--err-ink); }
+.attention-card.is-soon { background: color-mix(in srgb, var(--warn) 12%, var(--panel)); border-color: var(--warn); }
+.attention-card.is-later { border-color: var(--line); }
+.review-surface button.attention-card.is-overdue:hover,
+.review-surface button.attention-card.is-overdue:focus-visible { background: var(--err-bg); }
+.review-surface button.attention-card.is-soon:hover,
+.review-surface button.attention-card.is-soon:focus-visible {
+  background: color-mix(in srgb, var(--warn) 12%, var(--panel));
+}
+.attention-when {
+  display: inline-flex; align-items: center; gap: var(--space-1);
+  font-size: var(--text-sm); font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.attention-when .icon { width: 16px; height: 16px; }
+.attention-card.is-overdue .attention-when { color: var(--err-ink); }
+.attention-card.is-soon .attention-when { color: var(--warn); }
+.attention-card.is-later .attention-when { color: var(--ink-dim); }
+.attention-subject { font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.attention-meta { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-2); align-items: center; font-size: var(--text-sm); }
+.attention-orphan { color: var(--ink-dim); }
+.master-reminder {
+  display: flex; align-items: center; gap: var(--space-1); margin-top: var(--space-2);
+  color: var(--ink-dim); font-size: var(--text-sm); font-variant-numeric: tabular-nums;
+}
+.master-reminder .icon { width: 14px; height: 14px; flex: none; }
+.attention-remove { margin-top: var(--space-1); }
+.review-surface .attention-remove-button { min-height: 28px; font-size: var(--text-sm); }
+/* --- end needs attention --- */
+
+/* --- reminder box --- */
+.reminder-box { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--line); }
+.reminder-box-head {
+  display: flex; align-items: center; gap: var(--space-2); margin: 0 0 var(--space-2);
+  font-size: var(--text-md); font-weight: 600;
+}
+.reminder-box-head .icon { width: 16px; height: 16px; }
+.reminder-current { margin: 0 0 var(--space-2); font-size: var(--text-md); font-variant-numeric: tabular-nums; }
+.reminder-fields {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3);
+  min-width: 0; margin: 0; padding: 0; border: 0;
+}
+.reminder-field { display: grid; gap: var(--space-1); min-width: 0; color: var(--ink-dim); font-size: var(--text-sm); font-weight: 600; }
+.reminder-field input {
+  font: inherit; font-size: var(--text-base); font-weight: 400; min-height: 36px; min-width: 0; width: 100%;
+  padding: 0 var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel); color: var(--ink);
+}
+.reminder-field input:disabled { opacity: .5; }
+.reminder-subject, .reminder-actions { grid-column: 1 / -1; }
+.reminder-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.reminder-actions button { min-height: 36px; }
+.reminder-fields:disabled .reminder-actions button { opacity: .5; cursor: not-allowed; }
+.review-surface .reminder-remove:hover { border-color: var(--err-ink); color: var(--err-ink); }
+/* --- end reminder box --- */
+
 /* Tablet: two columns per row. */
 @media (max-width: 1100px) {
   .master-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }

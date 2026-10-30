@@ -151,6 +151,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         phase3,
         proposal_identity,
         registry,
+        reminders,
         rename,
         review_tokens,
         scope,
@@ -231,6 +232,8 @@ def test_every_application_exception_resolves_to_its_designed_code():
         action_receipts.InvalidActionReceipt: "E-RECEIPT",
         action_receipts.ReceiptStoreIntegrityError: "E-TAMPER",
         action_receipts.ReceiptStoreUnavailable: "E-UNAVAILABLE",
+        reminders.ReminderStoreUnavailable: "E-UNAVAILABLE",
+        reminders.InvalidReminder: "E-REQUEST",
         review_tokens.ReviewedProposalChanged: "E-REVIEW",
         review_tokens.InvalidReviewToken: "E-REQUEST",
         review_tokens.ReviewContractViolation: "E-INTERNAL",
@@ -1536,6 +1539,11 @@ EXPECTED_CONTRACTED_BOUNDARIES = (
     ("app.board", "capture_note"),
     ("app.board", "note_body"),
     ("app.master", "load_master"),
+    ("app.reminders", "reminder_store"),
+    ("app.reminders", "ReminderStore.all"),
+    ("app.reminders", "ReminderStore.save"),
+    ("app.reminders", "ReminderStore.remove"),
+    ("app.reminders", "ReminderStore.rekey"),
 )
 
 
@@ -1563,7 +1571,7 @@ def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypat
 
     main = _load_console_app(tmp_path, monkeypatch)
     qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
-    assert len(qualified) == 30
+    assert len(qualified) == 35
     assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
 
     missing = []
@@ -1595,6 +1603,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         SystemRegistryPathError,
     )
     from app.board import NoteUnreadable, entity_cards, note_body
+    from app.reminders import InvalidReminder, ReminderStoreUnavailable
     from app.inbox import read_inbox
     from app.ingest.base import IngestError
     from app.phase3 import CleanupError
@@ -1740,6 +1749,14 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
             (DestinationRegistryError, EntityManifestError, VaultRootUnavailable),
             (),
         ),
+        "app.reminders.reminder_store": ((), ()),
+        "app.reminders.ReminderStore.all": ((ReminderStoreUnavailable,), ()),
+        "app.reminders.ReminderStore.save": (
+            (ReminderStoreUnavailable, InvalidReminder),
+            (),
+        ),
+        "app.reminders.ReminderStore.remove": ((ReminderStoreUnavailable,), ()),
+        "app.reminders.ReminderStore.rekey": ((ReminderStoreUnavailable,), ()),
     }
 
     boundaries = _inventory_objects(main)
@@ -2070,6 +2087,20 @@ def _expected_route_services(main):
         health_endpoints["/readyz"]: (main.Vault.bundles,),
         main.shell: (main.load_master, main.Vault.bundles),
         main.master_card: (main.entity_cards, main.note_body),
+        main.master_reminder_save: (
+            main.entity_cards,
+            main.note_body,
+            main.reminder_store,
+            main.ReminderStore.save,
+        ),
+        main.master_reminder_remove: (
+            main.build_scope,
+            main.entity_cards,
+            main.note_body,
+            main.reminder_store,
+            main.ReminderStore.all,
+            main.ReminderStore.remove,
+        ),
         main.pulse: (),
         main.board_default: (main.Vault.bundles,),
         main.board: (main.load_board, main.Vault.bundles),
@@ -2132,9 +2163,9 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
-    assert sum(len(services) for services in expected.values()) == 53
+    assert sum(len(services) for services in expected.values()) == 63
     endpoints = list(_registered_console_endpoints(main.app))
-    assert len(endpoints) == 24, endpoints
+    assert len(endpoints) == 26, endpoints
     assert set(endpoints) == set(expected), (
         "registered route/service inventory mismatch: "
         f"missing={set(endpoints) - set(expected)}, "

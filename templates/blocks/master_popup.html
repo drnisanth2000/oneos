@@ -1,5 +1,7 @@
-{# Read-only card popup, swapped into #master-popup inside the dialog. No form
-   and no write control in plan 1. The body is escaped preformatted text. #}
+{# Card popup, swapped into #master-popup inside the dialog. The body is escaped
+   preformatted text. The one write control is the reminder box (Waiting and To
+   review cards only): it posts to /master/reminder/..., which never touches the
+   vault, and its responses swap this same popup back. #}
 {% from "_icon.html" import icon %}
 <header class="sheet-head master-popup-head">
   <h2 id="master-popup-title">{% if card %}{{ card.title }}{% else %}Card not found{% endif %}</h2>
@@ -18,6 +20,59 @@
     {% else %}{{ card.module }}{% if card.sub %} / {{ card.sub }}{% endif %}{% endif %}
   </p>
   <pre class="master-body">{{ body }}</pre>
+  {% if reminder_box %}
+  {# The browser fills `offset` (minutes east of UTC) for the chosen date and time;
+     the server stores the wall time as typed and never converts it. #}
+  <section class="reminder-box" aria-labelledby="reminder-box-label">
+    <h3 class="reminder-box-head" id="reminder-box-label">{{ icon("bell") }}Reminder</h3>
+    {% if reminder %}
+    <p class="reminder-current" role="status">{{ "Review by" if stage == "To review" else "Due" }} <time datetime="{{ reminder.due_at.isoformat() }}">{{ due_label(reminder.due_at) }}</time></p>
+    {% elif not reminders_available %}
+    <p class="muted reminder-current">Reminders are unavailable</p>
+    {% endif %}
+    <form class="reminder-form" hx-post="/master/reminder/{{ entity | urlencode }}"
+          hx-target="#master-popup" hx-swap="innerHTML"
+          x-data="reminderBox" @input="sync()">
+      <input type="hidden" name="path" value="{{ card.relative_path }}">
+      <input type="hidden" name="offset" value="" x-ref="offset">
+      <fieldset class="reminder-fields"{% if not reminders_available %} disabled{% endif %}>
+        <legend class="sr-only">Reminder details</legend>
+        <label class="reminder-field" for="reminder-date">Date
+          <input id="reminder-date" name="date" type="date" required x-ref="date"
+                 value="{{ reminder.due_at.date().isoformat() if reminder else '' }}">
+        </label>
+        <label class="reminder-field" for="reminder-time">Time
+          <input id="reminder-time" name="time" type="time" required x-ref="time"
+                 value="{{ reminder.due_at.strftime('%H:%M') if reminder else '09:00' }}">
+        </label>
+        <label class="reminder-field reminder-subject" for="reminder-subject">Subject
+          <input id="reminder-subject" name="subject" type="text" required maxlength="120"
+                 value="{{ reminder.subject if reminder else default_subject }}">
+        </label>
+        <div class="reminder-actions">
+          <button type="submit" class="button-primary">Save reminder</button>
+          {% if reminder %}
+          <button type="button" class="reminder-remove"
+                  hx-post="/master/reminder/{{ entity | urlencode }}/remove"
+                  hx-target="#master-popup" hx-swap="innerHTML">Remove</button>
+          {% endif %}
+        </div>
+      </fieldset>
+    </form>
+  </section>
+  {% elif reminder_stale %}
+  {# The card is no longer Waiting or To review (its status was edited by hand), but
+     its reminder still sits in Needs attention: show it read-only and let it go. #}
+  <section class="reminder-box" aria-labelledby="reminder-box-label">
+    <h3 class="reminder-box-head" id="reminder-box-label">{{ icon("bell") }}Reminder</h3>
+    <p class="reminder-current" role="status"><span>{{ reminder.subject }}</span> - <time datetime="{{ reminder.due_at.isoformat() }}">{{ due_label(reminder.due_at) }}</time></p>
+    <form class="reminder-actions" hx-post="/master/reminder/{{ entity | urlencode }}/remove"
+          hx-target="#master-popup" hx-swap="innerHTML">
+      <input type="hidden" name="path" value="{{ card.relative_path }}">
+      <button type="submit" class="reminder-remove">Remove</button>
+    </form>
+  </section>
+  {% endif %}
 </article>
 {% else %}
 <p class="muted">This card is no longer here. Refresh the page.</p>

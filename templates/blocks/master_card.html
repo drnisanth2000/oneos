@@ -1,6 +1,6 @@
 {# One master-view card. A button, so it is reachable by keyboard; it loads the
    read-only popup into the dialog outside #master (see home.html). Reads only. #}
-{% from "_icon.html" import file_icon %}
+{% from "_icon.html" import file_icon, icon %}
 <button type="button" class="board-card master-card"
         hx-get="/master/card/{{ item.entity | urlencode }}?path={{ item.card.relative_path | urlencode }}"
         hx-target="#master-popup" hx-swap="innerHTML">
@@ -13,4 +13,11 @@
     {% if item.card.lane == 'proposed' %}<span class="board-badge">Proposed</span>{% endif %}
     {% if item.card.updated %}<time class="master-date" datetime="{{ item.card.updated }}">{{ item.card.updated }}</time>{% endif %}
   </span>
+  {# The stored wall time, as typed; never converted here. #}
+  {% set card_stage = stage_of(item.card) if item.reminder else "" %}
+  {% if card_stage in ("waiting", "review") %}
+  <span class="master-reminder">
+    {{ icon("bell") }}<span>{{ "Review by" if card_stage == "review" else "Due" }} <time datetime="{{ item.reminder.due_at.isoformat() }}">{{ due_label(item.reminder.due_at) }}</time></span>
+  </span>
+  {% endif %}
 </button>
