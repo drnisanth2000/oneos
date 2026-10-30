@@ -205,3 +205,61 @@ def test_public_methods_declare_failure_contracts():
     ]:
         assert set(fn.__failure_contract__.raises) == expected
     assert reminders.reminder_store.__failure_contract__.raises == ()
+
+
+def test_a_zero_byte_safe_file_means_no_reminders_and_is_left_alone(state):
+    path = state / "reminders.sqlite3"
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    store = ReminderStore(state)
+    assert store.all() == {}
+    assert path.stat().st_size == 0
+    # A later save still works on top of it.
+    store.save(make())
+    assert set(store.all()) == {"inbox/pay-card.md"}
+
+
+def _has_table(path):
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as db:
+        return db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='reminders'"
+        ).fetchone() is not None
+
+
+def test_first_save_publishes_the_file_with_its_schema(state, monkeypatch):
+    import app.git_transaction as git_transaction
+
+    real = git_transaction._move_no_replace
+    seen = {}
+
+    def spy(from_fd, from_name, to_fd, to_name):
+        # At the moment of publication the live path is still absent and the
+        # staged file already holds the table.
+        assert not (state / "reminders.sqlite3").exists()
+        staged = next(state.glob(".reminders-*")) / from_name
+        seen["table"] = _has_table(staged)
+        seen["mode"] = stat.S_IMODE(staged.stat().st_mode)
+        real(from_fd, from_name, to_fd, to_name)
+
+    monkeypatch.setattr(git_transaction, "_move_no_replace", spy)
+    ReminderStore(state).save(make())
+    assert seen == {"table": True, "mode": 0o600}
+    assert _has_table(state / "reminders.sqlite3")
+    assert [p.name for p in state.iterdir()] == ["reminders.sqlite3"]
+
+
+def test_a_failure_before_publication_leaves_nothing_behind(state, monkeypatch):
+    import app.git_transaction as git_transaction
+
+    def boom(*args):
+        raise OSError("simulated crash before publication")
+
+    monkeypatch.setattr(git_transaction, "_move_no_replace", boom)
+    store = ReminderStore(state)
+    with pytest.raises(ReminderStoreUnavailable):
+        store.save(make())
+    assert list(state.iterdir()) == []
+    assert store.all() == {}

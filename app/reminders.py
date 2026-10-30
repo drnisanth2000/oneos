@@ -149,20 +149,46 @@ class ReminderStore:
         except OSError as exc:
             raise ReminderStoreUnavailable() from exc
 
-    def _create_file(self):
-        """Create the database file owner-only, never following a link."""
+    def _publish_new(self):
+        """Create the database with its schema, then publish it atomically.
+
+        The file is staged in a private temporary directory beside the final
+        path and moved into place without replacing anything, so the live
+        path never exists without its table. A crash leaves only staging.
+        Losing a race to another first save is fine: the winner's file stays.
+        """
+        import tempfile
+
+        from .git_transaction import AtomicMoveUnavailable, _move_no_replace
+
         try:
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with tempfile.TemporaryDirectory(prefix=".reminders-", dir=self.directory) as staging:
+                staged = Path(staging) / DATABASE_NAME
+                fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                finally:
+                    os.close(fd)
+                connection = sqlite3.connect(f"{staged.as_uri()}?mode=rw", uri=True, timeout=5)
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(_SCHEMA)
+                    connection.commit()
+                finally:
+                    connection.close()
+                source_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    target_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        _move_no_replace(source_fd, staged.name, target_fd, self.path.name)
+                    finally:
+                        os.close(target_fd)
+                finally:
+                    os.close(source_fd)
         except FileExistsError:
             return
-        except OSError as exc:
+        except (OSError, sqlite3.Error, AtomicMoveUnavailable) as exc:
             raise ReminderStoreUnavailable() from exc
-        try:
-            os.fchmod(fd, 0o600)
-        except OSError as exc:
-            raise ReminderStoreUnavailable() from exc
-        finally:
-            os.close(fd)
 
     @contextmanager
     @structured_reader(category="admin-db")
@@ -174,8 +200,19 @@ class ReminderStore:
             if not create:
                 yield None
                 return
-            self._create_file()
+            self._publish_new()
             expected_identity = self._check()
+            if expected_identity is None:
+                raise ReminderStoreUnavailable()
+        try:
+            size = self.path.lstat().st_size
+        except OSError as exc:
+            raise ReminderStoreUnavailable() from exc
+        if readonly and size == 0:
+            # Never published with a schema (left by an interrupted older
+            # path): there is nothing in it, so there are no reminders.
+            yield None
+            return
         mode = "ro" if readonly else "rw"
         try:
             connection = sqlite3.connect(f"{self.path.as_uri()}?mode={mode}", uri=True, timeout=5)
