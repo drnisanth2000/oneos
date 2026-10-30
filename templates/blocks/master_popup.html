@@ -47,7 +47,7 @@
         </label>
         <label class="reminder-field reminder-subject" for="reminder-subject">Subject
           <input id="reminder-subject" name="subject" type="text" required maxlength="120"
-                 value="{{ reminder.subject if reminder else card.title }}">
+                 value="{{ reminder.subject if reminder else default_subject }}">
         </label>
         <div class="reminder-actions">
           <button type="submit" class="button-primary">Save reminder</button>

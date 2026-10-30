@@ -1422,3 +1422,31 @@ def test_save_requires_csrf(tmp_path, monkeypatch):
         assert list(ReminderStore(directory).all()) == [path]
         removed = client.post("/master/reminder/alpha/remove", data={"path": path}, headers={**origin, "X-CSRF-Token": csrf})
         assert removed.status_code == 200 and ReminderStore(directory).all() == {}
+
+
+def test_default_subject_of_a_long_or_multiline_title_saves_unedited(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Longwinded", status="waiting", title="L" * 130)
+    # A YAML double-quoted \n is a real line break in the title, as in a mail subject.
+    _note(tmp_path, "alpha", "00-inbox", "Mail", sub="triage", title='"Re: split\\nsubject"')
+    cards = main.entity_cards(main.build_scope("alpha"), main.Vault(main.current_catalog()))
+    chosen = [c for c in (*cards.inbox, *cards.filed) if c.title.startswith(("LLL", "Re:"))]
+    assert len(chosen) == 2 and any("\n" in c.title for c in chosen)
+    for card in chosen:
+        html = client.get("/master/card/alpha", params={"path": card.relative_path}).text
+        value = re.search(r'id="reminder-subject"[^>]*value="([^"]*)"', html).group(1)
+        assert 0 < len(value) <= 120 and "\n" not in value
+        # What the browser submits for the untouched form is accepted and stored.
+        response = _save(client, "alpha", card.relative_path, subject=value)
+        assert response.headers["HX-Trigger"] == "master-refresh", response.text
+        assert ReminderStore(directory).all()[card.relative_path].subject == value
+    assert len(ReminderStore(directory).all()) == 2
+
+
+def test_popup_not_found_context_is_fresh_each_render(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    for _ in range(2):
+        assert "no longer here" in client.get("/master/card/alpha", params={"path": "nope.md"}).text
+    assert main._empty_popup() is not main._empty_popup()
+    assert "request" not in main._empty_popup()

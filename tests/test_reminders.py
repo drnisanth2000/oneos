@@ -169,6 +169,18 @@ def test_clean_subject():
             clean_subject(bad)
 
 
+def test_default_subject_is_always_accepted_by_clean_subject():
+    for title in ("x" * 130, "Re: a\nb\r\nc", "  spaced   out  ", "tab\tand\u2028sep\u0085x",
+                  "y" * 119 + " " + "z" * 20, "é" * 300, "\n\n"):
+        subject = reminders.default_subject(title)
+        assert len(subject) <= 120
+        if subject:
+            assert clean_subject(subject) == subject
+    assert reminders.default_subject("x" * 130) == "x" * 120
+    assert reminders.default_subject("a\nb  c") == "a b c"
+    assert reminders.default_subject("   ") == ""
+
+
 def _git(vault, *args):
     return subprocess.run(
         ["git", "-C", str(vault), *args], check=True, capture_output=True, text=True

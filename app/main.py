@@ -51,6 +51,7 @@ from .reminders import (
     ReminderStore,
     ReminderStoreUnavailable,
     clean_subject,
+    default_subject,
     parse_due,
     reminder_store,
 )
@@ -730,10 +731,14 @@ def _popup_context(scope: Scope, catalog, card, reminders: dict | None) -> dict:
         "reminder_box": stage in ("waiting", "review"),
         "reminders_available": reminders is not None,
         "reminder": reminder,
+        "default_subject": default_subject(card.title),
     }
 
 
-_EMPTY_POPUP = {"card": None, "stage": "", "entity_label": "", "tone": 0, "body": ""}
+def _empty_popup() -> dict:
+    """A fresh context per call: Starlette adds `request` to the dict it is
+    given, so a shared one would pin the first request for the process."""
+    return {"card": None, "stage": "", "entity_label": "", "tone": 0, "body": ""}
 
 
 @app.get("/master/card/{entity}", response_class=HTMLResponse)
@@ -748,7 +753,7 @@ def master_card(request: Request, scope: EntityScope, path: str = "") -> HTMLRes
     try:
         catalog = current_catalog()
         card = _find_card(entity_cards(scope, Vault(catalog)), path)
-        context = _EMPTY_POPUP
+        context = _empty_popup()
         if card is not None:
             context = _popup_context(scope, catalog, card, _page_reminders())
     except _BOARD_CATCHES as exc:

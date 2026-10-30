@@ -60,6 +60,17 @@ def clean_subject(text: str) -> str:
     return cleaned
 
 
+@failure_contract(raises=())
+def default_subject(title: str) -> str:
+    """A card title as a subject `clean_subject` always accepts: line breaks and
+    other whitespace runs become single spaces, trimmed, cut to the limit. Used
+    to prefill the form, so an unedited submit can never be refused for it. An
+    empty title gives an empty subject, which the required field flags."""
+    if not isinstance(title, str):
+        return ""
+    return " ".join(title.split())[:SUBJECT_MAX].rstrip()
+
+
 @failure_contract(raises=(InvalidReminder,))
 def parse_due(date: str, time: str, offset_minutes: str) -> datetime:
     """Build the due instant from the browser's wall date, wall time and
