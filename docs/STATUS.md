@@ -8,9 +8,10 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-10-29, after the running install was updated to
-`d28ea6b` (master view). Earlier reconciliations: 2026-10-28 (install
-updates to `d3dd761` and `85afa63`), 2026-10-26 (Board, rules line, and local
+Last reconciled: 2026-10-30, after the running install was updated to
+`8df5979` (module icons, List view grouping). Earlier reconciliations:
+2026-10-29 (install update to `d28ea6b`), 2026-10-28 (install updates to
+`d3dd761` and `85afa63`), 2026-10-26 (Board, rules line, and local
 deployment acceptance) and 2026-09-11 (trusted-local live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
@@ -33,6 +34,24 @@ The owner decided that backups happen only when they run `backup`.
 `doctor` reports backup state without failing on it. The job on the running
 Mac was unloaded and its plist moved out of `LaunchAgents`. Install updates no
 longer require a backup first; the owner may take one when they choose.
+
+## Running install update to `8df5979` (2026-10-30)
+
+With owner approval, the running install was updated to `origin/main`
+`8df5979`: module icons that follow the module name, the Board's weekly
+attention card removed, and the Board's List view showing the selected
+grouping (PR #51). The install checkout moved from `d28ea6b` by
+fast-forward. The app image running before the update is kept locally as the
+image tag `oneos-local:pre-8df5979`. The update changed no dependency,
+Dockerfile, Compose, or Caddy file. The app was healthy beforehand, so `start`
+alone rebuilt and recreated only the app container; no VM restart and no
+backup (owner's choice).
+
+Afterwards `status` reported every component available and services running,
+`/healthz` answered 200, `/` redirected to sign-in, the app log showed no
+errors, and the running container holds the new icon sprite and List view
+template. The vault's HEAD, status, worktree diff, and cached diff were
+byte-identical before and after.
 
 ## Running install update to `d28ea6b` (2026-10-29)
 
