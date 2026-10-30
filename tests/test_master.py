@@ -4,13 +4,14 @@ import re
 import importlib
 import subprocess
 import textwrap
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from starlette.testclient import TestClient
 
 from app.board import NoteUnreadable
-from app.master import load_master
+from app.master import due_label, load_master
+from app.reminders import Reminder
 from app.scope import CrossScopeError
 from tests.conftest import entities_yaml, scaffold_modules, write_vault
 
@@ -127,7 +128,7 @@ def test_cards_land_in_their_stage_across_entities(tmp_path, monkeypatch):
     _note(tmp_path, "alpha", "02-work", "Odd", status="open")
     _note(tmp_path, "alpha", "00-inbox", "New mail", sub="triage", title="New mail")
     page = load_master(vault, main.build_scope, entities=(), sort="updated",
-                       done_all=False, now=datetime(2026, 10, 29, 9, 12))
+                       done_all=False, now=datetime(2026, 10, 29, 9, 12, tzinfo=timezone.utc), reminders={})
     titles = {c.key: [m.card.title for m in c.cards] for c in page.columns}
     assert [c.key for c in page.columns] == ["draft", "waiting", "review", "done"]
     assert [c.label for c in page.columns] == ["Draft", "Waiting", "To review", "Done"]
@@ -141,7 +142,7 @@ def test_cards_land_in_their_stage_across_entities(tmp_path, monkeypatch):
 def test_greeting_and_date(tmp_path, monkeypatch):
     main, vault = _vault(tmp_path, monkeypatch)
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
-                       now=datetime(2026, 10, 29, 16, 59))
+                       now=datetime(2026, 10, 29, 16, 59, tzinfo=timezone.utc), reminders={})
     assert page.greeting == "Good afternoon"
     assert page.date_label == "Thursday, 29 October 2026"
     assert page.time_label == "16:59"
@@ -153,7 +154,7 @@ def test_entity_filter_and_done_limit(tmp_path, monkeypatch):
         _note(tmp_path, "alpha", "02-work", f"Done {i:02}", status="done", updated=f"2026-10-{i + 1:02}")
     _note(tmp_path, "beta1", "02-work", "Beta done", status="done")
     page = load_master(vault, main.build_scope, entities=("alpha",), sort="updated",
-                       done_all=False, now=datetime(2026, 10, 29, 9))
+                       done_all=False, now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     done = page.columns[3]
     assert done.total == 12 and len(done.cards) == 10
     assert done.cards[0].card.title == "Done 11"
@@ -167,7 +168,7 @@ def test_an_unmatched_selection_shows_every_entity(tmp_path, monkeypatch):
     _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
     _note(tmp_path, "beta1", "02-work", "Filing", status="draft")
     page = load_master(vault, main.build_scope, entities=("nope",), sort="", done_all=False,
-                       now=datetime(2026, 10, 29, 9))
+                       now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert {m.entity for m in page.columns[0].cards} == {"alpha", "beta1"}
     assert [c.active for c in page.chips] == [False, False]
 
@@ -176,7 +177,7 @@ def test_proposed_inbox_item_appears_once(tmp_path, monkeypatch):
     main, vault = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
     _inbox_with_proposal(tmp_path, "alpha", "marker.md")
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
-                       now=datetime(2026, 10, 29, 9))
+                       now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     review = page.columns[2].cards
     assert len(review) == 1 and review[0].card.lane == "proposed"
 
@@ -191,7 +192,7 @@ def test_unreadable_entity_is_reported_not_fatal(tmp_path, monkeypatch):
         return main.build_scope(slug)
 
     page = load_master(vault, scope_for, entities=(), sort="", done_all=False,
-                       now=datetime(2026, 10, 29, 9))
+                       now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert [m.card.title for m in page.columns[0].cards] == ["Still here"]
     assert [f.entity_label for f in page.failures] == ["Alpha"]
     assert isinstance(page.failures[0].error, CrossScopeError)
@@ -206,7 +207,7 @@ def test_note_with_invalid_utf8_fails_only_its_entity(tmp_path, monkeypatch):
     _break_note_encoding(_note(tmp_path, "alpha", "02-work", "Garbled", status="draft"))
     _note(tmp_path, "beta1", "02-work", "Still here", status="draft")
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
-                       now=datetime(2026, 10, 29, 9))
+                       now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert [f.entity_label for f in page.failures] == ["Alpha"]
     error = page.failures[0].error
     assert isinstance(error, NoteUnreadable)
@@ -227,7 +228,7 @@ def test_oserror_reading_a_note_fails_only_its_entity(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", read_text)
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
-                       now=datetime(2026, 10, 29, 9))
+                       now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert [f.entity_label for f in page.failures] == ["Alpha"]
     error = page.failures[0].error
     assert isinstance(error, NoteUnreadable)
@@ -258,11 +259,11 @@ def test_sort_by_title_and_done_stays_newest_first(tmp_path, monkeypatch):
     _note(tmp_path, "alpha", "02-work", "Old done", status="done", updated="2026-01-01")
     _note(tmp_path, "beta1", "02-work", "New done", status="done", updated="2026-09-01")
     by_title = load_master(vault, main.build_scope, entities=(), sort="title",
-                           done_all=False, now=datetime(2026, 10, 29, 9))
+                           done_all=False, now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert [m.card.title for m in by_title.columns[0].cards] == ["Aye", "Zed"]
     assert [m.card.title for m in by_title.columns[3].cards] == ["New done", "Old done"]
     by_updated = load_master(vault, main.build_scope, entities=(), sort="bogus",
-                             done_all=False, now=datetime(2026, 10, 29, 9))
+                             done_all=False, now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert by_updated.sort == "updated"
     assert [m.card.title for m in by_updated.columns[0].cards] == ["Aye", "Zed"]
     assert [(link.label, link.active) for link in by_title.sort_links] == [
@@ -275,7 +276,7 @@ def test_done_all_shows_every_card_and_links_keep_other_params(tmp_path, monkeyp
     for i in range(12):
         _note(tmp_path, "alpha", "02-work", f"Done {i:02}", status="done", updated=f"2026-10-{i + 1:02}")
     page = load_master(vault, main.build_scope, entities=("alpha", "nope"), sort="title",
-                       done_all=True, now=datetime(2026, 10, 29, 9))
+                       done_all=True, now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert page.columns[3].total == 12 and len(page.columns[3].cards) == 12
     assert page.done_all is True
     assert [c.slug for c in page.chips] == ["alpha", "beta1"]
@@ -294,7 +295,7 @@ def test_master_reads_without_writing(tmp_path, monkeypatch):
     _inbox_with_proposal(tmp_path, "beta1", "marker.md")
     before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=True,
-                       now=datetime(2026, 10, 29, 9))
+                       now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert page.failures == () and len(page.columns[2].cards) == 1
     after = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     assert before == after
@@ -526,7 +527,7 @@ def test_done_all_offers_a_way_back_to_recent(tmp_path, monkeypatch):
         r'<a[^>]*class="master-show-all"[^>]*>\s*Show recent', html).group(0)
     assert "Show all" not in html
     page = load_master(main.Vault(main.current_catalog()), main.build_scope, entities=("alpha",),
-                       sort="title", done_all=True, now=datetime(2026, 10, 29, 9))
+                       sort="title", done_all=True, now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert page.done_recent_href == "/?entity=alpha&sort=title"
 
 
@@ -634,3 +635,220 @@ def test_board_page_with_an_unreadable_inbox_note_is_described(tmp_path, monkeyp
     _break_note_encoding(_note(tmp_path, "alpha", "00-inbox", "Mail", sub="triage"))
     response = client.get("/board/alpha")
     assert "E-UNAVAILABLE" in response.text and "E-UNKNOWN" not in response.text
+
+
+# --- reminders -------------------------------------------------------------
+
+NOW = datetime(2026, 11, 3, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+
+
+def _path(entity: str, name: str) -> str:
+    return f"{entity}/02-work/active/{name}.md"
+
+
+def _reminder(entity: str, name: str, due: datetime, subject: str = "Chase it") -> Reminder:
+    key = _path(entity, name)
+    return Reminder(key, entity, subject, due)
+
+
+def _load(vault, main, reminders, **kwargs):
+    args = dict(entities=(), sort="updated", done_all=False, now=NOW, reminders=reminders)
+    args.update(kwargs)
+    return load_master(vault, main.build_scope, **args)
+
+
+def _by_key(*reminders: Reminder) -> dict[str, Reminder]:
+    return {r.key: r for r in reminders}
+
+
+def test_strip_orders_overdue_then_soon_then_later(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    for name in ("A", "B", "C"):
+        _note(tmp_path, "alpha", "02-work", name, status="waiting")
+    page = _load(vault, main, _by_key(
+        _reminder("alpha", "C", NOW + timedelta(days=3)),
+        _reminder("alpha", "A", NOW - timedelta(hours=1)),
+        _reminder("alpha", "B", NOW + timedelta(hours=2)),
+    ))
+    assert [a.level for a in page.attention] == ["overdue", "soon", "later"]
+    assert [a.card.card.title for a in page.attention] == ["A", "B", "C"]
+    assert page.reminders_available is True
+    assert page.attention[0].entity_label == "Alpha" and page.attention[0].tone == 1
+    assert page.attention[0].unreadable is False
+
+
+def test_strip_orders_within_a_level_soonest_first(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    for name in ("A", "B", "C"):
+        _note(tmp_path, "alpha", "02-work", name, status="waiting")
+    page = _load(vault, main, _by_key(
+        _reminder("alpha", "A", NOW + timedelta(days=5)),
+        _reminder("alpha", "B", NOW + timedelta(days=2)),
+        _reminder("alpha", "C", NOW + timedelta(days=9)),
+    ))
+    assert [a.reminder.key for a in page.attention] == [
+        _path("alpha", "B"), _path("alpha", "A"), _path("alpha", "C")]
+
+
+def test_strip_boundaries(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    for name in ("Now", "Day", "Past"):
+        _note(tmp_path, "alpha", "02-work", name, status="waiting")
+    page = _load(vault, main, _by_key(
+        _reminder("alpha", "Now", NOW),
+        _reminder("alpha", "Day", NOW + timedelta(hours=24)),
+        _reminder("alpha", "Past", NOW - timedelta(seconds=1)),
+    ))
+    levels = {a.reminder.key: a.level for a in page.attention}
+    assert levels == {
+        _path("alpha", "Now"): "soon",
+        _path("alpha", "Day"): "later",
+        _path("alpha", "Past"): "overdue",
+    }
+
+
+def test_levels_use_the_absolute_instant_not_the_wall_clock(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Far", status="waiting")
+    # 09:30 at -05:00 is 14:30 UTC, after NOW (08:00 UTC) although its wall time is earlier.
+    due = datetime(2026, 11, 3, 9, 30, tzinfo=timezone(timedelta(hours=-5)))
+    page = _load(vault, main, _by_key(_reminder("alpha", "Far", due)))
+    assert page.attention[0].level == "soon"
+
+
+def test_done_card_resolves_its_reminder(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Closed", status="done")
+    _note(tmp_path, "alpha", "02-work", "Filed", status="active")
+    _note(tmp_path, "alpha", "02-work", "Open", status="waiting")
+    page = _load(vault, main, _by_key(
+        _reminder("alpha", "Closed", NOW - timedelta(days=1)),
+        _reminder("alpha", "Filed", NOW - timedelta(days=1)),
+        _reminder("alpha", "Open", NOW + timedelta(hours=1)),
+    ))
+    assert [a.card.card.title for a in page.attention] == ["Open"]
+
+
+def test_moved_card_reminder_stays_visible(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Elsewhere", status="waiting")
+    gone = _reminder("alpha", "Gone", NOW - timedelta(hours=1), "Call the bank")
+    page = _load(vault, main, _by_key(gone))
+    assert len(page.attention) == 1
+    entry = page.attention[0]
+    assert entry.card is None and entry.unreadable is False
+    assert entry.reminder == gone and entry.level == "overdue"
+    assert entry.entity_label == "Alpha"
+
+
+def test_reminder_for_an_entity_not_in_the_registry_is_moved_or_removed(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    ghost = Reminder("ghost/02-work/active/X.md", "ghost", "Old", NOW + timedelta(days=2))
+    page = _load(vault, main, _by_key(ghost))
+    assert len(page.attention) == 1
+    entry = page.attention[0]
+    assert entry.card is None and entry.unreadable is False
+    assert entry.entity_label == "ghost"
+
+
+def test_reminder_whose_entity_differs_from_the_card_entity_is_not_attached(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="waiting")
+    stray = Reminder(_path("alpha", "Spec"), "beta1", "Stray", NOW + timedelta(hours=1))
+    page = _load(vault, main, _by_key(stray))
+    assert page.columns[1].cards[0].reminder is None
+    assert page.attention[0].card is None
+
+
+def test_unreadable_entity_reminders_are_not_called_moved(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "beta1", "02-work", "Still here", status="waiting")
+
+    def scope_for(slug):
+        if slug == "alpha":
+            raise main.CrossScopeError("synthetic")
+        return main.build_scope(slug)
+
+    page = load_master(vault, scope_for, entities=(), sort="updated", done_all=False,
+                       now=NOW, reminders=_by_key(
+                           _reminder("alpha", "Hidden", NOW - timedelta(hours=1)),
+                           _reminder("beta1", "Still here", NOW + timedelta(hours=1))))
+    by_entity = {a.reminder.entity: a for a in page.attention}
+    assert by_entity["alpha"].card is None and by_entity["alpha"].unreadable is True
+    assert by_entity["beta1"].card is not None and by_entity["beta1"].unreadable is False
+
+
+def test_strip_follows_the_entity_filter(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "A", status="waiting")
+    _note(tmp_path, "beta1", "02-work", "B", status="waiting")
+    both = _by_key(_reminder("alpha", "A", NOW + timedelta(hours=1)),
+                   _reminder("beta1", "B", NOW + timedelta(hours=1)))
+    page = _load(vault, main, both, entities=("alpha",))
+    assert [a.reminder.entity for a in page.attention] == ["alpha"]
+    everything = _load(vault, main, both)
+    assert {a.reminder.entity for a in everything.attention} == {"alpha", "beta1"}
+
+
+def test_waiting_and_review_put_reminders_first_soonest_first(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Newest", status="waiting", updated="2026-10-30")
+    _note(tmp_path, "alpha", "02-work", "Middle", status="waiting", updated="2026-10-20")
+    _note(tmp_path, "alpha", "02-work", "Oldest", status="waiting", updated="2026-10-10")
+    _note(tmp_path, "alpha", "02-work", "Zed", status="draft", updated="2026-10-01")
+    _note(tmp_path, "alpha", "02-work", "Aye", status="draft", updated="2026-10-02")
+    reminders = _by_key(
+        _reminder("alpha", "Oldest", NOW + timedelta(days=2)),
+        _reminder("alpha", "Middle", NOW + timedelta(days=1)),
+        _reminder("alpha", "Zed", NOW - timedelta(days=1)),
+    )
+    page = _load(vault, main, reminders)
+    waiting = [m.card.title for m in page.columns[1].cards]
+    assert waiting == ["Middle", "Oldest", "Newest"]
+    # Draft is not reordered by reminders.
+    assert [m.card.title for m in page.columns[0].cards] == ["Aye", "Zed"]
+    by_title = _load(vault, main, reminders, sort="title")
+    assert [m.card.title for m in by_title.columns[1].cards] == ["Middle", "Newest", "Oldest"]
+
+
+def test_review_column_puts_reminders_first(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "00-inbox", "Fresh", sub="triage", updated="2026-10-30")
+    _note(tmp_path, "alpha", "00-inbox", "Stale", sub="triage", updated="2026-10-01")
+    inbox = {m.card.title: m.card.relative_path for m in _load(vault, main, {}).columns[2].cards}
+    stale = Reminder(inbox["Stale"], "alpha", "Review soon", NOW + timedelta(hours=3))
+    page = _load(vault, main, {stale.key: stale})
+    assert [m.card.title for m in page.columns[2].cards] == ["Stale", "Fresh"]
+    assert page.attention[0].card.card.title == "Stale"
+
+
+def test_card_carries_its_reminder(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "A", status="waiting")
+    _note(tmp_path, "alpha", "02-work", "B", status="waiting")
+    mine = _reminder("alpha", "A", NOW + timedelta(hours=1))
+    page = _load(vault, main, _by_key(mine))
+    cards = {m.card.title: m for m in page.columns[1].cards}
+    assert cards["A"].reminder == mine and cards["B"].reminder is None
+    assert page.attention[0].card is cards["A"]
+
+
+def test_store_unavailable_gives_an_empty_strip(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "A", status="waiting")
+    page = _load(vault, main, None)
+    assert page.reminders_available is False and page.attention == ()
+    assert page.columns[1].cards[0].reminder is None
+
+
+def test_now_must_be_timezone_aware(tmp_path, monkeypatch):
+    import pytest
+
+    main, vault = _vault(tmp_path, monkeypatch)
+    with pytest.raises(ValueError):
+        _load(vault, main, {}, now=datetime(2026, 11, 3, 10, 0))
+
+
+def test_due_label():
+    due = datetime(2026, 11, 4, 11, 0, tzinfo=timezone(timedelta(hours=2)))
+    assert due_label(due) == "Wed 4 Nov 11:00"

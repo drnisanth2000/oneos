@@ -431,7 +431,8 @@ def shell(request: Request) -> HTMLResponse:
             entities=tuple(params.getlist("entity")),
             sort=params.get("sort") or "",
             done_all=params.get("done") == "all",
-            now=datetime.now(),
+            now=datetime.now().astimezone(),
+            reminders={},
         )
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))

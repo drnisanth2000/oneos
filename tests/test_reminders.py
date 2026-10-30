@@ -147,9 +147,18 @@ def test_parse_due():
         ("2026-11-04", "11:00", "x"),
         ("2026-11-04", "11:00", "2000"),
         ("11/04/2026", "11:00", "0"),
+        ("1969-12-31", "23:59", "0"),
+        ("0001-01-01", "00:00", "0"),
     ]:
         with pytest.raises(InvalidReminder):
             parse_due(*bad)
+
+
+def test_parse_due_extremes_order_without_overflow():
+    earliest = parse_due("1970-01-01", "00:00", "840")
+    latest = parse_due("9999-12-31", "23:59", "-840")
+    assert earliest < latest
+    assert parse_due("9999-12-31", "23:59", "840") < latest
 
 
 def test_clean_subject():
