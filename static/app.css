@@ -911,7 +911,35 @@ a.board-chip:hover { background: var(--fill-strong); }
   color: var(--ink-dim); font-size: var(--text-sm); font-variant-numeric: tabular-nums;
 }
 .master-reminder .icon { width: 14px; height: 14px; flex: none; }
+.attention-remove { margin-top: var(--space-1); }
+.review-surface .attention-remove-button { min-height: 28px; font-size: var(--text-sm); }
 /* --- end needs attention --- */
+
+/* --- reminder box --- */
+.reminder-box { margin-top: var(--space-4); padding-top: var(--space-3); border-top: 1px solid var(--line); }
+.reminder-box-head {
+  display: flex; align-items: center; gap: var(--space-2); margin: 0 0 var(--space-2);
+  font-size: var(--text-md); font-weight: 600;
+}
+.reminder-box-head .icon { width: 16px; height: 16px; }
+.reminder-current { margin: 0 0 var(--space-2); font-size: var(--text-md); font-variant-numeric: tabular-nums; }
+.reminder-fields {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3);
+  min-width: 0; margin: 0; padding: 0; border: 0;
+}
+.reminder-field { display: grid; gap: var(--space-1); min-width: 0; color: var(--ink-dim); font-size: var(--text-sm); font-weight: 600; }
+.reminder-field input {
+  font: inherit; font-size: var(--text-base); font-weight: 400; min-height: 36px; min-width: 0; width: 100%;
+  padding: 0 var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel); color: var(--ink);
+}
+.reminder-field input:disabled { opacity: .5; }
+.reminder-subject, .reminder-actions { grid-column: 1 / -1; }
+.reminder-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.reminder-actions button { min-height: 36px; }
+.reminder-fields:disabled .reminder-actions button { opacity: .5; cursor: not-allowed; }
+.review-surface .reminder-remove:hover { border-color: var(--err-ink); color: var(--err-ink); }
+/* --- end reminder box --- */
 
 /* Tablet: two columns per row. */
 @media (max-width: 1100px) {

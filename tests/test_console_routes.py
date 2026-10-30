@@ -3900,6 +3900,23 @@ def _route_totality_plan(main) -> dict:
             ),
             "patch_targets": [(main, "entity_cards")],
         },
+        main.master_reminder_save: {
+            "request": lambda c, submitted=None: c.post(
+                "/master/reminder/alpha",
+                data={
+                    "path": submitted or "alpha/02-work/active/x.md", "subject": "s",
+                    "date": "2099-01-01", "time": "09:00", "offset": "0",
+                },
+            ),
+            "patch_targets": [(main, "entity_cards")],
+        },
+        main.master_reminder_remove: {
+            "request": lambda c, submitted=None: c.post(
+                "/master/reminder/alpha/remove",
+                data={"path": submitted or "alpha/02-work/active/x.md"},
+            ),
+            "patch_targets": [(main, "reminder_store")],
+        },
         main.board_default: {
             "request": lambda c, submitted=None: c.get("/board"),
             "patch_targets": [(main.Vault, "bundles")],

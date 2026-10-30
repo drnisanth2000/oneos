@@ -11,6 +11,19 @@
       const pad = (n) => String(n).padStart(2, '0')
       const hhmm = (d) => pad(d.getHours()) + ':' + pad(d.getMinutes())
       const isRefresh = (e) => e.detail && e.detail.target && e.detail.target.id === 'master'
+      // The reminder box in the popup. The server wants the browser's UTC offset
+      // (minutes east of UTC) for the day and time picked, not for today, so a
+      // reminder set across a daylight-saving change keeps the right wall time.
+      Alpine.data('reminderBox', () => ({
+        init() { this.sync() },
+        sync() {
+          const [y, m, d] = (this.$refs.date.value || '').split('-').map(Number)
+          const [hh, mm] = (this.$refs.time.value || '').split(':').map(Number)
+          let when = new Date()
+          if (y && m && d) when = new Date(y, m - 1, d, hh || 0, mm || 0)
+          this.$refs.offset.value = String(-when.getTimezoneOffset())
+        },
+      }))
       Alpine.data('masterHead', () => ({
         greeting: '', date: '', clock: '', loaded: '', stale: '',
         init() {
@@ -46,14 +59,16 @@
   {% include "_sidebar.html" %}
 
   <main class="main">
-    {# The master view, read-only. It refreshes itself every minute with a
-       morph that keeps Alpine state (the phone stage switcher, the clock).
+    {# The master view. It refreshes itself every minute, and when a reminder is
+       saved or removed (the response's HX-Trigger: master-refresh, which bubbles
+       to the body), with a morph that keeps Alpine state (the phone stage
+       switcher, the clock).
        The URL is relative so the refresh keeps the page's own scheme behind
        a TLS proxy. hx-disinherit stops the cards inheriting the wrapper's
        hx-select/hx-swap. #}
     <div id="master" class="master"
          hx-get="{{ request.url.path }}{% if request.url.query %}?{{ request.url.query }}{% endif %}"
-         hx-trigger="every 60s"
+         hx-trigger="every 60s, master-refresh from:body"
          hx-select="#master"
          hx-swap="morph"
          hx-disinherit="*"
@@ -102,7 +117,14 @@
                 {% if entry.unreadable and not entry.card %}<span class="attention-orphan">Can't read this entity right now</span>
                 {% elif not entry.card %}<span class="attention-orphan">Card moved or removed</span>{% endif %}
               </span>
-            {% if entry.card %}</button>{% else %}</div>{% endif %}
+            {% if entry.card %}</button>{% else %}
+              {# No card to open, so the only action is clearing the reminder. The
+                 form swaps nothing; the master-refresh trigger redraws the strip. #}
+              <form class="attention-remove" hx-post="/master/reminder/{{ entry.reminder.entity | urlencode }}/remove" hx-swap="none">
+                <input type="hidden" name="path" value="{{ entry.reminder.key }}">
+                <button type="submit" class="attention-remove-button">Remove<span class="sr-only"> reminder: {{ entry.reminder.subject }}</span></button>
+              </form>
+            </div>{% endif %}
           </li>
           {% endfor %}
         </ul>

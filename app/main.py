@@ -45,7 +45,15 @@ from .entities import (
 )
 from .inbox import read_inbox
 from .master import due_label, entity_tone, load_master, stage_label, stage_of
-from .reminders import ReminderStoreUnavailable, reminder_store
+from .reminders import (
+    InvalidReminder,
+    Reminder,
+    ReminderStore,
+    ReminderStoreUnavailable,
+    clean_subject,
+    parse_due,
+    reminder_store,
+)
 from .ingest.base import IngestError
 from .phase3 import (
     CleanupError,
@@ -413,10 +421,10 @@ async def _console_fallback_handler(request: Request, exc: Exception) -> HTMLRes
 def _page_reminders() -> dict | None:
     """Every reminder, or None when the store is missing or unsafe. The page
     renders either way ("Reminders are unavailable"); a read creates nothing."""
-    store = reminder_store()
-    if store is None:
-        return None
     try:
+        store = reminder_store()
+        if store is None:
+            return None
         return store.all()
     except ReminderStoreUnavailable:
         return None
@@ -688,6 +696,46 @@ def board(request: Request, scope: EntityScope) -> HTMLResponse:
         return _render_console_error(request, describe(exc))
 
 
+def _find_card(cards, path: str):
+    """The card whose own path is `path`, or None. `path` is only ever compared
+    with the paths the entity's reader returned; it is never resolved itself."""
+    return next(
+        # Proposed first, as `load_master` dedups: a proposal shares its
+        # inbox card's path, and only the proposed card knows its destination.
+        (c for c in (*cards.proposed, *cards.inbox, *cards.filed) if c.relative_path == path),
+        None,
+    )
+
+
+def _popup_context(scope: Scope, catalog, card, reminders: dict | None) -> dict:
+    """The popup's template context. `reminders` is every stored reminder, or
+    None when the store is unavailable (the reminder box is then disabled)."""
+    slug = scope.current_entity()
+    # Registry order, as `load_master` colours its chips.
+    index, label = next(
+        ((i, e.label) for i, e in enumerate(catalog.entities) if e.slug == slug),
+        (None, slug),
+    )
+    stage = stage_of(card)
+    reminder = (reminders or {}).get(card.relative_path)
+    if reminder is not None and reminder.entity != slug:
+        reminder = None
+    return {
+        "card": card,
+        "stage": stage_label(stage),
+        "entity": slug,
+        "entity_label": label,
+        "tone": entity_tone(index) if index is not None else 0,
+        "body": note_body(scope, card.relative_path),
+        "reminder_box": stage in ("waiting", "review"),
+        "reminders_available": reminders is not None,
+        "reminder": reminder,
+    }
+
+
+_EMPTY_POPUP = {"card": None, "stage": "", "entity_label": "", "tone": 0, "body": ""}
+
+
 @app.get("/master/card/{entity}", response_class=HTMLResponse)
 @console_route(
     catches=_BOARD_CATCHES,
@@ -695,32 +743,14 @@ def board(request: Request, scope: EntityScope) -> HTMLResponse:
     services=(entity_cards, note_body),
 )
 def master_card(request: Request, scope: EntityScope, path: str = "") -> HTMLResponse:
-    """Read-only popup for one card. `path` is only ever compared with the
-    paths the entity's own reader returned; it is resolved only after a match."""
+    """Popup for one card, with the reminder box on Waiting and To review
+    cards. Opening it reads the reminder store and writes nothing."""
     try:
         catalog = current_catalog()
-        cards = entity_cards(scope, Vault(catalog))
-        card = next(
-            # Proposed first, as `load_master` dedups: a proposal shares its
-            # inbox card's path, and only the proposed card knows its destination.
-            (c for c in (*cards.proposed, *cards.inbox, *cards.filed) if c.relative_path == path),
-            None,
-        )
-        context = {"card": None, "stage": "", "entity_label": "", "tone": 0, "body": ""}
+        card = _find_card(entity_cards(scope, Vault(catalog)), path)
+        context = _EMPTY_POPUP
         if card is not None:
-            slug = scope.current_entity()
-            # Registry order, as `load_master` colours its chips.
-            index, label = next(
-                ((i, e.label) for i, e in enumerate(catalog.entities) if e.slug == slug),
-                (None, slug),
-            )
-            context = {
-                "card": card,
-                "stage": stage_label(stage_of(card)),
-                "entity_label": label,
-                "tone": entity_tone(index) if index is not None else 0,
-                "body": note_body(scope, card.relative_path),
-            }
+            context = _popup_context(scope, catalog, card, _page_reminders())
     except _BOARD_CATCHES as exc:
         # The popup dialog has no other way to close than Escape and the
         # backdrop, so its error view carries the same close button.
@@ -728,6 +758,115 @@ def master_card(request: Request, scope: EntityScope, path: str = "") -> HTMLRes
             request, describe(exc), fragment_template="blocks/master_popup_error.html"
         )
     return templates.TemplateResponse(request, "blocks/master_popup.html", context)
+
+
+_REMINDER_CATCHES = (*_BOARD_CATCHES, ReminderStoreUnavailable, InvalidReminder)
+# `build_scope` can also report an unreadable vault root; the remove route has
+# no scope dependency, so it answers that itself.
+_REMINDER_REMOVE_CATCHES = (*_REMINDER_CATCHES, VaultRootUnavailable)
+_REMINDERS_CHANGED = "master-refresh"
+
+
+@app.post("/master/reminder/{entity}", response_class=HTMLResponse)
+@console_route(
+    catches=_REMINDER_CATCHES,
+    surface="fragment-only",
+    services=(entity_cards, note_body, reminder_store, ReminderStore.save),
+)
+def master_reminder_save(
+    request: Request,
+    scope: EntityScope,
+    path: Annotated[str, Form()] = "",
+    subject: Annotated[str, Form()] = "",
+    date: Annotated[str, Form()] = "",
+    time: Annotated[str, Form()] = "",
+    offset: Annotated[str, Form()] = "",
+) -> HTMLResponse:
+    """Set (or replace) the reminder on one Waiting or To review card.
+
+    `path` is trusted only after it matches a card the entity's own reader
+    returned, in a stage that takes reminders; so a forged or stale form is
+    refused. The due time is the wall time the browser typed with the offset it
+    reported; it is stored as given and never converted here. Nothing is
+    written to the vault.
+    """
+    try:
+        catalog = current_catalog()
+        cards = entity_cards(scope, Vault(catalog))
+        store = reminder_store()
+        if store is None:
+            raise ReminderStoreUnavailable()
+        card = _find_card(cards, path)
+        if card is None or stage_of(card) not in ("waiting", "review"):
+            raise InvalidReminder("not a card that takes a reminder")
+        reminder = Reminder(
+            key=card.relative_path,
+            entity=scope.current_entity(),
+            subject=clean_subject(subject),
+            due_at=parse_due(date, time, offset),
+        )
+        # Bound-method calls are not what the route-service sweep resolves, so
+        # the store is called through its class, which is what it declares.
+        ReminderStore.save(store, reminder)
+        context = _popup_context(scope, catalog, card, {reminder.key: reminder})
+    except _REMINDER_CATCHES as exc:
+        return _render_console_error(
+            request, describe(exc), fragment_template="blocks/master_popup_error.html"
+        )
+    response = templates.TemplateResponse(request, "blocks/master_popup.html", context)
+    response.headers["HX-Trigger"] = _REMINDERS_CHANGED
+    return response
+
+
+@app.post("/master/reminder/{entity}/remove", response_class=HTMLResponse)
+@console_route(
+    catches=_REMINDER_REMOVE_CATCHES,
+    surface="fragment-only",
+    services=(
+        build_scope, entity_cards, note_body, reminder_store, ReminderStore.all, ReminderStore.remove,
+    ),
+)
+def master_reminder_remove(
+    request: Request, entity: str, path: Annotated[str, Form()] = ""
+) -> HTMLResponse:
+    """Remove the reminder stored under `path`, if it is `entity`'s.
+
+    No card check: a reminder whose card was moved or deleted outside the
+    master view, or whose entity left the registry, must still be removable.
+    The route has no scope dependency for the same reason. Once the row is
+    gone the popup comes back if the card is still there; otherwise the
+    response is empty (the strip card's button swaps nothing).
+    """
+    try:
+        store = reminder_store()
+        if store is None:
+            raise ReminderStoreUnavailable()
+        stored = ReminderStore.all(store).get(path)
+        if stored is not None and stored.entity != entity:
+            raise InvalidReminder("that reminder belongs to another entity")
+        if stored is not None:
+            ReminderStore.remove(store, path)
+    except _REMINDER_REMOVE_CATCHES as exc:
+        return _render_console_error(
+            request, describe(exc), fragment_template="blocks/master_popup_error.html"
+        )
+    card = None
+    try:
+        scope = build_scope(entity)
+        catalog = current_catalog()
+        card = _find_card(entity_cards(scope, Vault(catalog)), path)
+        if card is not None:
+            response = templates.TemplateResponse(
+                request, "blocks/master_popup.html", _popup_context(scope, catalog, card, {})
+            )
+    except (*_BOARD_CATCHES, VaultRootUnavailable):
+        # The reminder is already gone; an entity that cannot be read right now
+        # (or has left the registry) simply has no popup to refresh.
+        card = None
+    if card is None:
+        response = HTMLResponse("")
+    response.headers["HX-Trigger"] = _REMINDERS_CHANGED
+    return response
 
 
 _CAPTURE_CATCHES = (IngestError, CrossScopeError)

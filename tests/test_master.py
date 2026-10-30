@@ -441,7 +441,7 @@ def test_refresh_wrapper_uses_a_relative_url(tmp_path, monkeypatch):
         tag = re.search(r'<div id="master"[^>]*>', html).group(0)
         hx_get = re.search(r'hx-get="([^"]*)"', tag).group(1)
         assert hx_get.startswith("/") and hx_get == expected
-        assert 'hx-trigger="every 60s"' in tag and 'hx-select="#master"' in tag
+        assert 'hx-trigger="every 60s, master-refresh from:body"' in tag and 'hx-select="#master"' in tag
         assert 'hx-swap="morph"' in tag
     # The popup dialog sits outside the refreshed wrapper, so a refresh never closes it.
     html = client.get("/").text
@@ -966,13 +966,14 @@ def test_waiting_card_shows_due_and_review_card_shows_review_by(tmp_path, tmp_pa
     assert f"Review by {due_label(due.replace(day=5))}" in text
 
 
-def test_orphan_attention_card_is_not_a_link_or_button(tmp_path, tmp_path_factory, monkeypatch):
+def test_orphan_attention_card_is_not_a_link(tmp_path, tmp_path_factory, monkeypatch):
     main, client = _client(tmp_path, monkeypatch)
     directory = _auth_dir(tmp_path_factory, monkeypatch)
     _seed(directory, _reminder("alpha", "Gone", datetime.now(timezone.utc) + timedelta(days=2), "Lost one"))
     strip = _strip(client.get("/").text)
     assert "Card moved or removed" in strip and "Lost one" in strip and "Alpha" in strip
-    assert "hx-get" not in strip and "<button" not in strip and "hx-post" not in strip
+    # Static, with only its own Remove: no link opens a popup for a missing card.
+    assert "hx-get" not in strip and strip.count("<button") == 1
     assert 'class="attention-card is-later' in strip
 
 
@@ -999,7 +1000,7 @@ def test_unreadable_entity_reminder_is_not_called_moved_and_is_not_a_link(
     strip = _strip(response.text)
     assert "Cannot see" in strip and "Card moved or removed" not in strip
     assert "Can't read this entity right now" in strip or "Can&#39;t read this entity right now" in strip
-    assert "hx-get" not in strip and "<button" not in strip
+    assert "hx-get" not in strip and strip.count("<button") == 1
 
 
 def test_attention_card_shows_the_stored_wall_time_not_a_converted_one(
@@ -1065,3 +1066,359 @@ def test_reminder_date_shows_only_on_waiting_and_review_cards(tmp_path, tmp_path
     board = html.split('class="master-cols"')[1]
     assert "master-reminder" not in board
     assert due_label(due) not in board
+
+
+# --- setting and removing a reminder from the popup -------------------------------
+
+_FORM = {"subject": "Chase the supplier", "date": "2099-11-04", "time": "11:00", "offset": "120"}
+
+
+def _vault_state(root):
+    """What a vault write would change: the work tree status and the commit."""
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True).stdout
+
+    return git("status", "--porcelain"), git("rev-parse", "HEAD")
+
+
+def _save(client, entity, path, **overrides):
+    return client.post(f"/master/reminder/{entity}", data={**_FORM, "path": path, **overrides})
+
+
+def _remove(client, entity, path):
+    return client.post(f"/master/reminder/{entity}/remove", data={"path": path})
+
+
+def _setup(tmp_path, tmp_path_factory, monkeypatch, status="waiting"):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status=status)
+    _git_commit_all(tmp_path)
+    return main, client, directory, _card_path(main, "alpha", "Chase")
+
+
+def _refused(response):
+    assert response.status_code == 200
+    assert 'class="alert' in response.text and "sr-only\">Close<" in response.text
+    assert "Traceback" not in response.text and "E-UNKNOWN" not in response.text
+
+
+def test_save_reminder_from_the_popup(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    before = _vault_state(tmp_path)
+    response = _save(client, "alpha", path)
+    assert response.status_code == 200
+    assert response.headers["HX-Trigger"] == "master-refresh"
+    saved = ReminderStore(directory).all()
+    assert list(saved) == [path]
+    assert saved[path].entity == "alpha" and saved[path].subject == "Chase the supplier"
+    # The typed wall time and the browser's offset are stored as they came.
+    assert saved[path].due_at.isoformat() == "2099-11-04T11:00:00+02:00"
+    assert _vault_state(tmp_path) == before
+    # The popup comes back showing the reminder, with a way to remove it.
+    assert due_label(saved[path].due_at) in response.text
+    assert "Remove" in response.text and "Save reminder" in response.text
+
+
+def test_save_again_replaces_the_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _save(client, "alpha", path)
+    _save(client, "alpha", path, subject="Second thoughts", date="2099-12-01", time="08:30", offset="-300")
+    saved = ReminderStore(directory).all()
+    assert len(saved) == 1
+    assert saved[path].subject == "Second thoughts"
+    assert saved[path].due_at.isoformat() == "2099-12-01T08:30:00-05:00"
+
+
+def test_save_for_a_card_to_review(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "00-inbox", "New mail", sub="triage", title="New mail")
+    path = _card_path(main, "alpha", "New mail")
+    assert _save(client, "alpha", path).headers["HX-Trigger"] == "master-refresh"
+    assert list(ReminderStore(directory).all()) == [path]
+
+
+def test_remove_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _save(client, "alpha", path)
+    before = _vault_state(tmp_path)
+    response = _remove(client, "alpha", path)
+    assert response.status_code == 200
+    assert response.headers["HX-Trigger"] == "master-refresh"
+    assert ReminderStore(directory).all() == {}
+    assert _vault_state(tmp_path) == before
+    # The card is still there, so the popup comes back, now with no Remove.
+    assert "Save reminder" in response.text and ">Remove<" not in response.text
+
+
+def test_remove_orphan_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    gone = _reminder("alpha", "Gone", datetime.now(timezone.utc) + timedelta(days=2))
+    ghost = Reminder("ghost/02-work/active/X.md", "ghost", "Old", datetime.now(timezone.utc) + timedelta(days=2))
+    other = _reminder("alpha", "Kept", datetime.now(timezone.utc) + timedelta(days=2))
+    _seed(directory, gone, ghost, other)
+    response = _remove(client, "alpha", gone.key)
+    assert response.status_code == 200 and response.text == ""
+    assert response.headers["HX-Trigger"] == "master-refresh"
+    # An entity that left the registry can still be cleaned up.
+    response = _remove(client, "ghost", ghost.key)
+    assert response.status_code == 200 and response.text == ""
+    assert response.headers["HX-Trigger"] == "master-refresh"
+    assert list(ReminderStore(directory).all()) == [other.key]
+
+
+def test_remove_of_an_absent_reminder_is_a_quiet_success(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    response = _remove(client, "alpha", path)
+    assert response.status_code == 200 and response.headers["HX-Trigger"] == "master-refresh"
+    assert list(directory.iterdir()) == []
+
+
+def test_remove_refuses_another_entitys_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    row = Reminder("alpha/02-work/active/Odd.md", "beta1", "Not yours", datetime.now(timezone.utc) + timedelta(days=2))
+    _seed(directory, row)
+    response = _remove(client, "alpha", row.key)
+    _refused(response)
+    assert "HX-Trigger" not in response.headers
+    assert ReminderStore(directory).all() == {row.key: row}
+
+
+def test_remove_without_a_store_is_refused_not_500(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
+    response = _remove(client, "alpha", "alpha/02-work/active/X.md")
+    _refused(response)
+    assert "E-UNAVAILABLE" in response.text
+
+
+def test_save_is_refused_for_a_draft_or_done_card(tmp_path, tmp_path_factory, monkeypatch):
+    for status in ("draft", "done", "active", "open"):
+        main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch, status=status)
+        response = _save(client, "alpha", path)
+        _refused(response)
+        assert "HX-Trigger" not in response.headers
+        assert list(directory.iterdir()) == [], status
+
+
+def test_save_is_refused_for_a_path_that_is_not_a_card(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    for forged in ("alpha/02-work/active/Nope.md", "../alpha/02-work/active/Chase.md", "", "alpha/outbox"):
+        _refused(_save(client, "alpha", forged))
+    assert list(directory.iterdir()) == []
+
+
+def test_save_is_refused_for_another_entitys_path(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _note(tmp_path, "beta1", "02-work", "Theirs", status="waiting")
+    theirs = _card_path(main, "beta1", "Theirs")
+    _refused(_save(client, "alpha", theirs))
+    _refused(_save(client, "beta1", path))
+    # An entity outside the registry is refused by the scope dependency, described.
+    ghost = _save(client, "ghost", path)
+    assert ghost.status_code == 200 and "E-ENTITY" in ghost.text
+    assert list(directory.iterdir()) == []
+
+
+def test_save_is_refused_for_an_empty_or_multiline_subject(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    for subject in ("", "   ", "one\ntwo", "one\rtwo", "x" * 121):
+        _refused(_save(client, "alpha", path, subject=subject))
+    assert list(directory.iterdir()) == []
+    assert ReminderStore(directory).all() == {}
+
+
+def test_save_is_refused_for_a_bad_date_or_offset(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    for bad in (
+        {"date": "2026-02-30"}, {"date": ""}, {"date": "not a date"}, {"time": "25:00"},
+        {"time": ""}, {"offset": ""}, {"offset": "x"}, {"offset": "9999"},
+    ):
+        _refused(_save(client, "alpha", path, **bad))
+    assert list(directory.iterdir()) == []
+
+
+def test_a_refused_save_keeps_the_existing_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _save(client, "alpha", path)
+    before = ReminderStore(directory).all()
+    _refused(_save(client, "alpha", path, subject=""))
+    assert ReminderStore(directory).all() == before
+
+
+def test_save_without_a_store_is_refused_not_500(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
+    response = _save(client, "alpha", _card_path(main, "alpha", "Chase"))
+    _refused(response)
+    assert "E-UNAVAILABLE" in response.text
+
+
+def test_save_with_an_unsafe_store_is_refused_not_500(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    _auth_dir(tmp_path_factory, monkeypatch, mode=0o755)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _refused(_save(client, "alpha", _card_path(main, "alpha", "Chase")))
+
+
+def test_save_stores_the_wall_time_without_converting_it(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    # 23:30 at UTC-11 is already the next day in UTC; the label must keep the typed day.
+    _save(client, "alpha", path, date="2099-11-04", time="23:30", offset="-660")
+    due = ReminderStore(directory).all()[path].due_at
+    assert due.isoformat() == "2099-11-04T23:30:00-11:00"
+    page = client.get(f"/master/card/alpha?path={path}").text
+    assert "23:30" in page
+
+
+def test_popup_shows_reminder_box_only_for_waiting_and_review(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    _auth_dir(tmp_path_factory, monkeypatch)
+    for title, status in (("Waits", "waiting"), ("Sketch", "draft"), ("Finished", "done"),
+                          ("Live", "active"), ("Odd", "open")):
+        _note(tmp_path, "alpha", "02-work", title, status=status)
+    _note(tmp_path, "alpha", "00-inbox", "New mail", sub="triage", title="New mail")
+    for title, shown in (("Waits", True), ("New mail", True), ("Sketch", False),
+                         ("Finished", False), ("Live", False), ("Odd", False)):
+        html = client.get("/master/card/alpha", params={"path": _card_path(main, "alpha", title)}).text
+        assert ("Save reminder" in html) is shown, title
+        assert ('hx-post="/master/reminder/alpha"' in html) is shown, title
+        assert (">Remove<" in html) is False, title
+
+
+def test_popup_box_prefills_the_card_title_and_has_the_form_fields(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    html = client.get("/master/card/alpha", params={"path": path}).text
+    for fragment in ('name="path"', 'name="subject"', 'name="date"', 'name="time"', 'name="offset"',
+                     'type="date"', 'type="time"', 'maxlength="120"', 'value="Chase"'):
+        assert fragment in html, fragment
+    assert "Reminders are unavailable" not in html and "disabled" not in html
+
+
+def test_popup_prefills_existing_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _save(client, "alpha", path, subject="Call <b>them</b>", date="2099-11-04", time="09:15", offset="-480")
+    html = client.get("/master/card/alpha", params={"path": path}).text
+    assert 'value="Call &lt;b&gt;them&lt;/b&gt;"' in html and "<b>them</b>" not in html
+    assert 'value="2099-11-04"' in html and 'value="09:15"' in html
+    assert ">Remove<" in html and "/master/reminder/alpha/remove" in html
+    assert "Due" in re.sub(r"<[^>]+>|\s+", " ", html)
+
+
+def test_popup_ignores_a_reminder_stored_for_another_entity(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _seed(directory, Reminder(path, "beta1", "Stray", datetime.now(timezone.utc) + timedelta(days=2)))
+    html = client.get("/master/card/alpha", params={"path": path}).text
+    assert "Stray" not in html and 'value="Chase"' in html and ">Remove<" not in html
+
+
+def test_popup_without_a_store_disables_the_box(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    response = client.get("/master/card/alpha", params={"path": _card_path(main, "alpha", "Chase")})
+    assert response.status_code == 200
+    assert "Reminders are unavailable" in response.text
+    assert re.search(r"<fieldset[^>]*\bdisabled\b", response.text)
+
+
+def test_popup_sends_the_browsers_offset_for_the_chosen_date(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    home = client.get("/").text
+    script = home.split("Alpine.data('reminderBox'")[1].split("Alpine.data('masterHead'")[0]
+    assert "getTimezoneOffset" in script and "new Date(y, m - 1, d" in script
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    popup = client.get("/master/card/alpha", params={"path": _card_path(main, "alpha", "Chase")}).text
+    assert 'x-data="reminderBox"' in popup and 'x-ref="offset"' in popup
+
+
+def test_orphan_strip_card_has_an_inline_remove(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    gone = _reminder("alpha", "Gone", datetime.now(timezone.utc) + timedelta(days=2), "Lost one")
+    _seed(directory, gone)
+    strip = _strip(client.get("/").text)
+    assert 'hx-post="/master/reminder/alpha/remove"' in strip
+    assert f'name="path" value="{gone.key}"' in strip
+    assert 'hx-swap="none"' in strip and re.search(r"<button[^>]*>Remove<span", strip)
+    assert "hx-get" not in strip
+    # Posting what the button posts removes the reminder.
+    assert _remove(client, "alpha", gone.key).headers["HX-Trigger"] == "master-refresh"
+    assert ReminderStore(directory).all() == {}
+    assert 'id="master-attention"' not in client.get("/").text
+
+
+def test_unreadable_entity_strip_card_has_an_inline_remove(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    outside = tmp_path / "outside"
+    _note(outside, "other", "02-work", "Secretnote")
+    (tmp_path / "beta1" / "02-work" / "active").symlink_to(
+        outside / "other" / "02-work" / "active", target_is_directory=True)
+    row = _reminder("beta1", "Filing", datetime.now(timezone.utc) + timedelta(days=2), "Cannot see")
+    _seed(directory, row)
+    strip = _strip(client.get("/").text)
+    assert 'hx-post="/master/reminder/beta1/remove"' in strip and f'value="{row.key}"' in strip
+    assert _remove(client, "beta1", row.key).status_code == 200
+    assert ReminderStore(directory).all() == {}
+
+
+def test_linked_strip_cards_have_no_remove_button(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _save(client, "alpha", path)
+    strip = _strip(client.get("/").text)
+    assert "hx-post" not in strip and strip.count("<button") == 1
+
+
+def test_the_master_view_refreshes_when_a_reminder_changes():
+    main_template = (Path(__file__).resolve().parent.parent / "templates" / "home.html").read_text(encoding="utf-8")
+    tag = main_template.split('<div id="master"')[1].split(">")[0]
+    assert "master-refresh from:body" in tag and "every 60s" in tag
+    assert 'hx-get="{{ request.url.path }}' in tag  # still relative
+
+
+def test_reminder_box_css_uses_existing_tokens():
+    assert ".reminder-box" in _CSS
+    rules = _CSS.split("/* --- reminder box --- */")[1].split("/* --- end reminder box --- */")[0]
+    assert "var(--" in rules and "#" not in re.sub(r"/\*.*?\*/", "", rules, flags=re.S).replace("#master", "")
+
+
+def test_save_requires_csrf(tmp_path, monkeypatch):
+    import pyotp
+    from app.auth import AuthStore
+
+    main, _client_ = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    path = _card_path(main, "alpha", "Chase")
+    directory = tmp_path / "auth"
+    directory.mkdir(mode=0o700)
+    secret = pyotp.random_base32()
+    store = AuthStore(directory)
+    store.enroll("synthetic owner password", secret, pyotp.TOTP(secret).at(3000), now=3000)
+    monkeypatch.setenv("ONEOS_AUTH_STATE_DIR", str(directory))
+    monkeypatch.setenv("ONEOS_AUTH_MODE", "required")
+    monkeypatch.setenv("ONEOS_ORIGIN", "https://localhost:8443")
+    origin = {"Origin": "https://localhost:8443", "HX-Request": "true"}
+    with TestClient(main.app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        # Signed out: refused outright.
+        assert client.post(f"/master/reminder/alpha", data={**_FORM, "path": path}, headers=origin).status_code == 401
+        token = store.login("synthetic owner password", pyotp.TOTP(secret).now())
+        client.cookies.set("__Host-oneos", token)
+        csrf = store.session(token)
+        for headers in (origin, {**origin, "X-CSRF-Token": "wrong"}):
+            assert client.post("/master/reminder/alpha", data={**_FORM, "path": path}, headers=headers).status_code == 403
+            assert client.post("/master/reminder/alpha/remove", data={"path": path}, headers=headers).status_code == 403
+        assert ReminderStore(directory).all() == {}
+        ok = client.post("/master/reminder/alpha", data={**_FORM, "path": path}, headers={**origin, "X-CSRF-Token": csrf})
+        assert ok.status_code == 200 and ok.headers["HX-Trigger"] == "master-refresh"
+        assert list(ReminderStore(directory).all()) == [path]
+        # The popup form is a POST that htmx sends the token with, from the page meta.
+        assert 'name="csrf-token"' in client.get("/").text
+        assert client.post("/master/reminder/alpha/remove", data={"path": path}, headers=origin).status_code == 403
+        assert list(ReminderStore(directory).all()) == [path]
+        removed = client.post("/master/reminder/alpha/remove", data={"path": path}, headers={**origin, "X-CSRF-Token": csrf})
+        assert removed.status_code == 200 and ReminderStore(directory).all() == {}
