@@ -18,18 +18,20 @@
 - Nothing is written on page load, filter, sort, refresh, or opening a popup — the store file is created on the first save, not on read.
 - The store lives at `<ONEOS_AUTH_STATE_DIR>/reminders.sqlite3` (beside `owner.sqlite3`, so the owner-run `backup` already copies it). Same safety rules as `app/auth.py` `AuthStore`: no symlinked component, directory owned by the process uid with no group/other bits, file mode `0600`, regular file, one link.
 - If `ONEOS_AUTH_STATE_DIR` is unset or the store is unsafe, the page still renders: no reminders, the strip says "Reminders are unavailable", and the popup's reminder box is disabled. Never a 500.
-- A reminder's time is the owner's local wall time as typed, stored as ISO 8601 with the browser's UTC offset (e.g. `2026-11-04T11:00:00+05:30`). Overdue / within a day are decided on the absolute instant; labels show the stored wall time ("Tue 4 Nov 11:00"). No server-side timezone setting.
+- A reminder's time is the local wall time as typed in the browser, stored as ISO 8601 with the UTC offset the browser reports (examples here use a synthetic `+02:00`) (e.g. `2026-11-04T11:00:00+02:00`). Overdue / within a day are decided on the absolute instant; labels show the stored wall time ("Wed 4 Nov 11:00"). No server-side timezone setting.
 - Thresholds: **overdue** = due before now (red `--err-ink` on `--err-bg`, alarm-clock icon, first); **soon** = due within the next 24 hours (amber `--warn`, bell icon, next); **later** = everything else (grey `--ink-dim`, calendar icon, last). Within each group, soonest first.
 - Reminders are allowed only on cards in the **Waiting** or **To review** stage. A card in **Done** (`done` or `active`) resolves its reminder: it is not shown, and its row is kept untouched.
+- Approving a proposal through Outbox files the item with its ingest status `active`, i.e. Done: the review happened, so its "Review by" reminder is resolved and leaves the strip. The row still follows the card (Task 5) so plan 3's moves can bring it back.
+- Paths change on an entity rename (`app/rename.py`, axis `entity`): the rename re-keys reminders in the same run (Task 5), so the rename test's "every reference resolves" holds for reminders too.
 - Subject: required, trimmed, 1–120 characters, no line breaks; defaults to the card's title in the form.
 - Key = the card's `relative_path` (vault-relative, as `entity_cards` returns it); a proposed card uses its inbox path, which it shares. The row also stores the entity slug.
 - `app/master.py` must not import `app.console_errors` (invariant test). Every new route uses `@console_route` with a declared catch family and failure contracts (`tests/test_console_invariants.py`).
-- Copy: strip heading "Needs attention"; card date line "Due Tue 4 Nov 11:00" (Waiting) / "Review by Tue 4 Nov 11:00" (To review); orphan line "Card moved or removed"; buttons "Save reminder", "Remove".
+- Copy: strip heading "Needs attention"; card date line "Due Wed 4 Nov 11:00" (Waiting) / "Review by Wed 4 Nov 11:00" (To review); orphan line "Card moved or removed"; buttons "Save reminder", "Remove".
 - Never write "/home/" followed by a path segment anywhere (private-path audit). Run tests as `env -u GIT_EDITOR uv run pytest ...`.
 
 ## Review Focus
 
-1. **A reminder for a card that was filed, renamed or deleted outside the master view** — must still appear (subject + entity + "Card moved or removed") with a working Remove, never vanish. Pinned in Task 2.
+1. **A reminder for a card that was moved or deleted outside the master view** — must still appear (subject + entity + "Card moved or removed") with a working inline Remove on the strip card, never vanish. Pinned in Tasks 2 and 3.
 2. **The store missing, unreadable, or a symlink** (test/disabled mode, a broken install) — page renders, no write happens, strip says unavailable. Pinned in Tasks 1 and 3.
 3. **A forged or stale save** (path not a card of that entity, card no longer Waiting/To review, entity slug mismatch) — refused with a described error, nothing stored. Pinned in Task 4.
 4. **Times around the boundaries** — exactly now, now+24h, and a reminder saved with a past time (shows red at once). Pinned in Task 2.
@@ -50,17 +52,17 @@
   - `class ReminderStoreUnavailable(Exception)`, `class InvalidReminder(ValueError)`
   - `class ReminderStore: __init__(self, directory: Path)`; `all(self) -> dict[str, Reminder]` (returns `{}` when the file does not exist, creates nothing); `save(self, reminder: Reminder) -> None` (upsert by key; creates the file `0600` on first use); `remove(self, key: str) -> None` (no-op if absent); `rekey(self, old: str, new: str) -> None` (no-op if `old` absent; replaces an existing `new`)
   - `reminder_store() -> ReminderStore | None` — from `ONEOS_AUTH_STATE_DIR`; `None` when unset
-  - `parse_due(date: str, time: str, offset_minutes: str) -> datetime` — `"2026-11-04"`, `"11:00"`, `"330"` → `2026-11-04T11:00+05:30`; raises `InvalidReminder`
+  - `parse_due(date: str, time: str, offset_minutes: str) -> datetime` — `"2026-11-04"`, `"11:00"`, `"120"` → `2026-11-04T11:00+02:00`; raises `InvalidReminder`
   - `clean_subject(text: str) -> str` — trims; raises `InvalidReminder` if empty, > 120 chars, or contains `\r`/`\n`
   - Each public method carries a `failure_contract` declaring `ReminderStoreUnavailable` (and `InvalidReminder` where it can raise).
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_reminders.py`, each with a `tmp_path` directory chmod `0700`:
   - `test_all_on_a_new_directory_is_empty_and_creates_nothing` — `all() == {}` and `list(dir.iterdir()) == []`.
-  - `test_save_then_all_round_trips_the_wall_time_and_offset` — saved `due_at.isoformat() == "2026-11-04T11:00:00+05:30"`.
+  - `test_save_then_all_round_trips_the_wall_time_and_offset` — saved `due_at.isoformat() == "2026-11-04T11:00:00+02:00"`.
   - `test_save_creates_the_file_owner_only` — `stat.S_IMODE(mode) == 0o600`.
   - `test_save_upserts_by_key`, `test_remove_is_idempotent`, `test_rekey_moves_and_replaces`.
   - `test_unsafe_store_is_unavailable` — parametrised: directory mode `0o755`; `reminders.sqlite3` is a symlink; file mode `0o644` → `ReminderStoreUnavailable` from `all()` and `save()`.
-  - `test_parse_due` — the example above; `("2026-02-30", "11:00", "330")`, `("2026-11-04", "25:00", "0")`, `("2026-11-04", "11:00", "x")` raise `InvalidReminder`.
+  - `test_parse_due` — the example above; `("2026-02-30", "11:00", "120")`, `("2026-11-04", "25:00", "0")`, `("2026-11-04", "11:00", "x")` raise `InvalidReminder`.
   - `test_clean_subject` — `"  Pay card  "` → `"Pay card"`; `""`, `"a\nb"`, `"x" * 121` raise.
   - `test_store_is_never_written_into_the_vault` — save with a synthetic vault present; the vault's `git status --porcelain` is empty before and after.
   - `test_reminder_store_is_none_without_the_env` — `monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)`.
@@ -84,9 +86,9 @@
   - `@dataclass(frozen=True) class AttentionCard: reminder: Reminder; entity_label: str; tone: int; level: str  # "overdue" | "soon" | "later"; card: MasterCard | None  # None = moved/removed or entity unreadable; unreadable: bool`
   - `MasterPage` gains `attention: tuple[AttentionCard, ...]` and `reminders_available: bool`.
   - `load_master(vault, scope_for, *, entities, sort, done_all, now, reminders: Mapping[str, Reminder] | None)` — `now` must be timezone-aware; `reminders=None` means the store is unavailable (`reminders_available=False`, empty strip).
-  - `due_label(due: datetime) -> str` — `"Tue 4 Nov 11:00"` from the stored wall time (`%a %-d %b %H:%M`).
+  - `due_label(due: datetime) -> str` — `"Wed 4 Nov 11:00"` from the stored wall time (`%a %-d %b %H:%M`).
 
-- [ ] **Step 1: Write the failing tests** (reuse `_vault` / `_note`; `now = datetime(2026, 11, 3, 10, 0, tzinfo=timezone(timedelta(hours=5, minutes=30)))`):
+- [ ] **Step 1: Write the failing tests** (reuse `_vault` / `_note`; `now = datetime(2026, 11, 3, 10, 0, tzinfo=timezone(timedelta(hours=2)))`):
   - `test_strip_orders_overdue_then_soon_then_later` — reminders at now−1 h, now+2 h, now+3 d on three Waiting cards → `[a.level for a in page.attention] == ["overdue", "soon", "later"]`.
   - `test_strip_boundaries` — due exactly `now` → `"soon"`; `now + 24h` → `"later"`; `now − 1 s` → `"overdue"`.
   - `test_done_card_resolves_its_reminder` — reminder on a `status: done` note and on a `status: active` note → not in `page.attention`.
@@ -95,7 +97,7 @@
   - `test_strip_follows_the_entity_filter` — `entities=("alpha",)` hides beta's reminder.
   - `test_waiting_and_review_put_reminders_first_soonest_first` — under `sort="updated"`; under `sort="title"` the order is by title only.
   - `test_card_carries_its_reminder` and `test_store_unavailable_gives_an_empty_strip` (`reminders=None` → `page.reminders_available is False`, `page.attention == ()`).
-  - `test_due_label` — `"Tue 4 Nov 11:00"`.
+  - `test_due_label` — `"Wed 4 Nov 11:00"`.
   - Update existing callers/tests to pass an aware `now` and `reminders={}`.
 - [ ] **Step 2: Run** `env -u GIT_EDITOR uv run pytest tests/test_master.py -q` — new tests fail.
 - [ ] **Step 3: Implement.** Attach reminders by key after cards are built; build the strip from all reminders whose entity is in the filter (or no filter), skipping Done-stage cards; order by (level rank, `due_at`). Reminder-first ordering applies only to the `review` and `waiting` columns under `sort == "updated"`.
@@ -113,15 +115,15 @@
 
 **Interfaces:**
 - Consumes: `MasterPage.attention`, `reminders_available`, `MasterCard.reminder`, `due_label` (Task 2); `reminder_store`, `ReminderStoreUnavailable` (Task 1).
-- Produces: `#master-attention` section inside the `#master` morph wrapper (so the 60 s refresh updates it); each strip card is a `<button type="button" class="attention-card is-{level}">` that opens the card popup exactly like a board card (same `hx-get`, `hx-target="#master-popup"`); orphan/unreadable cards are not buttons.
+- Produces: `#master-attention` section inside the `#master` morph wrapper (so the 60 s refresh updates it); each strip card is a `<button type="button" class="attention-card is-{level}">` that opens the card popup exactly like a board card (same `hx-get`, `hx-target="#master-popup"`); orphan/unreadable cards are not buttons; each carries a small inline "Remove" button that `hx-post`s to Task 4's remove route (`path` = the reminder key) and then refreshes `#master`.
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_home_shows_needs_attention_in_order_with_icons` — three reminders → the strip's cards appear in overdue, soon, later order with classes `is-overdue`/`is-soon`/`is-later` and `#i-alarm`/`#i-bell`/`#i-calendar`; each shows subject, entity label, `due_label`.
   - `test_home_with_no_reminders_has_no_strip` — no `#master-attention` element.
   - `test_home_without_a_store_says_reminders_are_unavailable` — `ONEOS_AUTH_STATE_DIR` unset → 200, text "Reminders are unavailable".
   - `test_home_with_an_unsafe_store_still_renders` — store dir mode `0o755` → 200, same text, no file created.
-  - `test_waiting_card_shows_due_and_review_card_shows_review_by` — "Due Tue 4 Nov 11:00" / "Review by Tue 4 Nov 11:00".
-  - `test_orphan_attention_card_is_not_a_link` — contains "Card moved or removed", no `hx-get` on that card.
+  - `test_waiting_card_shows_due_and_review_card_shows_review_by` — "Due Wed 4 Nov 11:00" / "Review by Wed 4 Nov 11:00".
+  - `test_orphan_attention_card_is_not_a_link` — contains "Card moved or removed", no `hx-get` on that card, and has an inline Remove posting to `/master/reminder/{entity}/remove` with its key.
   - `test_page_load_writes_nothing` — store directory and vault unchanged after `GET /`, `GET /?entity=…&sort=title`, and a popup GET.
 - [ ] **Step 2: Run** them — fail.
 - [ ] **Step 3: Implement.** Strip markup sits between the header and the filters; compact cards (not full width), horizontally scrollable at phone width (no page-level horizontal scroll at 375 px), light and dark via existing tokens.
@@ -140,13 +142,14 @@
 - Consumes: Task 1 store and parsers; `entity_cards`, `stage_of` (existing).
 - Produces:
   - `POST /master/reminder/{entity}` — form `path`, `subject`, `date`, `time`, `offset` (minutes east of UTC, filled by the browser from `-new Date().getTimezoneOffset()`). Re-reads `entity_cards(scope, vault)`, requires `path` to match a card of that entity whose `stage_of` is `waiting` or `review`, then `save`. Responds with the re-rendered popup fragment and `HX-Trigger: master-refresh`.
-  - `POST /master/reminder/{entity}/remove` — form `path`; removes; same response.
+  - `POST /master/reminder/{entity}/remove` — form `path` (the reminder key); removes it if the stored row's entity is `{entity}`, with no card check (so orphans can be removed); responds with the popup fragment when the card exists, otherwise an empty 200, and always `HX-Trigger: master-refresh`.
   - Both: `@console_route(catches=..., surface="fragment-only", services=(entity_cards, ReminderStore.save | .remove, ...))`; refusals render `blocks/master_popup_error.html`.
   - The popup shows the reminder box only for Waiting and To review cards: date, time, subject (prefilled with the existing reminder or the card title), "Save reminder", and "Remove" when one exists; disabled with "Reminders are unavailable" when the store is unavailable.
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_save_reminder_from_the_popup` — POST for a Waiting card → 200; store has the reminder with the typed wall time and offset; vault `git status` and `git rev-parse HEAD` unchanged; response has `HX-Trigger: master-refresh`.
   - `test_remove_reminder` — then remove → store empty, vault unchanged.
+  - `test_remove_orphan_reminder` — a key no card has → removed; `test_remove_refuses_another_entitys_reminder` — row entity `beta`, POST to `/master/reminder/alpha/remove` → refused, row kept.
   - `test_save_is_refused_for_a_draft_or_done_card`, `..._for_a_path_that_is_not_a_card`, `..._for_another_entitys_path`, `..._for_an_empty_or_multiline_subject`, `..._for_a_bad_date` — described error fragment with a Close button; store unchanged.
   - `test_save_without_a_store_is_refused_not_500` — env unset → described error, 200 fragment.
   - `test_popup_shows_reminder_box_only_for_waiting_and_review` and `test_popup_prefills_existing_reminder`.
@@ -158,21 +161,25 @@
 
 ---
 
-### Task 5: A reminder follows its card when Outbox approval files it
+### Task 5: A reminder follows its card through Outbox approval and entity rename
 
 **Files:**
-- Modify: `app/main.py` (`_outbox_approve_response`, after a successful `approve`)
+- Modify: `app/main.py` (`_outbox_approve_response`, after a successful `approve`); `app/reminders.py` (`rename_entity`); `app/rename.py` (after `apply_rename` commits an `entity` rename)
 - Test: `tests/test_master.py` (or the Outbox test file that already covers approval)
 
 **Interfaces:**
+- Produces: `ReminderStore.rename_entity(self, old: str, new: str) -> int` — rewrites `entity` and the leading `old/` path segment of every key for that entity; returns rows changed.
 - Consumes: `ReminderStore.rekey` (Task 1); the approval result's source and destination paths (`approve` returns `ClassificationActionResult = OutboxProposal | SpentAction` in `app/outbox.py`; a `SpentAction` means nothing new was filed, so no re-key; do not change `approve` or its receipt).
 
 - [ ] **Step 1: Write the failing tests:**
   - `test_approving_a_proposal_moves_its_reminder` — reminder on an inbox card with a pending proposal; approve via `POST /outbox/{entity}/approve` with the right `review_sha256` → the store's key is the destination `relative_path`; the reminder now shows on the filed card.
   - `test_rekey_failure_does_not_fail_the_approval` — store unavailable → approval still commits and responds as before; the reminder shows as "Card moved or removed".
   - `test_approval_commit_is_unchanged` — the commit's file list and receipt are byte-identical in shape to an approval with no reminder.
+  - `test_approved_review_reminder_is_resolved` — after approval the filed card is Done (`active`) and the reminder is not in the strip, but its row exists under the new key.
+  - `test_entity_rename_rekeys_reminders` — in the existing rename-test style: throwaway entity with a reminder, `apply_rename` axis `entity` with `ONEOS_AUTH_STATE_DIR` set → the reminder's key and entity use the new slug and it shows on its card; `.sensitive/` read still denied.
+  - `test_entity_rename_without_a_store_still_succeeds` — env unset → the rename commits as before and prints that reminders were not updated.
 - [ ] **Step 2: Run** — fail.
-- [ ] **Step 3: Implement** the re-key strictly after the commit succeeded; catch `ReminderStoreUnavailable` there and continue.
+- [ ] **Step 3: Implement** both re-keys strictly after the vault commit succeeded; catch `ReminderStoreUnavailable` there and continue (the reminder then shows as "Card moved or removed"). `rename.py` reads the store via `reminder_store()`; it never writes the store on a dry run.
 - [ ] **Step 4: Run** the Outbox, master and invariant test files, then the full suite `env -u GIT_EDITOR uv run pytest -q --ignore=tests/test_local_backup.py --ignore=tests/test_local_service.py` and `uv run python -m tools.public_repo_audit --repo .` (CLEAN).
 - [ ] **Step 5: Commit** — `Outbox: a filed item keeps its reminder`.
 
@@ -188,6 +195,7 @@
 1. The store file sits in the authentication directory (spec: "beside the authentication database"), so no Compose or mount change and the existing backup covers it.
 2. Reminders only on Waiting and To review cards in this plan; the "To review" flag on a filed note comes with moves in plan 3.
 3. The strip follows the entity filter chips, like the board.
-4. A reminder whose card was moved or removed outside OneOS stays in the strip as "Card moved or removed" with Remove, rather than disappearing.
+4. A reminder whose card was moved or removed outside OneOS stays in the strip as "Card moved or removed" with an inline Remove, rather than disappearing.
+7. Outbox approval files an item as `active` (Done), so it resolves that item's "Review by" reminder; the reminder row still follows the card.
 5. Under the default "Updated" sort, Waiting and To review show cards with a reminder first, soonest first; "Title" sort ignores reminders.
 6. A reminder can be removed (spec names only Save); removing is needed so a mistaken reminder can go.

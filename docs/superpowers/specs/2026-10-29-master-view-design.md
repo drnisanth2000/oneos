@@ -25,7 +25,7 @@ entity at once:
 - and lets them move a card to its next stage with one drag or one click.
 
 A reminder must reach the owner's calendar at the right time with its
-subject ("Pay the credit card bill", Tue 4 Nov 11:00). Everything else about
+subject ("Pay the credit card bill", Wed 4 Nov 11:00). Everything else about
 a reminder (amount, account, how to pay) the owner handles by hand for
 now.
 
@@ -168,7 +168,7 @@ approval protocol, and stops the "another status" list from growing.)*
 
 ### Reminders and review flags
 
-A reminder is a date, a time (local, Asia/Kolkata on this Mac) and a
+A reminder is a date, a time (the Mac's local time) and a
 subject, attached to one card. Reminders, and the "To review" flag on an
 already-filed note, are kept in a small OneOS store in private state
 (SQLite beside the authentication database), **not** written into the
