@@ -288,6 +288,7 @@ from . import git_transaction as _git_transaction  # noqa: E402
 from . import outbox as _outbox  # noqa: E402
 from . import proposal_identity as _proposal_identity  # noqa: E402
 from . import registry as _registry  # noqa: E402
+from . import reminders as _reminders  # noqa: E402
 from . import review_tokens as _review_tokens  # noqa: E402
 from . import rename as _rename  # noqa: E402
 from . import scope as _scope  # noqa: E402
@@ -335,6 +336,8 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _action_receipts.ReceiptStoreIntegrityError: _CODES["E-TAMPER"],
     _action_receipts.ReceiptStoreUnavailable: _CODES["E-UNAVAILABLE"],
     _outbox.ProposalSourceUnavailable: _CODES["E-UNAVAILABLE"],
+    _reminders.ReminderStoreUnavailable: _CODES["E-UNAVAILABLE"],
+    _reminders.InvalidReminder: _CODES["E-REQUEST"],
     _board.NoteUnreadable: _CODES["E-UNAVAILABLE"],
     _outbox.StaleProposalSource: _CODES["E-STALE"],
     _outbox.MissingProposalSource: _CODES["E-MISSING"],
