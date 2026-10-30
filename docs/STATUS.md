@@ -473,7 +473,8 @@ are in `SAFETY-FOUNDATION-S1-S4.md`, including its S5 addendum.
   work. Cadence belongs to Hermes scheduling, not the request path.
 - ADR-008 escapee lint (re-scan committed content for missed patterns).
 - Full Command Center dashboard cards and workspace CRUD beyond current
-  screens. The Board's weekly attention card is the only summary card built.
+  screens. The master view home page is the only summary built; the Board's
+  weekly attention card was removed at the owner's request (2026-10-29).
 - Board extensions listed under "Board screen" above.
 
 ---

@@ -4,9 +4,27 @@
 <svg class="icon{% if cls %} {{ cls }}{% endif %}" aria-hidden="true" focusable="false"><use href="#i-{{ name }}"/></svg>
 {%- endmacro %}
 
+{# A module's own name picks its icon (knowledge, legal, analytics, ... all sit
+   in the "govern" block but mean different things). A key matches a whole
+   hyphen-separated word of the module stem, singular or plural ("asset" matches
+   "assets", never "reassets"); the first matching word wins, then the block
+   icon, then a folder. #}
+{% set module_icons = [
+  ("inbox", "inbox"), ("archive", "archive"), ("foundation", "block-govern"),
+  ("pipeline", "branch"), ("asset", "block-build"), ("operation", "wrench"),
+  ("communication", "message"), ("people", "block-people"), ("finance", "block-finance"),
+  ("sales", "block-growth"), ("marketing", "megaphone"), ("support", "lifebuoy"),
+  ("knowledge", "book"), ("analytic", "chart"), ("legal", "scale"), ("self", "user"),
+] %}
 {% macro block_icon(block, module="") -%}
-{%- if module == "00-inbox" -%}{{ icon("inbox") }}
-{%- elif module.endswith("-archive") -%}{{ icon("archive") }}
+{%- set name = module.split("-", 1)[-1] if module[:1].isdigit() else module -%}
+{%- set found = namespace(icon="") -%}
+{%- for word in name.split("-") if not found.icon -%}
+{%- for key, symbol in module_icons if not found.icon and (word == key or word == key ~ "s") -%}
+{%- set found.icon = symbol -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- if found.icon -%}{{ icon(found.icon) }}
 {%- elif block in ("system", "govern", "build", "deliver", "retain", "people", "finance", "growth") -%}{{ icon("block-" ~ block) }}
 {%- else -%}{{ icon("folder") }}
 {%- endif -%}
