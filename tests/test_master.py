@@ -998,6 +998,7 @@ def test_unreadable_entity_reminder_is_not_called_moved_and_is_not_a_link(
     assert response.status_code == 200
     strip = _strip(response.text)
     assert "Cannot see" in strip and "Card moved or removed" not in strip
+    assert "Can't read this entity right now" in strip or "Can&#39;t read this entity right now" in strip
     assert "hx-get" not in strip and "<button" not in strip
 
 
@@ -1049,3 +1050,18 @@ def test_attention_css_uses_existing_tokens_and_scrolls_inside_itself():
     assert "overflow-x: auto" in rules
     for token in ("--err-ink", "--err-bg", "--warn", "--ink-dim"):
         assert f"var({token})" in rules
+
+
+def test_reminder_date_shows_only_on_waiting_and_review_cards(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Finished", status="done")
+    _note(tmp_path, "alpha", "02-work", "Active one", status="active")
+    _note(tmp_path, "alpha", "02-work", "Sketch", status="draft")
+    _note(tmp_path, "alpha", "02-work", "Odd", status="open")
+    due = datetime(2099, 11, 4, 11, 0, tzinfo=timezone(timedelta(hours=2)))
+    _seed(directory, *(_reminder("alpha", n, due) for n in ("Finished", "Active one", "Sketch", "Odd")))
+    html = client.get("/?done=all").text
+    board = html.split('class="master-cols"')[1]
+    assert "master-reminder" not in board
+    assert due_label(due) not in board

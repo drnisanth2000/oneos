@@ -45,7 +45,7 @@ from .entities import (
 )
 from .inbox import read_inbox
 from .master import due_label, entity_tone, load_master, stage_label, stage_of
-from .reminders import ReminderStore, ReminderStoreUnavailable, reminder_store
+from .reminders import ReminderStoreUnavailable, reminder_store
 from .ingest.base import IngestError
 from .phase3 import (
     CleanupError,
