@@ -26,6 +26,8 @@ DATABASE_NAME = "reminders.sqlite3"
 SUBJECT_MAX = 120
 _LINE_BREAKS = ("\r", "\n", "\x0b", "\x0c", "\x85", " ", " ")
 _MAX_OFFSET_MINUTES = 14 * 60
+_MIN_YEAR = 1970
+_MAX_YEAR = 9999
 
 
 class ReminderStoreUnavailable(Exception):
@@ -71,6 +73,9 @@ def parse_due(date: str, time: str, offset_minutes: str) -> datetime:
         raise InvalidReminder("due date is not valid")
     offset = int(offset_minutes)
     if abs(offset) > _MAX_OFFSET_MINUTES:
+        raise InvalidReminder("due date is not valid")
+    # Bounded so ordering aware datetimes can never raise OverflowError.
+    if not _MIN_YEAR <= int(date_match[1]) <= _MAX_YEAR:
         raise InvalidReminder("due date is not valid")
     try:
         return datetime(
@@ -149,6 +154,7 @@ class ReminderStore:
         except OSError as exc:
             raise ReminderStoreUnavailable() from exc
 
+    @structured_reader(category="admin-db")
     def _publish_new(self):
         """Create the database with its schema, then publish it atomically.
 
