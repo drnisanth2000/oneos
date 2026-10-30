@@ -11,7 +11,7 @@ from starlette.testclient import TestClient
 
 from app.board import NoteUnreadable
 from app.master import due_label, load_master
-from app.reminders import Reminder
+from app.reminders import Reminder, ReminderStore
 from app.scope import CrossScopeError
 from tests.conftest import entities_yaml, scaffold_modules, write_vault
 
@@ -852,3 +852,200 @@ def test_now_must_be_timezone_aware(tmp_path, monkeypatch):
 def test_due_label():
     due = datetime(2026, 11, 4, 11, 0, tzinfo=timezone(timedelta(hours=2)))
     assert due_label(due) == "Wed 4 Nov 11:00"
+
+
+# --- the Needs attention strip on the home page ---------------------------------
+
+
+def _auth_dir(tmp_path_factory, monkeypatch, mode=0o700):
+    directory = tmp_path_factory.mktemp("auth")
+    directory.chmod(mode)
+    monkeypatch.setenv("ONEOS_AUTH_STATE_DIR", str(directory))
+    return directory
+
+
+def _seed(directory, *reminders):
+    store = ReminderStore(directory)
+    for reminder in reminders:
+        store.save(reminder)
+    return store
+
+
+def _strip(html):
+    """The Needs attention section's markup, or "" when there is none."""
+    if 'id="master-attention"' not in html:
+        return ""
+    return html.split('id="master-attention"')[1].split("</section>")[0]
+
+
+def test_home_shows_needs_attention_in_order_with_icons(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Late", status="waiting")
+    _note(tmp_path, "alpha", "02-work", "Soonish", status="waiting")
+    _note(tmp_path, "beta1", "02-work", "Eventually", status="waiting")
+    now = datetime.now(timezone.utc)
+    zone = timezone(timedelta(hours=2))
+    overdue = (now - timedelta(hours=3)).astimezone(zone).replace(microsecond=0)
+    soon = (now + timedelta(hours=3)).astimezone(zone).replace(microsecond=0)
+    later = (now + timedelta(days=5)).astimezone(zone).replace(microsecond=0)
+    # Saved in reverse of display order, so the order is the strip's own.
+    _seed(
+        directory,
+        _reminder("beta1", "Eventually", later, "Third subject"),
+        _reminder("alpha", "Soonish", soon, "Second subject"),
+        _reminder("alpha", "Late", overdue, "First subject"),
+    )
+    strip = _strip(client.get("/").text)
+    assert strip.index("First subject") < strip.index("Second subject") < strip.index("Third subject")
+    assert strip.index("is-overdue") < strip.index("is-soon") < strip.index("is-later")
+    assert strip.index("#i-alarm") < strip.index("#i-bell") < strip.index("#i-calendar")
+    for due in (overdue, soon, later):
+        assert due_label(due) in strip
+    assert "Alpha" in strip and "Beta1" in strip
+    assert strip.count("<button") == 3 and strip.count('class="attention-card is-') == 3
+    assert strip.count('hx-target="#master-popup"') == 3
+    assert "Needs attention" in strip
+
+
+def test_strip_sits_between_the_header_and_the_filters_inside_the_morph_wrapper(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Late", status="waiting")
+    _seed(directory, _reminder("alpha", "Late", datetime.now(timezone.utc) + timedelta(days=2)))
+    html = client.get("/").text
+    assert html.index('id="master"') < html.index('class="master-head"') < html.index('id="master-attention"')
+    assert html.index('id="master-attention"') < html.index('class="master-filters"')
+    assert html.index('id="master-attention"') < html.index("<!-- /master -->")
+
+
+def test_home_with_no_reminders_has_no_strip(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Quiet", status="waiting")
+    html = client.get("/").text
+    assert 'id="master-attention"' not in html
+    assert "Reminders are unavailable" not in html
+
+
+def test_home_without_a_store_says_reminders_are_unavailable(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Reminders are unavailable" in _strip(response.text)
+
+
+def test_home_with_an_unsafe_store_still_renders(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch, mode=0o755)
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "Reminders are unavailable" in _strip(response.text)
+    assert list(directory.iterdir()) == []
+
+
+def test_waiting_card_shows_due_and_review_card_shows_review_by(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _note(tmp_path, "alpha", "00-inbox", "New mail", sub="triage", title="New mail")
+    due = datetime(2099, 11, 4, 11, 0, tzinfo=timezone(timedelta(hours=2)))
+    review_path = _card_path(main, "alpha", "New mail")
+    _seed(
+        directory,
+        _reminder("alpha", "Chase", due),
+        Reminder(review_path, "alpha", "Look at it", due.replace(day=5)),
+    )
+    html = client.get("/").text
+    board = html.split('class="master-cols"')[1]
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", board))
+    assert f"Due {due_label(due)}" in text
+    assert f"Review by {due_label(due.replace(day=5))}" in text
+
+
+def test_orphan_attention_card_is_not_a_link_or_button(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _seed(directory, _reminder("alpha", "Gone", datetime.now(timezone.utc) + timedelta(days=2), "Lost one"))
+    strip = _strip(client.get("/").text)
+    assert "Card moved or removed" in strip and "Lost one" in strip and "Alpha" in strip
+    assert "hx-get" not in strip and "<button" not in strip and "hx-post" not in strip
+    assert 'class="attention-card is-later' in strip
+
+
+def test_orphan_for_an_unknown_entity_gets_a_neutral_chip(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _seed(directory, _reminder("ghost", "Gone", datetime.now(timezone.utc) + timedelta(days=2)))
+    strip = _strip(client.get("/").text)
+    assert "ghost" in strip and "ent-1" not in strip
+
+
+def test_unreadable_entity_reminder_is_not_called_moved_and_is_not_a_link(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    outside = tmp_path / "outside"
+    _note(outside, "other", "02-work", "Secretnote")
+    (tmp_path / "beta1" / "02-work" / "active").symlink_to(
+        outside / "other" / "02-work" / "active", target_is_directory=True)
+    _seed(directory, _reminder("beta1", "Filing", datetime.now(timezone.utc) + timedelta(days=2), "Cannot see"))
+    response = client.get("/")
+    assert response.status_code == 200
+    strip = _strip(response.text)
+    assert "Cannot see" in strip and "Card moved or removed" not in strip
+    assert "hx-get" not in strip and "<button" not in strip
+
+
+def test_attention_card_shows_the_stored_wall_time_not_a_converted_one(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    due = datetime(2099, 11, 4, 23, 30, tzinfo=timezone(timedelta(hours=-11)))
+    _seed(directory, _reminder("alpha", "Chase", due))
+    strip = _strip(client.get("/").text)
+    assert "23:30" in strip and due_label(due) in strip
+
+
+def test_page_load_writes_nothing(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _seed(directory, _reminder("alpha", "Chase", datetime.now(timezone.utc) + timedelta(days=2)))
+    path = _card_path(main, "alpha", "Chase")
+
+    def snapshot():
+        return {
+            p.relative_to(root): (p.read_bytes(), p.stat().st_mtime_ns)
+            for root in (tmp_path, directory)
+            for p in root.rglob("*")
+            if p.is_file() and ".git" not in p.parts[len(root.parts):]
+        }
+
+    before = snapshot()
+    names = sorted(p.name for p in directory.iterdir())
+    assert client.get("/").status_code == 200
+    assert client.get("/?entity=alpha&sort=title").status_code == 200
+    assert client.get(f"/master/card/alpha?path={path}").status_code == 200
+    assert snapshot() == before
+    assert sorted(p.name for p in directory.iterdir()) == names
+
+
+def test_page_load_with_an_empty_store_directory_creates_no_file(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    assert client.get("/").status_code == 200
+    assert list(directory.iterdir()) == []
+
+
+def test_attention_css_uses_existing_tokens_and_scrolls_inside_itself():
+    rules = _CSS.split("/* --- needs attention --- */")[1].split("/* --- end needs attention --- */")[0]
+    assert "overflow-x: auto" in rules
+    for token in ("--err-ink", "--err-bg", "--warn", "--ink-dim"):
+        assert f"var({token})" in rules

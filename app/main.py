@@ -44,7 +44,8 @@ from .entities import (
     EntitySelectionError,
 )
 from .inbox import read_inbox
-from .master import entity_tone, load_master, stage_label, stage_of
+from .master import due_label, entity_tone, load_master, stage_label, stage_of
+from .reminders import ReminderStore, ReminderStoreUnavailable, reminder_store
 from .ingest.base import IngestError
 from .phase3 import (
     CleanupError,
@@ -132,6 +133,10 @@ def _require_issue(value: str | None) -> str:
 
 
 templates.env.globals["new_issue"] = _new_issue
+# Presentation helpers for the master view: the stored wall time as a label (never
+# a converted instant) and the stage a card sits in ("Due" or "Review by").
+templates.env.globals["due_label"] = due_label
+templates.env.globals["stage_of"] = stage_of
 
 app = FastAPI(title="OneOS")
 app.router.route_class = AuthenticatedFormRoute
@@ -405,6 +410,18 @@ async def _console_fallback_handler(request: Request, exc: Exception) -> HTMLRes
     return _render_console_error(request, describe(exc), force_page_status=True)
 
 
+def _page_reminders() -> dict | None:
+    """Every reminder, or None when the store is missing or unsafe. The page
+    renders either way ("Reminders are unavailable"); a read creates nothing."""
+    store = reminder_store()
+    if store is None:
+        return None
+    try:
+        return store.all()
+    except ReminderStoreUnavailable:
+        return None
+
+
 @app.get("/", response_class=HTMLResponse)
 @console_route(
     catches=_SIDEBAR_CATCHES,
@@ -432,7 +449,7 @@ def shell(request: Request) -> HTMLResponse:
             sort=params.get("sort") or "",
             done_all=params.get("done") == "all",
             now=datetime.now().astimezone(),
-            reminders={},
+            reminders=_page_reminders(),
         )
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))

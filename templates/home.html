@@ -73,6 +73,42 @@
         <p class="master-stale" id="master-stale" role="status" hidden :hidden="!stale" x-text="stale"></p>
       </header>
 
+      {# Needs attention: every open reminder, overdue first. Inside #master so the
+         minute refresh updates it. A card whose note is gone, or whose entity
+         cannot be read, is shown without a link. Times are the stored wall time. #}
+      {% if not page.reminders_available %}
+      <section class="master-attention" id="master-attention" aria-labelledby="master-attention-label">
+        <h2 class="attention-head" id="master-attention-label">Needs attention</h2>
+        <p class="muted attention-note">Reminders are unavailable</p>
+      </section>
+      {% elif page.attention %}
+      {% set level_icon = {"overdue": "alarm", "soon": "bell", "later": "calendar"} %}
+      <section class="master-attention" id="master-attention" aria-labelledby="master-attention-label">
+        <h2 class="attention-head" id="master-attention-label">Needs attention <span class="count">{{ page.attention | length }}</span></h2>
+        <ul class="attention-strip">
+          {% for entry in page.attention %}
+          <li class="attention-item">
+            {% if entry.card %}
+            <button type="button" class="attention-card is-{{ entry.level }}"
+                    hx-get="/master/card/{{ entry.card.entity | urlencode }}?path={{ entry.card.card.relative_path | urlencode }}"
+                    hx-target="#master-popup" hx-swap="innerHTML">
+            {% else %}
+            <div class="attention-card is-{{ entry.level }} is-static">
+            {% endif %}
+              <span class="attention-when">{{ icon(level_icon[entry.level]) }}<time datetime="{{ entry.reminder.due_at.isoformat() }}">{{ due_label(entry.reminder.due_at) }}</time></span>
+              <span class="attention-subject">{{ entry.reminder.subject }}</span>
+              <span class="attention-meta">
+                <span class="ent{% if entry.card %} ent-{{ entry.tone }}{% endif %}">{{ entry.entity_label }}</span>
+                {% if entry.unreadable and not entry.card %}<span class="attention-orphan">Can't read this entity right now</span>
+                {% elif not entry.card %}<span class="attention-orphan">Card moved or removed</span>{% endif %}
+              </span>
+            {% if entry.card %}</button>{% else %}</div>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      </section>
+      {% endif %}
+
       <div class="master-filters">
         <nav class="master-chips" aria-label="Entities">
           {% set any_active = page.chips | selectattr("active") | list %}
