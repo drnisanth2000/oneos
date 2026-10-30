@@ -11,8 +11,8 @@ Calendar permission on the Mac is OK; the popup edits the draft text.
 
 Today OneOS opens on a "Wiring check" clock. To see anything real the
 owner picks one entity in the sidebar, opens its Board, and switches the
-grouping to find filed notes. With five entities (Neshlin Medtech,
-Nambisons Softronix, Personal, Personal · Professor, Personal · Council)
+grouping to find filed notes. With five entities (two businesses and
+three personal workspaces)
 nothing shows the whole picture, and nothing warns that a payment or a
 filing is due tomorrow.
 
@@ -25,7 +25,7 @@ entity at once:
 - and lets them move a card to its next stage with one drag or one click.
 
 A reminder must reach the owner's calendar at the right time with its
-subject ("Pay HDFC credit card", Tue 4 Nov 11:00). Everything else about
+subject ("Pay the credit card bill", Tue 4 Nov 11:00). Everything else about
 a reminder (amount, account, how to pay) the owner handles by hand for
 now.
 
@@ -244,7 +244,7 @@ edit cannot break the policy enforcer's required fields.)*
   written.
 
 The comment, if any, is added to the note as one dated line in the same
-commit, e.g. `Comment (2026-10-29): Pay ₹12,400 from savings`. A comment
+commit, e.g. `Comment (2026-10-29): Pay from savings`. A comment
 on a move that makes no vault commit (into To review) is kept with the
 flag in the private store.
 
