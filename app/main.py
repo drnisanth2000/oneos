@@ -69,6 +69,7 @@ from .outbox import (
     OutboxError,
     OutboxRow,
     LifecycleProposal,
+    Proposal,
     lifecycle_review_journal,
     UnreadableProposalRecord,
     approve,
@@ -1857,6 +1858,25 @@ def outbox_approve(
     )
 
 
+def _reminder_follows_approval(result) -> None:
+    """After `approve` filed an item, move its reminder to the filed path.
+
+    The vault change is already committed and its receipt written; this only
+    updates the owner-private store and never changes what approval did. A
+    SpentAction (nothing new filed) or a lifecycle proposal (no source move)
+    has nothing to follow. If the store is missing or unsafe the reminder
+    stays under its old key and the strip shows it as "Card moved or removed".
+    """
+    if not isinstance(result, Proposal):
+        return
+    try:
+        store = reminder_store()
+        if store is not None:
+            ReminderStore.rekey(store, result.src, result.dst)
+    except ReminderStoreUnavailable:
+        return
+
+
 def _outbox_approve_response(
     request: Request,
     scope: Scope,
@@ -1914,6 +1934,7 @@ def _outbox_approve_response(
                 return _outbox_list_error(
                     request, scope, exc, action_receipt=result.receipt
                 )
+        _reminder_follows_approval(result)
     try:
         return _outbox_list(
             request,

@@ -293,6 +293,33 @@ class ReminderStore:
                 (new, datetime.now(timezone.utc).isoformat(), old),
             )
 
+    @failure_contract(raises=(ReminderStoreUnavailable,))
+    def rename_entity(self, old: str, new: str) -> int:
+        """Follow an entity rename: rewrite `entity` and the leading `old/`
+        path segment of every key stored for `old`, in one transaction.
+        Returns the number of rows changed. Only the exact first segment moves
+        (`older/x.md` is another entity's key and stays). A stale row already
+        sitting under a rewritten key is replaced, as in `rekey`."""
+        if old == new:
+            return 0
+        prefix = old + "/"
+        changed = 0
+        with self.connect() as db:
+            if db is None:
+                return 0
+            now = datetime.now(timezone.utc).isoformat()
+            rows = db.execute("SELECT key FROM reminders WHERE entity=?", (old,)).fetchall()
+            for (key,) in rows:
+                new_key = new + "/" + key[len(prefix):] if key.startswith(prefix) else key
+                if new_key != key:
+                    db.execute("DELETE FROM reminders WHERE key=?", (new_key,))
+                db.execute(
+                    "UPDATE reminders SET key=?, entity=?, updated_at=? WHERE key=?",
+                    (new_key, new, now, key),
+                )
+                changed += 1
+        return changed
+
 
 @failure_contract(raises=())
 def reminder_store() -> ReminderStore | None:

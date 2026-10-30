@@ -1543,6 +1543,7 @@ EXPECTED_CONTRACTED_BOUNDARIES = (
     ("app.reminders", "ReminderStore.all"),
     ("app.reminders", "ReminderStore.save"),
     ("app.reminders", "ReminderStore.remove"),
+    ("app.reminders", "ReminderStore.rekey"),
 )
 
 
@@ -1570,7 +1571,7 @@ def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypat
 
     main = _load_console_app(tmp_path, monkeypatch)
     qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
-    assert len(qualified) == 34
+    assert len(qualified) == 35
     assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
 
     missing = []
@@ -1755,6 +1756,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
             (),
         ),
         "app.reminders.ReminderStore.remove": ((ReminderStoreUnavailable,), ()),
+        "app.reminders.ReminderStore.rekey": ((ReminderStoreUnavailable,), ()),
     }
 
     boundaries = _inventory_objects(main)

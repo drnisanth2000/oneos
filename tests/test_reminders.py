@@ -88,6 +88,27 @@ def test_rekey_moves_and_replaces(state):
     assert found["b"].subject == "From a"
 
 
+def test_rename_entity_rewrites_only_that_entitys_exact_first_segment(state):
+    store = ReminderStore(state)
+    assert store.rename_entity("old", "new") == 0  # no file yet
+    assert list(state.iterdir()) == []
+    store.save(make(key="old/02-work/a.md", entity="old", subject="A"))
+    store.save(make(key="old/00-inbox/old/b.md", entity="old", subject="B"))
+    store.save(make(key="older/02-work/c.md", entity="older", subject="C"))
+    store.save(make(key="other/old/d.md", entity="other", subject="D"))
+    # A leftover row already sitting under a rewritten key is replaced.
+    store.save(make(key="new/02-work/a.md", entity="new", subject="Stale"))
+    assert store.rename_entity("old", "new") == 2
+    found = store.all()
+    assert set(found) == {
+        "new/02-work/a.md", "new/00-inbox/old/b.md", "older/02-work/c.md", "other/old/d.md",
+    }
+    assert found["new/02-work/a.md"].subject == "A" and found["new/02-work/a.md"].entity == "new"
+    assert found["new/00-inbox/old/b.md"].entity == "new"
+    assert (found["older/02-work/c.md"].entity, found["other/old/d.md"].entity) == ("older", "other")
+    assert store.rename_entity("old", "new") == 0
+
+
 def _dir_0755(state):
     state.chmod(0o755)
 

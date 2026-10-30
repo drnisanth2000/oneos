@@ -86,13 +86,16 @@ def _git_commit_all(root: Path) -> None:
     subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=root, check=True)
 
 
-def _inbox_with_proposal(root: Path, entity: str, name: str) -> None:
-    """One inbox note and one pending classify proposal for it (as in test_app's client)."""
+def _inbox_with_proposal(root: Path, entity: str, name: str, status: str | None = None) -> None:
+    """One inbox note and one pending classify proposal for it (as in test_app's client).
+    `status` adds the front-matter status real ingest writes (`active`)."""
     (root / entity / "02-work" / "active").mkdir(parents=True, exist_ok=True)
     path = root / entity / "00-inbox" / "active" / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        f"---\ntype: inbox-item\ntitle: {entity} proposed\nsub: triage\n---\nbody\n",
+        f"---\ntype: inbox-item\ntitle: {entity} proposed\nsub: triage\n"
+        + (f"status: {status}\n" if status else "")
+        + "---\nbody\n",
         encoding="utf-8",
     )
     outbox = root / entity / "outbox"
@@ -1450,3 +1453,136 @@ def test_popup_not_found_context_is_fresh_each_render(tmp_path, monkeypatch):
         assert "no longer here" in client.get("/master/card/alpha", params={"path": "nope.md"}).text
     assert main._empty_popup() is not main._empty_popup()
     assert "request" not in main._empty_popup()
+
+
+# --- a reminder follows its card through Outbox approval ------------------------
+
+_PROPOSAL_ID = "20260815T090703-" + "11" * 16
+_SRC = "alpha/00-inbox/active/marker.md"
+_DST = "alpha/02-work/active/marker.md"
+
+
+def _approval_setup(tmp_path, tmp_path_factory, monkeypatch, *, store=True):
+    """A committed vault with one inbox note and its pending classify proposal,
+    and (unless `store` is false) a reminder on the inbox card."""
+    main, vault = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
+    _inbox_with_proposal(tmp_path, "alpha", "marker.md", status="active")
+    client = TestClient(main.app)
+    if not store:
+        monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
+        return main, vault, client, None
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _seed(directory, Reminder(_SRC, "alpha", "Review it", datetime.now(timezone.utc) + timedelta(days=2)))
+    return main, vault, client, directory
+
+
+def _approve(client, tmp_path, proposal_id=_PROPOSAL_ID):
+    from app.outbox import get_proposal_review
+    from app.scope import Scope
+
+    sha = get_proposal_review(Scope(tmp_path, "alpha"), proposal_id).sha256
+    return client.post("/outbox/alpha/approve", data={"id": proposal_id, "review_sha256": sha})
+
+
+def _page(main, vault, directory):
+    return load_master(vault, main.build_scope, entities=(), sort="updated", done_all=True,
+                       now=datetime.now(timezone.utc), reminders=ReminderStore(directory).all())
+
+
+def test_approving_a_proposal_moves_its_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, vault, client, directory = _approval_setup(tmp_path, tmp_path_factory, monkeypatch)
+    assert list(ReminderStore(directory).all()) == [_SRC]
+    response = _approve(client, tmp_path)
+    assert response.status_code == 200
+    assert (tmp_path / _DST).is_file() and not (tmp_path / _SRC).exists()
+    found = ReminderStore(directory).all()
+    assert list(found) == [_DST]
+    assert (found[_DST].entity, found[_DST].subject) == ("alpha", "Review it")
+    # The reminder is on the filed card, in Done.
+    done = _page(main, vault, directory).columns[3].cards
+    assert [(m.card.relative_path, m.reminder.subject) for m in done] == [(_DST, "Review it")]
+
+
+def test_approved_review_reminder_is_resolved(tmp_path, tmp_path_factory, monkeypatch):
+    main, vault, client, directory = _approval_setup(tmp_path, tmp_path_factory, monkeypatch)
+    before = _page(main, vault, directory)
+    assert [e.reminder.key for e in before.attention] == [_SRC]
+    _approve(client, tmp_path)
+    after = _page(main, vault, directory)
+    assert after.attention == ()
+    assert [m.card.relative_path for m in after.columns[3].cards] == [_DST]
+    assert after.columns[3].cards[0].card.status == "active"
+    assert list(ReminderStore(directory).all()) == [_DST]  # resolved, not deleted
+    assert "Needs attention" not in client.get("/").text
+
+
+def test_rekey_failure_does_not_fail_the_approval(tmp_path, tmp_path_factory, monkeypatch):
+    main, vault, client, directory = _approval_setup(tmp_path, tmp_path_factory, monkeypatch)
+    directory.chmod(0o755)  # an unsafe store: the re-key cannot run
+    response = _approve(client, tmp_path)
+    assert response.status_code == 200
+    assert (tmp_path / _DST).is_file() and not (tmp_path / _SRC).exists()
+    assert "outbox: approve" in subprocess.run(
+        ["git", "log", "-1", "--format=%s"], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    directory.chmod(0o700)
+    assert list(ReminderStore(directory).all()) == [_SRC]  # nothing lost
+    page = _page(main, vault, directory)
+    assert [(e.reminder.key, e.card) for e in page.attention] == [(_SRC, None)]
+    assert "Card moved or removed" in client.get("/").text
+
+
+def test_approval_without_a_store_still_files_the_item(tmp_path, tmp_path_factory, monkeypatch):
+    _main, _vault_, client, _ = _approval_setup(tmp_path, tmp_path_factory, monkeypatch, store=False)
+    assert _approve(client, tmp_path).status_code == 200
+    assert (tmp_path / _DST).is_file()
+
+
+def test_a_spent_replay_does_not_move_a_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    _main, _vault_, client, directory = _approval_setup(tmp_path, tmp_path_factory, monkeypatch)
+    from app.outbox import get_proposal_review
+    from app.scope import Scope
+
+    sha = get_proposal_review(Scope(tmp_path, "alpha"), _PROPOSAL_ID).sha256
+    data = {"id": _PROPOSAL_ID, "review_sha256": sha}
+    assert client.post("/outbox/alpha/approve", data=data).status_code == 200
+    assert list(ReminderStore(directory).all()) == [_DST]
+    # The owner sets a new reminder under the old path, then replays the stale button.
+    _seed(directory, Reminder(_SRC, "alpha", "Unrelated", datetime.now(timezone.utc) + timedelta(days=1)))
+    replay = client.post("/outbox/alpha/approve", data=data)
+    assert replay.status_code == 200
+    assert "An approval has already completed" in replay.text
+    assert set(ReminderStore(directory).all()) == {_SRC, _DST}
+
+
+def _approval_commit(tmp_path):
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=tmp_path, capture_output=True, check=True).stdout
+
+    files = git("show", "--name-status", "--format=", "HEAD").decode().splitlines()
+    receipt = next(line.split("\t")[-1] for line in files if "/.receipts/" in line)
+    return {
+        "count": git("rev-list", "--count", "HEAD").strip(),
+        "subject": git("log", "-1", "--format=%s%n%b").decode(),
+        "files": files,
+        "receipt": git("show", f"HEAD:{receipt}"),
+        "tree": git("ls-tree", "-r", "--name-only", "HEAD").decode().splitlines(),
+    }
+
+
+def test_approval_commit_is_unchanged(tmp_path, tmp_path_factory, monkeypatch):
+    with_reminder = tmp_path / "with"
+    without = tmp_path / "without"
+    outcomes = []
+    for root, store in ((with_reminder, True), (without, False)):
+        root.mkdir()
+        _main, _vault_, client, directory = _approval_setup(root, tmp_path_factory, monkeypatch, store=store)
+        assert _approve(client, root).status_code == 200
+        outcomes.append(_approval_commit(root))
+        if store:
+            assert list(ReminderStore(directory).all()) == [_DST]
+    assert outcomes[0] == outcomes[1]
+    # The move and its receipt, nothing else; the proposal is not in the commit.
+    assert [line.split("\t")[0][0] for line in outcomes[0]["files"]] == ["R", "A"]
+    assert outcomes[0]["receipt"].startswith(b"version: 1")
+    # Neither the reminder store nor a reminder trace is in the vault.
+    assert not any("reminder" in name for name in outcomes[0]["tree"])
