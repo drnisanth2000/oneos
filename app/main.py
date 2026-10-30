@@ -730,6 +730,9 @@ def _popup_context(scope: Scope, catalog, card, reminders: dict | None) -> dict:
         "tone": entity_tone(index) if index is not None else 0,
         "body": note_body(scope, card.relative_path),
         "reminder_box": stage in ("waiting", "review"),
+        # A reminder on a card that has since left those stages (the owner
+        # edited `status:`) is shown read-only, with Remove and no Save.
+        "reminder_stale": reminder is not None and stage not in ("waiting", "review"),
         "reminders_available": reminders is not None,
         "reminder": reminder,
         "default_subject": default_subject(card.title),

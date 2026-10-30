@@ -513,14 +513,19 @@ def _reminders_follow_rename(plan: RenamePlan) -> None:
     """
     if plan.axis != "entity":
         return
+    # One line: what happened, what the owner will see, and what to do about it.
+    remedy = (
+        f"reminders for {plan.old} will show as 'Card moved or removed' "
+        "- remove them on the home page and set them again."
+    )
     try:
         store = reminder_store()
         if store is None:
-            print("Reminders were not updated: ONEOS_AUTH_STATE_DIR is not set.")
+            print(f"Reminders were not updated (ONEOS_AUTH_STATE_DIR is not set): {remedy}")
             return
         store.rename_entity(plan.old, plan.new)
     except ReminderStoreUnavailable:
-        print("Reminders were not updated: the reminder store is unavailable.")
+        print(f"Reminders were not updated (the reminder store is unavailable): {remedy}")
 
 
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:

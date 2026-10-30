@@ -7,6 +7,7 @@ import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from app.board import NoteUnreadable
@@ -1375,6 +1376,47 @@ def test_linked_strip_cards_have_no_remove_button(tmp_path, tmp_path_factory, mo
     _save(client, "alpha", path)
     strip = _strip(client.get("/").text)
     assert "hx-post" not in strip and strip.count("<button") == 1
+
+
+def _restage(tmp_path, name, status):
+    """Edit a card's `status:` by hand, as the owner would."""
+    path = tmp_path / "alpha" / "02-work" / "active" / f"{name}.md"
+    path.write_text(path.read_text(encoding="utf-8").replace("status: waiting", f"status: {status}"), encoding="utf-8")
+
+
+@pytest.mark.parametrize("status, label", [("draft", "Draft"), ("wating", "Another status")])
+def test_a_reminder_on_a_card_that_left_waiting_can_still_be_removed(
+    tmp_path, tmp_path_factory, monkeypatch, status, label
+):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _save(client, "alpha", path, subject="Chase the supplier")
+    _restage(tmp_path, "Chase", status)
+    # The strip still shows it, as a linked card with no inline Remove.
+    assert "Chase the supplier" in _strip(client.get("/").text)
+    html = client.get("/master/card/alpha", params={"path": path}).text
+    assert label in html
+    # Read-only: the subject and due label, and a Remove button; nothing to save.
+    stored = ReminderStore(directory).all()[path]
+    assert "Chase the supplier" in html and due_label(stored.due_at) in html
+    assert ">Remove<" in html and 'hx-post="/master/reminder/alpha/remove"' in html
+    assert "Save reminder" not in html and 'type="date"' not in html
+    assert 'type="time"' not in html and 'name="subject"' not in html
+    assert 'hx-post="/master/reminder/alpha"' not in html
+    # Removing it (what the button posts) empties the strip.
+    removed = _remove(client, "alpha", path)
+    assert removed.status_code == 200 and removed.headers["HX-Trigger"] == "master-refresh"
+    assert "Save reminder" not in removed.text and ">Remove<" not in removed.text
+    assert ReminderStore(directory).all() == {}
+    assert _strip(client.get("/").text) == ""
+
+
+def test_saving_for_a_card_that_left_waiting_is_still_refused(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    _save(client, "alpha", path)
+    _restage(tmp_path, "Chase", "draft")
+    before = ReminderStore(directory).all()
+    _refused(_save(client, "alpha", path, subject="Changed"))
+    assert ReminderStore(directory).all() == before
 
 
 def test_the_master_view_refreshes_when_a_reminder_changes():

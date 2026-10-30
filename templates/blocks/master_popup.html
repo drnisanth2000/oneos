@@ -60,6 +60,18 @@
       </fieldset>
     </form>
   </section>
+  {% elif reminder_stale %}
+  {# The card is no longer Waiting or To review (its status was edited by hand), but
+     its reminder still sits in Needs attention: show it read-only and let it go. #}
+  <section class="reminder-box" aria-labelledby="reminder-box-label">
+    <h3 class="reminder-box-head" id="reminder-box-label">{{ icon("bell") }}Reminder</h3>
+    <p class="reminder-current" role="status"><span>{{ reminder.subject }}</span> - <time datetime="{{ reminder.due_at.isoformat() }}">{{ due_label(reminder.due_at) }}</time></p>
+    <form class="reminder-actions" hx-post="/master/reminder/{{ entity | urlencode }}/remove"
+          hx-target="#master-popup" hx-swap="innerHTML">
+      <input type="hidden" name="path" value="{{ card.relative_path }}">
+      <button type="submit" class="reminder-remove">Remove</button>
+    </form>
+  </section>
   {% endif %}
 </article>
 {% else %}
