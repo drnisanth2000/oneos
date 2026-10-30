@@ -110,14 +110,6 @@ class MapRow:
 
 
 @dataclass(frozen=True)
-class Attention:
-    inbox: int
-    proposed: int
-    updated: int
-    by_status: tuple[tuple[str, int], ...]
-
-
-@dataclass(frozen=True)
 class BoardPage:
     entity: str
     view: str
@@ -139,7 +131,6 @@ class BoardPage:
     period_label: str
     previous_href: str
     next_href: str
-    attention: Attention
     outline: tuple[OutlineNode, ...]
     outline_title: str
     note_open: bool
@@ -816,27 +807,6 @@ def _map_rows(vault: Vault, scope: Scope, filed: list[BoardCard]) -> tuple[MapRo
     return tuple(rows)
 
 
-def _attention(
-    inbox: list[BoardCard], proposed: list[BoardCard], filed: list[BoardCard], today: date
-) -> Attention:
-    start = today - timedelta(days=7)
-    recent = []
-    for card in filed:
-        updated = _day(card.updated)
-        if updated is not None and start <= updated <= today:
-            recent.append(card)
-    counts: dict[str, int] = {}
-    for card in recent:
-        label = card.status or "Unspecified"
-        counts[label] = counts.get(label, 0) + 1
-    return Attention(
-        inbox=len(inbox),
-        proposed=len(proposed),
-        updated=len(recent),
-        by_status=tuple(sorted(counts.items())),
-    )
-
-
 def _outline(body: str) -> tuple[OutlineNode, ...]:
     items: list[tuple[int, str]] = []
     for line in body.splitlines():
@@ -1026,7 +996,6 @@ def load_board(
             else week_token,
             **common,
         ),
-        attention=_attention(inbox, proposed, filed, current),
         outline=outline,
         outline_title=opened.title if opened else "",
         note_open=opened is not None,

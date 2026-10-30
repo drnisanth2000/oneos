@@ -5,8 +5,10 @@
 {%- endmacro %}
 
 {# A module's own name picks its icon (knowledge, legal, analytics, ... all sit
-   in the "govern" block but mean different things); the block icon is the
-   fallback for names this list does not know. #}
+   in the "govern" block but mean different things). A key matches a whole
+   hyphen-separated word of the module stem, singular or plural ("asset" matches
+   "assets", never "reassets"); the first matching word wins, then the block
+   icon, then a folder. #}
 {% set module_icons = [
   ("inbox", "inbox"), ("archive", "archive"), ("foundation", "block-govern"),
   ("pipeline", "branch"), ("asset", "block-build"), ("operation", "wrench"),
@@ -16,8 +18,13 @@
 ] %}
 {% macro block_icon(block, module="") -%}
 {%- set name = module.split("-", 1)[-1] if module[:1].isdigit() else module -%}
-{%- set matches = module_icons | selectattr(0, "in", name) | list -%}
-{%- if matches -%}{{ icon(matches[0][1]) }}
+{%- set found = namespace(icon="") -%}
+{%- for word in name.split("-") if not found.icon -%}
+{%- for key, symbol in module_icons if not found.icon and (word == key or word == key ~ "s") -%}
+{%- set found.icon = symbol -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- if found.icon -%}{{ icon(found.icon) }}
 {%- elif block in ("system", "govern", "build", "deliver", "retain", "people", "finance", "growth") -%}{{ icon("block-" ~ block) }}
 {%- else -%}{{ icon("folder") }}
 {%- endif -%}
