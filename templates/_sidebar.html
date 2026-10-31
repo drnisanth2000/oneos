@@ -198,22 +198,21 @@ OneOS.command restore-check</code></pre>
           {% if request.state.owner_authenticated | default(false) %}
           {% set passkeys = request.state.passkeys | default([]) %}
           <div class="signin-touch" x-data="{ setup: false, busy: false, message: '' }">
-            {% if passkeys %}
             {% for credential_id, created in passkeys %}
             <div class="settings-row">
               <span class="row-label">Touch ID set up · {{ created | owner_date }}</span>
               <form method="post" action="/settings/passkey/remove">
                 <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
                 <input type="hidden" name="id" value="{{ credential_id }}">
-                <button type="submit">Remove Touch ID</button>
+                <button type="submit" aria-label="Remove Touch ID, set up {{ created | owner_date }}">Remove Touch ID</button>
               </form>
             </div>
             {% endfor %}
-            {% else %}
+            {% set setup_label = "Add Touch ID on this Mac" if passkeys else "Set up Touch ID" %}
             <div class="settings-row">
-              <span class="row-label">Touch ID on this Mac: not set up</span>
+              {% if not passkeys %}<span class="row-label">Touch ID on this Mac: not set up</span>{% endif %}
               <button type="button" class="button-primary" :aria-expanded="setup" aria-controls="touch-setup"
-                      x-show="!setup" @click="setup = true; $nextTick(() => $refs.touchPassword.focus())">Set up Touch ID</button>
+                      x-show="!setup" @click="setup = true; $nextTick(() => $refs.touchPassword.focus())">{{ setup_label }}</button>
             </div>
             <form id="touch-setup" class="signin-form" method="post" x-show="setup" x-cloak
                   @submit.prevent="
@@ -234,13 +233,12 @@ OneOS.command restore-check</code></pre>
                        pattern="[0-9]{6}" maxlength="6" required>
               </label>
               <div class="signin-actions">
-                <button type="submit" class="button-primary" :disabled="busy">Set up Touch ID</button>
+                <button type="submit" class="button-primary" :disabled="busy">{{ setup_label }}</button>
                 <button type="button" :disabled="busy" @click="setup = false; message = ''">Cancel</button>
               </div>
               <p class="signin-message" role="alert" x-show="message" x-cloak x-text="message"></p>
             </form>
             <p class="settings-note">Asks for your password and code once, then your fingerprint. If you just used a code to sign in, wait for the next one.</p>
-            {% endif %}
           </div>
           <div class="settings-row">
             <span class="row-label">Sign out on this Mac and every other</span>

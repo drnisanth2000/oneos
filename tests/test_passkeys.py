@@ -1058,7 +1058,24 @@ def test_request_state_passkeys_for_signed_in_requests(owner, monkeypatch):
 
 # --- Settings -> Sign-in ----------------------------------------------------------
 
-OCT_31_2026 = 1793448000  # 12:00 UTC, so the same calendar day in every time zone
+OCT_28_2026 = 1793188800  # 12:00 UTC: the same calendar day in nearly every time zone
+OCT_31_2026 = 1793448000
+
+
+@pytest.fixture
+def utc():
+    """Render dates in UTC whatever the machine's time zone; restored afterwards."""
+    import os
+    import time
+    before = os.environ.get("TZ")
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+    yield
+    if before is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = before
+    time.tzset()
 
 
 class _Forms(HTMLParser):
@@ -1132,11 +1149,14 @@ def test_settings_sign_in_section_without_a_passkey(web):
     assert everywhere["buttons"] == ["Sign out everywhere"]
 
 
-def test_settings_lists_each_passkey_with_its_date_and_a_remove_form(web):
+def test_settings_lists_each_passkey_with_its_date_and_a_remove_form(web, utc):
     client, store, secret = web
-    first = _register(store, secret, OCT_31_2026 - 3600 * 24 * 3)
-    second = _register(store, secret, OCT_31_2026)
-    csrf = _store_session(client, store, secret, OCT_31_2026 + 90)
+    # Small explicit store times keep the owner's TOTP counter in the past; only `created` is dated.
+    first = _register(store, secret, 3030)
+    second = _register(store, secret, 3060)
+    _execute(store, "UPDATE passkeys SET created=? WHERE id=?", (OCT_28_2026, first.id))
+    _execute(store, "UPDATE passkeys SET created=? WHERE id=?", (OCT_31_2026, second.id))
+    csrf = _store_session(client, store, secret, 3090)
     page, forms = _settings_page(client)
     text = _text_of(page)
     assert "not set up" not in text
@@ -1146,14 +1166,16 @@ def test_settings_lists_each_passkey_with_its_date_and_a_remove_form(web):
     for form in removes:
         assert form["method"] == "post" and form["buttons"] == ["Remove Touch ID"]
         assert form["inputs"]["csrf_token"]["value"] == csrf
-    # A second setup on this Mac would only be refused as already set up, so it is not offered.
-    assert not any("password" in form["inputs"] for form in forms)
+    assert 'aria-label="Remove Touch ID, set up 28 Oct 2026"' in page and 'aria-label="Remove Touch ID, set up 31 Oct 2026"' in page
+    # More than one passkey may be stored (a new Mac), so setup stays available.
+    assert any("password" in form["inputs"] for form in forms)
+    assert "Add Touch ID on this Mac" in text and "Set up Touch ID" not in text
 
 
 def test_settings_remove_form_works_end_to_end(web):
     client, store, secret = web
-    fake = _register(store, secret, OCT_31_2026)
-    _store_session(client, store, secret, OCT_31_2026 + 90)
+    fake = _register(store, secret, 3030)
+    _store_session(client, store, secret, 3090)
     _, forms = _settings_page(client)
     form = next(form for form in forms if form["action"] == "/settings/passkey/remove")
     response = client.post(form["action"], data={name: item["value"] for name, item in form["inputs"].items()}, headers=OWN)
