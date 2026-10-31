@@ -1,22 +1,54 @@
 """Authentication precedes route matching, including framework error handlers."""
 import os
 import secrets
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from fastapi.routing import APIRoute
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from .auth import AuthStore, AuthUnavailable
 
 COOKIE = "__Host-oneos"
 LOGIN_COOKIE = "__Host-oneos-login"
+# When a kept session's cookie was last issued (Unix seconds). It only schedules
+# renewal; whether a session is kept comes from the database, never from a cookie.
+ISSUED_COOKIE = "__Host-oneos-issued"
+UNKEPT_COOKIE_AGE = 43200
+KEPT_COOKIE_AGE = 34560000
+RENEW_AFTER_SECONDS = 86400
+_COOKIE_FLAGS = dict(secure=True, httponly=True, samesite="strict", path="/")
 LIMIT = 16384
 # Lifecycle proposal bytes may reach 4 MiB. Their reviewed fields add JSON
 # escaping and form percent-encoding; leave room for both and the form envelope.
 AUTHENTICATED_LIMIT = 32 * 1024 * 1024
+
+
+def _set_session_cookie(response, token, *, kept):
+    """The one rule for the session cookie, shared by every sign-in path and renewal."""
+    if kept:
+        response.set_cookie(COOKIE, token, max_age=KEPT_COOKIE_AGE, **_COOKIE_FLAGS)
+        response.set_cookie(ISSUED_COOKIE, str(int(time.time())), max_age=KEPT_COOKIE_AGE, **_COOKIE_FLAGS)
+    else:
+        response.set_cookie(COOKIE, token, max_age=UNKEPT_COOKIE_AGE, **_COOKIE_FLAGS)
+        response.delete_cookie(ISSUED_COOKIE, secure=True, httponly=True, samesite="strict")
+
+
+def _clear_session_cookies(response):
+    for name in (COOKIE, ISSUED_COOKIE):
+        response.delete_cookie(name, secure=True, httponly=True, samesite="strict")
+
+
+def _renewal_due(issued):
+    """A missing, unreadable or future stamp counts as due: re-issuing is harmless."""
+    try:
+        age = time.time() - int(issued)
+    except (TypeError, ValueError):
+        return True
+    return not 0 <= age <= RENEW_AFTER_SECONDS
 
 
 class AuthenticatedFormRoute(APIRoute):
@@ -78,7 +110,8 @@ class OwnerAuthMiddleware:
             if request.headers.get("origin") is not None and request.headers.getlist("origin") != [origin]:
                 return await finish(PlainTextResponse("Invalid origin", 403))
             token = request.cookies.get(COOKIE)
-            csrf = await run_in_threadpool(store.session, token)
+            info = await run_in_threadpool(store.session_info, token)
+            csrf = info.csrf if info else None
             scope.setdefault("state", {})["csrf_token"] = csrf or ""
             scope["state"]["owner_authenticated"] = bool(csrf)
             login = request.url.path == "/login"
@@ -95,6 +128,7 @@ class OwnerAuthMiddleware:
                     f'<input type="hidden" name="csrf_token" value="{nonce}">'
                     '<label>Password <input type="password" name="password" autocomplete="current-password" required maxlength="1024"></label>'
                     '<label>Authenticator code <input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required maxlength="6"></label>'
+                    '<label><input type="checkbox" name="keep" value="1" checked> Keep me signed in on this Mac</label>'
                     '<button type="submit">Sign in</button></form></main></html>'
                 )
                 response.set_cookie(LOGIN_COOKIE, nonce, max_age=600, secure=True, httponly=True, samesite="strict", path="/")
@@ -124,18 +158,25 @@ class OwnerAuthMiddleware:
                 if login:
                     if request.method != "POST" or any(len(v) != 1 for v in fields.values()):
                         return await finish(PlainTextResponse("Invalid form", 400))
-                    session = await run_in_threadpool(store.login, (fields.get("password") or [""])[0], (fields.get("code") or [""])[0])
+                    keep = fields.get("keep") == ["1"]
+                    session = await run_in_threadpool(lambda: store.login((fields.get("password") or [""])[0], (fields.get("code") or [""])[0], keep=keep))
                     if session is None:
                         return await finish(HTMLResponse('<p>Sign in failed. Check your credentials or wait before retrying.</p><a href="/login">Try again</a>', 401))
                     response = RedirectResponse("/", 303)
-                    response.set_cookie(COOKIE, session, max_age=43200, secure=True, httponly=True, samesite="strict", path="/")
+                    _set_session_cookie(response, session, kept=keep)
                     response.delete_cookie(LOGIN_COOKIE, secure=True, httponly=True, samesite="strict")
                     return await finish(response)
                 if request.url.path == "/logout" and request.method == "POST":
                     await run_in_threadpool(store.logout, token)
                     response = RedirectResponse("/login", 303)
                     response.headers["HX-Redirect"] = "/login"
-                    response.delete_cookie(COOKIE, secure=True, httponly=True, samesite="strict")
+                    _clear_session_cookies(response)
+                    return await finish(response)
+                if request.url.path == "/logout/everywhere" and request.method == "POST":
+                    await run_in_threadpool(store.logout_everywhere)
+                    response = RedirectResponse("/login", 303)
+                    response.headers["HX-Redirect"] = "/login"
+                    _clear_session_cookies(response)
                     return await finish(response)
                 sent = False
                 async def replay():
@@ -147,9 +188,16 @@ class OwnerAuthMiddleware:
                 downstream_receive = replay
             else:
                 downstream_receive = receive
+            renewal = []
+            if info and info.kept and _renewal_due(request.cookies.get(ISSUED_COOKIE)):
+                # Re-issue the cookie the client just presented (already validated as
+                # a kept session in the database) so its 400 days restart.
+                renewed = Response()
+                _set_session_cookie(renewed, token, kept=True)
+                renewal = [(k, v) for k, v in renewed.raw_headers if k == b"set-cookie"]
             async def secured_send(message):
                 if message["type"] == "http.response.start":
-                    message["headers"] = list(message["headers"]) + [(b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"), (b"content-security-policy", b"frame-ancestors 'none'")]
+                    message["headers"] = list(message["headers"]) + renewal + [(b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"), (b"content-security-policy", b"frame-ancestors 'none'")]
                 await send(message)
             return await self.app(scope, downstream_receive, secured_send)
         except AuthUnavailable:

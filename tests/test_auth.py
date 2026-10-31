@@ -679,3 +679,201 @@ def test_invalid_kept_flag_makes_store_unavailable(owner, kept):
 def test_webauthn_is_importable():
     import webauthn
     assert webauthn.generate_registration_options
+
+
+KEPT_AGE = 34560000
+OWN_ORIGIN = {"Origin": "https://localhost:8443"}
+
+
+def _store_login(store, secret, at, *, keep=False):
+    import pyotp
+    return store.login("synthetic owner password", pyotp.TOTP(secret).at(at), keep=keep, now=at)
+
+
+def test_kept_session_outlives_idle_and_absolute_limits(owner):
+    store, secret = owner
+    token = _store_login(store, secret, 3030, keep=True)
+    assert store.session_info(token, now=3030 + 3600).kept is True
+    # 13 h after sign-in, and 13 h of silence: neither limit applies.
+    info = store.session_info(token, now=3030 + 13 * 3600)
+    assert info.kept is True and store.session(token, now=3030 + 26 * 3600) == info.csrf
+    assert store.session_info(token, now=3030 + 400 * 86400)
+
+
+def test_kept_session_survives_a_clock_that_steps_backwards(owner):
+    store, secret = owner
+    token = _store_login(store, secret, 3030, keep=True)
+    assert store.session(token, now=9000)
+    assert store.session(token, now=3100)  # clock stepped back; still signed in
+    store.available()  # seen never drops below created
+
+
+def test_unkept_session_limits_unchanged(owner):
+    store, secret = owner
+    token = _store_login(store, secret, 3030)
+    assert store.session_info(token, now=3031).kept is False
+    assert store.session(token, now=3031 + 1799)
+    assert store.session(token, now=3031 + 1799 + 1800) is None  # idle
+    token = _store_login(store, secret, 4000)
+    for now in range(4001, 46000, 1000):
+        assert store.session(token, now=now)
+    assert store.session(token, now=4000 + 43200) is None  # absolute
+
+
+def test_login_purge_keeps_kept_sessions(owner):
+    import sqlite3
+    store, secret = owner
+    kept = _store_login(store, secret, 3030, keep=True)
+    unkept = _store_login(store, secret, 3060)
+    later = 3060 + 50000
+    assert _store_login(store, secret, later, keep=False)
+    with closing(sqlite3.connect(store.path)) as db:
+        rows = db.execute("SELECT kept FROM sessions ORDER BY created").fetchall()
+    assert rows == [(1,), (0,)]  # the expired unkept one was purged, the kept one was not
+    assert store.session(unkept, now=later) is None
+    assert store.session(kept, now=later)
+
+
+def _web_login(client, secret, *, keep):
+    import pyotp
+    page = client.get("/login")
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+    data = {"password": "synthetic owner password", "code": pyotp.TOTP(secret).now(), "csrf_token": csrf}
+    if keep:
+        data["keep"] = "1"
+    return client.post("/login", data=data, headers=OWN_ORIGIN)
+
+
+def _cookie_headers(response, name):
+    return [value for value in response.headers.get_list("set-cookie") if value.startswith(name + "=")]
+
+
+def test_login_form_offers_keep_checked_by_default(owner):
+    from app.main import app
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        page = client.get("/login").text
+    assert re.search(r'<input[^>]*type="checkbox"[^>]*name="keep"[^>]*value="1"[^>]*checked', page)
+    assert "Keep me signed in on this Mac" in page
+
+
+def test_kept_login_sets_long_cookie_and_renews_it(owner, monkeypatch):
+    import time
+    from app import auth
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        response = _web_login(client, secret, keep=True)
+        assert response.status_code == 303
+        (cookie,) = _cookie_headers(response, "__Host-oneos")
+        assert f"Max-Age={KEPT_AGE}" in cookie
+        for flag in ("Secure", "HttpOnly", "SameSite=strict", "Path=/"):
+            assert flag in cookie
+        (issued,) = _cookie_headers(response, "__Host-oneos-issued")
+        assert f"Max-Age={KEPT_AGE}" in issued and "Secure" in issued and "HttpOnly" in issued
+        token = client.cookies.get("__Host-oneos")
+        assert store.session_info(token).kept is True
+        # Same day: no re-issue.
+        assert _cookie_headers(client.get("/docs"), "__Host-oneos") == []
+        real = time.time()
+        monkeypatch.setattr(auth.time, "time", lambda: real + 86401)
+        response = client.get("/docs")
+        assert response.status_code == 200
+        (renewed,) = _cookie_headers(response, "__Host-oneos")
+        assert renewed.startswith(f"__Host-oneos={token};") and f"Max-Age={KEPT_AGE}" in renewed
+        assert len(_cookie_headers(response, "__Host-oneos-issued")) == 1
+        # Renewed once; the next request that day does not renew again.
+        assert _cookie_headers(client.get("/docs"), "__Host-oneos") == []
+        # Past the idle and absolute limits the kept session still works.
+        monkeypatch.setattr(auth.time, "time", lambda: real + 3 * 86400)
+        assert client.get("/docs").status_code == 200
+
+
+def test_kept_session_without_a_usable_issue_stamp_is_renewed(owner):
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        assert _web_login(client, secret, keep=True).status_code == 303
+        for stamp in ("", "garbage", "-5", "9" * 20):
+            client.cookies.set("__Host-oneos-issued", stamp, domain="localhost.local")
+            assert len(_cookie_headers(client.get("/docs"), "__Host-oneos")) == 1, stamp
+
+
+def test_unkept_login_gets_short_cookie_and_is_never_renewed_or_promoted(owner, monkeypatch):
+    import time
+    from app import auth
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        response = _web_login(client, secret, keep=False)
+        assert response.status_code == 303
+        (cookie,) = _cookie_headers(response, "__Host-oneos")
+        assert "Max-Age=43200" in cookie
+        token = client.cookies.get("__Host-oneos")
+        # A client forging every hint it controls changes nothing for an unkept session.
+        client.cookies.set("__Host-oneos-issued", "0", domain="localhost.local")
+        client.cookies.set("__Host-oneos-kept", "1", domain="localhost.local")
+        real = time.time()
+        monkeypatch.setattr(auth.time, "time", lambda: real + 1000)
+        response = client.get("/docs", headers={"X-OneOS-Keep": "1"})
+        assert response.status_code == 200
+        assert _cookie_headers(response, "__Host-oneos") == []
+        assert store.session_info(token, now=real + 1000).kept is False
+        monkeypatch.setattr(auth.time, "time", lambda: real + 50000)
+        assert client.get("/docs").status_code == 303  # absolute limit still applies
+        assert store.session_info(token, now=real + 50000) is None
+
+
+def _cleared(response, name):
+    return any("Max-Age=0" in value for value in _cookie_headers(response, name))
+
+
+def test_logout_and_logout_everywhere_end_kept_sessions(owner):
+    from app.main import app
+    store, secret = owner
+    # Store-side sign-ins first: their small `now` values must precede the web sign-in's TOTP step.
+    first = _store_login(store, secret, 3030, keep=True)
+    second = _store_login(store, secret, 3060, keep=True)
+    store.logout(first)
+    assert store.session(first) is None and store.session(second)
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        assert _web_login(client, secret, keep=True).status_code == 303
+        token = client.cookies.get("__Host-oneos")
+        csrf = store.session(token)
+        # Sign out ends only this session and clears both cookies.
+        response = client.post("/logout", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": csrf}))
+        assert response.status_code == 303 and response.headers["location"] == "/login"
+        assert _cleared(response, "__Host-oneos") and _cleared(response, "__Host-oneos-issued")
+        assert store.session(token) is None
+        assert store.session(second)
+        # Sign out everywhere, from a session that is itself kept, ends every session.
+        client.cookies.set("__Host-oneos", second, domain="localhost.local")
+        response = client.post("/logout/everywhere", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": store.session(second), "HX-Request": "true"}))
+        assert response.status_code == 303
+        assert response.headers["location"] == "/login" and response.headers["HX-Redirect"] == "/login"
+        assert _cleared(response, "__Host-oneos") and _cleared(response, "__Host-oneos-issued")
+        assert store.session(second) is None
+        assert client.get("/docs").status_code == 303
+    store.logout_everywhere()  # idempotent on an empty table
+    store.available()
+
+
+def test_logout_everywhere_requires_csrf(owner):
+    from app.main import app
+    store, secret = owner
+    token = _store_login(store, secret, 3030, keep=True)
+    other = _store_login(store, secret, 3060, keep=True)
+    csrf = store.session(token)
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        client.cookies.set("__Host-oneos", token, domain="localhost.local")
+        # No token, wrong token, wrong origin, no origin: refused, nothing deleted.
+        assert client.post("/logout/everywhere", headers=OWN_ORIGIN).status_code == 403
+        assert client.post("/logout/everywhere", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": "x" * 43})).status_code == 403
+        assert client.post("/logout/everywhere", headers={"Origin": "https://evil.invalid", "X-CSRF-Token": csrf}).status_code == 403
+        assert client.post("/logout/everywhere", headers={"X-CSRF-Token": csrf}).status_code == 403
+        # A GET is not the sign-out action.
+        assert client.get("/logout/everywhere").status_code != 303
+        assert store.session(token) and store.session(other)
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as anonymous:
+        response = anonymous.post("/logout/everywhere", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": csrf}))
+        assert response.status_code == 401
+    assert store.session(other)

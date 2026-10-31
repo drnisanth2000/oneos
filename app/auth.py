@@ -11,6 +11,7 @@ import stat
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyotp
@@ -22,6 +23,12 @@ HASHER = PasswordHasher()
 IDLE_SECONDS = 1800
 ABSOLUTE_SECONDS = 43200
 MAX_BLOCK_SECONDS = 900
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    csrf: str
+    kept: bool
 
 
 class AuthUnavailable(Exception):
@@ -200,7 +207,19 @@ class AuthStore:
                 db.execute(f"DELETE FROM {table}")
             db.execute("INSERT INTO throttle VALUES(1,0,0) ON CONFLICT(id) DO UPDATE SET failures=0, blocked=0")
 
-    def login(self, password, code, *, now=None):
+    def _create_session(self, db, *, now, keep):
+        """The one place a session is made (password and passkey sign-in both call it).
+
+        Runs inside the caller's write transaction. Kept sessions have no idle or
+        absolute limit, so the expiry purge never touches them.
+        """
+        _ensure_schema(db)
+        db.execute("DELETE FROM sessions WHERE kept=0 AND (seen<=? OR created<=?)", (now-IDLE_SECONDS, now-ABSOLUTE_SECONDS))
+        token = secrets.token_urlsafe(32)
+        db.execute("INSERT INTO sessions(token,csrf,created,seen,kept) VALUES(?,?,?,?,?)", (digest(token), secrets.token_urlsafe(32), now, now, int(bool(keep))))
+        return token
+
+    def login(self, password, code, *, keep=False, now=None):
         now = time.time() if now is None else now
         if not isinstance(password, str) or len(password) > 1024 or not re.fullmatch(r"[0-9]{6}", code):
             return None
@@ -225,13 +244,9 @@ class AuthStore:
             if HASHER.check_needs_rehash(row[0]):
                 db.execute("UPDATE owner SET password=? WHERE id=1", (HASHER.hash(password),))
             db.execute("UPDATE throttle SET failures=0,blocked=0 WHERE id=1")
-            _ensure_schema(db)
-            db.execute("DELETE FROM sessions WHERE seen<=? OR created<=?", (now-IDLE_SECONDS, now-ABSOLUTE_SECONDS))
-            token = secrets.token_urlsafe(32)
-            db.execute("INSERT INTO sessions(token,csrf,created,seen) VALUES(?,?,?,?)", (digest(token), secrets.token_urlsafe(32), now, now))
-            return token
+            return self._create_session(db, now=now, keep=keep)
 
-    def session(self, token, *, now=None):
+    def session_info(self, token, *, now=None):
         if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
             return None
         with self.connect() as db:
@@ -242,12 +257,23 @@ class AuthStore:
             if not row:
                 return None
             _validate_session(row)
-            if now-row[2] >= ABSOLUTE_SECONDS or now-row[3] >= IDLE_SECONDS or now < row[3]:
+            kept = row[4] == 1
+            if not kept and (now-row[2] >= ABSOLUTE_SECONDS or now-row[3] >= IDLE_SECONDS or now < row[3]):
                 db.execute("DELETE FROM sessions WHERE token=?", (digest(token),))
                 return None
-            db.execute("UPDATE sessions SET seen=? WHERE token=?", (now, digest(token)))
-            return row[1]
+            # A kept session has no clock limits. If the clock stepped back, keep
+            # `seen` where it was so seen >= created still holds.
+            db.execute("UPDATE sessions SET seen=? WHERE token=?", (max(now, row[3]) if kept else now, digest(token)))
+            return SessionInfo(row[1], kept)
+
+    def session(self, token, *, now=None):
+        info = self.session_info(token, now=now)
+        return info.csrf if info else None
 
     def logout(self, token):
         with self.connect() as db:
             db.execute("DELETE FROM sessions WHERE token=?", (digest(token),))
+
+    def logout_everywhere(self):
+        with self.connect() as db:
+            db.execute("DELETE FROM sessions")
