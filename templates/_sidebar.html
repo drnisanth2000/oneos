@@ -188,14 +188,69 @@ document.addEventListener('click', (event) => {
 
         <section class="settings-group" aria-labelledby="set-backup">
           <h3 id="set-backup">{{ icon("backup") }}Backup</h3>
-          <p class="settings-note">Encrypted snapshots go to your external drive once a day while the Mac is awake. To back up now, or to prove a snapshot restores, run the launcher in your OneOS state folder:</p>
+          <p class="settings-note">Encrypted snapshots go to your external drive only when you run a backup. To back up now, or to prove a snapshot restores, run the launcher in your OneOS state folder:</p>
           <pre class="command">{{ icon("terminal") }}<code>OneOS.command backup
 OneOS.command restore-check</code></pre>
         </section>
 
         <section class="settings-group" aria-labelledby="set-security">
-          <h3 id="set-security">{{ icon("lock") }}Password &amp; two-factor</h3>
-          <p class="settings-note">Passwords and authenticator secrets are changed only in Terminal, so they never pass through the browser. Recovery sets a new password and a new authenticator code:</p>
+          <h3 id="set-security">{{ icon("lock") }}Sign-in</h3>
+          {% if request.state.owner_authenticated | default(false) %}
+          {% set passkeys = request.state.passkeys | default([]) %}
+          <div class="signin-touch" x-data="{ setup: false, busy: false, message: '' }">
+            {% if passkeys %}
+            {% for credential_id, created in passkeys %}
+            <div class="settings-row">
+              <span class="row-label">Touch ID set up · {{ created | owner_date }}</span>
+              <form method="post" action="/settings/passkey/remove">
+                <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+                <input type="hidden" name="id" value="{{ credential_id }}">
+                <button type="submit">Remove Touch ID</button>
+              </form>
+            </div>
+            {% endfor %}
+            {% else %}
+            <div class="settings-row">
+              <span class="row-label">Touch ID on this Mac: not set up</span>
+              <button type="button" class="button-primary" :aria-expanded="setup" aria-controls="touch-setup"
+                      x-show="!setup" @click="setup = true; $nextTick(() => $refs.touchPassword.focus())">Set up Touch ID</button>
+            </div>
+            <form id="touch-setup" class="signin-form" method="post" x-show="setup" x-cloak
+                  @submit.prevent="
+                    if (busy) return;
+                    busy = true; message = '';
+                    const answer = window.OneOSPasskey
+                      ? await window.OneOSPasskey.register($refs.touchPassword.value, $refs.touchCode.value)
+                      : { ok: false, message: 'Touch ID setup did not load. Reload the page and try again.' };
+                    if (answer.ok) { location.reload(); return; }
+                    message = answer.message || 'Touch ID could not be set up.';
+                    $refs.touchCode.value = '';
+                    busy = false;">
+              <label class="signin-field"><span>Password</span>
+                <input type="password" name="password" x-ref="touchPassword" autocomplete="current-password" required>
+              </label>
+              <label class="signin-field"><span>6-digit code</span>
+                <input type="text" name="code" x-ref="touchCode" autocomplete="one-time-code" inputmode="numeric"
+                       pattern="[0-9]{6}" maxlength="6" required>
+              </label>
+              <div class="signin-actions">
+                <button type="submit" class="button-primary" :disabled="busy">Set up Touch ID</button>
+                <button type="button" :disabled="busy" @click="setup = false; message = ''">Cancel</button>
+              </div>
+              <p class="signin-message" role="alert" x-show="message" x-cloak x-text="message"></p>
+            </form>
+            <p class="settings-note">Asks for your password and code once, then your fingerprint. If you just used a code to sign in, wait for the next one.</p>
+            {% endif %}
+          </div>
+          <div class="settings-row">
+            <span class="row-label">Sign out on this Mac and every other</span>
+            <form method="post" action="/logout/everywhere">
+              <input type="hidden" name="csrf_token" value="{{ request.state.csrf_token }}">
+              <button type="submit">Sign out everywhere</button>
+            </form>
+          </div>
+          {% endif %}
+          <p class="settings-note signin-recover">Passwords and authenticator secrets are changed only in Terminal, so they never pass through the browser. Recovery, which also removes Touch ID, sets a new password and a new authenticator code:</p>
           <pre class="command">{{ icon("terminal") }}<code>OneOS.command recover</code></pre>
         </section>
 

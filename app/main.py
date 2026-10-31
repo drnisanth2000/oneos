@@ -101,6 +101,15 @@ from .deployment_health import install_health
 
 BASE = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE / "templates"))
+
+
+def _owner_date(stamp) -> str:
+    """'31 Oct 2026' for a Unix time, in the owner's local time zone."""
+    moment = datetime.fromtimestamp(float(stamp))
+    return f"{moment.day} {moment:%b %Y}"
+
+
+templates.env.filters["owner_date"] = _owner_date
 templates.env.globals["stylesheet_version"] = hashlib.sha256(
     (BASE / "static/app.css").read_bytes()
 ).hexdigest()[:12]

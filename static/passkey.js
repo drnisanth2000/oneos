@@ -56,6 +56,15 @@
     return {ok: false, error: error, message: message};
   }
 
+  // A 401 that is not the server's JSON {"error": "check"}, or a 403, means
+  // the session or page token is no longer valid (for example an unkept
+  // session that timed out): go to the sign-in page rather than blame the
+  // password.
+  function signedOut() {
+    try { location.assign('/login'); } catch (_) {}
+    return failure('signed-out', 'You have been signed out. Sign in again.');
+  }
+
   // The server's options JSON (base64url strings) as the ArrayBuffers
   // navigator.credentials.create() needs. Done here because
   // PublicKeyCredential.parseCreationOptionsFromJSON is not in every browser.
@@ -96,10 +105,12 @@
     try {
       var begun = await post('/settings/passkey/begin', form({password: String(password), code: String(code)}), 'application/x-www-form-urlencoded');
       if (begun.status === 401) {
-        var refusal = {};
+        var refusal = null;
         try { refusal = await begun.json(); } catch (_) {}
+        if (!refusal || typeof refusal !== 'object' || refusal.error !== 'check') return signedOut();
         return failure('check', typeof refusal.message === 'string' && refusal.message ? refusal.message : CHECK);
       }
+      if (begun.status === 403) return signedOut();
       if (!begun.ok) return failure('failed', 'Touch ID could not be set up.' + AGAIN);
       var options = creationOptions(await begun.json());
       var credential;
@@ -111,6 +122,7 @@
       }
       if (!credential) return failure('cancelled', 'Touch ID was cancelled or timed out.' + AGAIN);
       var finished = await post('/settings/passkey/finish', JSON.stringify(registrationJSON(credential)), 'application/json');
+      if (finished.status === 401 || finished.status === 403) return signedOut();
       if (!finished.ok) return failure('failed', 'Touch ID could not be set up.' + AGAIN);
       return {ok: true};
     } catch (error) {
@@ -127,6 +139,7 @@
         location.reload();
         return {ok: true};
       }
+      if (response.status === 401 || response.status === 403) return signedOut();
       return failure('failed', 'Touch ID could not be removed. Reload the page and try again.');
     } catch (error) {
       return failure('failed', 'Touch ID could not be removed. Reload the page and try again.');

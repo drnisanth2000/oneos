@@ -314,9 +314,12 @@ class OwnerAuthMiddleware:
             csrf = info.csrf if info else None
             scope.setdefault("state", {})["csrf_token"] = csrf or ""
             scope["state"]["owner_authenticated"] = bool(csrf)
-            # For the Settings sheet: (id, created) of each stored passkey.
-            scope["state"]["passkeys"] = await run_in_threadpool(store.passkeys) if csrf else []
             path = request.url.path
+            # For the Settings sheet: (id, created) of each stored passkey.
+            # Static files never show it, so they skip the database read.
+            scope["state"]["passkeys"] = (
+                await run_in_threadpool(store.passkeys) if csrf and not path.startswith("/static/") else []
+            )
             login = path in PRE_SIGN_IN
             if not csrf and not login:
                 response = RedirectResponse("/login", 303) if request.method in ("GET", "HEAD") else PlainTextResponse("Sign in required", 401)

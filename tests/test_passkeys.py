@@ -2,6 +2,7 @@
 import hashlib
 import json
 import sqlite3
+from html.parser import HTMLParser
 from contextlib import closing
 
 import pyotp
@@ -1036,11 +1037,143 @@ def test_request_state_passkeys_for_signed_in_requests(owner, monkeypatch):
     def state(request: Request):
         return {"passkeys": request.state.passkeys}
 
+    @app.get("/static/state")
+    def static_state(request: Request):
+        return {"passkeys": request.state.passkeys}
+
     with TestClient(app, base_url=ORIGIN, follow_redirects=False) as client:
         _store_session(client, store, secret)
         assert client.get("/state").json() == {"passkeys": []}
         fake = _register(store, secret, 3060)
         assert client.get("/state").json() == {"passkeys": [[fake.id, 3061]]}
+        # Static files do not need the list: it stays [] without a database read.
+        calls = []
+        real = type(store).passkeys
+        monkeypatch.setattr(type(store), "passkeys", lambda self: calls.append(1) or real(self))
+        assert client.get("/static/state").json() == {"passkeys": []}
+        assert calls == []
+        assert client.get("/state").json() == {"passkeys": [[fake.id, 3061]]}
+        assert calls == [1]
+
+
+# --- Settings -> Sign-in ----------------------------------------------------------
+
+OCT_31_2026 = 1793448000  # 12:00 UTC, so the same calendar day in every time zone
+
+
+class _Forms(HTMLParser):
+    """Each <form>: its attributes, its named inputs and its button labels."""
+
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self._form = None
+        self._button = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            self._form = {"action": attrs.get("action"), "method": (attrs.get("method") or "").lower(), "inputs": {}, "buttons": []}
+            self.forms.append(self._form)
+        elif tag == "input" and self._form is not None and attrs.get("name"):
+            self._form["inputs"][attrs["name"]] = attrs
+        elif tag == "button" and self._form is not None:
+            self._button = ""
+
+    def handle_data(self, data):
+        if self._button is not None:
+            self._button += data
+
+    def handle_endtag(self, tag):
+        if tag == "button" and self._button is not None:
+            self._form["buttons"].append(self._button.strip())
+            self._button = None
+        elif tag == "form":
+            self._form = None
+
+
+def _settings_page(client):
+    response = client.get("/")
+    assert response.status_code == 200, response.text[:300]
+    parser = _Forms()
+    parser.feed(response.text)
+    return response.text, parser.forms
+
+
+def _text_of(page):
+    import re
+    from html import unescape
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", page)))
+
+
+def test_settings_sign_in_section_without_a_passkey(web):
+    client, store, secret = web
+    csrf = _store_session(client, store, secret)
+    page, forms = _settings_page(client)
+    text = _text_of(page)
+    assert ">Sign-in<" in page and "Password &amp; two-factor" not in page
+    assert "Touch ID on this Mac: not set up" in text
+    assert "Touch ID set up" not in text and "Remove Touch ID" not in text
+    assert "Set up Touch ID" in text
+    assert "Asks for your password and code once, then your fingerprint." in text
+    assert "If you just used a code to sign in, wait for the next one." in text
+    assert "which also removes Touch ID" in text
+    # The setup form calls the vendored script; the inputs carry the right autofill hints.
+    setup = next(form for form in forms if "password" in form["inputs"])
+    assert setup["inputs"]["password"]["type"] == "password" and setup["inputs"]["password"]["autocomplete"] == "current-password"
+    code = setup["inputs"]["code"]
+    assert code["autocomplete"] == "one-time-code" and code["inputmode"] == "numeric"
+    assert "OneOSPasskey.register" in page and '<script defer src="/static/passkey.js"' in page
+    # Without JavaScript the form can only post to the page itself, never put the password in a URL.
+    assert setup["action"] is None and setup["method"] == "post"
+    # Sign out everywhere posts the session's token to its endpoint.
+    everywhere = next(form for form in forms if form["action"] == "/logout/everywhere")
+    assert everywhere["method"] == "post" and everywhere["inputs"]["csrf_token"]["value"] == csrf
+    assert everywhere["buttons"] == ["Sign out everywhere"]
+
+
+def test_settings_lists_each_passkey_with_its_date_and_a_remove_form(web):
+    client, store, secret = web
+    first = _register(store, secret, OCT_31_2026 - 3600 * 24 * 3)
+    second = _register(store, secret, OCT_31_2026)
+    csrf = _store_session(client, store, secret, OCT_31_2026 + 90)
+    page, forms = _settings_page(client)
+    text = _text_of(page)
+    assert "not set up" not in text
+    assert "Touch ID set up · 28 Oct 2026" in text and "Touch ID set up · 31 Oct 2026" in text
+    removes = [form for form in forms if form["action"] == "/settings/passkey/remove"]
+    assert sorted(form["inputs"]["id"]["value"] for form in removes) == sorted([first.id, second.id])
+    for form in removes:
+        assert form["method"] == "post" and form["buttons"] == ["Remove Touch ID"]
+        assert form["inputs"]["csrf_token"]["value"] == csrf
+    # A second setup on this Mac would only be refused as already set up, so it is not offered.
+    assert not any("password" in form["inputs"] for form in forms)
+
+
+def test_settings_remove_form_works_end_to_end(web):
+    client, store, secret = web
+    fake = _register(store, secret, OCT_31_2026)
+    _store_session(client, store, secret, OCT_31_2026 + 90)
+    _, forms = _settings_page(client)
+    form = next(form for form in forms if form["action"] == "/settings/passkey/remove")
+    response = client.post(form["action"], data={name: item["value"] for name, item in form["inputs"].items()}, headers=OWN)
+    assert response.status_code == 303
+    assert store.passkeys() == []
+    assert "Touch ID on this Mac: not set up" in _text_of(client.get("/").text)
+
+
+def test_settings_sign_in_section_is_for_signed_in_owners_only(web):
+    client, store, secret = web
+    assert client.get("/").status_code == 303
+    assert client.get("/login").status_code == 200
+
+
+def test_settings_backup_note_says_backups_run_only_on_request(web):
+    client, store, secret = web
+    _store_session(client, store, secret)
+    text = _text_of(client.get("/").text)
+    assert "once a day" not in text and "while the Mac is awake" not in text
+    assert "only when you run" in text
 
 
 # --- static/passkey.js (Settings), run under node when it is installed --------------
@@ -1135,6 +1268,71 @@ const api = window.OneOSPasskey;
   assert.strictEqual(remove[1].body, 'id=AQID-vv8');
   assert.strictEqual(remove[1].redirect, 'manual');
   assert.ok(calls.some((c) => c[0] === 'reload'));
+  console.log('ok');
+})().catch((e) => { console.error(e); process.exit(1); });
+""")
+    result = subprocess.run([_node(), str(harness), str(script)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_passkey_js_sends_an_expired_session_to_sign_in_not_a_password_message(tmp_path):
+    """Only the server's JSON {"error": "check"} is a wrong password or code; any other 401 or a 403 means signed out."""
+    import subprocess
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "static" / "passkey.js"
+    harness = tmp_path / "harness.js"
+    harness.write_text(r"""
+const assert = require('assert');
+const calls = [];
+const b64 = (bytes) => Buffer.from(bytes).toString('base64url');
+global.window = global;
+global.document = { querySelector: () => ({ content: 'T'.repeat(43) }) };
+global.PublicKeyCredential = function () {};
+global.location = { reload() { calls.push(['reload']); }, assign(url) { calls.push(['assign', url]); } };
+const credential = () => ({ id: 'AQ', rawId: new Uint8Array([1]).buffer, type: 'public-key',
+  response: { clientDataJSON: new Uint8Array([123, 125]).buffer, attestationObject: new Uint8Array([9]).buffer },
+  getClientExtensionResults: () => ({}) });
+Object.defineProperty(globalThis, 'navigator', { configurable: true, writable: true, value: { credentials: { create: async () => credential() } } });
+const options = { rp: { id: 'localhost', name: 'OneOS' }, user: { id: b64(Buffer.from('oneos-owner')), name: 'owner', displayName: 'o' },
+  challenge: b64(new Uint8Array(32)), pubKeyCredParams: [{ type: 'public-key', alg: -7 }], timeout: 300000,
+  excludeCredentials: [], authenticatorSelection: {}, attestation: 'none' };
+let begin, finish;
+const reply = (status, body) => ({ ok: status < 300, status, json: async () => { if (typeof body === 'string') throw new SyntaxError('not json'); return body; } });
+global.fetch = async (url) => (url === '/settings/passkey/begin' ? begin : finish);
+require(process.argv[2]);
+const api = window.OneOSPasskey;
+(async () => {
+  begin = reply(401, { error: 'check', message: 'Server says check.' });
+  let result = await api.register('p', '1');
+  assert.deepStrictEqual(result, { ok: false, error: 'check', message: 'Server says check.' });
+  assert.deepStrictEqual(calls, []);
+  begin = reply(401, { error: 'check' });
+  result = await api.register('p', '1');
+  assert.strictEqual(result.error, 'check');
+  assert.ok(result.message.startsWith('Password or code not accepted'));
+  for (const refusal of [reply(401, 'Sign in required'), reply(401, { error: 'other' }), reply(401, null), reply(403, 'Invalid form token; reload and retry')]) {
+    calls.length = 0;
+    begin = refusal;
+    result = await api.register('p', '1');
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.error, 'signed-out');
+    assert.ok(!/Password or code not accepted/.test(result.message));
+    assert.deepStrictEqual(calls, [['assign', '/login']]);
+  }
+  begin = reply(200, options);
+  for (const status of [401, 403]) {
+    calls.length = 0;
+    finish = reply(status, 'Sign in required');
+    result = await api.register('p', '1');
+    assert.strictEqual(result.error, 'signed-out');
+    assert.deepStrictEqual(calls, [['assign', '/login']]);
+  }
+  calls.length = 0;
+  finish = reply(400, { error: 'failed' });
+  result = await api.register('p', '1');
+  assert.strictEqual(result.error, 'failed');
+  assert.deepStrictEqual(calls, []);
   console.log('ok');
 })().catch((e) => { console.error(e); process.exit(1); });
 """)

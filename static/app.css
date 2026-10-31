@@ -254,6 +254,16 @@ h1, h2, h3 { font-family: var(--display); letter-spacing: -.01em; }
   font: var(--text-sm)/1.6 var(--mono); white-space: pre-wrap; user-select: all;
 }
 .command .icon { color: var(--ink-dim); margin-top: 3px; }
+/* Settings -> Sign-in */
+.signin-touch + .settings-row { margin-top: var(--space-3); }
+.settings-row form { margin: 0; }
+.signin-touch .settings-note { margin: var(--space-2) 0 0; }
+.signin-form { display: grid; gap: var(--space-3); margin-top: var(--space-2); padding: var(--space-3); border-radius: var(--radius-sm); background: var(--fill); }
+.signin-field { display: grid; gap: 4px; font-size: var(--text-md); color: var(--ink-dim); }
+.signin-field input { width: 100%; min-width: 0; color: var(--ink); }
+.signin-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.signin-message { margin: 0; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); background: var(--err-bg); color: var(--err-ink); font-size: var(--text-md); }
+.signin-recover { margin-top: var(--space-4); }
 .swatches { display: flex; gap: var(--space-2); flex-wrap: wrap; }
 .swatch {
   position: relative; width: 24px; height: 24px; border-radius: 50%; cursor: pointer;
@@ -298,7 +308,7 @@ button {
 button:hover { background: var(--fill); }
 .button-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .button-primary:hover { background: var(--accent); filter: brightness(1.08); }
-input[type="text"], input:not([type]), select {
+input[type="text"], input[type="password"], input:not([type]), select {
   font: inherit; font-size: var(--text-base); min-height: 34px; padding: 0 var(--space-3);
   border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--panel); color: var(--ink);
 }
