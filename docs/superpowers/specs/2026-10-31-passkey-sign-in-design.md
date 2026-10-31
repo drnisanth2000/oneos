@@ -2,7 +2,7 @@
 
 Date: 2026-10-31
 
-Status: draft for owner approval.
+Status: owner-approved on 2026-10-31.
 
 ## Why
 
