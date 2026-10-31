@@ -178,9 +178,12 @@ def test_every_application_exception_resolves_to_its_designed_code():
     # Authentication terminates at the pre-routing boundary with a generic
     # 503. It must not invoke the vault-backed console error renderer; the
     # fail-closed response and untouched downstream route are tested in auth.
+    # PasskeyRejected never leaves the auth store: every one is caught there
+    # and becomes a refusal (tests/test_passkeys.py).
     from app.auth import AuthUnavailable
+    from app.passkeys import PasskeyRejected
 
-    exempt = _abstract_bases() | {AuthUnavailable}
+    exempt = _abstract_bases() | {AuthUnavailable, PasskeyRejected}
     for cls in _application_exception_classes():
         if cls in exempt:
             continue

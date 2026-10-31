@@ -17,12 +17,19 @@ from pathlib import Path
 import pyotp
 from argon2 import PasswordHasher, Type, extract_parameters
 from argon2.exceptions import VerificationError, InvalidHashError
+from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+from . import passkeys as webauthn_checks
 from .console_routing import structured_reader
+from .passkeys import PasskeyRejected
 
 HASHER = PasswordHasher()
 IDLE_SECONDS = 1800
 ABSOLUTE_SECONDS = 43200
 MAX_BLOCK_SECONDS = 900
+CHALLENGE_SECONDS = 300
+# Pending challenges kept per purpose. Sign-in options need no session, so
+# this bounds what an unauthenticated caller can make the store hold.
+MAX_CHALLENGES = 16
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,92 @@ def _validate_passkey(row):
             or type(sign_count) is not int or sign_count < 0
             or type(created) not in (int, float) or not math.isfinite(created) or created < 0):
         raise AuthUnavailable()
+
+
+def _relying_party(origin):
+    """(RP ID, expected origin) for the configured origin; a bad one is unsafe state."""
+    try:
+        return webauthn_checks.rp_from_origin(origin)
+    except PasskeyRejected as exc:
+        raise AuthUnavailable() from exc
+
+
+def _well_formed(password, code):
+    return isinstance(password, str) and len(password) <= 1024 and isinstance(code, str) and re.fullmatch(r"[0-9]{6}", code) is not None
+
+
+def _throttle(db):
+    row = db.execute("SELECT failures,blocked FROM throttle WHERE id=1").fetchone()
+    if row is None:
+        raise AuthUnavailable()
+    return row
+
+
+def _record_failure(db, failures, now):
+    """Count one failed sign-in (password, setup check or passkey); five or more block."""
+    failures += 1
+    db.execute("UPDATE throttle SET failures=?,blocked=? WHERE id=1", (failures, now + min(MAX_BLOCK_SECONDS, 30 * 2 ** min(failures - 5, 5)) if failures >= 5 else 0))
+
+
+def _purge_challenges(db, now):
+    """Delete expired challenge rows and any row that is not a well-formed live challenge.
+
+    Rows are untrusted: a wrong type, an unknown purpose, or an expiry further
+    away than a challenge ever lives (clock stepped back, or tampering) is
+    removed rather than trusted. Call only inside a write transaction, after
+    `_ensure_schema`.
+    """
+    db.execute(
+        "DELETE FROM passkey_challenges WHERE NOT (typeof(digest)='text' AND purpose IN ('register','login')"
+        " AND typeof(expires) IN ('integer','real') AND expires>? AND expires<=?)",
+        (now, now + CHALLENGE_SECONDS))
+
+
+def _new_challenge(db, purpose, now):
+    """A fresh 32-byte challenge, stored only as its SHA-256 digest, purpose and expiry."""
+    db.execute(
+        "DELETE FROM passkey_challenges WHERE purpose=? AND rowid NOT IN"
+        " (SELECT rowid FROM passkey_challenges WHERE purpose=? ORDER BY rowid DESC LIMIT ?)",
+        (purpose, purpose, MAX_CHALLENGES - 1))
+    challenge = secrets.token_bytes(webauthn_checks.CHALLENGE_BYTES)
+    db.execute("INSERT INTO passkey_challenges(digest,purpose,expires) VALUES(?,?,?)",
+               (hashlib.sha256(challenge).hexdigest(), purpose, now + CHALLENGE_SECONDS))
+    return challenge
+
+
+def _take_challenge(db, response_json, purpose, now):
+    """Consume the live challenge the answer claims to answer; None if there is none.
+
+    The answer's `clientDataJSON.challenge` is hashed and looked up by digest.
+    A row that is found is deleted before anything else is checked, so a
+    challenge is used at most once whatever the outcome. The returned bytes are
+    the stored challenge (its digest matched); `webauthn` then checks that the
+    signed client data carries exactly these bytes.
+    """
+    try:
+        challenge = webauthn_checks.response_challenge(response_json)
+    except PasskeyRejected:
+        return None
+    key = hashlib.sha256(challenge).hexdigest()
+    row = db.execute("SELECT purpose,expires FROM passkey_challenges WHERE digest=?", (key,)).fetchone()
+    if row is None:
+        return None
+    db.execute("DELETE FROM passkey_challenges WHERE digest=?", (key,))
+    stored_purpose, expires = row
+    if (stored_purpose != purpose or type(expires) not in (int, float) or not math.isfinite(expires)
+            or not now < expires <= now + CHALLENGE_SECONDS):
+        return None
+    return challenge
+
+
+def _stored_passkeys(db):
+    """Validated passkey rows, or [] when an older database has no passkey table (no write)."""
+    if not _has_table(db, "passkeys"):
+        return []
+    rows = db.execute("SELECT id,public_key,sign_count,created FROM passkeys ORDER BY created,id").fetchall()
+    for row in rows:
+        _validate_passkey(row)
+    return rows
 
 
 def _validate_session(row):
@@ -219,32 +312,166 @@ class AuthStore:
         db.execute("INSERT INTO sessions(token,csrf,created,seen,kept) VALUES(?,?,?,?,?)", (digest(token), secrets.token_urlsafe(32), now, now, int(bool(keep))))
         return token
 
+    def _check_owner(self, db, password, code, now):
+        """The password + code check shared by sign-in and passkey setup.
+
+        Runs inside the caller's write transaction. While the throttle blocks it
+        refuses without counting. A wrong password or code, or a code from a
+        30-second window already used, counts one failure. On success the code
+        window is spent (so the same code cannot be used twice) and the throttle
+        is reset.
+        """
+        failures, blocked = _throttle(db)
+        if now < blocked:
+            return False
+        row = db.execute("SELECT password,secret,counter FROM owner WHERE id=1").fetchone()
+        if row is None:
+            raise AuthUnavailable()
+        try:
+            valid = HASHER.verify(row[0], password)
+        except (VerificationError, InvalidHashError):
+            valid = False
+        counter = int(now // 30)
+        if not valid or counter <= row[2] or not pyotp.TOTP(row[1]).verify(code, for_time=now):
+            _record_failure(db, failures, now)
+            return False
+        # Password verification and counter advance share the write transaction.
+        db.execute("UPDATE owner SET counter=? WHERE id=1", (counter,))
+        if HASHER.check_needs_rehash(row[0]):
+            db.execute("UPDATE owner SET password=? WHERE id=1", (HASHER.hash(password),))
+        db.execute("UPDATE throttle SET failures=0,blocked=0 WHERE id=1")
+        return True
+
     def login(self, password, code, *, keep=False, now=None):
         now = time.time() if now is None else now
-        if not isinstance(password, str) or len(password) > 1024 or not re.fullmatch(r"[0-9]{6}", code):
+        if not _well_formed(password, code):
             return None
         with self.connect() as db:
-            failures, blocked = db.execute("SELECT failures,blocked FROM throttle WHERE id=1").fetchone()
+            if not self._check_owner(db, password, code, now):
+                return None
+            return self._create_session(db, now=now, keep=keep)
+
+    def begin_registration(self, password, code, *, origin, now=None):
+        """Options JSON to set up a passkey, after a fresh password + code check; else None.
+
+        The check is exactly sign-in's (throttle, one use per code window) but
+        makes no session. Nothing is stored unless it passes.
+        """
+        if not _well_formed(password, code):
+            return None
+        rp_id, _ = _relying_party(origin)
+        with self.connect() as db:
+            now = time.time() if now is None else now
+            if not self._check_owner(db, password, code, now):
+                return None
+            _ensure_schema(db)
+            _purge_challenges(db, now)
+            exclude = [base64url_to_bytes(row[0]) for row in _stored_passkeys(db)]
+            return webauthn_checks.registration_options(rp_id, _new_challenge(db, "register", now), exclude)
+
+    def finish_registration(self, response_json, *, origin, now=None):
+        """Store the passkey in a verified answer to a live setup challenge. Never raises for bad input.
+
+        A failure here does not count toward the throttle: it needs a challenge
+        that only a passed password + code check creates, and the setup
+        endpoint is behind a signed-in session, so counting would only let a
+        misbehaving browser lock the owner out. The challenge is spent either way.
+        """
+        rp_id, expected_origin = _relying_party(origin)
+        with self.connect() as db:
+            now = time.time() if now is None else now
+            _ensure_schema(db)
+            _purge_challenges(db, now)
+            _, blocked = _throttle(db)
+            if now < blocked:
+                return False
+            challenge = _take_challenge(db, response_json, "register", now)
+            if challenge is None:
+                return False
+            try:
+                credential_id, public_key, sign_count = webauthn_checks.verify_registration(response_json, challenge, rp_id, expected_origin)
+            except PasskeyRejected:
+                return False
+            row = (bytes_to_base64url(credential_id), public_key, sign_count, now)
+            try:
+                # Never store a row that available() would reject: that would
+                # fail every request closed and lock the owner out.
+                _validate_passkey(row)
+            except AuthUnavailable:
+                return False
+            if db.execute("SELECT 1 FROM passkeys WHERE id=?", (row[0],)).fetchone():
+                return False
+            db.execute("INSERT INTO passkeys(id,public_key,sign_count,created) VALUES(?,?,?,?)", row)
+            return True
+
+    def begin_login(self, *, origin, now=None):
+        """Options JSON for a passkey sign-in; None if no passkey is stored or the throttle blocks."""
+        rp_id, _ = _relying_party(origin)
+        with self.connect() as db:
+            now = time.time() if now is None else now
+            # Read first: an older database without passkeys is left untouched.
+            if not _has_table(db, "passkeys") or db.execute("SELECT 1 FROM passkeys LIMIT 1").fetchone() is None:
+                return None
+            _, blocked = _throttle(db)
             if now < blocked:
                 return None
-            row = db.execute("SELECT password,secret,counter FROM owner WHERE id=1").fetchone()
-            if row is None:
-                raise AuthUnavailable()
-            try:
-                valid = HASHER.verify(row[0], password)
-            except (VerificationError, InvalidHashError):
-                valid = False
-            counter = int(now // 30)
-            if not valid or counter <= row[2] or not pyotp.TOTP(row[1]).verify(code, for_time=now):
-                failures += 1
-                db.execute("UPDATE throttle SET failures=?,blocked=? WHERE id=1", (failures, now + min(MAX_BLOCK_SECONDS, 30 * 2 ** min(failures - 5, 5)) if failures >= 5 else 0))
+            _ensure_schema(db)
+            _purge_challenges(db, now)
+            return webauthn_checks.authentication_options(rp_id, _new_challenge(db, "login", now))
+
+    def finish_login(self, response_json, *, origin, keep, now=None):
+        """A session token for a verified passkey sign-in; None otherwise.
+
+        Every refusal counts toward the throttle like a failed password; while
+        it blocks, refuses without counting (as `login` does). Success resets it.
+        """
+        rp_id, expected_origin = _relying_party(origin)
+        with self.connect() as db:
+            now = time.time() if now is None else now
+            _ensure_schema(db)
+            _purge_challenges(db, now)
+            failures, blocked = _throttle(db)
+            if now < blocked:
                 return None
-            # Password verification and counter advance share the write transaction.
-            db.execute("UPDATE owner SET counter=? WHERE id=1", (counter,))
-            if HASHER.check_needs_rehash(row[0]):
-                db.execute("UPDATE owner SET password=? WHERE id=1", (HASHER.hash(password),))
-            db.execute("UPDATE throttle SET failures=0,blocked=0 WHERE id=1")
-            return self._create_session(db, now=now, keep=keep)
+            token = self._passkey_sign_in(db, response_json, rp_id, expected_origin, keep, now)
+            if token is None:
+                # Returning (not raising) commits the count with the spent challenge.
+                _record_failure(db, failures, now)
+            return token
+
+    def _passkey_sign_in(self, db, response_json, rp_id, expected_origin, keep, now):
+        challenge = _take_challenge(db, response_json, "login", now)
+        if challenge is None:
+            return None
+        try:
+            credential_id = webauthn_checks.response_credential_id(response_json)
+        except PasskeyRejected:
+            return None
+        row = db.execute("SELECT id,public_key,sign_count,created FROM passkeys WHERE id=?", (credential_id,)).fetchone()
+        if row is None:
+            return None
+        _validate_passkey(row)
+        try:
+            sign_count = webauthn_checks.verify_authentication(response_json, challenge, rp_id, expected_origin, row[1], row[2])
+        except PasskeyRejected:
+            return None
+        db.execute("UPDATE passkeys SET sign_count=? WHERE id=?", (sign_count, credential_id))
+        db.execute("UPDATE throttle SET failures=0,blocked=0 WHERE id=1")
+        return self._create_session(db, now=now, keep=keep)
+
+    def passkeys(self):
+        """(id, created) of each stored passkey, oldest first. Never writes."""
+        with self.connect() as db:
+            return [(row[0], row[3]) for row in _stored_passkeys(db)]
+
+    def remove_passkey(self, credential_id):
+        """Delete one passkey; False if there was none. Open sessions are not ended."""
+        if not isinstance(credential_id, str):
+            return False
+        with self.connect() as db:
+            if not _has_table(db, "passkeys"):
+                return False
+            return db.execute("DELETE FROM passkeys WHERE id=?", (credential_id,)).rowcount > 0
 
     def session_info(self, token, *, now=None):
         if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
