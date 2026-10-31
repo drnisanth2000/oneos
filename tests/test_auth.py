@@ -598,6 +598,12 @@ def _markers(path):
 SESSION_COLUMNS = ["token", "csrf", "created", "seen"]
 
 
+def _binding(secret):
+    """What a passkey row stores to bind it to the owner's authenticator secret."""
+    import hashlib
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
 def test_old_schema_database_still_signs_in_and_writes_nothing_on_read(tmp_path):
     import sqlite3
     import time
@@ -637,7 +643,7 @@ def test_recover_deletes_passkeys_challenges_and_sessions(owner):
     assert store.session_info(token, now=3031).kept is True
     with closing(sqlite3.connect(store.path)) as db:
         with db:
-            db.execute("INSERT INTO passkeys VALUES(?,?,?,?)", ("a" * 22, b"key", 0, time.time()))
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", ("a" * 22, b"key", 0, time.time(), _binding(secret)))
             db.execute("INSERT INTO passkey_challenges VALUES(?,?,?)", ("d" * 64, "login", time.time() + 300))
     store.available()
     store.enroll("another synthetic owner password", secret, pyotp.TOTP(secret).at(4000), now=4000, recover=True)
@@ -652,7 +658,7 @@ def test_enroll_creates_current_schema(owner):
     store, _ = owner
     assert _columns(store.path, "sessions") == SESSION_COLUMNS
     assert _columns(store.path, "kept_sessions") == ["token"]
-    assert _columns(store.path, "passkeys") == ["id", "public_key", "sign_count", "created"]
+    assert _columns(store.path, "passkeys") == ["id", "public_key", "sign_count", "created", "owner_binding"]
     assert _columns(store.path, "passkey_challenges") == ["digest", "purpose", "expires"]
 
 
@@ -661,27 +667,35 @@ def test_enroll_creates_current_schema(owner):
     ("sign_count", -1), ("sign_count", 1.5),
     ("created", -1), ("created", float("inf")),
     ("id", "short"), ("id", "not base64url!" * 2),
+    ("owner_binding", "short"), ("owner_binding", "A" * 64), ("owner_binding", "g" * 64),
+    ("owner_binding", "a" * 65), ("owner_binding", 5), ("owner_binding", b"\x00" * 32),
 ])
 def test_invalid_passkey_row_makes_store_unavailable(owner, column, bad_value):
     import sqlite3
     from app.auth import AuthUnavailable
-    store, _ = owner
-    good = {"id": "a" * 22, "public_key": b"key", "sign_count": 0, "created": 5.0}
+    store, secret = owner
+    good = {"id": "a" * 22, "public_key": b"key", "sign_count": 0, "created": 5.0, "owner_binding": _binding(secret)}
     good[column] = bad_value
     with closing(sqlite3.connect(store.path)) as db:
         with db:
-            db.execute("INSERT INTO passkeys VALUES(?,?,?,?)", tuple(good[name] for name in ("id", "public_key", "sign_count", "created")))
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", tuple(good[name] for name in ("id", "public_key", "sign_count", "created", "owner_binding")))
     with pytest.raises(AuthUnavailable):
         store.available()
 
 
 def test_valid_passkey_row_is_available(owner):
     import sqlite3
-    store, _ = owner
+    store, secret = owner
     with closing(sqlite3.connect(store.path)) as db:
         with db:
-            db.execute("INSERT INTO passkeys VALUES(?,?,?,?)", ("a" * 22, b"key", 3, 5.0))
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", ("a" * 22, b"key", 3, 5.0, _binding(secret)))
     store.available()
+    # A well-formed binding for another secret is not unsafe state, only a revoked passkey.
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", ("b" * 22, b"key", 3, 5.0, "0" * 64))
+    store.available()
+    assert [key_id for key_id, _ in store.passkeys()] == ["a" * 22]
 
 
 @pytest.mark.parametrize("marker", [None, 5, 1.5, b"\x00" * 32, "short", "A" * 64, "g" * 64, "a" * 63, "a" * 65])
@@ -783,6 +797,93 @@ def test_previous_release_still_works_on_an_upgraded_database(owner):
     assert store.session_info(token, now=4001).kept is True
     assert _markers(store.path) == [digest(token)]  # orphans cleared by the write
     assert _columns(store.path, "sessions") == SESSION_COLUMNS
+    store.available()
+
+
+def _previous_release_recover(store, password, *, now=None):
+    """The previous release's recovery, verbatim: new owner row, sessions deleted, nothing else.
+
+    It knows nothing of passkeys, so their rows survive it. Returns the new secret.
+    """
+    import sqlite3
+    import time
+    import pyotp
+    from app.auth import HASHER
+    secret = pyotp.random_base32()
+    now = time.time() if now is None else now
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT OR REPLACE INTO owner VALUES(1,?,?,?)", (HASHER.hash(password), secret, int(now // 30)))
+            db.execute("DELETE FROM sessions")
+    return secret
+
+
+def _passkey_rows(store):
+    import sqlite3
+    with closing(sqlite3.connect(store.path)) as db:
+        return db.execute("SELECT id FROM passkeys").fetchall()
+
+
+def test_previous_release_recover_revokes_passkeys_after_roll_forward(owner):
+    """Register, roll back and recover (a suspect credential), roll forward: Touch ID is revoked."""
+    import hashlib
+    import sqlite3
+    import time
+    import pyotp
+    from app.main import app
+    from tests.passkey_fake import ORIGIN, FakeAuthenticator, b64url
+    store, secret = owner
+    fake = FakeAuthenticator()
+    options = store.begin_registration("synthetic owner password", pyotp.TOTP(secret).at(3030), origin=ORIGIN, now=3030)
+    assert store.finish_registration(fake.register(options), origin=ORIGIN, now=3031) is True
+    assert [key_id for key_id, _ in store.passkeys()] == [fake.id]
+    new_secret = _previous_release_recover(store, "another synthetic owner password")
+    # This build again. Reads hide the revoked passkey and write nothing.
+    store.available()
+    before = store.path.read_bytes()
+    assert store.passkeys() == []
+    assert store.path.read_bytes() == before
+    assert _passkey_rows(store) == [(fake.id,)]
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        page = client.get("/login")
+        assert page.status_code == 200 and "Sign in with Touch ID" not in page.text
+    # A sign-in answer from the revoked passkey, to a live challenge, is refused and counted.
+    now = time.time()
+    challenge = bytes(range(32))
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkey_challenges VALUES(?,?,?)", (hashlib.sha256(challenge).hexdigest(), "login", now + 200))
+    answer = fake.assertion('{"rpId": "localhost", "challenge": "' + b64url(challenge) + '"}')
+    assert store.finish_login(answer, origin=ORIGIN, keep=True, now=now) is None
+    with closing(sqlite3.connect(store.path)) as db:
+        assert db.execute("SELECT failures FROM throttle").fetchone() == (1,)
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+    # The same write transaction removed the stale row.
+    assert _passkey_rows(store) == []
+    store.available()
+    # The recovered credentials still sign in.
+    assert store.login("another synthetic owner password", pyotp.TOTP(new_secret).at(now + 30), now=now + 30)
+
+
+def test_passkey_registered_under_the_current_secret_survives_and_signs_in(owner):
+    import pyotp
+    from tests.passkey_fake import ORIGIN, FakeAuthenticator
+    store, secret = owner
+    stale = FakeAuthenticator()
+    options = store.begin_registration("synthetic owner password", pyotp.TOTP(secret).at(3030), origin=ORIGIN, now=3030)
+    assert store.finish_registration(stale.register(options), origin=ORIGIN, now=3031) is True
+    new_secret = _previous_release_recover(store, "synthetic owner password", now=3060)
+    # The recovery spent its code window; set up again in the next one.
+    now = 3090
+    fresh = FakeAuthenticator()
+    options = store.begin_registration("synthetic owner password", pyotp.TOTP(new_secret).at(now), origin=ORIGIN, now=now)
+    assert options and stale.id not in options  # the revoked passkey is not excluded as "already set up"
+    assert store.finish_registration(fresh.register(options), origin=ORIGIN, now=now + 1) is True
+    # Setup (a write) removed the stale one; only the new passkey is stored and listed.
+    assert _passkey_rows(store) == [(fresh.id,)]
+    assert [key_id for key_id, _ in store.passkeys()] == [fresh.id]
+    login = store.begin_login(origin=ORIGIN, now=now + 2)
+    assert store.finish_login(fresh.assertion(login), origin=ORIGIN, keep=False, now=now + 3)
     store.available()
 
 

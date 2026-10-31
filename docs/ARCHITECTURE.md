@@ -80,7 +80,8 @@ the bug.
   or 12-hour limit, marked in a separate `kept_sessions` table so `sessions`
   keeps its original columns), middleware that runs before routing, and
   interactive enrollment/recovery. Recovery ends every session and removes
-  every passkey.
+  every passkey. Passkeys are bound to the authenticator secret, so any
+  recovery (including an older release's) revokes them.
 - `app/passkeys.py` — WebAuthn checks for passkey setup and sign-in (wraps
   the `webauthn` library); `static/passkey.js` — Settings-side setup and
   removal.

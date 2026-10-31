@@ -557,12 +557,60 @@ def test_kept_table_without_passkey_tables(tmp_path):
 def test_passkey_table_without_challenge_table(tmp_path):
     store, secret = _old_schema_store(tmp_path)
     fake = FakeAuthenticator()
-    _execute(store, "CREATE TABLE passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL)")
+    _execute(store, "CREATE TABLE passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL, owner_binding TEXT NOT NULL)")
     from app import passkeys as passkey_module
     options = passkey_module.registration_options("localhost", bytes(32), [])
     _, public_key, _ = passkey_module.verify_registration(fake.register(options), bytes(32), "localhost", ORIGIN)
-    _execute(store, "INSERT INTO passkeys VALUES(?,?,?,?)", (fake.id, public_key, 0, 1.0))
+    _execute(store, "INSERT INTO passkeys VALUES(?,?,?,?,?)", (fake.id, public_key, 0, 1.0, hashlib.sha256(secret.encode()).hexdigest()))
     assert _sign_in(store, fake, 4000)
+
+
+def _replace_secret(store):
+    """Change the owner's authenticator secret behind the store's back (as an older release's recover does)."""
+    new_secret = pyotp.random_base32()
+    _execute(store, "UPDATE owner SET secret=? WHERE id=1", (new_secret,))
+    return new_secret
+
+
+def test_begin_login_removes_revoked_passkeys_before_offering_touch_id(owner):
+    store, secret = owner
+    _register(store, secret, 3030)
+    _replace_secret(store)
+    assert store.passkeys() == []
+    assert len(_rows(store, "SELECT id FROM passkeys")) == 1  # reads filter, never delete
+    assert store.begin_login(origin=ORIGIN, now=4000) is None
+    assert _rows(store, "SELECT id FROM passkeys") == [] and _challenges(store) == []
+    assert _failures(store) == 0
+
+
+def test_finish_registration_removes_revoked_passkeys_and_binds_the_new_one(owner):
+    store, secret = owner
+    _register(store, secret, 3030)
+    options = store.begin_registration(PASSWORD, _code(secret, 3060), origin=ORIGIN, now=3060)
+    new_secret = _replace_secret(store)
+    fresh = FakeAuthenticator()
+    assert store.finish_registration(fresh.register(options), origin=ORIGIN, now=3061) is True
+    assert _rows(store, "SELECT id,owner_binding FROM passkeys") == [(fresh.id, hashlib.sha256(new_secret.encode()).hexdigest())]
+    assert [key_id for key_id, _ in store.passkeys()] == [fresh.id]
+
+
+def test_a_revoked_passkey_sign_in_is_refused_and_counted(owner):
+    store, secret = owner
+    fake = _register(store, secret, 3030)
+    options = store.begin_login(origin=ORIGIN, now=4000)
+    _replace_secret(store)
+    assert store.finish_login(fake.assertion(options), origin=ORIGIN, keep=False, now=4001) is None
+    assert _failures(store) == 1
+    assert _rows(store, "SELECT id FROM passkeys") == [] and _rows(store, "SELECT COUNT(*) FROM sessions") == [(0,)]
+
+
+def test_options_endpoint_reports_no_passkey_once_revoked(web):
+    client, store, secret = web
+    _register(store, secret, 3030)
+    _replace_secret(store)
+    assert "Sign in with Touch ID" not in client.get("/login").text
+    response = _options(client, _nonce(client))
+    assert response.status_code == 409 and response.json() == {"error": "no-passkey"}
 
 
 # --- app/passkeys.py --------------------------------------------------------------

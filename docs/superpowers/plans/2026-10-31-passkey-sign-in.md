@@ -45,7 +45,7 @@
 
 **Interfaces:**
 - Produces in `app/auth.py`:
-  - `_ensure_schema(db) -> None` — inside a write transaction: creates `kept_sessions(token TEXT PRIMARY KEY)`, `passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL)` and `passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)` if missing.
+  - `_ensure_schema(db) -> None` — inside a write transaction: creates `kept_sessions(token TEXT PRIMARY KEY)`, `passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL, owner_binding TEXT NOT NULL)` (the binding is the SHA-256 hex of the owner's TOTP secret at setup; a passkey whose binding no longer matches was revoked by a recovery, including an older release's, and is never listed or accepted, and is deleted by the next passkey write) and `passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)` if missing.
   - `_has_table(db, table) -> bool`.
   - `_validate_session` checks the 4-column row `(token, csrf, created, seen)`; `available()` checks every `kept_sessions` marker is a well-formed digest when the table exists (a marker with no session is tolerated and never makes anything kept), and validates `passkeys` rows (id base64url 16–1024 chars, `public_key` non-empty bytes, `sign_count` int ≥ 0, `created` finite ≥ 0) only when the table exists.
   - `_save_owner` (enroll and recover) calls `_ensure_schema` and deletes all `sessions`, `passkeys`, `passkey_challenges`.

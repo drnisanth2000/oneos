@@ -58,7 +58,7 @@ def _ensure_schema(db):
     still works on an upgraded database if it is rolled back to.
     """
     db.execute("CREATE TABLE IF NOT EXISTS kept_sessions(token TEXT PRIMARY KEY)")
-    db.execute("CREATE TABLE IF NOT EXISTS passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL, owner_binding TEXT NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)")
 
 
@@ -93,13 +93,30 @@ def _end_sessions(db, token_digest=None):
         db.execute("DELETE FROM sessions WHERE token=?", (token_digest,))
 
 
+PASSKEY_COLUMNS = "id,public_key,sign_count,created,owner_binding"
+
+
 def _validate_passkey(row):
-    key_id, public_key, sign_count, created = row
+    key_id, public_key, sign_count, created, owner_binding = row
     if (not isinstance(key_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,1024}", key_id)
             or type(public_key) is not bytes or not public_key
             or type(sign_count) is not int or sign_count < 0
-            or type(created) not in (int, float) or not math.isfinite(created) or created < 0):
+            or type(created) not in (int, float) or not math.isfinite(created) or created < 0
+            or not isinstance(owner_binding, str) or not re.fullmatch(r"[0-9a-f]{64}", owner_binding)):
         raise AuthUnavailable()
+
+
+def _owner_binding(db):
+    """SHA-256 (lowercase hex) of the owner's current authenticator secret.
+
+    Every passkey row stores the binding current when it was set up. Every
+    recovery (this release's or an older one's, which knows nothing of
+    passkeys) writes a new random secret, so it revokes every passkey.
+    """
+    row = db.execute("SELECT secret FROM owner WHERE id=1").fetchone()
+    if row is None or not isinstance(row[0], str):
+        raise AuthUnavailable()
+    return hashlib.sha256(row[0].encode()).hexdigest()
 
 
 def _relying_party(origin):
@@ -178,14 +195,23 @@ def _take_challenge(db, response_json, purpose, now):
     return challenge
 
 
-def _stored_passkeys(db):
-    """Validated passkey rows, or [] when an older database has no passkey table (no write)."""
+def _stored_passkeys(db, *, prune=False):
+    """Validated passkey rows bound to the current owner secret; [] without a passkey table.
+
+    Every row is validated first (a malformed one is unsafe state). A row
+    bound to another secret was revoked by a recovery: it is never returned.
+    Reads leave it in place (they never write); with `prune` (only inside a
+    write transaction) it is deleted.
+    """
     if not _has_table(db, "passkeys"):
         return []
-    rows = db.execute("SELECT id,public_key,sign_count,created FROM passkeys ORDER BY created,id").fetchall()
+    binding = _owner_binding(db)
+    rows = db.execute(f"SELECT {PASSKEY_COLUMNS} FROM passkeys ORDER BY created,id").fetchall()
     for row in rows:
         _validate_passkey(row)
-    return rows
+    if prune:
+        db.execute("DELETE FROM passkeys WHERE owner_binding!=?", (binding,))
+    return [row for row in rows if row[4] == binding]
 
 
 def _validate_session(row):
@@ -291,7 +317,7 @@ class AuthStore:
                 for marker in db.execute("SELECT token FROM kept_sessions").fetchall():
                     _validate_kept_marker(marker)
             if _has_table(db, "passkeys"):
-                for passkey in db.execute("SELECT id,public_key,sign_count,created FROM passkeys").fetchall():
+                for passkey in db.execute(f"SELECT {PASSKEY_COLUMNS} FROM passkeys").fetchall():
                     _validate_passkey(passkey)
             if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise AuthUnavailable()
@@ -420,7 +446,7 @@ class AuthStore:
                 return None
             _ensure_schema(db)
             _purge_challenges(db, now)
-            exclude = [base64url_to_bytes(row[0]) for row in _stored_passkeys(db)]
+            exclude = [base64url_to_bytes(row[0]) for row in _stored_passkeys(db, prune=True)]
             return webauthn_checks.registration_options(rp_id, _new_challenge(db, "register", now), exclude)
 
     def finish_registration(self, response_json, *, origin, now=None):
@@ -436,6 +462,7 @@ class AuthStore:
             now = time.time() if now is None else now
             _ensure_schema(db)
             _purge_challenges(db, now)
+            _stored_passkeys(db, prune=True)
             _, blocked = _throttle(db)
             if now < blocked:
                 return False
@@ -446,7 +473,7 @@ class AuthStore:
                 credential_id, public_key, sign_count = webauthn_checks.verify_registration(response_json, challenge, rp_id, expected_origin)
             except PasskeyRejected:
                 return False
-            row = (bytes_to_base64url(credential_id), public_key, sign_count, now)
+            row = (bytes_to_base64url(credential_id), public_key, sign_count, now, _owner_binding(db))
             try:
                 # Never store a row that available() would reject: that would
                 # fail every request closed and lock the owner out.
@@ -455,7 +482,7 @@ class AuthStore:
                 return False
             if db.execute("SELECT 1 FROM passkeys WHERE id=?", (row[0],)).fetchone():
                 return False
-            db.execute("INSERT INTO passkeys(id,public_key,sign_count,created) VALUES(?,?,?,?)", row)
+            db.execute(f"INSERT INTO passkeys({PASSKEY_COLUMNS}) VALUES(?,?,?,?,?)", row)
             return True
 
     def begin_login(self, *, origin, now=None):
@@ -463,8 +490,9 @@ class AuthStore:
         rp_id, _ = _relying_party(origin)
         with self.connect() as db:
             now = time.time() if now is None else now
-            # Read first: an older database without passkeys is left untouched.
-            if not _has_table(db, "passkeys") or db.execute("SELECT 1 FROM passkeys LIMIT 1").fetchone() is None:
+            # An older database without passkeys is left untouched. Revoked
+            # passkeys are removed before deciding there is one to offer.
+            if not _has_table(db, "passkeys") or not _stored_passkeys(db, prune=True):
                 return None
             _, blocked = _throttle(db)
             if now < blocked:
@@ -484,6 +512,8 @@ class AuthStore:
             now = time.time() if now is None else now
             _ensure_schema(db)
             _purge_challenges(db, now)
+            # Revoked passkeys go in this transaction, which commits even on refusal.
+            _stored_passkeys(db, prune=True)
             failures, blocked = _throttle(db)
             if now < blocked:
                 return None
@@ -501,10 +531,12 @@ class AuthStore:
             credential_id = webauthn_checks.response_credential_id(response_json)
         except PasskeyRejected:
             return None
-        row = db.execute("SELECT id,public_key,sign_count,created FROM passkeys WHERE id=?", (credential_id,)).fetchone()
+        row = db.execute(f"SELECT {PASSKEY_COLUMNS} FROM passkeys WHERE id=?", (credential_id,)).fetchone()
         if row is None:
             return None
         _validate_passkey(row)
+        if row[4] != _owner_binding(db):
+            return None  # revoked by a recovery (pruned above; checked again here)
         try:
             sign_count = webauthn_checks.verify_authentication(response_json, challenge, rp_id, expected_origin, row[1], row[2])
         except PasskeyRejected:
@@ -514,7 +546,7 @@ class AuthStore:
         return self._create_session(db, now=now, keep=keep)
 
     def passkeys(self):
-        """(id, created) of each stored passkey, oldest first. Never writes."""
+        """(id, created) of each passkey bound to the current owner secret, oldest first. Never writes."""
         with self.connect() as db:
             return [(row[0], row[3]) for row in _stored_passkeys(db)]
 
