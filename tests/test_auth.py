@@ -704,8 +704,11 @@ def test_kept_session_survives_a_clock_that_steps_backwards(owner):
     store, secret = owner
     token = _store_login(store, secret, 3030, keep=True)
     assert store.session(token, now=9000)
-    assert store.session(token, now=3100)  # clock stepped back; still signed in
-    store.available()  # seen never drops below created
+    # The clock steps back to before the session was created. `seen` must not
+    # be written below `created`, or available() would fail every request.
+    assert store.session(token, now=1000)
+    store.available()
+    assert store.session(token, now=1001)
 
 
 def test_unkept_session_limits_unchanged(owner):
