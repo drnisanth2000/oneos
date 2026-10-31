@@ -29,7 +29,7 @@
 
 ## Review Focus
 
-1. **An existing install's database (no new column or tables)** — sign-in, `available()`, `session()` and doctor keep working, and nothing is written until a write needs the new schema. Pinned in Task 1.
+1. **An existing install's database (no new tables)** — sign-in, `available()`, `session()` and doctor keep working, and nothing is written until a write needs the new schema. Pinned in Task 1.
 2. **A passkey answer replayed, for the wrong origin/RP ID, without user verification, or after Remove/recover** — refused and counted by the throttle. Pinned in Tasks 3 and 4.
 3. **The password + code backup** — still works with passkeys stored, with "Keep me signed in" ticked or not. Pinned in Tasks 2 and 4.
 4. **A kept session across days** — survives idle and 12 h, its cookie is renewed, and Sign out / Sign out everywhere / recover end it. Pinned in Task 2.
@@ -46,7 +46,7 @@
 **Interfaces:**
 - Produces in `app/auth.py`:
   - `_ensure_schema(db) -> None` — inside a write transaction: creates `kept_sessions(token TEXT PRIMARY KEY)`, `passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL)` and `passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)` if missing.
-  - `_has_column(db, table, column) -> bool`, `_has_table(db, table) -> bool`.
+  - `_has_table(db, table) -> bool`.
   - `_validate_session` checks the 4-column row `(token, csrf, created, seen)`; `available()` checks every `kept_sessions` marker is a well-formed digest when the table exists (a marker with no session is tolerated and never makes anything kept), and validates `passkeys` rows (id base64url 16–1024 chars, `public_key` non-empty bytes, `sign_count` int ≥ 0, `created` finite ≥ 0) only when the table exists.
   - `_save_owner` (enroll and recover) calls `_ensure_schema` and deletes all `sessions`, `passkeys`, `passkey_challenges`.
 
