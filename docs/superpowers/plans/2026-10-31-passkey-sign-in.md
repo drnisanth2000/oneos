@@ -23,6 +23,7 @@
 - `recover` (via `_save_owner`) deletes every session, every passkey and every challenge.
 - CSRF, Origin, Host, body-size and cookie checks in `OwnerAuthMiddleware` apply unchanged to every new endpoint. Pre-sign-in endpoints use the existing login cookie nonce as their CSRF token; signed-in endpoints use the session CSRF token (`X-CSRF-Token`).
 - Nothing touches the vault. No network call leaves the Mac.
+- "Touch ID" in the copy means the Mac's user verification (Touch ID, or the Mac login password when Touch ID is unavailable); nothing may assume a fingerprint was used. Apple may sync the passkey via iCloud Keychain; that is accepted (spec).
 - Copy (exact): "Sign in with Touch ID", "Keep me signed in on this Mac", "Use password and code instead", "Sign-in", "Touch ID on this Mac: not set up", "Touch ID set up · {d Mon YYYY}", "Set up Touch ID", "Remove Touch ID", "Sign out everywhere".
 - Never write "/home/" followed by a path segment anywhere. Run tests as `env -u GIT_EDITOR uv run pytest ...`.
 
@@ -97,7 +98,7 @@
   - `AuthStore.passkeys() -> list[tuple[str, float]]` (id, created) and `AuthStore.remove_passkey(credential_id: str) -> bool`.
   - Expired challenges are deleted inside any write transaction that touches challenges.
 
-- [ ] **Step 1: Failing tests** (all with the fake authenticator, origin `https://localhost:8443`): register then sign in → token; sign in refused for: UV flag off, wrong origin, wrong RP ID, reused challenge, expired challenge (`now` +301 s), unknown credential, tampered signature, counter not increasing (stored 5, received 5), passkey removed, after `recover`; each refusal increments `throttle.failures`; five refusals block both passkey and password sign-in; zero counters accepted; `begin_registration` refused with a wrong code, with a code already used for `login` in the same 30 s window, and while blocked — and stores no challenge then; `begin_login` returns `None` with no passkeys; `finish_registration` refuses a `"login"` challenge and vice versa.
+- [ ] **Step 1: Failing tests** (all with the fake authenticator, origin `https://localhost:8443`): register then sign in → token; sign in refused for: UV flag off, wrong origin, wrong RP ID, reused challenge, expired challenge (`now` +301 s), unknown credential, tampered signature, counter not increasing (stored 5, received 5), passkey removed, after `recover`; each refusal increments `throttle.failures`; five refusals block both passkey and password sign-in; zero counters accepted; `begin_registration` refused with a wrong code, with a code already used for `login` in the same 30 s window, and while blocked — and stores no challenge then; each failed `begin_registration` increments `throttle.failures` and five of them block both sign-in methods; `begin_login` returns `None` with no passkeys; `finish_registration` refuses a `"login"` challenge and vice versa.
 - [ ] **Step 2: Run** `env -u GIT_EDITOR uv run pytest -q tests/test_passkeys.py` — fail.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** `tests/test_passkeys.py tests/test_auth.py` — pass.

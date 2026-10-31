@@ -64,8 +64,12 @@ Touch ID) and to stay signed in on the Mac until they choose to sign out.
 - The owner locked out because a passkey was lost, the Mac was reset, or the
   browser's passkey store was cleared.
 - A passkey private key, password, or authenticator secret stored anywhere
-  but where it is today (the passkey's private key never leaves the Mac's
-  passkey store; OneOS keeps only its public key).
+  but where it is today. The passkey's private key never reaches OneOS or
+  the vault: it stays in Apple's passkey store, and OneOS keeps only its
+  public key. If iCloud Keychain is on, Apple syncs that passkey to the
+  owner's other Apple devices; this is accepted, because OneOS only answers on
+  this Mac, so a synced copy can only sign in from here. *(My call: macOS
+  cannot be made to keep a passkey off iCloud from a web page.)*
 - Anything written to the vault, or a network call outside this Mac.
 - Weakening the existing throttle, CSRF, Origin, Host, or cookie protections.
 
@@ -82,7 +86,10 @@ Touch ID) and to stay signed in on the Mac until they choose to sign out.
   (`https://localhost:8443`): RP ID `localhost`, origin checked exactly, as
   the middleware already checks Host and Origin.
 - User verification is required on registration and on every passkey
-  sign-in (that is what makes it "fingerprint", not just "this Mac").
+  sign-in. On the Mac that is Touch ID, or the Mac's login password when
+  Touch ID is unavailable (for example with the lid closed); a web page
+  cannot demand the fingerprint specifically, so the screens say "Touch ID"
+  as the usual case and nothing relies on a fingerprint having been used.
 - `.sensitive/` rules, the approval protocol, and the vault are untouched.
 - The auth middleware (`app/auth_web.py`) stays the single gate for every
   request; no route is reachable without a session except the sign-in steps
@@ -94,7 +101,8 @@ Touch ID) and to stay signed in on the Mac until they choose to sign out.
 
 From Settings → Sign-in → **Set up Touch ID** while signed in:
 
-1. OneOS asks for the password and 6-digit code again (a fresh check, so an
+1. OneOS asks for the password and 6-digit code again (a fresh check, which
+   counts toward the same failed-sign-in throttle as the sign-in page, so an
    unlocked Mac left open for a moment cannot quietly add a passkey).
 2. The browser asks for Touch ID and creates a passkey for OneOS on this Mac.
 3. OneOS stores the passkey's public key, its id, and the date it was added.
@@ -120,7 +128,10 @@ lists them with their dates and each can be removed. *(My call.)*
 - Ticked: the session has no idle or 12-hour limit. The browser cookie is
   refreshed as the owner uses OneOS so it does not expire on its own
   (browsers cap cookie lifetimes, so it must be renewed). The session ends
-  only on **Sign out**, **Sign out everywhere**, or `recover`.
+  only on **Sign out**, **Sign out everywhere**, or `recover` — or if
+  OneOS is not opened at all for longer than the browser keeps a cookie
+  (about 400 days in current browsers), after which one Touch ID sign-in is
+  needed.
 - Unticked: today's 30-minute idle and 12-hour limits apply.
 
 ### Removing and recovering
@@ -159,7 +170,7 @@ lists them with their dates and each can be removed. *(My call.)*
   challenge, an unknown credential, or a bad signature does not.
 - Failed passkey attempts are throttled like failed password attempts.
 - Setting up Touch ID requires a fresh, correct password + code; without it
-  nothing is stored.
+  nothing is stored, and each failed check counts toward the throttle.
 - A kept session survives past 30 minutes idle and 12 hours; an unticked one
   does not; **Sign out**, **Sign out everywhere**, and `recover` end kept
   sessions.
