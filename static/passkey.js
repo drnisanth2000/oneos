@@ -13,6 +13,7 @@
 
   var CHECK = 'Password or code not accepted. If you just used this code to sign in, wait for the next one.';
   var AGAIN = ' Enter the next code to try again.';
+  var BLOCKED = 'Too many failed sign-ins. Wait a few minutes and try again.';
 
   function toBase64url(buffer) {
     var bytes = new Uint8Array(buffer);
@@ -109,6 +110,12 @@
         try { refusal = await begun.json(); } catch (_) {}
         if (!refusal || typeof refusal !== 'object' || refusal.error !== 'check') return signedOut();
         return failure('check', typeof refusal.message === 'string' && refusal.message ? refusal.message : CHECK);
+      }
+      // The throttle is blocking: a wait, not a sign-out or a wrong password.
+      if (begun.status === 429) {
+        var wait = null;
+        try { wait = await begun.json(); } catch (_) {}
+        return failure('blocked', wait && typeof wait === 'object' && typeof wait.message === 'string' && wait.message ? wait.message : BLOCKED);
       }
       if (begun.status === 403) return signedOut();
       if (!begun.ok) return failure('failed', 'Touch ID could not be set up.' + AGAIN);

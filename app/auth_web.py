@@ -37,6 +37,7 @@ PASSKEY_SETTINGS = frozenset({"/settings/passkey/begin", "/settings/passkey/fini
 FORM = "application/x-www-form-urlencoded"
 JSON_TYPE = "application/json"
 CHECK_MESSAGE = "Password or code not accepted. If you just used this code to sign in, wait for the next one."
+BLOCKED_MESSAGE = "Too many failed sign-ins. Wait a few minutes and try again."
 DEFAULT_CSP = "frame-ancestors 'none'"
 
 
@@ -401,6 +402,10 @@ class OwnerAuthMiddleware:
                         return await finish(_invalid())
                     options = await run_in_threadpool(lambda: store.begin_registration(check["password"], check["code"], origin=origin))
                     if options is None:
+                        # Asked after the refusal (as sign-in options does): blocked
+                        # now means the next try would be refused too, so say wait.
+                        if await run_in_threadpool(store.blocked):
+                            return await finish(JSONResponse({"error": "blocked", "message": BLOCKED_MESSAGE}, 429))
                         return await finish(JSONResponse({"error": "check", "message": CHECK_MESSAGE}, 401))
                     return await finish(Response(options, 200, media_type=JSON_TYPE))
                 if path == "/settings/passkey/finish" and request.method == "POST":

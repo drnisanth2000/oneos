@@ -75,8 +75,15 @@ the bug.
 **Deployment and owner administration**
 
 - `app/auth.py`, `app/auth_web.py`, `app/auth_admin.py` — single-owner
-  password + TOTP login, middleware that runs before routing, and interactive
-  enrollment/recovery.
+  sign-in (password + TOTP, or a Touch ID passkey once one is set up in
+  Settings), optional kept sessions ("Keep me signed in on this Mac": no idle
+  or 12-hour limit, marked in a separate `kept_sessions` table so `sessions`
+  keeps its original columns), middleware that runs before routing, and
+  interactive enrollment/recovery. Recovery ends every session and removes
+  every passkey.
+- `app/passkeys.py` — WebAuthn checks for passkey setup and sign-in (wraps
+  the `webauthn` library); `static/passkey.js` — Settings-side setup and
+  removal.
 - `app/deployment_health.py` — `/healthz` and authenticated `/readyz`.
 - `app/rename.py`, `app/cutover*.py` — owner-run admin operations with their own
   one-commit rules.
@@ -89,7 +96,11 @@ backups; see `docs/LOCAL-OPERATIONS.md`).
 ## HTTP routes
 
 Owner authentication (`app/auth_web.py`) runs before routing. It lets
-`GET /healthz` and the `/login` sign-in exchange through without a session.
+`GET /healthz` and the three sign-in steps (`/login`,
+`POST /login/passkey/options`, `POST /login/passkey`) through without a
+session; every other path needs one. The middleware answers the sign-in,
+passkey Settings and sign-out paths itself (no FastAPI route), after the same
+Host, Origin and form-token checks as every other request.
 With `ONEOS_AUTH_MODE=disabled` and `ONEOS_DEPLOYMENT` not `local`, it lets
 every route through unauthenticated; use that only for loopback development
 and tests.
@@ -112,11 +123,18 @@ and tests.
 | POST | `/registry/{entity}/product/delete-preview` | reference count and proposal |
 | GET | `/registry/{entity}/product/review/{proposal_id}` | review a pending deletion or its receipt |
 | POST | `/registry/{entity}/product/delete-execute` | reviewed deletion, one commit |
-| GET, POST | `/login` | owner sign-in |
-| POST | `/logout` | owner sign-out |
+| GET, POST | `/login` | owner sign-in with password + code (optional "keep me signed in") |
+| POST | `/login/passkey/options` | Touch ID sign-in options (no session; sign-in form token; 409 without a passkey, 429 while blocked) |
+| POST | `/login/passkey` | Touch ID sign-in with the authenticator's answer (no session; counts toward the throttle) |
+| POST | `/settings/passkey/begin` | fresh password + code check, then setup options (401 wrong check, 429 while blocked) |
+| POST | `/settings/passkey/finish` | store the new passkey |
+| POST | `/settings/passkey/remove` | remove one passkey; open sessions stay |
+| POST | `/logout` | owner sign-out (this session) |
+| POST | `/logout/everywhere` | end every session, kept ones included |
 | GET | `/healthz`, `/readyz` | liveness; authenticated readiness |
 
-`app/main.py` is the source of truth for this table.
+`app/main.py` is the source of truth for this table, and `app/auth_web.py`
+for the sign-in, passkey and sign-out rows.
 
 ## Configuration
 

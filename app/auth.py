@@ -50,22 +50,47 @@ def _has_table(db, table):
     return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
 
-def _has_column(db, table, column):
-    return any(row[1] == column for row in db.execute(f"PRAGMA table_info({table})"))
-
-
 def _ensure_schema(db):
-    """Bring an older database up to date. Call only inside a write transaction."""
-    if not _has_column(db, "sessions", "kept"):
-        db.execute("ALTER TABLE sessions ADD COLUMN kept INTEGER NOT NULL DEFAULT 0")
+    """Bring an older database up to date. Call only inside a write transaction.
+
+    Only new tables are added; `sessions` keeps exactly its original four
+    columns, so the previous release (which inserts sessions positionally)
+    still works on an upgraded database if it is rolled back to.
+    """
+    db.execute("CREATE TABLE IF NOT EXISTS kept_sessions(token TEXT PRIMARY KEY)")
     db.execute("CREATE TABLE IF NOT EXISTS passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL)")
     db.execute("CREATE TABLE IF NOT EXISTS passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)")
 
 
-def _session_query(db, where=""):
-    """Session rows as (token, csrf, created, seen, kept); old databases read kept as 0."""
-    kept = "kept" if _has_column(db, "sessions", "kept") else "0"
-    return f"SELECT token,csrf,created,seen,{kept} FROM sessions {where}"
+def _is_kept(db, token_digest):
+    """Whether the session with this token digest is kept: its digest has a marker.
+
+    The caller has already found the session row, so a marker alone (an
+    orphan, left when the previous release deleted its session) never makes
+    anything kept. An older database without the table has no kept sessions.
+    Never writes.
+    """
+    return _has_table(db, "kept_sessions") and db.execute(
+        "SELECT 1 FROM kept_sessions WHERE token=?", (token_digest,)).fetchone() is not None
+
+
+def _end_sessions(db, token_digest=None):
+    """Delete one session (by token digest), or every session when None, with its kept marker.
+
+    Runs inside the caller's write transaction, so a session and its marker
+    always go together. Markers are matched by digest (or all removed), so an
+    orphaned marker for the same token goes too. An older database without
+    the marker table is left without one (no write beyond the delete).
+    """
+    markers = _has_table(db, "kept_sessions")
+    if token_digest is None:
+        if markers:
+            db.execute("DELETE FROM kept_sessions")
+        db.execute("DELETE FROM sessions")
+    else:
+        if markers:
+            db.execute("DELETE FROM kept_sessions WHERE token=?", (token_digest,))
+        db.execute("DELETE FROM sessions WHERE token=?", (token_digest,))
 
 
 def _validate_passkey(row):
@@ -164,13 +189,26 @@ def _stored_passkeys(db):
 
 
 def _validate_session(row):
-    token, csrf, created, seen, kept = row
+    token, csrf, created, seen = row
     if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token)
             or not isinstance(csrf, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", csrf)
             or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
                    for value in (created, seen))
-            or seen < created
-            or type(kept) is not int or kept not in (0, 1)):
+            or seen < created):
+        raise AuthUnavailable()
+
+
+def _validate_kept_marker(row):
+    """A kept marker must be a well-formed token digest; anything else is unsafe state.
+
+    A well-formed marker with no session (an orphan) is tolerated: the
+    previous release deletes sessions without knowing about markers, and
+    failing closed on that would turn a rollback into a lockout. Orphans are
+    harmless because a session is kept only when its own row exists and its
+    digest has a marker (see `_is_kept`); the next sign-in removes them.
+    """
+    (token,) = row
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
         raise AuthUnavailable()
 
 
@@ -247,8 +285,11 @@ class AuthStore:
                     or not math.isfinite(throttle[1]) or throttle[1] < 0
                     or throttle[1] > time.time() + MAX_BLOCK_SECONDS):
                 raise AuthUnavailable()
-            for session in db.execute(_session_query(db)).fetchall():
+            for session in db.execute("SELECT token,csrf,created,seen FROM sessions").fetchall():
                 _validate_session(session)
+            if _has_table(db, "kept_sessions"):
+                for marker in db.execute("SELECT token FROM kept_sessions").fetchall():
+                    _validate_kept_marker(marker)
             if _has_table(db, "passkeys"):
                 for passkey in db.execute("SELECT id,public_key,sign_count,created FROM passkeys").fetchall():
                     _validate_passkey(passkey)
@@ -296,7 +337,7 @@ class AuthStore:
                 db.execute("INSERT INTO throttle VALUES(1,0,0)")
             db.execute("INSERT OR REPLACE INTO owner VALUES(1,?,?,?)", (password_hash, secret, int(now // 30)))
             _ensure_schema(db)
-            for table in ("sessions", "passkeys", "passkey_challenges"):
+            for table in ("sessions", "kept_sessions", "passkeys", "passkey_challenges"):
                 db.execute(f"DELETE FROM {table}")
             db.execute("INSERT INTO throttle VALUES(1,0,0) ON CONFLICT(id) DO UPDATE SET failures=0, blocked=0")
 
@@ -304,12 +345,19 @@ class AuthStore:
         """The one place a session is made (password and passkey sign-in both call it).
 
         Runs inside the caller's write transaction. Kept sessions have no idle or
-        absolute limit, so the expiry purge never touches them.
+        absolute limit, so the expiry purge never touches them. A kept session
+        is a `sessions` row plus a marker in `kept_sessions` with the same
+        digest; orphaned markers (whose session is gone) are cleared here.
         """
         _ensure_schema(db)
-        db.execute("DELETE FROM sessions WHERE kept=0 AND (seen<=? OR created<=?)", (now-IDLE_SECONDS, now-ABSOLUTE_SECONDS))
+        # NOT EXISTS, not NOT IN: a NULL in the other table must not stop either sweep.
+        db.execute("DELETE FROM sessions WHERE NOT EXISTS (SELECT 1 FROM kept_sessions WHERE kept_sessions.token=sessions.token)"
+                   " AND (seen<=? OR created<=?)", (now-IDLE_SECONDS, now-ABSOLUTE_SECONDS))
+        db.execute("DELETE FROM kept_sessions WHERE NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.token=kept_sessions.token)")
         token = secrets.token_urlsafe(32)
-        db.execute("INSERT INTO sessions(token,csrf,created,seen,kept) VALUES(?,?,?,?,?)", (digest(token), secrets.token_urlsafe(32), now, now, int(bool(keep))))
+        db.execute("INSERT INTO sessions(token,csrf,created,seen) VALUES(?,?,?,?)", (digest(token), secrets.token_urlsafe(32), now, now))
+        if keep:
+            db.execute("INSERT INTO kept_sessions(token) VALUES(?)", (digest(token),))
         return token
 
     def _check_owner(self, db, password, code, now):
@@ -341,6 +389,12 @@ class AuthStore:
             db.execute("UPDATE owner SET password=? WHERE id=1", (HASHER.hash(password),))
         db.execute("UPDATE throttle SET failures=0,blocked=0 WHERE id=1")
         return True
+
+    def blocked(self, *, now=None):
+        """Whether the sign-in throttle refuses checks right now. Never writes."""
+        with self.connect() as db:
+            now = time.time() if now is None else now
+            return now < _throttle(db)[1]
 
     def login(self, password, code, *, keep=False, now=None):
         now = time.time() if now is None else now
@@ -480,13 +534,13 @@ class AuthStore:
             # Order production timestamps by the write transaction, not by
             # concurrent requests reaching this method.
             now = time.time() if now is None else now
-            row = db.execute(_session_query(db, "WHERE token=?"), (digest(token),)).fetchone()
+            row = db.execute("SELECT token,csrf,created,seen FROM sessions WHERE token=?", (digest(token),)).fetchone()
             if not row:
                 return None
             _validate_session(row)
-            kept = row[4] == 1
+            kept = _is_kept(db, row[0])
             if not kept and (now-row[2] >= ABSOLUTE_SECONDS or now-row[3] >= IDLE_SECONDS or now < row[3]):
-                db.execute("DELETE FROM sessions WHERE token=?", (digest(token),))
+                _end_sessions(db, digest(token))
                 return None
             # A kept session has no clock limits. If the clock stepped back, keep
             # `seen` where it was so seen >= created still holds.
@@ -499,8 +553,8 @@ class AuthStore:
 
     def logout(self, token):
         with self.connect() as db:
-            db.execute("DELETE FROM sessions WHERE token=?", (digest(token),))
+            _end_sessions(db, digest(token))
 
     def logout_everywhere(self):
         with self.connect() as db:
-            db.execute("DELETE FROM sessions")
+            _end_sessions(db)

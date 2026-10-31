@@ -104,7 +104,7 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 
 def _owner_date(stamp) -> str:
-    """'31 Oct 2026' for a Unix time, in the owner's local time zone."""
+    """'31 Oct 2026' for a Unix time, in the server's time zone (UTC in the container)."""
     moment = datetime.fromtimestamp(float(stamp))
     return f"{moment.day} {moment:%b %Y}"
 

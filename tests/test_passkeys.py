@@ -542,9 +542,9 @@ def test_old_schema_reads_tolerate_missing_tables_without_writing(tmp_path):
     store.available()
 
 
-def test_kept_column_without_passkey_tables(tmp_path):
+def test_kept_table_without_passkey_tables(tmp_path):
     store, secret = _old_schema_store(tmp_path)
-    _execute(store, "ALTER TABLE sessions ADD COLUMN kept INTEGER NOT NULL DEFAULT 0")
+    _execute(store, "CREATE TABLE kept_sessions(token TEXT PRIMARY KEY)")
     before = store.path.read_bytes()
     assert store.passkeys() == [] and store.begin_login(origin=ORIGIN, now=4000) is None
     assert store.path.read_bytes() == before
@@ -709,10 +709,36 @@ def _finish(client, csrf, answer):
                        headers=dict(OWN, **{"X-CSRF-Token": csrf, "Content-Type": "application/json"}))
 
 
+def _tree_digest(root, *, skip):
+    """SHA-256 over every path under `root` with its kind and, for files, its bytes.
+
+    `skip` is left out: in these fixtures the auth state directory sits under
+    the same temporary root as the vault, and sign-in is meant to write it.
+    """
+    import os
+    from pathlib import Path
+    root, skip = Path(root), Path(skip)
+    total = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        if path == skip or skip in path.parents:
+            continue
+        relative = path.relative_to(root).as_posix().encode()
+        if path.is_symlink():
+            total.update(b"L" + relative + b"\0" + os.readlink(path).encode() + b"\0")
+        elif path.is_dir():
+            total.update(b"D" + relative + b"\0")
+        else:
+            total.update(b"F" + relative + b"\0" + path.read_bytes() + b"\0")
+    return total.hexdigest()
+
+
 def test_setup_then_sign_out_then_touch_id_sign_in_loads_home(web, monkeypatch):
+    import os
     import time
     from app import auth
     client, store, secret = web
+    vault = os.environ["ONEOS_VAULT"]
+    vault_before = _tree_digest(vault, skip=store.directory)
     nonce = _nonce(client)
     real = time.time()
     signed_in = client.post("/login", data={"password": PASSWORD, "code": pyotp.TOTP(secret).at(real), "keep": "1", "csrf_token": nonce}, headers=OWN)
@@ -737,6 +763,8 @@ def test_setup_then_sign_out_then_touch_id_sign_in_loads_home(web, monkeypatch):
     home = client.get("/")
     assert home.status_code == 200
     assert _failures(store) == 0
+    # Sign-in, setup and sign-out never touch the vault.
+    assert _tree_digest(vault, skip=store.directory) == vault_before
 
 
 @pytest.mark.parametrize("keep,age", [(True, 34560000), (False, 43200)])
@@ -970,6 +998,63 @@ def test_settings_endpoints_require_a_session(web, path):
     assert response.status_code == 401
     assert response.headers["HX-Redirect"] == "/login"
     assert len(store.passkeys()) == 1 and _challenges(store) == [] and _failures(store) == 0
+
+
+NEW_PATHS = ["/login/passkey/options", "/login/passkey", "/settings/passkey/begin",
+             "/settings/passkey/finish", "/settings/passkey/remove", "/logout/everywhere"]
+
+
+@pytest.mark.parametrize("path", NEW_PATHS)
+def test_new_endpoints_refuse_a_wrong_host_before_anything_else(web, path):
+    """A wrong Host is a 400 with nothing stored, spent or counted, even with a good request."""
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    nonce = _nonce(client)
+    csrf = _store_session(client, store, secret, 3060)
+    token = nonce if path.startswith("/login/") else csrf
+    if path == "/login/passkey/options":
+        content_type, body = "application/json", b"{}"
+    elif path == "/login/passkey":
+        options = _options(client, nonce)
+        assert options.status_code == 200
+        content_type = "application/json"
+        body = json.dumps({"credential": json.loads(fake.assertion(options.text)), "keep": True}).encode()
+    elif path == "/settings/passkey/begin":
+        content_type, body = "application/x-www-form-urlencoded", f"password={PASSWORD}&code={pyotp.TOTP(secret).now()}".encode()
+    elif path == "/settings/passkey/finish":
+        begun = _begin(client, csrf, PASSWORD, pyotp.TOTP(secret).now())
+        assert begun.status_code == 200
+        content_type, body = "application/json", FakeAuthenticator().register(begun.text).encode()
+    elif path == "/settings/passkey/remove":
+        content_type, body = "application/x-www-form-urlencoded", f"id={fake.id}".encode()
+    else:
+        content_type, body = "application/x-www-form-urlencoded", b""
+    headers = dict(OWN, **{"Content-Type": content_type, "X-CSRF-Token": token})
+    before = store.path.read_bytes()
+    passkeys, challenges, sessions = store.passkeys(), _challenges(store), _rows(store, "SELECT token FROM sessions")
+    for host in ("evil.invalid", "localhost:8444", "localhost"):
+        response = client.post(path, content=body, headers=dict(headers, Host=host))
+        assert response.status_code == 400 and response.text == "Invalid host", host
+        assert "set-cookie" not in response.headers
+    assert store.path.read_bytes() == before
+    assert store.passkeys() == passkeys and _challenges(store) == challenges
+    assert _rows(store, "SELECT token FROM sessions") == sessions
+    assert _failures(store) == 0
+    # The same request on the right host is accepted (so the 400 above was the Host check).
+    assert client.post(path, content=body, headers=headers).status_code in (200, 204, 303)
+
+
+def test_setup_check_while_blocked_says_wait_and_counts_nothing(web):
+    client, store, secret = web
+    csrf = _store_session(client, store, secret)
+    for _ in range(5):
+        assert store.login("wrong password", "000000") is None
+    assert _failures(store) == 5
+    response = _begin(client, csrf, PASSWORD, pyotp.TOTP(secret).now())
+    assert response.status_code == 429
+    assert response.json() == {"error": "blocked", "message": "Too many failed sign-ins. Wait a few minutes and try again."}
+    assert _failures(store) == 5
+    assert _challenges(store) == [] and store.passkeys() == []
 
 
 def test_setup_check_is_refused_with_a_clear_message_and_counted(web):
@@ -1354,6 +1439,17 @@ const api = window.OneOSPasskey;
   finish = reply(400, { error: 'failed' });
   result = await api.register('p', '1');
   assert.strictEqual(result.error, 'failed');
+  assert.deepStrictEqual(calls, []);
+  // A blocked throttle is a wait, never a sign-out or a password message.
+  begin = reply(429, { error: 'blocked', message: 'Server says wait.' });
+  result = await api.register('p', '1');
+  assert.deepStrictEqual(result, { ok: false, error: 'blocked', message: 'Server says wait.' });
+  for (const body of [{ error: 'blocked' }, 'Too many', null]) {
+    begin = reply(429, body);
+    result = await api.register('p', '1');
+    assert.strictEqual(result.error, 'blocked');
+    assert.strictEqual(result.message, 'Too many failed sign-ins. Wait a few minutes and try again.');
+  }
   assert.deepStrictEqual(calls, []);
   console.log('ok');
 })().catch((e) => { console.error(e); process.exit(1); });
