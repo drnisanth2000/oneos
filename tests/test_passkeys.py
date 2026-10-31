@@ -594,3 +594,651 @@ def test_verify_functions_raise_passkey_rejected_only():
     with pytest.raises(PasskeyRejected):
         passkey_module.verify_authentication(fake.assertion(login), challenge, "localhost", ORIGIN, b"not a key", 0)
     assert options_challenge(login) == challenge
+
+
+@pytest.mark.parametrize("cross_origin", [True, "true", 1])
+def test_cross_origin_client_data_is_refused(cross_origin):
+    from app import passkeys as passkey_module
+    from app.passkeys import PasskeyRejected
+    fake = FakeAuthenticator()
+    challenge = bytes(range(32))
+    options = passkey_module.registration_options("localhost", challenge, [])
+    with pytest.raises(PasskeyRejected):
+        passkey_module.verify_registration(fake.register(options, cross_origin=cross_origin), challenge, "localhost", ORIGIN)
+    _, public_key, _ = passkey_module.verify_registration(fake.register(options), challenge, "localhost", ORIGIN)
+    login = passkey_module.authentication_options("localhost", challenge)
+    with pytest.raises(PasskeyRejected):
+        passkey_module.verify_authentication(fake.assertion(login, cross_origin=cross_origin), challenge, "localhost", ORIGIN, public_key, 0)
+    assert passkey_module.verify_authentication(fake.assertion(login), challenge, "localhost", ORIGIN, public_key, 0) == 0
+
+
+def test_cross_origin_answers_are_refused_by_the_store(owner):
+    store, secret = owner
+    _, response = _setup_answer(store, secret, 3030, cross_origin=True)
+    assert store.finish_registration(response, origin=ORIGIN, now=3031) is False
+    assert store.passkeys() == []
+    fake = _register(store, secret, 3060)
+    assert _sign_in(store, fake, 4000, cross_origin=True) is None
+    assert _failures(store) == 1
+
+
+def test_options_timeout_matches_the_challenge_lifetime(owner):
+    from app.auth import CHALLENGE_SECONDS
+    store, secret = owner
+    _register(store, secret, 3030)
+    registration = json.loads(store.begin_registration(PASSWORD, _code(secret, 3060), origin=ORIGIN, now=3060))
+    login = json.loads(store.begin_login(origin=ORIGIN, now=4000))
+    assert registration["timeout"] == login["timeout"] == CHALLENGE_SECONDS * 1000 == 300000
+
+
+def test_icloud_backed_up_passkey_registers_and_signs_in(owner):
+    store, secret = owner
+    fake = _register(store, secret, 3030, backup=True)
+    assert _sign_in(store, fake, 4000, backup=True)
+    assert _failures(store) == 0
+
+
+# --- the endpoints in OwnerAuthMiddleware -------------------------------------------
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.auth_web import LIMIT  # noqa: E402
+
+OWN = {"Origin": ORIGIN}
+CHECK_MESSAGE = "Password or code not accepted. If you just used this code to sign in, wait for the next one."
+
+
+@pytest.fixture
+def web(owner, make_vault, monkeypatch):
+    from tests.conftest import entities_yaml
+    store, secret = owner
+    monkeypatch.setenv("ONEOS_VAULT", str(make_vault(entities_yaml("sample"))))
+    monkeypatch.setenv("ONEOS_AUTH_STATE_DIR", str(store.directory))
+    monkeypatch.setenv("ONEOS_AUTH_MODE", "required")
+    monkeypatch.setenv("ONEOS_ORIGIN", ORIGIN)
+    from app.main import app
+    with TestClient(app, base_url=ORIGIN, follow_redirects=False) as client:
+        yield client, store, secret
+
+
+def _nonce(client):
+    """GET the sign-in page (which sets the login cookie) and return its form token."""
+    import re
+    page = client.get("/login")
+    assert page.status_code == 200
+    return re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+
+
+def _cookie_headers(response, name):
+    return [value for value in response.headers.get_list("set-cookie") if value.startswith(name + "=")]
+
+
+def _store_session(client, store, secret, at=3030):
+    """A kept session made at a store time long past (kept sessions have no clock limit)."""
+    token = store.login(PASSWORD, _code(secret, at), keep=True, now=at)
+    client.cookies.set("__Host-oneos", token, domain="localhost.local")
+    return store.session(token)
+
+
+def _options(client, nonce):
+    return client.post("/login/passkey/options", content=b"{}",
+                       headers=dict(OWN, **{"X-CSRF-Token": nonce, "Content-Type": "application/json"}))
+
+
+def _passkey_post(client, nonce, body):
+    return client.post("/login/passkey", content=json.dumps(body).encode(),
+                       headers=dict(OWN, **{"X-CSRF-Token": nonce, "Content-Type": "application/json"}))
+
+
+def _web_passkey_sign_in(client, fake, *, keep, **answer):
+    nonce = _nonce(client)
+    options = _options(client, nonce)
+    assert options.status_code == 200, options.text
+    assert options.headers["content-type"].startswith("application/json")
+    return _passkey_post(client, nonce, {"credential": json.loads(fake.assertion(options.text, **answer)), "keep": keep})
+
+
+def _begin(client, csrf, password, code):
+    return client.post("/settings/passkey/begin", data={"password": password, "code": code},
+                       headers=dict(OWN, **{"X-CSRF-Token": csrf}))
+
+
+def _finish(client, csrf, answer):
+    return client.post("/settings/passkey/finish", content=answer.encode() if isinstance(answer, str) else answer,
+                       headers=dict(OWN, **{"X-CSRF-Token": csrf, "Content-Type": "application/json"}))
+
+
+def test_setup_then_sign_out_then_touch_id_sign_in_loads_home(web, monkeypatch):
+    import time
+    from app import auth
+    client, store, secret = web
+    nonce = _nonce(client)
+    real = time.time()
+    signed_in = client.post("/login", data={"password": PASSWORD, "code": pyotp.TOTP(secret).at(real), "keep": "1", "csrf_token": nonce}, headers=OWN)
+    assert signed_in.status_code == 303
+    csrf = store.session(client.cookies.get("__Host-oneos"))
+    # Setup needs a fresh code: move to the next 30-second window.
+    monkeypatch.setattr(auth.time, "time", lambda: real + 30)
+    begun = _begin(client, csrf, PASSWORD, pyotp.TOTP(secret).at(real + 30))
+    assert begun.status_code == 200 and begun.headers["content-type"].startswith("application/json")
+    assert json.loads(begun.text)["timeout"] == 300000
+    fake = FakeAuthenticator()
+    finished = _finish(client, csrf, fake.register(begun.text))
+    assert finished.status_code == 200 and finished.json() == {"ok": True}
+    assert [key_id for key_id, _ in store.passkeys()] == [fake.id]
+    assert client.post("/logout", headers=dict(OWN, **{"X-CSRF-Token": csrf})).status_code == 303
+    assert client.get("/").status_code == 303
+    page = client.get("/login").text
+    assert "Sign in with Touch ID" in page
+    response = _web_passkey_sign_in(client, fake, keep=True)
+    assert response.status_code == 200 and response.json() == {"redirect": "/"}
+    assert _cookie_headers(response, "__Host-oneos-login") and "Max-Age=0" in _cookie_headers(response, "__Host-oneos-login")[0]
+    home = client.get("/")
+    assert home.status_code == 200
+    assert _failures(store) == 0
+
+
+@pytest.mark.parametrize("keep,age", [(True, 34560000), (False, 43200)])
+def test_passkey_sign_in_cookie_follows_keep(web, keep, age):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    response = _web_passkey_sign_in(client, fake, keep=keep)
+    assert response.status_code == 200
+    (cookie,) = _cookie_headers(response, "__Host-oneos")
+    for flag in (f"Max-Age={age}", "Secure", "HttpOnly", "SameSite=strict", "Path=/"):
+        assert flag in cookie
+    issued = _cookie_headers(response, "__Host-oneos-issued")
+    if keep:
+        assert len(issued) == 1 and f"Max-Age={age}" in issued[0]
+    else:
+        assert all("Max-Age=0" in value for value in issued)
+    token = client.cookies.get("__Host-oneos")
+    assert store.session_info(token).kept is keep
+    assert client.get("/docs").status_code == 200
+
+
+def test_password_backup_still_signs_in_with_a_passkey_stored(web):
+    client, store, secret = web
+    _register(store, secret, 3030)
+    nonce = _nonce(client)
+    response = client.post("/login", data={"password": PASSWORD, "code": pyotp.TOTP(secret).now(), "csrf_token": nonce}, headers=OWN)
+    assert response.status_code == 303
+    assert "Max-Age=43200" in _cookie_headers(response, "__Host-oneos")[0]
+
+
+def test_options_without_a_passkey_is_409_and_writes_nothing(web):
+    client, store, _ = web
+    nonce = _nonce(client)
+    before = store.path.read_bytes()
+    response = _options(client, nonce)
+    assert response.status_code == 409 and response.json() == {"error": "no-passkey"}
+    assert store.path.read_bytes() == before
+
+
+def test_options_while_blocked_is_429_never_no_passkey(web):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    for _ in range(5):
+        assert store.login("wrong password", "000000") is None
+    nonce = _nonce(client)
+    response = _options(client, nonce)
+    assert response.status_code == 429 and response.json() == {"error": "blocked"}
+    assert _challenges(store) == []
+    assert len(store.passkeys()) == 1 and fake
+
+
+def _replay(client, store, fake):
+    nonce = _nonce(client)
+    options = _options(client, nonce).text
+    answer = json.loads(fake.assertion(options))
+    assert _passkey_post(client, nonce, {"credential": answer, "keep": False}).status_code == 200
+    client.cookies.delete("__Host-oneos")
+    return _passkey_post(client, _nonce(client), {"credential": answer, "keep": False})
+
+
+@pytest.mark.parametrize("case", [
+    {"uv": False}, {"up": False}, {"origin": "https://evil.example"}, {"rp_id": "evil.example"},
+    {"cross_origin": True}, {"flip_signature": True}, "replay", "unknown", "removed", "empty",
+], ids=str)
+def test_passkey_sign_in_refusals_are_401_and_counted(web, case):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    if case == "replay":
+        response = _replay(client, store, fake)
+        before = 0
+    else:
+        before = _failures(store)
+        if case == "unknown":
+            response = _web_passkey_sign_in(client, FakeAuthenticator(), keep=True)
+        elif case == "removed":
+            nonce = _nonce(client)
+            options = _options(client, nonce).text
+            assert store.remove_passkey(fake.id)
+            response = _passkey_post(client, nonce, {"credential": json.loads(fake.assertion(options)), "keep": True})
+        elif case == "empty":
+            response = _passkey_post(client, _nonce(client), {"credential": {}, "keep": True})
+        else:
+            response = _web_passkey_sign_in(client, fake, keep=True, **case)
+    assert response.status_code == 401 and response.json() == {"error": "failed"}
+    assert _cookie_headers(response, "__Host-oneos") == []
+    assert _failures(store) == before + 1
+    assert client.get("/docs").status_code == 303
+
+
+def test_sign_in_page_offers_touch_id_only_with_a_passkey(web):
+    import re
+    client, store, secret = web
+
+    def check_password_form(page):
+        assert '<form id="sign-in" method="post" action="/login">' in page
+        assert 'name="password"' in page and 'name="code"' in page and 'name="csrf_token"' in page
+        assert re.search(r'<input[^>]*type="checkbox"[^>]*name="keep"[^>]*value="1"[^>]*checked', page)
+        assert "Keep me signed in on this Mac" in page
+        # Nothing before sign-in needs a static file (they all need a session).
+        assert "src=" not in page and "/static" not in page and "<link" not in page
+
+    response = client.get("/login")
+    page = response.text
+    check_password_form(page)
+    assert "Sign in with Touch ID" not in page and "Use password and code instead" not in page
+    assert "<script" not in page
+    _register(store, secret, 3030)
+    response = client.get("/login")
+    page = response.text
+    check_password_form(page)
+    for copy in ("Sign in with Touch ID", "Keep me signed in on this Mac", "Use password and code instead"):
+        assert copy in page
+    assert page.count("<script>") == 1 and page.count("<script") == 1
+    # Without JavaScript the Touch ID controls stay hidden and the form is the page.
+    assert re.search(r'<div id="touch-id" hidden>', page)
+    assert re.search(r'<p id="use-password" hidden>', page)
+    script = page.split("<script>")[1].split("</script>")[0]
+    assert "innerHTML" not in script and "parseRequestOptionsFromJSON" not in script
+    assert "/login/passkey/options" in script and "/login/passkey" in script
+
+
+def test_sign_in_page_content_security_policy_allows_only_its_own_script(web):
+    import base64
+    client, store, secret = web
+    policy = client.get("/login").headers["content-security-policy"]
+    assert "default-src 'none'" in policy and "frame-ancestors 'none'" in policy and "script-src" not in policy
+    _register(store, secret, 3030)
+    response = client.get("/login")
+    script = response.text.split("<script>")[1].split("</script>")[0]
+    expected = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    policy = response.headers["content-security-policy"]
+    assert f"script-src 'sha256-{expected}'" in policy
+    assert "connect-src 'self'" in policy and "form-action 'self'" in policy and "base-uri 'none'" in policy
+
+
+@pytest.mark.parametrize("path", ["/login/passkey/options", "/login/passkey"])
+def test_passkey_paths_answer_post_only_and_never_render_the_page(web, path):
+    client, store, secret = web
+    _register(store, secret, 3030)
+    for method in ("GET", "HEAD", "PUT", "DELETE"):
+        response = client.request(method, path)
+        assert response.status_code == 405, method
+        assert _cookie_headers(response, "__Host-oneos-login") == []
+
+
+def _pre_sign_in_cases(path):
+    good = b"{}" if path.endswith("options") else json.dumps({"credential": {}, "keep": True}).encode()
+    json_type = {"Content-Type": "application/json"}
+    bad_bodies = [b"[]", b'"x"', b"7", b"null", b"not json", b"NaN", b'{"a": NaN}', b"\xff\xfe", b"", b"[" * 5000]
+    if path == "/login/passkey":
+        bad_bodies += [json.dumps(body).encode() for body in (
+            {}, {"credential": "x"}, {"credential": []}, {"credential": {}, "keep": "yes"},
+            {"credential": {}, "keep": 1}, {"credential": {}, "keep": True, "extra": 1})]
+    return good, json_type, bad_bodies
+
+
+@pytest.mark.parametrize("path", ["/login/passkey/options", "/login/passkey"])
+def test_pre_sign_in_endpoints_refuse_bad_token_origin_size_and_body(web, path):
+    client, store, secret = web
+    _register(store, secret, 3030)
+    session_csrf = store.session(store.login(PASSWORD, _code(secret, 3060), keep=True, now=3060))
+    nonce = _nonce(client)
+    good, json_type, bad_bodies = _pre_sign_in_cases(path)
+    with_token = dict(OWN, **json_type, **{"X-CSRF-Token": nonce})
+    refusals = [
+        (dict(OWN, **json_type), good, 403),  # no token
+        (dict(with_token, **{"X-CSRF-Token": "x" * 43}), good, 403),  # wrong token
+        (dict(with_token, **{"X-CSRF-Token": session_csrf}), good, 403),  # a session token is not the sign-in token
+        (dict(with_token, Origin="https://evil.invalid"), good, 403),
+        ({k: v for k, v in with_token.items() if k != "Origin"}, good, 403),
+        (with_token, b"{" + b" " * LIMIT + b"}", 413),
+        (dict(with_token, **{"Content-Type": "application/x-www-form-urlencoded"}), good, 400),
+        (dict(with_token, **{"Content-Type": "text/plain"}), good, 400),
+        ({k: v for k, v in with_token.items() if k != "Content-Type"}, good, 400),
+    ] + [(with_token, body, 400) for body in bad_bodies]
+    for headers, body, status in refusals:
+        response = client.post(path, content=body, headers=headers)
+        assert response.status_code == status, (headers, body[:40], response.status_code, response.text)
+        assert _cookie_headers(response, "__Host-oneos") == []
+    # No refusal reached the store: nothing counted, no challenge handed out.
+    assert _failures(store) == 0
+    assert _challenges(store) == []
+    # The token in a form field is accepted for the password form only, never for JSON.
+    assert client.post(path, content=good, headers=dict(OWN, **json_type), params={"csrf_token": nonce}).status_code == 403
+
+
+def _settings_cases(path, fake_id):
+    if path == "/settings/passkey/begin":
+        return ("application/x-www-form-urlencoded", f"password={PASSWORD}&code=123456".encode(),
+                [b"password=a&password=b&code=123456", b"code=123456", b"password=a&code=123456&extra=1", b"\xff=\xfe"])
+    if path == "/settings/passkey/remove":
+        return ("application/x-www-form-urlencoded", f"id={fake_id}".encode(),
+                [f"id={fake_id}&id={fake_id}".encode(), b"", b"other=1", f"id={fake_id}&extra=1".encode()])
+    return ("application/json", b"{}", [b"[]", b'"x"', b"null", b"not json", b"NaN", b"\xff", b"", b"[" * 5000])
+
+
+@pytest.mark.parametrize("path", ["/settings/passkey/begin", "/settings/passkey/finish", "/settings/passkey/remove"])
+def test_settings_endpoints_refuse_bad_token_origin_size_and_body(web, path):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    csrf = _store_session(client, store, secret, 3060)
+    nonce = _nonce(client)
+    content_type, good, bad_bodies = _settings_cases(path, fake.id)
+    other_type = "application/json" if content_type != "application/json" else "application/x-www-form-urlencoded"
+    with_token = dict(OWN, **{"Content-Type": content_type, "X-CSRF-Token": csrf})
+    refusals = [
+        ({k: v for k, v in with_token.items() if k != "X-CSRF-Token"}, good, 403),
+        (dict(with_token, **{"X-CSRF-Token": "x" * 43}), good, 403),
+        (dict(with_token, **{"X-CSRF-Token": nonce}), good, 403),  # the sign-in token is not a session token
+        (dict(with_token, Origin="https://evil.invalid"), good, 403),
+        ({k: v for k, v in with_token.items() if k != "Origin"}, good, 403),
+        (with_token, b"x" * (LIMIT + 1), 413),
+        (dict(with_token, **{"Content-Type": other_type}), good, 400),
+        ({k: v for k, v in with_token.items() if k != "Content-Type"}, good, 400),
+    ] + [(with_token, body, 400) for body in bad_bodies]
+    for headers, body, status in refusals:
+        response = client.post(path, content=body, headers=headers)
+        assert response.status_code == status, (headers, body[:40], response.status_code, response.text)
+    assert [key_id for key_id, _ in store.passkeys()] == [fake.id]
+    assert _challenges(store) == []
+    assert _failures(store) == 0
+
+
+@pytest.mark.parametrize("path", ["/settings/passkey/begin", "/settings/passkey/finish", "/settings/passkey/remove"])
+def test_settings_endpoints_require_a_session(web, path):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    nonce = _nonce(client)
+    content_type, good, _ = _settings_cases(path, fake.id)
+    response = client.post(path, content=good, headers=dict(OWN, **{"Content-Type": content_type, "X-CSRF-Token": nonce}))
+    assert response.status_code == 401
+    assert response.headers["HX-Redirect"] == "/login"
+    assert len(store.passkeys()) == 1 and _challenges(store) == [] and _failures(store) == 0
+
+
+def test_setup_check_is_refused_with_a_clear_message_and_counted(web):
+    client, store, secret = web
+    nonce = _nonce(client)
+    code = pyotp.TOTP(secret).now()
+    assert client.post("/login", data={"password": PASSWORD, "code": code, "csrf_token": nonce}, headers=OWN).status_code == 303
+    csrf = store.session(client.cookies.get("__Host-oneos"))
+    wrong = f"{(int(code) + 1) % 1_000_000:06d}"
+    for password, attempt in ((PASSWORD, code), (PASSWORD, wrong), ("wrong password", code)):
+        response = _begin(client, csrf, password, attempt)
+        assert response.status_code == 401
+        assert response.json() == {"error": "check", "message": CHECK_MESSAGE}
+    assert _failures(store) == 3
+    assert _challenges(store) == [] and store.passkeys() == []
+
+
+def test_finish_with_a_bad_answer_is_400_and_stores_nothing(web):
+    client, store, secret = web
+    csrf = _store_session(client, store, secret)
+    begun = _begin(client, csrf, PASSWORD, pyotp.TOTP(secret).now())
+    assert begun.status_code == 200
+    for answer in (FakeAuthenticator().register(begun.text, uv=False), "{}", json.dumps({"id": 5})):
+        response = _finish(client, csrf, answer)
+        assert response.status_code == 400 and response.json() == {"error": "failed"}
+    assert store.passkeys() == []
+
+
+def test_remove_ends_passkey_sign_in_and_returns_to_the_referring_page(web):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    other = _register(store, secret, 3060)
+    nonce = _nonce(client)
+    held = _options(client, nonce).text
+    csrf = _store_session(client, store, secret, 3090)
+    headers = dict(OWN, **{"X-CSRF-Token": csrf})
+    response = client.post("/settings/passkey/remove", data={"id": fake.id}, headers=dict(headers, Referer=ORIGIN + "/board?tab=1"))
+    assert response.status_code == 303 and response.headers["location"] == "/board?tab=1"
+    assert [key_id for key_id, _ in store.passkeys()] == [other.id]
+    # Removing an unknown id changes nothing; a foreign or odd referrer goes home.
+    for referer in ("https://evil.invalid/board", ORIGIN + "//evil.invalid", "javascript:alert(1)", ORIGIN + "/\\evil.invalid", ""):
+        response = client.post("/settings/passkey/remove", data={"id": "A" * 22}, headers=dict(headers, Referer=referer))
+        assert response.status_code == 303 and response.headers["location"] == "/", referer
+    response = client.post("/settings/passkey/remove", data={"id": other.id}, headers=dict(headers, **{"HX-Request": "true", "Referer": ORIGIN + "/outbox"}))
+    assert response.status_code == 204 and response.headers["HX-Redirect"] == "/outbox"
+    assert store.passkeys() == []
+    # The removed passkey no longer signs in, even with options handed out before.
+    client.cookies.delete("__Host-oneos")
+    response = _passkey_post(client, nonce, {"credential": json.loads(fake.assertion(held)), "keep": True})
+    assert response.status_code == 401
+    assert _options(client, _nonce(client)).status_code == 409
+
+
+def test_request_state_passkeys_for_signed_in_requests(owner, monkeypatch):
+    from fastapi import FastAPI, Request
+    from app.auth_web import OwnerAuthMiddleware
+    store, secret = owner
+    monkeypatch.setenv("ONEOS_AUTH_STATE_DIR", str(store.directory))
+    monkeypatch.setenv("ONEOS_AUTH_MODE", "required")
+    monkeypatch.setenv("ONEOS_ORIGIN", ORIGIN)
+    app = FastAPI()
+    app.add_middleware(OwnerAuthMiddleware)
+
+    @app.get("/state")
+    def state(request: Request):
+        return {"passkeys": request.state.passkeys}
+
+    with TestClient(app, base_url=ORIGIN, follow_redirects=False) as client:
+        _store_session(client, store, secret)
+        assert client.get("/state").json() == {"passkeys": []}
+        fake = _register(store, secret, 3060)
+        assert client.get("/state").json() == {"passkeys": [[fake.id, 3061]]}
+
+
+# --- static/passkey.js (Settings), run under node when it is installed --------------
+
+def _node():
+    import shutil
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    return node
+
+
+def test_passkey_js_has_no_dependencies_and_never_writes_html():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "static" / "passkey.js").read_text()
+    for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "import ", "require(", "http:", "https:", "eval(", "localStorage", "sessionStorage"):
+        assert forbidden not in source, forbidden
+
+
+def test_passkey_js_fetches_fresh_options_for_every_attempt(tmp_path):
+    import subprocess
+    from pathlib import Path
+    script = Path(__file__).resolve().parents[1] / "static" / "passkey.js"
+    harness = tmp_path / "harness.js"
+    harness.write_text(r"""
+const assert = require('assert');
+const calls = [];
+let creates = 0;
+let failCreate = true;
+const b64 = (bytes) => Buffer.from(bytes).toString('base64url');
+global.window = global;
+global.document = { querySelector: (s) => s === 'meta[name="csrf-token"]' ? { content: 'T'.repeat(43) } : null };
+global.PublicKeyCredential = function () {};
+global.location = { reload() { calls.push(['reload']); }, assign(url) { calls.push(['assign', url]); } };
+// Node 22 defines a read-only navigator of its own.
+Object.defineProperty(globalThis, 'navigator', { configurable: true, writable: true, value: { credentials: { create: async ({ publicKey }) => {
+  creates += 1;
+  assert.ok(publicKey.challenge instanceof ArrayBuffer && publicKey.user.id instanceof ArrayBuffer);
+  assert.ok(publicKey.excludeCredentials[0].id instanceof ArrayBuffer);
+  assert.strictEqual(Buffer.from(publicKey.user.id).toString(), 'oneos-owner');
+  if (failCreate) { const e = new Error('cancelled'); e.name = 'NotAllowedError'; throw e; }
+  const raw = new Uint8Array([1, 2, 3, 250, 251, 252]).buffer;
+  return { id: b64(new Uint8Array(raw)), rawId: raw, type: 'public-key', authenticatorAttachment: 'platform',
+    response: { clientDataJSON: new Uint8Array([123, 125]).buffer, attestationObject: new Uint8Array([9]).buffer, getTransports: () => ['internal'] },
+    getClientExtensionResults: () => ({}) };
+} } } });
+let n = 0;
+global.fetch = async (url, init) => {
+  calls.push([url, init]);
+  if (url === '/settings/passkey/begin') {
+    n += 1;
+    const options = { rp: { id: 'localhost', name: 'OneOS' }, user: { id: b64(Buffer.from('oneos-owner')), name: 'owner', displayName: 'OneOS owner' },
+      challenge: b64(new Uint8Array(32).fill(n)), pubKeyCredParams: [{ type: 'public-key', alg: -7 }], timeout: 300000,
+      excludeCredentials: [{ id: b64(new Uint8Array([7, 7])), type: 'public-key' }], authenticatorSelection: { residentKey: 'required', userVerification: 'required' }, attestation: 'none' };
+    return { ok: true, status: 200, json: async () => options };
+  }
+  if (url === '/settings/passkey/finish') return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  if (url === '/settings/passkey/remove') return { ok: false, status: 0, type: 'opaqueredirect', json: async () => ({}) };
+  throw new Error('unexpected ' + url);
+};
+require(process.argv[2]);
+const api = window.OneOSPasskey;
+(async () => {
+  assert.strictEqual(api.toBase64url(api.fromBase64url('AQID-vv8')), 'AQID-vv8');
+  assert.strictEqual(api.toBase64url(new Uint8Array([255, 254, 253]).buffer), '__79');
+  assert.throws(() => api.fromBase64url('A+/='));
+  const first = await api.register('pw one', '111111');
+  assert.strictEqual(first.ok, false);
+  assert.strictEqual(first.error, 'cancelled');
+  failCreate = false;
+  const second = await api.register('pw two', '222222');
+  assert.deepStrictEqual(second, { ok: true });
+  const begins = calls.filter((c) => c[0] === '/settings/passkey/begin');
+  assert.strictEqual(begins.length, 2);
+  assert.strictEqual(begins[0][1].body, 'password=pw+one&code=111111');
+  assert.strictEqual(begins[1][1].body, 'password=pw+two&code=222222');
+  for (const [, init] of begins) {
+    assert.strictEqual(init.method, 'POST');
+    assert.strictEqual(init.headers['X-CSRF-Token'], 'T'.repeat(43));
+    assert.strictEqual(init.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  }
+  assert.strictEqual(creates, 2);
+  const finish = calls.find((c) => c[0] === '/settings/passkey/finish');
+  const sent = JSON.parse(finish[1].body);
+  assert.strictEqual(finish[1].headers['Content-Type'], 'application/json');
+  assert.deepStrictEqual(sent.response, { clientDataJSON: 'e30', attestationObject: 'CQ', transports: ['internal'] });
+  assert.strictEqual(sent.rawId, 'AQID-vv8');
+  assert.strictEqual(sent.type, 'public-key');
+  const removed = await api.remove('AQID-vv8');
+  assert.deepStrictEqual(removed, { ok: true });
+  const remove = calls.find((c) => c[0] === '/settings/passkey/remove');
+  assert.strictEqual(remove[1].body, 'id=AQID-vv8');
+  assert.strictEqual(remove[1].redirect, 'manual');
+  assert.ok(calls.some((c) => c[0] === 'reload'));
+  console.log('ok');
+})().catch((e) => { console.error(e); process.exit(1); });
+""")
+    result = subprocess.run([_node(), str(harness), str(script)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_sign_in_page_script_produces_an_answer_the_server_accepts(web, tmp_path):
+    """Run the page's inline script under node with stubbed DOM and authenticator, then post its body."""
+    import subprocess
+    node = _node()
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    page = client.get("/login").text
+    nonce = __import__("re").search(r'name="csrf_token" value="([^"]+)"', page).group(1)
+    script = page.split("<script>")[1].split("</script>")[0]
+    options = _options(client, nonce).text
+    answer = json.loads(fake.assertion(options))
+    (tmp_path / "page.js").write_text(script)
+    (tmp_path / "fixture.json").write_text(json.dumps({"options": json.loads(options), "answer": answer, "nonce": nonce}))
+    harness = tmp_path / "harness.js"
+    harness.write_text(r"""
+const assert = require('assert');
+const fs = require('fs');
+const fixture = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const buf = (text) => { const b = Buffer.from(text, 'base64url'); return b.buffer.slice(b.byteOffset, b.byteOffset + b.length); };
+const element = (extra) => Object.assign({ hidden: true, disabled: false, textContent: '', listeners: {},
+  addEventListener(name, fn) { this.listeners[name] = fn; } }, extra || {});
+const link = element();
+const els = {
+  'touch-id': element(), 'password-fields': element({ hidden: false }), 'password-submit': element({ hidden: false }),
+  'use-password': element({ querySelector: () => link }), 'touch-id-button': element(), 'touch-id-status': element(),
+  'sign-in': { elements: { csrf_token: { value: fixture.nonce }, keep: { checked: true }, password: { focus() { els.focused = true; } } } },
+};
+global.window = global;
+global.document = { getElementById: (id) => els[id] || null };
+global.PublicKeyCredential = function () {};
+global.btoa = (s) => Buffer.from(s, 'binary').toString('base64');
+global.atob = (s) => Buffer.from(s, 'base64').toString('binary');
+const visits = [];
+global.location = { assign(url) { visits.push(url); }, reload() { visits.push('reload'); } };
+let gets = 0;
+Object.defineProperty(globalThis, 'navigator', { configurable: true, writable: true, value: { credentials: { get: async ({ publicKey }) => {
+  gets += 1;
+  assert.ok(publicKey.challenge instanceof ArrayBuffer);
+  assert.strictEqual(Buffer.from(publicKey.challenge).toString('base64url'), fixture.options.challenge);
+  assert.strictEqual(publicKey.rpId, 'localhost');
+  assert.strictEqual(publicKey.userVerification, 'required');
+  assert.strictEqual(publicKey.timeout, 300000);
+  const r = fixture.answer.response;
+  return { id: fixture.answer.id, rawId: buf(fixture.answer.rawId), type: 'public-key', authenticatorAttachment: 'platform',
+    response: { clientDataJSON: buf(r.clientDataJSON), authenticatorData: buf(r.authenticatorData), signature: buf(r.signature), userHandle: buf(r.userHandle) },
+    getClientExtensionResults: () => ({}) };
+} } } });
+const posts = [];
+global.fetch = async (url, init) => {
+  posts.push([url, init]);
+  assert.strictEqual(init.method, 'POST');
+  assert.strictEqual(init.headers['X-CSRF-Token'], fixture.nonce);
+  assert.strictEqual(init.headers['Content-Type'], 'application/json');
+  if (url === '/login/passkey/options') return { ok: true, status: 200, json: async () => fixture.options };
+  if (url === '/login/passkey') return { ok: true, status: 200, json: async () => ({ redirect: '/' }) };
+  throw new Error('unexpected ' + url);
+};
+require(process.argv[2]);
+(async () => {
+  // Script ran: Touch ID shown, password fields hidden.
+  assert.strictEqual(els['touch-id'].hidden, false);
+  assert.strictEqual(els['password-fields'].hidden, true);
+  await els['touch-id-button'].listeners.click();
+  await els['touch-id-button'].listeners.click();
+  // Every press asks for fresh options.
+  assert.deepStrictEqual(posts.map((p) => p[0]), ['/login/passkey/options', '/login/passkey', '/login/passkey/options', '/login/passkey']);
+  assert.strictEqual(gets, 2);
+  assert.deepStrictEqual(visits, ['/', '/']);
+  // "Use password and code instead" brings the form back.
+  link.listeners.click({ preventDefault() {} });
+  assert.strictEqual(els['password-fields'].hidden, false);
+  assert.strictEqual(els['touch-id'].hidden, true);
+  assert.strictEqual(els.focused, true);
+  process.stdout.write(posts[1][1].body);
+})().catch((e) => { console.error(e); process.exit(1); });
+""")
+    result = subprocess.run([node, str(harness), str(tmp_path / "page.js"), str(tmp_path / "fixture.json")], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = json.loads(result.stdout)
+    assert body["keep"] is True and body["credential"]["response"]["userHandle"] == answer["response"]["userHandle"]
+    response = client.post("/login/passkey", content=result.stdout.encode(),
+                           headers=dict(OWN, **{"X-CSRF-Token": nonce, "Content-Type": "application/json"}))
+    assert response.status_code == 200 and response.json() == {"redirect": "/"}
+    assert store.session_info(client.cookies.get("__Host-oneos")).kept is True
+
+
+def test_deeply_nested_json_is_refused_without_an_error(web):
+    client, store, secret = web
+    _register(store, secret, 3030)
+    depth = 7900  # balanced, and just under the 16 KiB cap
+    nested = "[" * depth + "]" * depth
+    body = ('{"credential": {"x": ' + nested + '}, "keep": true}').encode()
+    assert len(body) <= LIMIT
+    response = client.post("/login/passkey", content=body, headers=dict(OWN, **{"X-CSRF-Token": _nonce(client), "Content-Type": "application/json"}))
+    assert response.status_code in (400, 401) and "error" in response.json()
+    csrf = _store_session(client, store, secret, 3060)
+    response = _finish(client, csrf, '{"x": ' + nested + '}')
+    assert response.status_code == 400 and "error" in response.json()
+    assert len(store.passkeys()) == 1

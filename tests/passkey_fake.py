@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 
 ORIGIN = "https://localhost:8443"
-UP, UV, AT = 0x01, 0x04, 0x40
+UP, UV, BE, BS, AT = 0x01, 0x04, 0x08, 0x10, 0x40
 
 
 def b64url(data: bytes) -> str:
@@ -53,22 +53,24 @@ class FakeAuthenticator:
         return cbor2.dumps({1: 2, 3: -7, -1: 1, -2: numbers.x.to_bytes(32, "big"), -3: numbers.y.to_bytes(32, "big")})
 
     @staticmethod
-    def _client_data(kind, challenge, origin):
-        return json.dumps({"type": kind, "challenge": b64url(challenge), "origin": origin, "crossOrigin": False}).encode()
+    def _client_data(kind, challenge, origin, cross_origin=False):
+        return json.dumps({"type": kind, "challenge": b64url(challenge), "origin": origin, "crossOrigin": cross_origin}).encode()
 
     @staticmethod
-    def _flags(up, uv, extra=0):
-        return (UP if up else 0) | (UV if uv else 0) | extra
+    def _flags(up, uv, extra=0, backup=False):
+        # backup=True sets BE and BS (backup eligible, backed up) as iCloud Keychain passkeys do.
+        return (UP if up else 0) | (UV if uv else 0) | (BE | BS if backup else 0) | extra
 
     def register(self, options_json: str, *, origin: str = ORIGIN, rp_id: str | None = None,
                  challenge: bytes | None = None, up: bool = True, uv: bool = True,
-                 sign_count: int = 0, kind: str = "webauthn.create", fmt: str = "none") -> str:
+                 sign_count: int = 0, kind: str = "webauthn.create", fmt: str = "none",
+                 cross_origin=False, backup: bool = False) -> str:
         options = json.loads(options_json)
         rp_id = _options_rp_id(options) if rp_id is None else rp_id
         challenge = unb64url(options["challenge"]) if challenge is None else challenge
         auth_data = (
             hashlib.sha256(rp_id.encode()).digest()
-            + bytes([self._flags(up, uv, AT)])
+            + bytes([self._flags(up, uv, AT, backup)])
             + struct.pack(">I", sign_count)
             + bytes(16)  # AAGUID: all zeros, as with "none" attestation
             + struct.pack(">H", len(self.credential_id)) + self.credential_id
@@ -78,7 +80,7 @@ class FakeAuthenticator:
         return json.dumps({
             "id": self.id, "rawId": self.id, "type": "public-key",
             "response": {
-                "clientDataJSON": b64url(self._client_data(kind, challenge, origin)),
+                "clientDataJSON": b64url(self._client_data(kind, challenge, origin, cross_origin)),
                 "attestationObject": b64url(attestation),
                 "transports": ["internal"],
             },
@@ -89,12 +91,12 @@ class FakeAuthenticator:
                   challenge: bytes | None = None, up: bool = True, uv: bool = True,
                   sign_count: int = 0, kind: str = "webauthn.get",
                   signer: ec.EllipticCurvePrivateKey | None = None, flip_signature: bool = False,
-                  user_handle: bytes | None = None) -> str:
+                  user_handle: bytes | None = None, cross_origin=False, backup: bool = False) -> str:
         options = json.loads(options_json)
         rp_id = _options_rp_id(options) if rp_id is None else rp_id
         challenge = unb64url(options["challenge"]) if challenge is None else challenge
-        auth_data = hashlib.sha256(rp_id.encode()).digest() + bytes([self._flags(up, uv)]) + struct.pack(">I", sign_count)
-        client_data = self._client_data(kind, challenge, origin)
+        auth_data = hashlib.sha256(rp_id.encode()).digest() + bytes([self._flags(up, uv, 0, backup)]) + struct.pack(">I", sign_count)
+        client_data = self._client_data(kind, challenge, origin, cross_origin)
         signature = (signer or self.key).sign(auth_data + hashlib.sha256(client_data).digest(), ec.ECDSA(hashes.SHA256()))
         if flip_signature:
             signature = signature[:-1] + bytes([signature[-1] ^ 0x01])

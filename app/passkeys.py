@@ -41,6 +41,8 @@ USER_DISPLAY_NAME = "OneOS owner"
 CHALLENGE_BYTES = 32
 ALGORITHMS = [COSEAlgorithmIdentifier.ECDSA_SHA_256, COSEAlgorithmIdentifier.RSASSA_PKCS1_v1_5_SHA_256]
 MAX_RESPONSE_CHARS = 64 * 1024
+# How long the browser waits for Touch ID: the stored challenge's 300 s lifetime.
+TIMEOUT_MS = 300_000
 
 
 class PasskeyRejected(ValueError):
@@ -72,9 +74,8 @@ def _load(response_json) -> dict:
     return value
 
 
-def response_challenge(response_json) -> bytes:
-    """The 32-byte challenge the answer's `clientDataJSON` claims to answer (not yet verified)."""
-    response = _load(response_json).get("response")
+def _client_data(answer: dict) -> dict:
+    response = answer.get("response")
     if not isinstance(response, dict):
         raise PasskeyRejected("answer has no response")
     try:
@@ -83,6 +84,24 @@ def response_challenge(response_json) -> bytes:
         raise PasskeyRejected("clientDataJSON is not JSON") from exc
     if not isinstance(client_data, dict):
         raise PasskeyRejected("clientDataJSON is not an object")
+    return client_data
+
+
+def _refuse_cross_origin(answer: dict) -> None:
+    """OneOS never runs in a frame: refuse an answer made inside another origin's page.
+
+    `webauthn` parses `crossOrigin` but does not check it. Absent or exactly
+    false is accepted; anything else (true, "true", 1) is refused, as is a
+    `topOrigin`, which browsers only send for a cross-origin ceremony.
+    """
+    client_data = _client_data(answer)
+    if client_data.get("crossOrigin", False) is not False or "topOrigin" in client_data:
+        raise PasskeyRejected("cross-origin ceremony")
+
+
+def response_challenge(response_json) -> bytes:
+    """The 32-byte challenge the answer's `clientDataJSON` claims to answer (not yet verified)."""
+    client_data = _client_data(_load(response_json))
     challenge = _strict_base64url(client_data.get("challenge"))
     if len(challenge) != CHALLENGE_BYTES:
         raise PasskeyRejected("challenge has the wrong length")
@@ -123,6 +142,7 @@ def registration_options(rp_id: str, challenge: bytes, exclude: list[bytes]) -> 
         user_name=USER_NAME,
         user_display_name=USER_DISPLAY_NAME,
         challenge=challenge,
+        timeout=TIMEOUT_MS,
         attestation=AttestationConveyancePreference.NONE,
         authenticator_selection=AuthenticatorSelectionCriteria(
             resident_key=ResidentKeyRequirement.REQUIRED,
@@ -138,6 +158,7 @@ def authentication_options(rp_id: str, challenge: bytes) -> str:
     return options_to_json(generate_authentication_options(
         rp_id=rp_id,
         challenge=challenge,
+        timeout=TIMEOUT_MS,
         allow_credentials=[],
         user_verification=UserVerificationRequirement.REQUIRED,
     ))
@@ -148,6 +169,7 @@ def verify_registration(response_json: str, challenge: bytes, rp_id: str, origin
     try:
         _check_challenge(challenge)
         answer = _load(response_json)
+        _refuse_cross_origin(answer)
         verified = verify_registration_response(
             credential=answer,
             expected_challenge=challenge,
@@ -176,7 +198,9 @@ def verify_authentication(response_json: str, challenge: bytes, rp_id: str, orig
     """The new sign count of a verified sign-in with user verification."""
     try:
         _check_challenge(challenge)
-        credential = parse_authentication_credential_json(_load(response_json))
+        answer = _load(response_json)
+        _refuse_cross_origin(answer)
+        credential = parse_authentication_credential_json(answer)
         user_handle = credential.response.user_handle
         if user_handle is not None and user_handle != USER_ID:
             raise PasskeyRejected("passkey belongs to another user")
