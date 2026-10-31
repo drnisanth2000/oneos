@@ -258,6 +258,11 @@ def test_settings_live_in_the_sidebar_foot_without_credential_fields(client):
     assert "OneOS.command backup" in foot
     assert "OneOS.command recover" in foot
     assert 'type="password"' not in html
+    # Signed out (auth disabled in tests) the Sign-in section is just the Terminal note.
+    assert ">Sign-in<" in foot and "which also removes Touch ID" in foot
+    assert "Set up Touch ID" not in html and "Sign out everywhere" not in html
+    assert "/static/passkey.js" not in html
+    assert "once a day" not in foot and "only when you run a backup" in foot
     # The saved appearance is applied before first paint.
     head = html[: html.index("</head>")]
     assert "localStorage.getItem('oneos.theme')" in head

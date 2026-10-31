@@ -16,6 +16,7 @@ dependencies = [
     "watchdog>=4.0",
     "pypdf>=4.0",
     "python-multipart>=0.0.9",
+    "webauthn>=2.2,<3",
 ]
 
 # Dependency changes are a hard stop for agents (AGENTS.md, "Cloud and

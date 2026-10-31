@@ -48,3 +48,4 @@ function oneosThemeColor(theme) {
 <script defer src="/static/vendor/alpine-persist.min.js"></script>
 <script defer src="/static/vendor/htmx-ext-alpine-morph.js"></script>
 <script defer src="/static/vendor/alpine.min.js"></script>
+{% if request.state.owner_authenticated | default(false) %}<script defer src="/static/passkey.js"></script>{% endif %}

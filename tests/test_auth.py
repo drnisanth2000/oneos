@@ -551,7 +551,546 @@ def test_corrupt_session_is_unavailable_without_mutation_and_restore_recovers(ow
             assert db.execute("SELECT token,csrf,created,seen FROM sessions").fetchone() == corrupted
             with db:
                 db.execute("DELETE FROM sessions")
-                db.execute("INSERT INTO sessions VALUES(?,?,?,?)", original)
+                db.execute("INSERT INTO sessions(token,csrf,created,seen) VALUES(?,?,?,?)", original)
         store.available()
         assert store.session(token) == original[1]
         assert client.get("/docs").status_code == 200
+
+
+def _old_schema_store(tmp_path):
+    """A database written before kept sessions/passkeys: the three original tables only."""
+    import sqlite3
+    import pyotp
+    from app.auth import AuthStore, HASHER
+    directory = tmp_path / "old-auth"
+    directory.mkdir(mode=0o700)
+    secret = pyotp.random_base32()
+    path = directory / "owner.sqlite3"
+    with closing(sqlite3.connect(path)) as db:
+        with db:
+            db.execute("CREATE TABLE owner(id INTEGER PRIMARY KEY CHECK(id=1), password TEXT NOT NULL, secret TEXT NOT NULL, counter INTEGER NOT NULL)")
+            db.execute("CREATE TABLE sessions(token TEXT PRIMARY KEY, csrf TEXT NOT NULL, created REAL NOT NULL, seen REAL NOT NULL)")
+            db.execute("CREATE TABLE throttle(id INTEGER PRIMARY KEY CHECK(id=1), failures INTEGER NOT NULL, blocked REAL NOT NULL)")
+            db.execute("INSERT INTO throttle VALUES(1,0,0)")
+            db.execute("INSERT INTO owner VALUES(1,?,?,?)", (HASHER.hash("synthetic owner password"), secret, 100))
+    path.chmod(0o600)
+    return AuthStore(directory), secret
+
+
+def _columns(path, table):
+    import sqlite3
+    with closing(sqlite3.connect(path)) as db:
+        return [row[1] for row in db.execute(f"PRAGMA table_info({table})")]
+
+
+def _tables(path):
+    import sqlite3
+    with closing(sqlite3.connect(path)) as db:
+        return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _markers(path):
+    import sqlite3
+    with closing(sqlite3.connect(path)) as db:
+        return sorted(row[0] for row in db.execute("SELECT token FROM kept_sessions"))
+
+
+SESSION_COLUMNS = ["token", "csrf", "created", "seen"]
+
+
+def _binding(secret):
+    """What a passkey row stores to bind it to the owner's authenticator secret."""
+    import hashlib
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+def test_old_schema_database_still_signs_in_and_writes_nothing_on_read(tmp_path):
+    import sqlite3
+    import time
+    import pyotp
+    store, secret = _old_schema_store(tmp_path)
+    # A session written by the previous release (four columns, no kept).
+    old_token = "A" * 43
+    from app.auth import digest
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (digest(old_token), "B" * 43, time.time(), time.time()))
+    before = store.path.read_bytes()
+    store.available()
+    assert store.path.read_bytes() == before
+    assert "kept_sessions" not in _tables(store.path)
+    info = store.session_info(old_token, now=time.time())
+    assert info.csrf == "B" * 43 and info.kept is False
+    assert "kept_sessions" not in _tables(store.path)
+    before = store.path.read_bytes()
+    store.available()
+    assert store.path.read_bytes() == before
+    token = store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), keep=True, now=3030)
+    assert token
+    # The sessions table keeps exactly the previous release's four columns.
+    assert _columns(store.path, "sessions") == SESSION_COLUMNS
+    assert _columns(store.path, "kept_sessions") == ["token"]
+    store.available()
+    assert store.session_info(token, now=3031).kept is True
+
+
+def test_recover_deletes_passkeys_challenges_and_sessions(owner):
+    import sqlite3
+    import time
+    import pyotp
+    store, secret = owner
+    token = store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), keep=True, now=3030)
+    assert store.session_info(token, now=3031).kept is True
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", ("a" * 22, b"key", 0, time.time(), _binding(secret)))
+            db.execute("INSERT INTO passkey_challenges VALUES(?,?,?)", ("d" * 64, "login", time.time() + 300))
+    store.available()
+    store.enroll("another synthetic owner password", secret, pyotp.TOTP(secret).at(4000), now=4000, recover=True)
+    with closing(sqlite3.connect(store.path)) as db:
+        for table in ("sessions", "kept_sessions", "passkeys", "passkey_challenges"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,), table
+    store.available()
+    assert store.session(token, now=4001) is None
+
+
+def test_enroll_creates_current_schema(owner):
+    store, _ = owner
+    assert _columns(store.path, "sessions") == SESSION_COLUMNS
+    assert _columns(store.path, "kept_sessions") == ["token"]
+    assert _columns(store.path, "passkeys") == ["id", "public_key", "sign_count", "created", "owner_binding"]
+    assert _columns(store.path, "passkey_challenges") == ["digest", "purpose", "expires"]
+
+
+@pytest.mark.parametrize("column,bad_value", [
+    ("public_key", b""), ("public_key", "text"),
+    ("sign_count", -1), ("sign_count", 1.5),
+    ("created", -1), ("created", float("inf")),
+    ("id", "short"), ("id", "not base64url!" * 2),
+    ("owner_binding", "short"), ("owner_binding", "A" * 64), ("owner_binding", "g" * 64),
+    ("owner_binding", "a" * 65), ("owner_binding", 5), ("owner_binding", b"\x00" * 32),
+])
+def test_invalid_passkey_row_makes_store_unavailable(owner, column, bad_value):
+    import sqlite3
+    from app.auth import AuthUnavailable
+    store, secret = owner
+    good = {"id": "a" * 22, "public_key": b"key", "sign_count": 0, "created": 5.0, "owner_binding": _binding(secret)}
+    good[column] = bad_value
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", tuple(good[name] for name in ("id", "public_key", "sign_count", "created", "owner_binding")))
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
+def test_valid_passkey_row_is_available(owner):
+    import sqlite3
+    store, secret = owner
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", ("a" * 22, b"key", 3, 5.0, _binding(secret)))
+    store.available()
+    # A well-formed binding for another secret is not unsafe state, only a revoked passkey.
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?,?)", ("b" * 22, b"key", 3, 5.0, "0" * 64))
+    store.available()
+    assert [key_id for key_id, _ in store.passkeys()] == ["a" * 22]
+
+
+@pytest.mark.parametrize("marker", [None, 5, 1.5, b"\x00" * 32, "short", "A" * 64, "g" * 64, "a" * 63, "a" * 65])
+def test_malformed_kept_marker_makes_store_unavailable(owner, marker):
+    import sqlite3
+    import pyotp
+    from app.auth import AuthUnavailable
+    store, secret = owner
+    assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), keep=True, now=3030)
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO kept_sessions(token) VALUES(?)", (marker,))
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
+def test_orphan_kept_marker_is_ignored_and_never_keeps_another_session(owner):
+    """A marker whose session is gone (the previous release deleted it) is tolerated, not trusted."""
+    import sqlite3
+    from app.auth import digest
+    store, secret = owner
+    orphan = digest("O" * 43)
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO kept_sessions(token) VALUES(?)", (orphan,))
+    before = store.path.read_bytes()
+    store.available()
+    assert store.path.read_bytes() == before  # tolerating it is a read: nothing is written
+    assert store.session("O" * 43, now=3031) is None
+    token = _store_login(store, secret, 3030)
+    assert store.session_info(token, now=3031).kept is False
+    assert store.session(token, now=3031 + 1800) is None  # the unkept limits apply
+    # The next sign-in (a write) clears orphans away.
+    assert orphan not in _markers(store.path)
+    store.available()
+
+
+def test_ending_a_session_removes_its_kept_marker(owner):
+    from app.auth import digest
+    store, secret = owner
+    first = _store_login(store, secret, 3030, keep=True)
+    second = _store_login(store, secret, 3060, keep=True)
+    third = _store_login(store, secret, 3090, keep=True)
+    assert _markers(store.path) == sorted(digest(t) for t in (first, second, third))
+    store.logout(first)
+    assert _markers(store.path) == sorted(digest(t) for t in (second, third))
+    store.logout_everywhere()
+    assert _markers(store.path) == []
+    store.available()
+
+
+def test_previous_release_still_works_on_an_upgraded_database(owner):
+    """Rolling back must not lock the owner out: the previous release's own SQL still runs.
+
+    The statements below are the previous release's, verbatim: its positional
+    session insert, its expiry purge (which knows nothing of kept sessions),
+    its session read and touch, its validation read, and its recovery delete.
+    """
+    import sqlite3
+    import time
+    import pyotp
+    from app.auth import digest
+    from tests.passkey_fake import ORIGIN, FakeAuthenticator
+    store, secret = owner
+    kept = _store_login(store, secret, 3030, keep=True)
+    other = _store_login(store, secret, 3060, keep=True)
+    options = store.begin_registration("synthetic owner password", pyotp.TOTP(secret).at(3090), origin=ORIGIN, now=3090)
+    assert store.finish_registration(FakeAuthenticator().register(options), origin=ORIGIN, now=3091) is True
+    assert len(_markers(store.path)) == 2
+    now = time.time()
+    old_token = "Q" * 43
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            # Previous release: sign-in (purge, then positional insert).
+            db.execute("DELETE FROM sessions WHERE seen<=? OR created<=?", (now - 1800, now - 43200))
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (digest(old_token), "C" * 43, now, now))
+        # Previous release: available() reads exactly four columns.
+        assert db.execute("SELECT token,csrf,created,seen FROM sessions").fetchall() == [(digest(old_token), "C" * 43, now, now)]
+        with db:
+            # Previous release: session() read and touch.
+            assert db.execute("SELECT token,csrf,created,seen FROM sessions WHERE token=?", (digest(old_token),)).fetchone()
+            db.execute("UPDATE sessions SET seen=? WHERE token=?", (now, digest(old_token)))
+    # Both kept sessions were purged by the old release; their markers are orphans now.
+    assert _markers(store.path) == sorted([digest(kept), digest(other)])
+    # This build, rolled forward again, still works on the same file.
+    store.available()
+    assert store.session(kept, now=now) is None and store.session(other, now=now) is None
+    info = store.session_info(old_token, now=now)
+    assert info.csrf == "C" * 43 and info.kept is False
+    assert store.session(old_token, now=now + 1800) is None  # an old-release session is unkept
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            # Previous release: recovery deletes every session (and nothing else).
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (digest(old_token), "C" * 43, now, now))
+            db.execute("DELETE FROM sessions")
+    store.available()
+    assert store.session(old_token, now=now) is None
+    token = _store_login(store, secret, 4000, keep=True)
+    assert store.session_info(token, now=4001).kept is True
+    assert _markers(store.path) == [digest(token)]  # orphans cleared by the write
+    assert _columns(store.path, "sessions") == SESSION_COLUMNS
+    store.available()
+
+
+def _previous_release_recover(store, password, *, now=None):
+    """The previous release's recovery, verbatim: new owner row, sessions deleted, nothing else.
+
+    It knows nothing of passkeys, so their rows survive it. Returns the new secret.
+    """
+    import sqlite3
+    import time
+    import pyotp
+    from app.auth import HASHER
+    secret = pyotp.random_base32()
+    now = time.time() if now is None else now
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT OR REPLACE INTO owner VALUES(1,?,?,?)", (HASHER.hash(password), secret, int(now // 30)))
+            db.execute("DELETE FROM sessions")
+    return secret
+
+
+def _passkey_rows(store):
+    import sqlite3
+    with closing(sqlite3.connect(store.path)) as db:
+        return db.execute("SELECT id FROM passkeys").fetchall()
+
+
+def test_previous_release_recover_revokes_passkeys_after_roll_forward(owner):
+    """Register, roll back and recover (a suspect credential), roll forward: Touch ID is revoked."""
+    import hashlib
+    import sqlite3
+    import time
+    import pyotp
+    from app.main import app
+    from tests.passkey_fake import ORIGIN, FakeAuthenticator, b64url
+    store, secret = owner
+    fake = FakeAuthenticator()
+    options = store.begin_registration("synthetic owner password", pyotp.TOTP(secret).at(3030), origin=ORIGIN, now=3030)
+    assert store.finish_registration(fake.register(options), origin=ORIGIN, now=3031) is True
+    assert [key_id for key_id, _ in store.passkeys()] == [fake.id]
+    new_secret = _previous_release_recover(store, "another synthetic owner password")
+    # This build again. Reads hide the revoked passkey and write nothing.
+    store.available()
+    before = store.path.read_bytes()
+    assert store.passkeys() == []
+    assert store.path.read_bytes() == before
+    assert _passkey_rows(store) == [(fake.id,)]
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        page = client.get("/login")
+        assert page.status_code == 200 and "Sign in with Touch ID" not in page.text
+    # A sign-in answer from the revoked passkey, to a live challenge, is refused and counted.
+    now = time.time()
+    challenge = bytes(range(32))
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkey_challenges VALUES(?,?,?)", (hashlib.sha256(challenge).hexdigest(), "login", now + 200))
+    answer = fake.assertion('{"rpId": "localhost", "challenge": "' + b64url(challenge) + '"}')
+    assert store.finish_login(answer, origin=ORIGIN, keep=True, now=now) is None
+    with closing(sqlite3.connect(store.path)) as db:
+        assert db.execute("SELECT failures FROM throttle").fetchone() == (1,)
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+    # The same write transaction removed the stale row.
+    assert _passkey_rows(store) == []
+    store.available()
+    # The recovered credentials still sign in.
+    assert store.login("another synthetic owner password", pyotp.TOTP(new_secret).at(now + 30), now=now + 30)
+
+
+def test_passkey_registered_under_the_current_secret_survives_and_signs_in(owner):
+    import pyotp
+    from tests.passkey_fake import ORIGIN, FakeAuthenticator
+    store, secret = owner
+    stale = FakeAuthenticator()
+    options = store.begin_registration("synthetic owner password", pyotp.TOTP(secret).at(3030), origin=ORIGIN, now=3030)
+    assert store.finish_registration(stale.register(options), origin=ORIGIN, now=3031) is True
+    new_secret = _previous_release_recover(store, "synthetic owner password", now=3060)
+    # The recovery spent its code window; set up again in the next one.
+    now = 3090
+    fresh = FakeAuthenticator()
+    options = store.begin_registration("synthetic owner password", pyotp.TOTP(new_secret).at(now), origin=ORIGIN, now=now)
+    assert options and stale.id not in options  # the revoked passkey is not excluded as "already set up"
+    assert store.finish_registration(fresh.register(options), origin=ORIGIN, now=now + 1) is True
+    # Setup (a write) removed the stale one; only the new passkey is stored and listed.
+    assert _passkey_rows(store) == [(fresh.id,)]
+    assert [key_id for key_id, _ in store.passkeys()] == [fresh.id]
+    login = store.begin_login(origin=ORIGIN, now=now + 2)
+    assert store.finish_login(fresh.assertion(login), origin=ORIGIN, keep=False, now=now + 3)
+    store.available()
+
+
+def test_webauthn_is_importable():
+    import webauthn
+    assert webauthn.generate_registration_options
+
+
+KEPT_AGE = 34560000
+OWN_ORIGIN = {"Origin": "https://localhost:8443"}
+
+
+def _store_login(store, secret, at, *, keep=False):
+    import pyotp
+    return store.login("synthetic owner password", pyotp.TOTP(secret).at(at), keep=keep, now=at)
+
+
+def test_kept_session_outlives_idle_and_absolute_limits(owner):
+    store, secret = owner
+    token = _store_login(store, secret, 3030, keep=True)
+    assert store.session_info(token, now=3030 + 3600).kept is True
+    # 13 h after sign-in, and 13 h of silence: neither limit applies.
+    info = store.session_info(token, now=3030 + 13 * 3600)
+    assert info.kept is True and store.session(token, now=3030 + 26 * 3600) == info.csrf
+    assert store.session_info(token, now=3030 + 400 * 86400)
+
+
+def test_kept_session_survives_a_clock_that_steps_backwards(owner):
+    store, secret = owner
+    token = _store_login(store, secret, 3030, keep=True)
+    assert store.session(token, now=9000)
+    # The clock steps back to before the session was created. `seen` must not
+    # be written below `created`, or available() would fail every request.
+    assert store.session(token, now=1000)
+    store.available()
+    assert store.session(token, now=1001)
+
+
+def test_unkept_session_limits_unchanged(owner):
+    store, secret = owner
+    token = _store_login(store, secret, 3030)
+    assert store.session_info(token, now=3031).kept is False
+    assert store.session(token, now=3031 + 1799)
+    assert store.session(token, now=3031 + 1799 + 1800) is None  # idle
+    token = _store_login(store, secret, 4000)
+    for now in range(4001, 46000, 1000):
+        assert store.session(token, now=now)
+    assert store.session(token, now=4000 + 43200) is None  # absolute
+
+
+def test_login_purge_keeps_kept_sessions(owner):
+    import sqlite3
+    store, secret = owner
+    kept = _store_login(store, secret, 3030, keep=True)
+    unkept = _store_login(store, secret, 3060)
+    later = 3060 + 50000
+    assert _store_login(store, secret, later, keep=False)
+    from app.auth import digest
+    with closing(sqlite3.connect(store.path)) as db:
+        rows = db.execute("SELECT token FROM sessions ORDER BY created").fetchall()
+    # The expired unkept one was purged, the kept one was not; the newest is the third sign-in.
+    assert len(rows) == 2 and rows[0] == (digest(kept),)
+    assert _markers(store.path) == [digest(kept)]
+    assert store.session(unkept, now=later) is None
+    assert store.session(kept, now=later)
+
+
+def _web_login(client, secret, *, keep):
+    import pyotp
+    page = client.get("/login")
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text).group(1)
+    data = {"password": "synthetic owner password", "code": pyotp.TOTP(secret).now(), "csrf_token": csrf}
+    if keep:
+        data["keep"] = "1"
+    return client.post("/login", data=data, headers=OWN_ORIGIN)
+
+
+def _cookie_headers(response, name):
+    return [value for value in response.headers.get_list("set-cookie") if value.startswith(name + "=")]
+
+
+def test_login_form_offers_keep_checked_by_default(owner):
+    from app.main import app
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        page = client.get("/login").text
+    assert re.search(r'<input[^>]*type="checkbox"[^>]*name="keep"[^>]*value="1"[^>]*checked', page)
+    assert "Keep me signed in on this Mac" in page
+
+
+def test_kept_login_sets_long_cookie_and_renews_it(owner, monkeypatch):
+    import time
+    from app import auth
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        response = _web_login(client, secret, keep=True)
+        assert response.status_code == 303
+        (cookie,) = _cookie_headers(response, "__Host-oneos")
+        assert f"Max-Age={KEPT_AGE}" in cookie
+        for flag in ("Secure", "HttpOnly", "SameSite=strict", "Path=/"):
+            assert flag in cookie
+        (issued,) = _cookie_headers(response, "__Host-oneos-issued")
+        assert f"Max-Age={KEPT_AGE}" in issued and "Secure" in issued and "HttpOnly" in issued
+        token = client.cookies.get("__Host-oneos")
+        assert store.session_info(token).kept is True
+        # Same day: no re-issue.
+        assert _cookie_headers(client.get("/docs"), "__Host-oneos") == []
+        real = time.time()
+        monkeypatch.setattr(auth.time, "time", lambda: real + 86401)
+        response = client.get("/docs")
+        assert response.status_code == 200
+        (renewed,) = _cookie_headers(response, "__Host-oneos")
+        assert renewed.startswith(f"__Host-oneos={token};") and f"Max-Age={KEPT_AGE}" in renewed
+        assert len(_cookie_headers(response, "__Host-oneos-issued")) == 1
+        # Renewed once; the next request that day does not renew again.
+        assert _cookie_headers(client.get("/docs"), "__Host-oneos") == []
+        # Past the idle and absolute limits the kept session still works.
+        monkeypatch.setattr(auth.time, "time", lambda: real + 3 * 86400)
+        assert client.get("/docs").status_code == 200
+
+
+def test_kept_session_without_a_usable_issue_stamp_is_renewed(owner):
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        assert _web_login(client, secret, keep=True).status_code == 303
+        for stamp in ("", "garbage", "-5", "9" * 20):
+            client.cookies.set("__Host-oneos-issued", stamp, domain="localhost.local")
+            assert len(_cookie_headers(client.get("/docs"), "__Host-oneos")) == 1, stamp
+
+
+def test_unkept_login_gets_short_cookie_and_is_never_renewed_or_promoted(owner, monkeypatch):
+    import time
+    from app import auth
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        response = _web_login(client, secret, keep=False)
+        assert response.status_code == 303
+        (cookie,) = _cookie_headers(response, "__Host-oneos")
+        assert "Max-Age=43200" in cookie
+        token = client.cookies.get("__Host-oneos")
+        # A client forging every hint it controls changes nothing for an unkept session.
+        client.cookies.set("__Host-oneos-issued", "0", domain="localhost.local")
+        client.cookies.set("__Host-oneos-kept", "1", domain="localhost.local")
+        real = time.time()
+        monkeypatch.setattr(auth.time, "time", lambda: real + 1000)
+        response = client.get("/docs", headers={"X-OneOS-Keep": "1"})
+        assert response.status_code == 200
+        assert _cookie_headers(response, "__Host-oneos") == []
+        assert store.session_info(token, now=real + 1000).kept is False
+        monkeypatch.setattr(auth.time, "time", lambda: real + 50000)
+        assert client.get("/docs").status_code == 303  # absolute limit still applies
+        assert store.session_info(token, now=real + 50000) is None
+
+
+def _cleared(response, name):
+    return any("Max-Age=0" in value for value in _cookie_headers(response, name))
+
+
+def test_logout_and_logout_everywhere_end_kept_sessions(owner):
+    from app.main import app
+    store, secret = owner
+    # Store-side sign-ins first: their small `now` values must precede the web sign-in's TOTP step.
+    first = _store_login(store, secret, 3030, keep=True)
+    second = _store_login(store, secret, 3060, keep=True)
+    store.logout(first)
+    assert store.session(first) is None and store.session(second)
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        assert _web_login(client, secret, keep=True).status_code == 303
+        token = client.cookies.get("__Host-oneos")
+        csrf = store.session(token)
+        # Sign out ends only this session and clears both cookies.
+        response = client.post("/logout", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": csrf}))
+        assert response.status_code == 303 and response.headers["location"] == "/login"
+        assert _cleared(response, "__Host-oneos") and _cleared(response, "__Host-oneos-issued")
+        assert store.session(token) is None
+        assert store.session(second)
+        # Sign out everywhere, from a session that is itself kept, ends every session.
+        client.cookies.set("__Host-oneos", second, domain="localhost.local")
+        response = client.post("/logout/everywhere", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": store.session(second), "HX-Request": "true"}))
+        assert response.status_code == 303
+        assert response.headers["location"] == "/login" and response.headers["HX-Redirect"] == "/login"
+        assert _cleared(response, "__Host-oneos") and _cleared(response, "__Host-oneos-issued")
+        assert store.session(second) is None
+        assert client.get("/docs").status_code == 303
+    store.logout_everywhere()  # idempotent on an empty table
+    store.available()
+
+
+def test_logout_everywhere_requires_csrf(owner):
+    from app.main import app
+    store, secret = owner
+    token = _store_login(store, secret, 3030, keep=True)
+    other = _store_login(store, secret, 3060, keep=True)
+    csrf = store.session(token)
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        client.cookies.set("__Host-oneos", token, domain="localhost.local")
+        # No token, wrong token, wrong origin, no origin: refused, nothing deleted.
+        assert client.post("/logout/everywhere", headers=OWN_ORIGIN).status_code == 403
+        assert client.post("/logout/everywhere", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": "x" * 43})).status_code == 403
+        assert client.post("/logout/everywhere", headers={"Origin": "https://evil.invalid", "X-CSRF-Token": csrf}).status_code == 403
+        assert client.post("/logout/everywhere", headers={"X-CSRF-Token": csrf}).status_code == 403
+        # A GET is not the sign-out action.
+        assert client.get("/logout/everywhere").status_code != 303
+        assert store.session(token) and store.session(other)
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as anonymous:
+        response = anonymous.post("/logout/everywhere", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": csrf}))
+        assert response.status_code == 401
+    assert store.session(other)

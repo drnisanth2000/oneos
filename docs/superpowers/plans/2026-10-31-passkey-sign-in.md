@@ -18,8 +18,8 @@
 - Challenges: 32 random bytes, stored only as SHA-256 digests with a purpose (`"register"` or `"login"`) and an expiry of 300 s; single-use (deleted when verified, refused when expired or reused).
 - A sign counter of 0 on both stored and received values is accepted (synced passkeys); otherwise the received counter must be greater than the stored one, else refuse.
 - Every passkey sign-in failure counts toward the existing `throttle` row exactly like a failed password; a blocked throttle refuses passkey sign-in; success resets it.
-- Kept sessions (`kept=1`) have no idle or absolute limit; unkept sessions keep `IDLE_SECONDS = 1800` and `ABSOLUTE_SECONDS = 43200`. Kept-session cookie `max_age = 34560000` (400 days), re-issued when the last issue is older than 86400 s. Cookie flags unchanged: `__Host-` prefix, `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`.
-- Schema: reads never write. A database from before this change (no `kept` column, no `passkeys`/`passkey_challenges` tables) must still pass `available()` and serve unkept sessions; the new column and tables are created inside the first write transaction that needs them (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN` guarded by a column check).
+- Kept sessions (a marker row in `kept_sessions`) have no idle or absolute limit; unkept sessions keep `IDLE_SECONDS = 1800` and `ABSOLUTE_SECONDS = 43200`. Kept-session cookie `max_age = 34560000` (400 days), re-issued when the last issue is older than 86400 s. Cookie flags unchanged: `__Host-` prefix, `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`.
+- Schema: reads never write. A database from before this change (no `kept_sessions`, `passkeys` or `passkey_challenges` tables) must still pass `available()` and serve unkept sessions; the new tables are created inside the first write transaction that needs them (`CREATE TABLE IF NOT EXISTS`). `sessions` keeps exactly its original four columns, so the previous release (which inserts sessions positionally) still works if rolled back to; a session is kept iff its token digest has a row in `kept_sessions(token TEXT PRIMARY KEY)`. (Amended after final review: an earlier draft added a `sessions.kept` column, which would lock the owner out on rollback.)
 - `recover` (via `_save_owner`) deletes every session, every passkey and every challenge.
 - CSRF, Origin, Host, body-size and cookie checks in `OwnerAuthMiddleware` apply unchanged to every new endpoint. Pre-sign-in endpoints use the existing login cookie nonce as their CSRF token; signed-in endpoints use the session CSRF token (`X-CSRF-Token`).
 - Nothing touches the vault. No network call leaves the Mac.
@@ -29,7 +29,7 @@
 
 ## Review Focus
 
-1. **An existing install's database (no new column or tables)** — sign-in, `available()`, `session()` and doctor keep working, and nothing is written until a write needs the new schema. Pinned in Task 1.
+1. **An existing install's database (no new tables)** — sign-in, `available()`, `session()` and doctor keep working, and nothing is written until a write needs the new schema. Pinned in Task 1.
 2. **A passkey answer replayed, for the wrong origin/RP ID, without user verification, or after Remove/recover** — refused and counted by the throttle. Pinned in Tasks 3 and 4.
 3. **The password + code backup** — still works with passkeys stored, with "Keep me signed in" ticked or not. Pinned in Tasks 2 and 4.
 4. **A kept session across days** — survives idle and 12 h, its cookie is renewed, and Sign out / Sign out everywhere / recover end it. Pinned in Task 2.
@@ -45,12 +45,12 @@
 
 **Interfaces:**
 - Produces in `app/auth.py`:
-  - `_ensure_schema(db) -> None` — inside a write transaction: adds `sessions.kept INTEGER NOT NULL DEFAULT 0` if missing; creates `passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL)` and `passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)` if missing.
-  - `_has_column(db, table, column) -> bool`, `_has_table(db, table) -> bool`.
-  - `_validate_session` accepts the 5-column row `(token, csrf, created, seen, kept)` with `kept in (0, 1)`; `available()` reads `kept` only when the column exists, and validates `passkeys` rows (id base64url 16–1024 chars, `public_key` non-empty bytes, `sign_count` int ≥ 0, `created` finite ≥ 0) only when the table exists.
+  - `_ensure_schema(db) -> None` — inside a write transaction: creates `kept_sessions(token TEXT PRIMARY KEY)`, `passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL, owner_binding TEXT NOT NULL)` (the binding is the SHA-256 hex of the owner's TOTP secret at setup; a passkey whose binding no longer matches was revoked by a recovery, including an older release's, and is never listed or accepted, and is deleted by the next passkey write) and `passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)` if missing.
+  - `_has_table(db, table) -> bool`.
+  - `_validate_session` checks the 4-column row `(token, csrf, created, seen)`; `available()` checks every `kept_sessions` marker is a well-formed digest when the table exists (a marker with no session is tolerated and never makes anything kept), and validates `passkeys` rows (id base64url 16–1024 chars, `public_key` non-empty bytes, `sign_count` int ≥ 0, `created` finite ≥ 0) only when the table exists.
   - `_save_owner` (enroll and recover) calls `_ensure_schema` and deletes all `sessions`, `passkeys`, `passkey_challenges`.
 
-- [ ] **Step 1: Failing tests** — `test_old_schema_database_still_signs_in_and_writes_nothing_on_read` (build a DB with today's three tables only; `available()`, `session()` on a real token, and `login()` work; after `available()` the file bytes are unchanged; after `login()` the `kept` column exists); `test_recover_deletes_passkeys_challenges_and_sessions`; `test_invalid_passkey_row_makes_store_unavailable` (parametrise: empty key, negative counter, NaN created); `test_webauthn_is_importable` (`import webauthn`).
+- [ ] **Step 1: Failing tests** — `test_old_schema_database_still_signs_in_and_writes_nothing_on_read` (build a DB with today's three tables only; `available()`, `session()` on a real token, and `login()` work; after `available()` the file bytes are unchanged; after `login()` the `kept_sessions` table exists and `sessions` still has four columns); `test_recover_deletes_passkeys_challenges_and_sessions`; `test_invalid_passkey_row_makes_store_unavailable` (parametrise: empty key, negative counter, NaN created); `test_webauthn_is_importable` (`import webauthn`).
 - [ ] **Step 2: Run** `env -u GIT_EDITOR uv run pytest -q tests/test_auth.py` — new tests fail.
 - [ ] **Step 3: Implement**; add `"webauthn>=2.2,<3"` to dependencies and run `uv lock`.
 - [ ] **Step 4: Run** `tests/test_auth.py tests/test_local_service.py -k "auth or diagnostic"` — pass (doctor's authentication check must still read an upgraded DB).
@@ -67,7 +67,7 @@
 **Interfaces:**
 - Consumes: Task 1 schema.
 - Produces:
-  - `AuthStore.login(password, code, *, keep: bool = False, now=None) -> str | None` — creates the session with `kept=int(keep)`; its purge deletes only expired **unkept** sessions.
+  - `AuthStore.login(password, code, *, keep: bool = False, now=None) -> str | None` — creates the session (and, when `keep`, its `kept_sessions` marker in the same transaction); its purge deletes only expired **unkept** sessions.
   - `@dataclass(frozen=True) class SessionInfo: csrf: str; kept: bool` and `AuthStore.session_info(token, *, now=None) -> SessionInfo | None` — kept sessions skip the idle/absolute checks; `session()` keeps its signature and returns `session_info(...).csrf` or `None`.
   - `AuthStore.logout_everywhere() -> None` — deletes every session.
   - Middleware: `POST /login` reads an optional `keep` field (`"1"` = kept; the form's checkbox is ticked by default); a kept login sets the cookie with `max_age=34560000`; a kept session's cookie is re-issued on a response when the cookie's issue time is older than 86400 s (track issue time in a second `__Host-oneos-issued` cookie or the session row — builder's choice); `POST /logout/everywhere` (signed-in, CSRF) calls `logout_everywhere()` and redirects to `/login` with `HX-Redirect`.
@@ -94,7 +94,7 @@
   - `AuthStore.begin_registration(password, code, *, origin, now=None) -> str | None` — the same password + code check as `login` (counter advance, throttle) without creating a session; on success stores a `"register"` challenge and returns options JSON; `None` on failure.
   - `AuthStore.finish_registration(response_json, *, origin, now=None) -> bool` — consumes a live `"register"` challenge (found by the response's `clientDataJSON.challenge`), verifies, stores the passkey (`created=now`); `False` on any failure, never raises for bad input.
   - `AuthStore.begin_login(*, origin, now=None) -> str | None` — `None` if no passkey is stored or the throttle blocks; else stores a `"login"` challenge and returns options JSON.
-  - `AuthStore.finish_login(response_json, *, origin, keep: bool, now=None) -> str | None` — consumes the challenge, looks up the credential, verifies with UV, checks the counter rule, updates `sign_count`, resets the throttle, creates a session (`kept=int(keep)`) and returns its token; any failure increments the throttle and returns `None`.
+  - `AuthStore.finish_login(response_json, *, origin, keep: bool, now=None) -> str | None` — consumes the challenge, looks up the credential, verifies with UV, checks the counter rule, updates `sign_count`, resets the throttle, creates a session (kept when `keep`) and returns its token; any failure increments the throttle and returns `None`.
   - `AuthStore.passkeys() -> list[tuple[str, float]]` (id, created) and `AuthStore.remove_passkey(credential_id: str) -> bool`.
   - Expired challenges are deleted inside any write transaction that touches challenges.
 
