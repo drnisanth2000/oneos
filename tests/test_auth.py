@@ -551,7 +551,131 @@ def test_corrupt_session_is_unavailable_without_mutation_and_restore_recovers(ow
             assert db.execute("SELECT token,csrf,created,seen FROM sessions").fetchone() == corrupted
             with db:
                 db.execute("DELETE FROM sessions")
-                db.execute("INSERT INTO sessions VALUES(?,?,?,?)", original)
+                db.execute("INSERT INTO sessions(token,csrf,created,seen) VALUES(?,?,?,?)", original)
         store.available()
         assert store.session(token) == original[1]
         assert client.get("/docs").status_code == 200
+
+
+def _old_schema_store(tmp_path):
+    """A database written before kept sessions/passkeys: the three original tables only."""
+    import sqlite3
+    import pyotp
+    from app.auth import AuthStore, HASHER
+    directory = tmp_path / "old-auth"
+    directory.mkdir(mode=0o700)
+    secret = pyotp.random_base32()
+    path = directory / "owner.sqlite3"
+    with closing(sqlite3.connect(path)) as db:
+        with db:
+            db.execute("CREATE TABLE owner(id INTEGER PRIMARY KEY CHECK(id=1), password TEXT NOT NULL, secret TEXT NOT NULL, counter INTEGER NOT NULL)")
+            db.execute("CREATE TABLE sessions(token TEXT PRIMARY KEY, csrf TEXT NOT NULL, created REAL NOT NULL, seen REAL NOT NULL)")
+            db.execute("CREATE TABLE throttle(id INTEGER PRIMARY KEY CHECK(id=1), failures INTEGER NOT NULL, blocked REAL NOT NULL)")
+            db.execute("INSERT INTO throttle VALUES(1,0,0)")
+            db.execute("INSERT INTO owner VALUES(1,?,?,?)", (HASHER.hash("synthetic owner password"), secret, 100))
+    path.chmod(0o600)
+    return AuthStore(directory), secret
+
+
+def _columns(path, table):
+    import sqlite3
+    with closing(sqlite3.connect(path)) as db:
+        return [row[1] for row in db.execute(f"PRAGMA table_info({table})")]
+
+
+def test_old_schema_database_still_signs_in_and_writes_nothing_on_read(tmp_path):
+    import sqlite3
+    import time
+    import pyotp
+    store, secret = _old_schema_store(tmp_path)
+    # A session written by the previous release (four columns, no kept).
+    old_token = "A" * 43
+    from app.auth import digest
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (digest(old_token), "B" * 43, time.time(), time.time()))
+    before = store.path.read_bytes()
+    store.available()
+    assert store.path.read_bytes() == before
+    assert "kept" not in _columns(store.path, "sessions")
+    assert store.session(old_token, now=time.time()) == "B" * 43
+    before = store.path.read_bytes()
+    store.available()
+    assert store.path.read_bytes() == before
+    token = store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
+    assert token
+    assert "kept" in _columns(store.path, "sessions")
+    store.available()
+    assert store.session(token, now=3031)
+
+
+def test_recover_deletes_passkeys_challenges_and_sessions(owner):
+    import sqlite3
+    import time
+    import pyotp
+    store, secret = owner
+    assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?)", ("a" * 22, b"key", 0, time.time()))
+            db.execute("INSERT INTO passkey_challenges VALUES(?,?,?)", ("d" * 64, "login", time.time() + 300))
+    store.available()
+    store.enroll("another synthetic owner password", secret, pyotp.TOTP(secret).at(4000), now=4000, recover=True)
+    with closing(sqlite3.connect(store.path)) as db:
+        for table in ("sessions", "passkeys", "passkey_challenges"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,), table
+    store.available()
+
+
+def test_enroll_creates_current_schema(owner):
+    store, _ = owner
+    assert "kept" in _columns(store.path, "sessions")
+    assert _columns(store.path, "passkeys") == ["id", "public_key", "sign_count", "created"]
+    assert _columns(store.path, "passkey_challenges") == ["digest", "purpose", "expires"]
+
+
+@pytest.mark.parametrize("column,bad_value", [
+    ("public_key", b""), ("public_key", "text"),
+    ("sign_count", -1), ("sign_count", 1.5),
+    ("created", -1), ("created", float("inf")),
+    ("id", "short"), ("id", "not base64url!" * 2),
+])
+def test_invalid_passkey_row_makes_store_unavailable(owner, column, bad_value):
+    import sqlite3
+    from app.auth import AuthUnavailable
+    store, _ = owner
+    good = {"id": "a" * 22, "public_key": b"key", "sign_count": 0, "created": 5.0}
+    good[column] = bad_value
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?)", tuple(good[name] for name in ("id", "public_key", "sign_count", "created")))
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
+def test_valid_passkey_row_is_available(owner):
+    import sqlite3
+    store, _ = owner
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("INSERT INTO passkeys VALUES(?,?,?,?)", ("a" * 22, b"key", 3, 5.0))
+    store.available()
+
+
+@pytest.mark.parametrize("kept", [2, -1])
+def test_invalid_kept_flag_makes_store_unavailable(owner, kept):
+    import sqlite3
+    import pyotp
+    from app.auth import AuthUnavailable
+    store, secret = owner
+    assert store.login("synthetic owner password", pyotp.TOTP(secret).at(3030), now=3030)
+    with closing(sqlite3.connect(store.path)) as db:
+        with db:
+            db.execute("UPDATE sessions SET kept=?", (kept,))
+    with pytest.raises(AuthUnavailable):
+        store.available()
+
+
+def test_webauthn_is_importable():
+    import webauthn
+    assert webauthn.generate_registration_options

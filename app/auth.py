@@ -32,13 +32,45 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _has_table(db, table):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def _has_column(db, table, column):
+    return any(row[1] == column for row in db.execute(f"PRAGMA table_info({table})"))
+
+
+def _ensure_schema(db):
+    """Bring an older database up to date. Call only inside a write transaction."""
+    if not _has_column(db, "sessions", "kept"):
+        db.execute("ALTER TABLE sessions ADD COLUMN kept INTEGER NOT NULL DEFAULT 0")
+    db.execute("CREATE TABLE IF NOT EXISTS passkeys(id TEXT PRIMARY KEY, public_key BLOB NOT NULL, sign_count INTEGER NOT NULL, created REAL NOT NULL)")
+    db.execute("CREATE TABLE IF NOT EXISTS passkey_challenges(digest TEXT PRIMARY KEY, purpose TEXT NOT NULL, expires REAL NOT NULL)")
+
+
+def _session_query(db, where=""):
+    """Session rows as (token, csrf, created, seen, kept); old databases read kept as 0."""
+    kept = "kept" if _has_column(db, "sessions", "kept") else "0"
+    return f"SELECT token,csrf,created,seen,{kept} FROM sessions {where}"
+
+
+def _validate_passkey(row):
+    key_id, public_key, sign_count, created = row
+    if (not isinstance(key_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,1024}", key_id)
+            or type(public_key) is not bytes or not public_key
+            or type(sign_count) is not int or sign_count < 0
+            or type(created) not in (int, float) or not math.isfinite(created) or created < 0):
+        raise AuthUnavailable()
+
+
 def _validate_session(row):
-    token, csrf, created, seen = row
+    token, csrf, created, seen, kept = row
     if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token)
             or not isinstance(csrf, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", csrf)
             or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
                    for value in (created, seen))
-            or seen < created):
+            or seen < created
+            or type(kept) is not int or kept not in (0, 1)):
         raise AuthUnavailable()
 
 
@@ -115,8 +147,11 @@ class AuthStore:
                     or not math.isfinite(throttle[1]) or throttle[1] < 0
                     or throttle[1] > time.time() + MAX_BLOCK_SECONDS):
                 raise AuthUnavailable()
-            for session in db.execute("SELECT token,csrf,created,seen FROM sessions"):
+            for session in db.execute(_session_query(db)).fetchall():
                 _validate_session(session)
+            if _has_table(db, "passkeys"):
+                for passkey in db.execute("SELECT id,public_key,sign_count,created FROM passkeys").fetchall():
+                    _validate_passkey(passkey)
             if db.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise AuthUnavailable()
 
@@ -160,7 +195,9 @@ class AuthStore:
                 db.execute("CREATE TABLE throttle(id INTEGER PRIMARY KEY CHECK(id=1), failures INTEGER NOT NULL, blocked REAL NOT NULL)")
                 db.execute("INSERT INTO throttle VALUES(1,0,0)")
             db.execute("INSERT OR REPLACE INTO owner VALUES(1,?,?,?)", (password_hash, secret, int(now // 30)))
-            db.execute("DELETE FROM sessions")
+            _ensure_schema(db)
+            for table in ("sessions", "passkeys", "passkey_challenges"):
+                db.execute(f"DELETE FROM {table}")
             db.execute("INSERT INTO throttle VALUES(1,0,0) ON CONFLICT(id) DO UPDATE SET failures=0, blocked=0")
 
     def login(self, password, code, *, now=None):
@@ -188,9 +225,10 @@ class AuthStore:
             if HASHER.check_needs_rehash(row[0]):
                 db.execute("UPDATE owner SET password=? WHERE id=1", (HASHER.hash(password),))
             db.execute("UPDATE throttle SET failures=0,blocked=0 WHERE id=1")
+            _ensure_schema(db)
             db.execute("DELETE FROM sessions WHERE seen<=? OR created<=?", (now-IDLE_SECONDS, now-ABSOLUTE_SECONDS))
             token = secrets.token_urlsafe(32)
-            db.execute("INSERT INTO sessions VALUES(?,?,?,?)", (digest(token), secrets.token_urlsafe(32), now, now))
+            db.execute("INSERT INTO sessions(token,csrf,created,seen) VALUES(?,?,?,?)", (digest(token), secrets.token_urlsafe(32), now, now))
             return token
 
     def session(self, token, *, now=None):
@@ -200,7 +238,7 @@ class AuthStore:
             # Order production timestamps by the write transaction, not by
             # concurrent requests reaching this method.
             now = time.time() if now is None else now
-            row = db.execute("SELECT token,csrf,created,seen FROM sessions WHERE token=?", (digest(token),)).fetchone()
+            row = db.execute(_session_query(db, "WHERE token=?"), (digest(token),)).fetchone()
             if not row:
                 return None
             _validate_session(row)
