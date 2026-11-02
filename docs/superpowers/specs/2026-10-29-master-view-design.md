@@ -230,7 +230,11 @@ one commit. No new approval path and no change to S7. *(My call.)*
 
 The popup shows the note's body in a plain-text editor (Markdown as
 stored). Front-matter is not in the editor; the stage buttons own
-`status`, and the other required fields stay untouched. *(My call, so an
+`status`, and the other required fields stay untouched, except that
+every vault change made from the master view (a move, an edit, or a
+comment) also sets the existing `updated` field to the owner's local date
+(owner decision, 2026-11-02), so "Updated" sorting and card dates show
+what was just worked on. *(My call, so an
 edit cannot break the policy enforcer's required fields.)*
 
 - Any stage button, including Save as Draft, saves the edited body
