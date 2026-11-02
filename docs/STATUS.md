@@ -8,12 +8,12 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-10-30, after the running install was updated to
-`75e6725` (master view reminders and Needs attention). Earlier
-reconciliations: 2026-10-30 (install update to `8df5979`), 2026-10-29
-(install update to `d28ea6b`), 2026-10-28 (install updates to
-`d3dd761` and `85afa63`), 2026-10-26 (Board, rules line, and local
-deployment acceptance) and 2026-09-11 (trusted-local live Gate 1 session).
+Last reconciled: 2026-11-02, after the running install was updated to
+`345f7a7` (passkey sign-in and keep me signed in). Earlier reconciliations:
+2026-10-30 (install updates to `75e6725` and `8df5979`), 2026-10-29
+(install update to `d28ea6b`), 2026-10-28 (install updates to `d3dd761` and
+`85afa63`), 2026-10-26 (Board, rules line, and local deployment acceptance)
+and 2026-09-11 (trusted-local live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
 
@@ -35,6 +35,29 @@ The owner decided that backups happen only when they run `backup`.
 `doctor` reports backup state without failing on it. The job on the running
 Mac was unloaded and its plist moved out of `LaunchAgents`. Install updates no
 longer require a backup first; the owner may take one when they choose.
+
+## Running install update to `345f7a7` (2026-11-02)
+
+With owner approval, the running install was updated to `origin/main`
+`345f7a7`: passkey (Touch ID) sign-in and "keep me signed in" (PR #57). The
+install checkout moved from `75e6725` by fast-forward. The app image running
+before the update is kept locally as the image tag `oneos-local:pre-345f7a7`.
+The update adds the owner-approved `webauthn` dependency (2.8.0, with
+`cryptography`, `cbor2`, `pyopenssl`, `pyasn1`, `pyasn1-modules`), installed
+by the image build from `uv.lock`; no Dockerfile, Compose, or Caddy file
+changed. The app was healthy beforehand, so `start` alone rebuilt and
+recreated only the app container; no VM restart and no backup (owner's
+choice).
+
+Afterwards `status` reported every component available and services running,
+`/healthz` answered 200, `/` redirected to sign-in, and the sign-in page offers
+"Keep me signed in on this Mac" (Touch ID appears once a passkey is set up).
+Inside the container `webauthn` 2.8.0 imports, the existing authentication
+store passes its validation unchanged (no passkeys yet; new tables are created
+on the first write that needs them), and the app log showed no errors. The
+vault's HEAD, status, worktree diff, and cached diff were byte-identical
+before and after. The owner's real Touch ID check (set up, sign out, sign in,
+still signed in after 30 minutes, remove, password + code) is pending.
 
 ## Running install update to `75e6725` (2026-10-30)
 
