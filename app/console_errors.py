@@ -293,6 +293,7 @@ from . import reminders as _reminders  # noqa: E402
 from . import review_tokens as _review_tokens  # noqa: E402
 from . import rename as _rename  # noqa: E402
 from . import scope as _scope  # noqa: E402
+from . import stage as _stage  # noqa: E402
 from . import vault as _vault  # noqa: E402
 from . import lifecycle_shape as _lifecycle_shape  # noqa: E402
 from . import lifecycle_journal as _lifecycle_journal  # noqa: E402
@@ -340,6 +341,7 @@ _EXACT: dict[type[BaseException], ConsoleError] = {
     _reminders.ReminderStoreUnavailable: _CODES["E-UNAVAILABLE"],
     _reminders.InvalidReminder: _CODES["E-REQUEST"],
     _note_text.NoteTextError: _CODES["E-REQUEST"],
+    _stage.StageRequestError: _CODES["E-REQUEST"],
     _board.NoteUnreadable: _CODES["E-UNAVAILABLE"],
     _outbox.StaleProposalSource: _CODES["E-STALE"],
     _outbox.MissingProposalSource: _CODES["E-MISSING"],

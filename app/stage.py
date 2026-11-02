@@ -46,12 +46,15 @@ import yaml
 from . import outbox as _outbox
 from .action_receipts import (
     ActionReceipt,
+    InvalidActionReceipt,
+    ReceiptStoreIntegrityError,
+    ReceiptStoreUnavailable,
     SpentAction,
     make_action_receipt,
     receipt_relative_path,
     render_action_receipt,
 )
-from .console_routing import structured_reader
+from .console_routing import failure_contract, structured_reader
 from .destinations import (
     DestinationError,
     InvalidModule,
@@ -61,7 +64,12 @@ from .destinations import (
     _require_real_directory,
     resolve_classification_destination,
 )
-from .entities import EntityCatalog
+from .entities import (
+    EntityCatalog,
+    EntityManifestError,
+    EntitySelectionError,
+    SystemRegistryPathError,
+)
 from .git_transaction import (
     GitTransactionError,
     PathChange,
@@ -108,12 +116,14 @@ from .proposal_identity import (
     require_proposal_id,
     require_proposal_identity,
 )
+from .review_tokens import ReviewTokenError
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
 __all__ = [
     "STAGE_STATUSES",
     "StageProposal",
+    "StageRequestError",
     "StageUnchanged",
     "approve_stage",
     "propose_and_approve_stage",
@@ -144,6 +154,11 @@ _STAGED_LEAF = "record.part"
 
 class StageUnchanged(OutboxError):
     """The requested stage move would leave the note byte-for-byte as it is."""
+
+
+class StageRequestError(ValueError):
+    """A stage form value the master view never sends (an unknown stage, a
+    proposal that is not the card's, a malformed date). Nothing was written."""
 
 
 # --- record validation (bytes only; never the registries or the disk) -----
@@ -731,6 +746,23 @@ def propose_stage(
     return proposal_id, hashlib.sha256(contents).hexdigest()
 
 
+@failure_contract(
+    raises=(
+        OutboxError,
+        NoteTextError,
+        DestinationError,
+        CrossScopeError,
+        DestinationRegistryError,
+        EntityManifestError,
+        SystemRegistryPathError,
+        EntitySelectionError,
+        ReviewTokenError,
+        InvalidActionReceipt,
+        ReceiptStoreIntegrityError,
+        ReceiptStoreUnavailable,
+    ),
+    calls=(_outbox.approve, _outbox.reject),
+)
 def propose_and_approve_stage(scope: Scope, **kwargs) -> StageProposal | SpentAction:
     """Propose, then approve with the digest of the exact bytes published.
 

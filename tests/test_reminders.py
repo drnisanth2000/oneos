@@ -532,3 +532,49 @@ def test_flag_methods_declare_failure_contracts():
         (clean_flag_comment, {InvalidReminder}),
     ]:
         assert set(fn.__failure_contract__.raises) == expected
+
+
+def _file_state(directory):
+    return {
+        p.name: (p.read_bytes(), p.stat().st_mtime_ns, p.stat().st_mode)
+        for p in sorted(directory.iterdir())
+    }
+
+
+@pytest.mark.parametrize("call", [
+    lambda store: store.unflag("synthetic/02-work/active/a.md"),
+    lambda store: store.rekey("synthetic/00-inbox/active/a.md", "synthetic/02-work/active/a.md"),
+    lambda store: store.rename_entity("synthetic", "renamed"),
+    lambda store: store.remove("synthetic/02-work/active/a.md"),
+])
+def test_cleanup_writes_never_touch_a_zero_byte_store(state, call):
+    """The master view calls `unflag` on every move: a store that was never
+    published with a schema is left exactly as it is, with no sidecar files."""
+    path = state / "reminders.sqlite3"
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    before = _file_state(state)
+    call(ReminderStore(state))
+    assert _file_state(state) == before
+    assert path.stat().st_size == 0
+
+
+@pytest.mark.parametrize("call", [
+    lambda store: store.unflag("synthetic/02-work/active/a.md"),
+    lambda store: store.rekey("synthetic/00-inbox/active/a.md", "synthetic/02-work/active/a.md"),
+    lambda store: store.rename_entity("synthetic", "renamed"),
+    lambda store: store.remove("synthetic/02-work/active/a.md"),
+])
+def test_cleanup_writes_never_add_a_reminders_table(state, call):
+    import sqlite3
+    from contextlib import closing
+
+    path = state / "reminders.sqlite3"
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("CREATE TABLE unrelated (x TEXT)")
+        db.commit()
+    path.chmod(0o600)
+    before = _file_state(state)
+    call(ReminderStore(state))
+    assert _file_state(state) == before
+    assert _tables(path) == {"unrelated"}

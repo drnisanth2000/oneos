@@ -20,7 +20,7 @@ from .inbox import InboxItem, read_inbox, split_front_matter
 from .inbox import _require_real_directory as _require_real_lifecycle_directory
 from .inbox import _require_real_receipt as _require_real_entry
 from .ingest.base import IngestError, IngestResult, commit_inbox_item
-from .outbox import Proposal, project_outbox
+from .outbox import Proposal, _capture_source_state, project_outbox
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
@@ -317,6 +317,40 @@ def note_body(scope: Scope, relative: str) -> str:
         raise NoteUnreadable("note could not be read") from exc
     _fm, body = split_front_matter(text)
     return body
+
+
+@dataclass(frozen=True)
+class NoteSnapshot:
+    """One capture of a note: its text, and the SHA-256 of those same bytes."""
+
+    text: str
+    sha256: str
+
+
+@failure_contract(raises=(CrossScopeError, NoteUnreadable))
+def note_snapshot(scope: Scope, relative: str) -> NoteSnapshot:
+    """Read a note once, on the Outbox's no-follow terms (every component
+    checked, no symlink, the same inode that was looked up), and fingerprint
+    the bytes of that one read. What the master popup shows and the hash it
+    sends back with a stage button both come from here, so the hash always
+    names the bytes the owner saw.
+    """
+    scope.resolve_stored(relative)  # another entity's path is refused here
+    state = _capture_source_state(scope.root, relative)
+    if state.contents is None:
+        raise NoteUnreadable("note is missing")
+    try:
+        text = state.contents.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise NoteUnreadable("note could not be read") from exc
+    return NoteSnapshot(text, hashlib.sha256(state.contents).hexdigest())
+
+
+@structured_reader(category="front-matter")
+def snapshot_body(snapshot: NoteSnapshot) -> str:
+    """The body of a snapshot as the read-only popup shows it (the reader the
+    Board uses), for a note whose header the editor cannot place."""
+    return split_front_matter(snapshot.text)[1]
 
 
 def _inbox_cards(scope: Scope, vault: Vault, items: list[InboxItem]) -> list[BoardCard]:

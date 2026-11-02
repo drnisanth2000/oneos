@@ -200,10 +200,14 @@ _FLAGS_SCHEMA = (
 )
 
 
-def _has_flags_table(db) -> bool:
+def _has_table(db, name: str) -> bool:
     return db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_flags'"
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+def _has_flags_table(db) -> bool:
+    return _has_table(db, "review_flags")
 
 
 class ReminderStore:
@@ -284,11 +288,14 @@ class ReminderStore:
 
     @contextmanager
     @structured_reader(category="admin-db")
-    def connect(self, *, create=False, readonly=False, flags_table=False):
+    def connect(self, *, create=False, readonly=False, flags_table=False, existing=False):
         """Yield an open transaction, or None when the file is absent and
         `create` is false (nothing is created by a read or a no-op write).
         `flags_table` makes a write transaction create `review_flags` too; it
-        is set only by the call that stores a flag."""
+        is set only by the call that stores a flag. `existing` is for the
+        clean-up writes (remove, unflag, rekey, rename): they yield None, and
+        write nothing at all, for a zero-byte file or one without the
+        `reminders` table, instead of creating the schema in it."""
         expected_identity = self._check(creating=True)
         if expected_identity is None:
             if not create:
@@ -302,7 +309,7 @@ class ReminderStore:
             size = self.path.lstat().st_size
         except OSError as exc:
             raise ReminderStoreUnavailable() from exc
-        if readonly and size == 0:
+        if (readonly or existing) and size == 0:
             # Never published with a schema (left by an interrupted older
             # path): there is nothing in it, so there are no reminders.
             yield None
@@ -315,7 +322,12 @@ class ReminderStore:
                     raise ReminderStoreUnavailable()
                 if not readonly:
                     connection.execute("BEGIN IMMEDIATE")
-                    connection.execute(_SCHEMA)
+                    if existing and not _has_table(connection, "reminders"):
+                        connection.rollback()
+                        yield None
+                        return
+                    if not existing:
+                        connection.execute(_SCHEMA)
                     if flags_table:
                         connection.execute(_FLAGS_SCHEMA)
                 yield connection
@@ -353,7 +365,7 @@ class ReminderStore:
 
     @failure_contract(raises=(ReminderStoreUnavailable,))
     def remove(self, key: str) -> None:
-        with self.connect() as db:
+        with self.connect(existing=True) as db:
             if db is not None:
                 db.execute("DELETE FROM reminders WHERE key=?", (key,))
 
@@ -363,7 +375,7 @@ class ReminderStore:
         (a stale row already under `new` is replaced), in one transaction."""
         if old == new:
             return
-        with self.connect() as db:
+        with self.connect(existing=True) as db:
             if db is None:
                 return
             now = datetime.now(timezone.utc).isoformat()
@@ -409,7 +421,7 @@ class ReminderStore:
     @failure_contract(raises=(ReminderStoreUnavailable,))
     def unflag(self, key: str) -> None:
         """Drop the flag for a card; idempotent, and never creates anything."""
-        with self.connect() as db:
+        with self.connect(existing=True) as db:
             if db is not None and _has_flags_table(db):
                 db.execute("DELETE FROM review_flags WHERE key=?", (key,))
 
@@ -425,7 +437,7 @@ class ReminderStore:
             return 0
         prefix = old + "/"
         changed = 0
-        with self.connect() as db:
+        with self.connect(existing=True) as db:
             if db is None:
                 return 0
             now = datetime.now(timezone.utc).isoformat()

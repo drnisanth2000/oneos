@@ -1545,12 +1545,16 @@ EXPECTED_CONTRACTED_BOUNDARIES = (
     ("app.board", "load_board"),
     ("app.board", "capture_note"),
     ("app.board", "note_body"),
+    ("app.board", "note_snapshot"),
     ("app.master", "load_master"),
     ("app.reminders", "reminder_store"),
     ("app.reminders", "ReminderStore.all"),
     ("app.reminders", "ReminderStore.save"),
     ("app.reminders", "ReminderStore.remove"),
     ("app.reminders", "ReminderStore.rekey"),
+    ("app.reminders", "ReminderStore.flag"),
+    ("app.reminders", "ReminderStore.unflag"),
+    ("app.stage", "propose_and_approve_stage"),
 )
 
 
@@ -1578,7 +1582,7 @@ def test_closed_route_facing_inventory_has_failure_contracts(tmp_path, monkeypat
 
     main = _load_console_app(tmp_path, monkeypatch)
     qualified = [f"{module}.{name}" for module, name in EXPECTED_CONTRACTED_BOUNDARIES]
-    assert len(qualified) == 35
+    assert len(qualified) == 39
     assert len(set(qualified)) == len(qualified), "duplicate contracted boundary"
 
     missing = []
@@ -1610,6 +1614,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         SystemRegistryPathError,
     )
     from app.board import NoteUnreadable, entity_cards, note_body
+    from app.note_text import NoteTextError
     from app.reminders import InvalidReminder, ReminderStoreUnavailable
     from app.inbox import read_inbox
     from app.ingest.base import IngestError
@@ -1752,6 +1757,7 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         ),
         "app.board.capture_note": ((IngestError, CrossScopeError), ()),
         "app.board.note_body": ((CrossScopeError, NoteUnreadable), ()),
+        "app.board.note_snapshot": ((CrossScopeError, NoteUnreadable), ()),
         "app.master.load_master": (
             (DestinationRegistryError, EntityManifestError, VaultRootUnavailable),
             (),
@@ -1764,6 +1770,26 @@ def test_route_facing_failure_contracts_match_the_approved_inventory(
         ),
         "app.reminders.ReminderStore.remove": ((ReminderStoreUnavailable,), ()),
         "app.reminders.ReminderStore.rekey": ((ReminderStoreUnavailable,), ()),
+        "app.reminders.ReminderStore.flag": (
+            (ReminderStoreUnavailable, InvalidReminder),
+            (),
+        ),
+        "app.reminders.ReminderStore.unflag": ((ReminderStoreUnavailable,), ()),
+        "app.stage.propose_and_approve_stage": (
+            (
+                OutboxError,
+                NoteTextError,
+                DestinationError,
+                CrossScopeError,
+                DestinationRegistryError,
+                EntityManifestError,
+                SystemRegistryPathError,
+                EntitySelectionError,
+                ReviewTokenError,
+                *receipt_failures,
+            ),
+            (approve, reject),
+        ),
     }
 
     boundaries = _inventory_objects(main)
@@ -1984,6 +2010,7 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
         },
         "app.board.load_board": {"app.board.entity_cards", "app.board.note_body"},
         "app.master.load_master": {"app.board.entity_cards"},
+        "app.stage.propose_and_approve_stage": {"app.outbox.approve", "app.outbox.reject"},
     }
 
     actual = {}
@@ -2022,6 +2049,9 @@ def test_contract_call_edges_match_executable_closed_inventory(tmp_path, monkeyp
             "app.outbox.project_outbox",
         },
         "app.board.load_board": {"app.board.entity_cards", "app.board.note_body"},
+        # The press approves the record it just wrote; a refusal after that
+        # rejects (quarantines) it and re-raises the refusal.
+        "app.stage.propose_and_approve_stage": {"app.outbox.approve", "app.outbox.reject"},
     }
     summarized_or_contained_edges = {
         # Each entity's read failures are caught and reported on the page.
@@ -2093,20 +2123,28 @@ def _expected_route_services(main):
         health_endpoints["/healthz"]: (),
         health_endpoints["/readyz"]: (main.Vault.bundles,),
         main.shell: (main.load_master, main.Vault.bundles),
-        main.master_card: (main.entity_cards, main.note_body),
+        main.master_card: (main.entity_cards, main.note_snapshot),
         main.master_reminder_save: (
             main.entity_cards,
-            main.note_body,
+            main.note_snapshot,
             main.reminder_store,
             main.ReminderStore.save,
         ),
         main.master_reminder_remove: (
             main.build_scope,
             main.entity_cards,
-            main.note_body,
+            main.note_snapshot,
             main.reminder_store,
             main.ReminderStore.all,
             main.ReminderStore.remove,
+        ),
+        main.master_stage: (
+            main.entity_cards,
+            main.note_snapshot,
+            main.reminder_store,
+            main.propose_and_approve_stage,
+            main.ReminderStore.flag,
+            main.ReminderStore.unflag,
         ),
         main.pulse: (),
         main.board_default: (main.Vault.bundles,),
@@ -2170,9 +2208,9 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
-    assert sum(len(services) for services in expected.values()) == 63
+    assert sum(len(services) for services in expected.values()) == 69
     endpoints = list(_registered_console_endpoints(main.app))
-    assert len(endpoints) == 26, endpoints
+    assert len(endpoints) == 27, endpoints
     assert set(endpoints) == set(expected), (
         "registered route/service inventory mismatch: "
         f"missing={set(endpoints) - set(expected)}, "

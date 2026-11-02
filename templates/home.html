@@ -24,6 +24,17 @@
           this.$refs.offset.value = String(-when.getTimezoneOffset())
         },
       }))
+      // The popup's stage form sends the owner's local date as `today` (the
+      // note's `updated:` and the comment's date); the server accepts it within
+      // a day of its own. Stamped on every click, so a popup left open over
+      // midnight still sends the right day.
+      Alpine.data('stageForm', () => ({
+        init() { this.stamp() },
+        stamp() {
+          const d = new Date()
+          this.$refs.today.value = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+        },
+      }))
       Alpine.data('masterHead', () => ({
         greeting: '', date: '', clock: '', loaded: '', stale: '',
         init() {

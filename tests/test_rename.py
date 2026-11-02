@@ -230,9 +230,10 @@ def test_entity_rename_without_a_store_still_succeeds(tmp_path, monkeypatch, cap
     apply_rename(vault, plan_rename(vault, "entity", "oldentity", "newentity"))
     assert git_head_message(vault) == "rename: oldentity → newentity"
     assert (vault / "newentity").is_dir() and git_is_clean(vault)
-    lines = [line for line in capsys.readouterr().out.splitlines() if "Reminders were not updated" in line]
+    lines = [line for line in capsys.readouterr().out.splitlines() if "Reminders and review flags were not updated" in line]
     assert len(lines) == 1
     assert "Card moved or removed" in lines[0] and "set them again" in lines[0] and "oldentity" in lines[0]
+    assert "To review" in lines[0]
 
 
 def test_entity_rename_with_an_unsafe_store_still_succeeds(tmp_path, monkeypatch, capsys):
@@ -244,8 +245,9 @@ def test_entity_rename_with_an_unsafe_store_still_succeeds(tmp_path, monkeypatch
     apply_rename(vault, plan_rename(vault, "entity", "oldentity", "newentity"))
     assert git_head_message(vault) == "rename: oldentity → newentity" and git_is_clean(vault)
     out = capsys.readouterr().out
-    assert out.count("Reminders were not updated") == 1
+    assert out.count("Reminders and review flags were not updated") == 1
     assert "Card moved or removed" in out and "set them again" in out and "oldentity" in out
+    assert "To review" in out
     directory.chmod(0o700)
     assert set(ReminderStore(directory).all()) == {key}  # left as an orphan, not lost
 

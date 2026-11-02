@@ -1,7 +1,11 @@
-{# Card popup, swapped into #master-popup inside the dialog. The body is escaped
-   preformatted text. The one write control is the reminder box (Waiting and To
-   review cards only): it posts to /master/reminder/..., which never touches the
-   vault, and its responses swap this same popup back. #}
+{# Card popup, swapped into #master-popup inside the dialog. Two forms:
+   - the stage form: the draft (escaped, in a textarea), a comment box, a "File
+     to" picker for a bare inbox item, and the four stage buttons. It posts to
+     /master/stage/..., where each press is one approved Outbox change (or a
+     review flag), bound to `source_sha256`, the hash of the very bytes shown;
+   - the reminder box (Waiting and To review cards only): it posts to
+     /master/reminder/..., which never touches the vault.
+   Both responses swap this same popup back. Closing it writes nothing. #}
 {% from "_icon.html" import icon %}
 <header class="sheet-head master-popup-head">
   <h2 id="master-popup-title">{% if card %}{{ card.title }}{% else %}Card not found{% endif %}</h2>
@@ -19,7 +23,67 @@
     {% if card.lane == 'proposed' %}proposed for {{ card.module }}{% if card.sub %} / {{ card.sub }}{% endif %}
     {% else %}{{ card.module }}{% if card.sub %} / {{ card.sub }}{% endif %}{% endif %}
   </p>
+  {% if notice %}
+  <p class="master-notice is-{{ notice.tone }}" role="{{ 'alert' if notice.tone == 'error' else 'status' }}">{{ notice.text }}</p>
+  {% endif %}
+  {% if flag and flag.comment %}
+  <p class="master-flag-note"><span class="muted">Review note:</span> {{ flag.comment }}</p>
+  {% endif %}
+  {% if editable %}
+  {# The first submit button is disabled, so Enter in the comment box never
+     presses a stage button for the owner (implicit submission uses it). The
+     browser's local date goes in `today` when a button is clicked. #}
+  <form class="stage-form" hx-post="/master/stage/{{ entity | urlencode }}"
+        hx-target="#master-popup" hx-swap="innerHTML" hx-sync="this:drop"
+        x-data="stageForm" @click="stamp()">
+    <button type="submit" disabled hidden aria-hidden="true" tabindex="-1"></button>
+    <input type="hidden" name="path" value="{{ card.relative_path }}">
+    <input type="hidden" name="source_sha256" value="{{ source_sha256 }}">
+    <input type="hidden" name="today" value="" x-ref="today">
+    {% if card.lane == 'proposed' %}
+    <input type="hidden" name="proposal_id" value="{{ card.proposal_id or '' }}">
+    <input type="hidden" name="proposal_review_sha256" value="{{ proposal_review_sha256 or '' }}">
+    {% endif %}
+    <label class="stage-field" for="stage-body">Note</label>
+    <textarea id="stage-body" class="master-body master-body-edit" name="body" rows="10" spellcheck="true">{{ body }}</textarea>
+    {% if destinations is not none %}
+    <div class="stage-file-to" x-data="{ module: {{ typed_module | tojson | forceescape }} }">
+      <label class="stage-field" for="stage-module">File to
+        <select id="stage-module" name="module" x-model="module">
+          <option value="">Choose a module</option>
+          {% for module in destinations %}
+          <option value="{{ module }}"{% if module == typed_module %} selected{% endif %}>{{ module }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% for module, subs in destinations.items() if subs %}
+      {# x-show owns visibility (it toggles the inline display); the first paint
+         matches it. A hidden sub list is also disabled, so only the chosen
+         module's sub is sent. #}
+      <label class="stage-field" x-show="module === {{ module | tojson | forceescape }}"{% if module != typed_module %} style="display: none"{% endif %}>Sub-folder
+        <select name="sub" :disabled="module !== {{ module | tojson | forceescape }}"{% if module != typed_module %} disabled{% endif %}>
+          <option value="">None</option>
+          {% for sub in subs %}
+          <option value="{{ sub }}"{% if module == typed_module and sub == typed_sub %} selected{% endif %}>{{ sub }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <label class="stage-field" for="stage-comment">Comment
+      <input id="stage-comment" name="comment" type="text" maxlength="500"
+             placeholder="Optional, one line" value="{{ typed_comment }}">
+    </label>
+    <div class="stage-buttons" role="group" aria-label="Move to">
+      {% for key, label in stage_buttons %}
+      <button type="submit" name="stage" value="{{ key }}" class="stage-button{% if key == stage_key %} is-current{% endif %}"{% if key == stage_key %} aria-current="true"{% endif %}>{{ label }}</button>
+      {% endfor %}
+    </div>
+  </form>
+  {% else %}
   <pre class="master-body">{{ body }}</pre>
+  {% endif %}
   {% if reminder_box %}
   {# The browser fills `offset` (minutes east of UTC) for the chosen date and time;
      the server stores the wall time as typed and never converts it. #}

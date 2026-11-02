@@ -3917,6 +3917,16 @@ def _route_totality_plan(main) -> dict:
             ),
             "patch_targets": [(main, "reminder_store")],
         },
+        main.master_stage: {
+            "request": lambda c, submitted=None: c.post(
+                "/master/stage/alpha",
+                data={
+                    "path": submitted or "alpha/02-work/active/x.md", "source_sha256": "0" * 64,
+                    "stage": "done", "today": "2026-11-02",
+                },
+            ),
+            "patch_targets": [(main, "entity_cards")],
+        },
         main.board_default: {
             "request": lambda c, submitted=None: c.get("/board"),
             "patch_targets": [(main.Vault, "bundles")],
