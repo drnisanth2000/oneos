@@ -441,6 +441,18 @@ def _page_reminders() -> dict | None:
         return None
 
 
+def _page_flags() -> dict | None:
+    """Every review flag, or None when the store is missing or unsafe (the
+    page then ignores flags and still renders); a read creates nothing."""
+    try:
+        store = reminder_store()
+        if store is None:
+            return None
+        return store.flags()
+    except ReminderStoreUnavailable:
+        return None
+
+
 @app.get("/", response_class=HTMLResponse)
 @console_route(
     catches=_SIDEBAR_CATCHES,
@@ -469,6 +481,7 @@ def shell(request: Request) -> HTMLResponse:
             done_all=params.get("done") == "all",
             now=datetime.now().astimezone(),
             reminders=_page_reminders(),
+            flags=_page_flags(),
         )
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))

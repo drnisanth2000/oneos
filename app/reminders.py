@@ -8,6 +8,11 @@ The safety rules mirror `app.auth.AuthStore`: no symlinked component, a
 directory owned by this process with no group/other bits, a regular
 single-link file with mode 0600. Reading never creates anything; the file
 appears on the first save.
+
+Review flags (a filed note put in "To review") live in the same file, in their
+own `review_flags` table. That table is created only inside a write
+transaction that stores a flag; a file without it simply has no flags, and no
+read or no-op write ever creates it.
 """
 from __future__ import annotations
 
@@ -15,6 +20,7 @@ import os
 import re
 import sqlite3
 import stat
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,6 +30,7 @@ from .console_routing import failure_contract, structured_reader
 
 DATABASE_NAME = "reminders.sqlite3"
 SUBJECT_MAX = 120
+FLAG_COMMENT_MAX = 500
 _LINE_BREAKS = ("\r", "\n", "\x0b", "\x0c", "\x85", " ", " ")
 _MAX_OFFSET_MINUTES = 14 * 60
 _MIN_YEAR = 1970
@@ -46,6 +53,17 @@ class Reminder:
     due_at: datetime  # timezone-aware, wall time with the browser's UTC offset
 
 
+@dataclass(frozen=True)
+class ReviewFlag:
+    """A filed note the owner put in "To review". Stored beside reminders,
+    never in the note. `comment` is optional (None = no comment)."""
+
+    key: str
+    entity: str
+    comment: str | None
+    flagged_at: datetime  # timezone-aware
+
+
 @failure_contract(raises=(InvalidReminder,))
 def clean_subject(text: str) -> str:
     if not isinstance(text, str):
@@ -57,6 +75,24 @@ def clean_subject(text: str) -> str:
         raise InvalidReminder("subject is required")
     if len(cleaned) > SUBJECT_MAX:
         raise InvalidReminder(f"subject must be at most {SUBJECT_MAX} characters")
+    return cleaned
+
+
+@failure_contract(raises=(InvalidReminder,))
+def clean_flag_comment(text: str) -> str:
+    """A review-flag comment: one line, trimmed, 1..500 characters."""
+    if not isinstance(text, str):
+        raise InvalidReminder("comment must be text")
+    for char in text:
+        if char in _LINE_BREAKS:
+            raise InvalidReminder("comment must be a single line")
+        if unicodedata.category(char) == "Cc" and char != "\t":
+            raise InvalidReminder("comment contains a control character")
+    cleaned = text.strip()
+    if not cleaned:
+        raise InvalidReminder("comment is empty")
+    if len(cleaned) > FLAG_COMMENT_MAX:
+        raise InvalidReminder(f"comment must be at most {FLAG_COMMENT_MAX} characters")
     return cleaned
 
 
@@ -124,11 +160,50 @@ def _row_to_reminder(row) -> Reminder:
     return Reminder(key=key, entity=entity, subject=subject, due_at=due)
 
 
+def _validated_flag(flag: ReviewFlag) -> ReviewFlag:
+    if not isinstance(flag, ReviewFlag):
+        raise InvalidReminder("not a review flag")
+    if not (isinstance(flag.key, str) and flag.key.strip()
+            and isinstance(flag.entity, str) and flag.entity.strip()):
+        raise InvalidReminder("flag needs a card and an entity")
+    if flag.comment is not None:
+        clean_flag_comment(flag.comment)
+    if (not isinstance(flag.flagged_at, datetime) or flag.flagged_at.tzinfo is None
+            or flag.flagged_at.utcoffset() is None):
+        raise InvalidReminder("flag time needs a UTC offset")
+    return flag
+
+
+def _row_to_flag(row) -> ReviewFlag:
+    key, entity, comment, flagged_at = row
+    if not (isinstance(key, str) and isinstance(entity, str) and isinstance(flagged_at, str)
+            and (comment is None or isinstance(comment, str))):
+        raise ReminderStoreUnavailable()
+    try:
+        when = datetime.fromisoformat(flagged_at)
+    except ValueError as exc:
+        raise ReminderStoreUnavailable() from exc
+    if when.tzinfo is None or when.utcoffset() is None:
+        raise ReminderStoreUnavailable()
+    return ReviewFlag(key=key, entity=entity, comment=comment, flagged_at=when)
+
+
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS reminders ("
     "key TEXT PRIMARY KEY, entity TEXT NOT NULL, subject TEXT NOT NULL, "
     "due_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
 )
+_FLAGS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS review_flags ("
+    "key TEXT PRIMARY KEY, entity TEXT NOT NULL, comment TEXT, "
+    "flagged_at TEXT NOT NULL)"
+)
+
+
+def _has_flags_table(db) -> bool:
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_flags'"
+    ).fetchone() is not None
 
 
 class ReminderStore:
@@ -209,9 +284,11 @@ class ReminderStore:
 
     @contextmanager
     @structured_reader(category="admin-db")
-    def connect(self, *, create=False, readonly=False):
+    def connect(self, *, create=False, readonly=False, flags_table=False):
         """Yield an open transaction, or None when the file is absent and
-        `create` is false (nothing is created by a read or a no-op write)."""
+        `create` is false (nothing is created by a read or a no-op write).
+        `flags_table` makes a write transaction create `review_flags` too; it
+        is set only by the call that stores a flag."""
         expected_identity = self._check(creating=True)
         if expected_identity is None:
             if not create:
@@ -239,6 +316,8 @@ class ReminderStore:
                 if not readonly:
                     connection.execute("BEGIN IMMEDIATE")
                     connection.execute(_SCHEMA)
+                    if flags_table:
+                        connection.execute(_FLAGS_SCHEMA)
                 yield connection
                 if not readonly:
                     connection.commit()
@@ -280,26 +359,68 @@ class ReminderStore:
 
     @failure_contract(raises=(ReminderStoreUnavailable,))
     def rekey(self, old: str, new: str) -> None:
+        """Move the reminder and the review flag stored under `old` to `new`
+        (a stale row already under `new` is replaced), in one transaction."""
         if old == new:
             return
         with self.connect() as db:
             if db is None:
                 return
-            if db.execute("SELECT 1 FROM reminders WHERE key=?", (old,)).fetchone() is None:
-                return
-            db.execute("DELETE FROM reminders WHERE key=?", (new,))
+            now = datetime.now(timezone.utc).isoformat()
+            if db.execute("SELECT 1 FROM reminders WHERE key=?", (old,)).fetchone() is not None:
+                db.execute("DELETE FROM reminders WHERE key=?", (new,))
+                db.execute(
+                    "UPDATE reminders SET key=?, updated_at=? WHERE key=?",
+                    (new, now, old),
+                )
+            if _has_flags_table(db) and db.execute(
+                "SELECT 1 FROM review_flags WHERE key=?", (old,)
+            ).fetchone() is not None:
+                db.execute("DELETE FROM review_flags WHERE key=?", (new,))
+                db.execute("UPDATE review_flags SET key=? WHERE key=?", (new, old))
+
+    @failure_contract(raises=(ReminderStoreUnavailable,))
+    def flags(self) -> dict[str, ReviewFlag]:
+        """Every review flag by key. A file without the table has none; a read
+        never creates the file or the table."""
+        with self.connect(readonly=True) as db:
+            if db is None or not _has_flags_table(db):
+                return {}
+            rows = db.execute(
+                "SELECT key, entity, comment, flagged_at FROM review_flags"
+            ).fetchall()
+        return {row[0]: _row_to_flag(row) for row in rows}
+
+    @failure_contract(raises=(ReminderStoreUnavailable, InvalidReminder))
+    def flag(self, review_flag: ReviewFlag) -> None:
+        """Store (or replace) the flag for a card."""
+        review_flag = _validated_flag(review_flag)
+        comment = None if review_flag.comment is None else clean_flag_comment(review_flag.comment)
+        with self.connect(create=True, flags_table=True) as db:
             db.execute(
-                "UPDATE reminders SET key=?, updated_at=? WHERE key=?",
-                (new, datetime.now(timezone.utc).isoformat(), old),
+                "INSERT INTO review_flags (key, entity, comment, flagged_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
+                "entity=excluded.entity, comment=excluded.comment, "
+                "flagged_at=excluded.flagged_at",
+                (review_flag.key, review_flag.entity, comment,
+                 review_flag.flagged_at.isoformat()),
             )
+
+    @failure_contract(raises=(ReminderStoreUnavailable,))
+    def unflag(self, key: str) -> None:
+        """Drop the flag for a card; idempotent, and never creates anything."""
+        with self.connect() as db:
+            if db is not None and _has_flags_table(db):
+                db.execute("DELETE FROM review_flags WHERE key=?", (key,))
 
     @failure_contract(raises=(ReminderStoreUnavailable,))
     def rename_entity(self, old: str, new: str) -> int:
         """Follow an entity rename: rewrite `entity` and the leading `old/`
         path segment of every key stored for `old`, in one transaction.
-        Returns the number of rows changed. Only the exact first segment moves
+        Returns the number of rows changed (reminders and flags). Only the exact first segment moves
         (`older/x.md` is another entity's key and stays). A stale row already
-        sitting under a rewritten key is replaced, as in `rekey`."""
+        sitting under a rewritten key is replaced, as in `rekey`. Review flags
+        follow the same rule in the same transaction; the count includes them."""
         if old == new:
             return 0
         prefix = old + "/"
@@ -318,6 +439,19 @@ class ReminderStore:
                     (new_key, new, now, key),
                 )
                 changed += 1
+            if _has_flags_table(db):
+                flagged = db.execute(
+                    "SELECT key FROM review_flags WHERE entity=?", (old,)
+                ).fetchall()
+                for (key,) in flagged:
+                    new_key = new + "/" + key[len(prefix):] if key.startswith(prefix) else key
+                    if new_key != key:
+                        db.execute("DELETE FROM review_flags WHERE key=?", (new_key,))
+                    db.execute(
+                        "UPDATE review_flags SET key=?, entity=? WHERE key=?",
+                        (new_key, new, key),
+                    )
+                    changed += 1
         return changed
 
 

@@ -11,7 +11,9 @@ from app.reminders import (
     InvalidReminder,
     Reminder,
     ReminderStore,
+    ReviewFlag,
     ReminderStoreUnavailable,
+    clean_flag_comment,
     clean_subject,
     parse_due,
     reminder_store,
@@ -305,3 +307,228 @@ def test_a_failure_before_publication_leaves_nothing_behind(state, monkeypatch):
         store.save(make())
     assert list(state.iterdir()) == []
     assert store.all() == {}
+
+
+# --- review flags ----------------------------------------------------------
+
+WHEN = datetime(2026, 11, 3, 9, 30, tzinfo=PLUS_TWO)
+
+
+def flag_of(key="synthetic/02-work/active/a.md", entity="synthetic", comment="Check the totals"):
+    return ReviewFlag(key, entity, comment, WHEN)
+
+
+def _tables(path):
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as db:
+        return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_flag_then_flags_round_trips_and_unflag_removes(state):
+    store = ReminderStore(state)
+    store.flag(flag_of())
+    store.flag(flag_of(key="synthetic/02-work/active/b.md", comment=None))
+    found = store.flags()
+    assert set(found) == {"synthetic/02-work/active/a.md", "synthetic/02-work/active/b.md"}
+    first = found["synthetic/02-work/active/a.md"]
+    assert (first.entity, first.comment) == ("synthetic", "Check the totals")
+    assert first.flagged_at.isoformat() == "2026-11-03T09:30:00+02:00"
+    assert found["synthetic/02-work/active/b.md"].comment is None
+    store.unflag("synthetic/02-work/active/a.md")
+    store.unflag("synthetic/02-work/active/a.md")  # idempotent
+    assert set(store.flags()) == {"synthetic/02-work/active/b.md"}
+
+
+def test_flag_upserts_and_trims_the_comment(state):
+    store = ReminderStore(state)
+    store.flag(flag_of(comment="  first  "))
+    store.flag(flag_of(comment="second"))
+    found = store.flags()
+    assert list(found) == ["synthetic/02-work/active/a.md"]
+    assert found["synthetic/02-work/active/a.md"].comment == "second"
+    store.flag(flag_of(comment="  padded  "))
+    assert store.flags()["synthetic/02-work/active/a.md"].comment == "padded"
+
+
+def test_flag_reads_create_nothing(state):
+    store = ReminderStore(state)
+    assert store.flags() == {}
+    store.unflag("anything")
+    assert list(state.iterdir()) == []
+
+
+def test_a_reminders_only_file_has_no_flags_table_and_reads_never_add_one(state):
+    store = ReminderStore(state)
+    store.save(make())
+    path = state / "reminders.sqlite3"
+    assert "review_flags" not in _tables(path)
+    assert store.flags() == {}
+    store.unflag("nothing")
+    store.rekey("a", "b")
+    store.rename_entity("old", "new")
+    store.remove("inbox/pay-card.md")
+    assert "review_flags" not in _tables(path)
+    store.flag(flag_of())
+    assert "review_flags" in _tables(path)
+    assert set(store.all()) == set()  # the reminder table is untouched by flags
+
+
+def test_first_flag_publishes_the_file_and_creates_the_table(state):
+    ReminderStore(state).flag(flag_of())
+    assert [p.name for p in state.iterdir()] == ["reminders.sqlite3"]
+    assert {"reminders", "review_flags"} <= _tables(state / "reminders.sqlite3")
+
+
+def test_a_zero_byte_file_has_no_flags_and_is_left_alone(state):
+    path = state / "reminders.sqlite3"
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    store = ReminderStore(state)
+    assert store.flags() == {}
+    assert path.stat().st_size == 0
+    store.flag(flag_of())
+    assert set(store.flags()) == {"synthetic/02-work/active/a.md"}
+
+
+def test_flag_refuses_bad_values_and_writes_nothing(state):
+    store = ReminderStore(state)
+    for bad in (
+        ReviewFlag("k", "e", "a\nb", WHEN),
+        ReviewFlag("k", "e", "", WHEN),
+        ReviewFlag("k", "e", "   ", WHEN),
+        ReviewFlag("k", "e", "x" * 501, WHEN),
+        ReviewFlag("k", "e", "bell\x07", WHEN),
+        ReviewFlag("k", "e", "ok", datetime(2026, 11, 3, 9, 30)),
+        ReviewFlag("", "e", "ok", WHEN),
+        ReviewFlag("k", " ", "ok", WHEN),
+    ):
+        with pytest.raises(InvalidReminder):
+            store.flag(bad)
+    with pytest.raises(InvalidReminder):
+        store.flag("not a flag")
+    assert list(state.iterdir()) == []
+
+
+def test_clean_flag_comment():
+    assert clean_flag_comment("  Look again  ") == "Look again"
+    assert clean_flag_comment("x" * 500) == "x" * 500
+    for bad in ["", "   ", "a\nb", "a\rb", "a\u2028b", "x" * 501, "a\x00b", None, 3]:
+        with pytest.raises(InvalidReminder):
+            clean_flag_comment(bad)
+
+
+def test_rekey_moves_a_flag_with_its_reminder_in_one_go(state):
+    store = ReminderStore(state)
+    store.save(make(key="a", subject="From a"))
+    store.flag(flag_of(key="a", comment="from a"))
+    store.flag(flag_of(key="b", comment="stale b"))
+    store.rekey("a", "b")
+    assert set(store.all()) == {"b"}
+    found = store.flags()
+    assert set(found) == {"b"} and found["b"].comment == "from a"
+    # A flag alone (no reminder) moves too.
+    store.flag(flag_of(key="c", comment="alone"))
+    store.rekey("c", "d")
+    assert set(store.flags()) == {"b", "d"}
+    store.rekey("missing", "b")
+    assert store.flags()["b"].comment == "from a"
+
+
+def test_rename_entity_moves_flags_key_prefix_and_entity(state):
+    store = ReminderStore(state)
+    store.flag(flag_of(key="old/02-work/a.md", entity="old", comment="A"))
+    store.flag(flag_of(key="older/02-work/c.md", entity="older", comment="C"))
+    store.flag(flag_of(key="other/old/d.md", entity="other", comment="D"))
+    store.flag(flag_of(key="new/02-work/a.md", entity="new", comment="Stale"))
+    store.save(make(key="old/02-work/a.md", entity="old"))
+    assert store.rename_entity("old", "new") == 2  # one reminder, one flag
+    found = store.flags()
+    assert set(found) == {"new/02-work/a.md", "older/02-work/c.md", "other/old/d.md"}
+    assert (found["new/02-work/a.md"].entity, found["new/02-work/a.md"].comment) == ("new", "A")
+    assert (found["older/02-work/c.md"].entity, found["other/old/d.md"].entity) == ("older", "other")
+    assert set(store.all()) == {"new/02-work/a.md"}
+    assert store.rename_entity("old", "new") == 0
+
+
+def test_rekey_and_rename_are_all_or_nothing_across_both_tables(state, monkeypatch):
+    store = ReminderStore(state)
+    store.save(make(key="old/x.md", entity="old"))
+    store.flag(flag_of(key="old/x.md", entity="old"))
+    import app.reminders as module
+
+    real = module._has_flags_table
+
+    def boom(db):
+        raise __import__("sqlite3").OperationalError("simulated")
+
+    monkeypatch.setattr(module, "_has_flags_table", boom)
+    with pytest.raises(ReminderStoreUnavailable):
+        store.rename_entity("old", "new")
+    with pytest.raises(ReminderStoreUnavailable):
+        store.rekey("old/x.md", "new/x.md")
+    monkeypatch.setattr(module, "_has_flags_table", real)
+    assert set(store.all()) == {"old/x.md"} and set(store.flags()) == {"old/x.md"}
+
+
+def test_a_malformed_flag_row_is_unavailable(state):
+    import sqlite3
+    from contextlib import closing
+
+    store = ReminderStore(state)
+    store.flag(flag_of())
+    with closing(sqlite3.connect(state / "reminders.sqlite3")) as db:
+        db.execute("UPDATE review_flags SET flagged_at='not a time'")
+        db.commit()
+    with pytest.raises(ReminderStoreUnavailable):
+        store.flags()
+    with closing(sqlite3.connect(state / "reminders.sqlite3")) as db:
+        db.execute("UPDATE review_flags SET flagged_at='2026-11-03T09:30:00'")  # naive
+        db.commit()
+    with pytest.raises(ReminderStoreUnavailable):
+        store.flags()
+    with closing(sqlite3.connect(state / "reminders.sqlite3")) as db:
+        db.execute("UPDATE review_flags SET flagged_at=5")
+        db.commit()
+    with pytest.raises(ReminderStoreUnavailable):
+        store.flags()
+
+
+def test_unsafe_store_refuses_flags_too(state):
+    store = ReminderStore(state)
+    store.flag(flag_of())
+    (state / "reminders.sqlite3").chmod(0o644)
+    with pytest.raises(ReminderStoreUnavailable):
+        store.flags()
+    with pytest.raises(ReminderStoreUnavailable):
+        store.flag(flag_of(key="other"))
+    with pytest.raises(ReminderStoreUnavailable):
+        store.unflag("x")
+
+
+def test_flags_are_never_written_into_the_vault(state, tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _git(vault, "init", "-q")
+    (vault / "note.md").write_text("synthetic\n")
+    _git(vault, "add", "note.md")
+    _git(vault, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "seed")
+    head = _git(vault, "rev-parse", "HEAD")
+    store = ReminderStore(state)
+    store.flag(flag_of())
+    store.rekey("synthetic/02-work/active/a.md", "synthetic/02-work/active/b.md")
+    store.unflag("synthetic/02-work/active/b.md")
+    assert _git(vault, "status", "--porcelain") == ""
+    assert _git(vault, "rev-parse", "HEAD") == head
+
+
+def test_flag_methods_declare_failure_contracts():
+    for fn, expected in [
+        (ReminderStore.flags, {ReminderStoreUnavailable}),
+        (ReminderStore.flag, {ReminderStoreUnavailable, InvalidReminder}),
+        (ReminderStore.unflag, {ReminderStoreUnavailable}),
+        (ReminderStore.rename_entity, {ReminderStoreUnavailable}),
+        (clean_flag_comment, {InvalidReminder}),
+    ]:
+        assert set(fn.__failure_contract__.raises) == expected

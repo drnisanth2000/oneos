@@ -16,7 +16,7 @@ import pytest
 
 import app.git_transaction as git_transaction
 import app.rename as rename
-from app.reminders import Reminder, ReminderStore
+from app.reminders import Reminder, ReminderStore, ReviewFlag
 from app.rename import (
     RenameError,
     apply_rename,
@@ -206,6 +206,22 @@ def test_entity_rename_rekeys_reminders(tmp_path, monkeypatch):
     assert 'except: ["newentity/.sensitive/**"]' in pol and "oldentity" not in pol
     assert git_head_message(vault) == "rename: oldentity → newentity"
     assert git_is_clean(vault)
+
+
+def test_entity_rename_moves_review_flags(tmp_path, monkeypatch):
+    vault = git_vault(tmp_path / "v", ENTITY_FILES)
+    store = ReminderStore(_auth_state(tmp_path, monkeypatch))
+    key = "oldentity/00-inbox/active/note.md"
+    store.flag(ReviewFlag(key, "oldentity", "Look again", _due()))
+    store.flag(ReviewFlag("oldentityx/a.md", "oldentityx", None, _due()))
+
+    apply_rename(vault, plan_rename(vault, "entity", "oldentity", "newentity"))
+
+    found = store.flags()
+    assert set(found) == {"newentity/00-inbox/active/note.md", "oldentityx/a.md"}
+    moved = found["newentity/00-inbox/active/note.md"]
+    assert (moved.entity, moved.comment) == ("newentity", "Look again")
+    assert (vault / moved.key).is_file()
 
 
 def test_entity_rename_without_a_store_still_succeeds(tmp_path, monkeypatch, capsys):

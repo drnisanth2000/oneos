@@ -12,7 +12,7 @@ from starlette.testclient import TestClient
 
 from app.board import NoteUnreadable
 from app.master import due_label, load_master
-from app.reminders import Reminder, ReminderStore
+from app.reminders import Reminder, ReminderStore, ReviewFlag
 from app.scope import CrossScopeError
 from tests.conftest import entities_yaml, scaffold_modules, write_vault
 
@@ -1628,3 +1628,115 @@ def test_approval_commit_is_unchanged(tmp_path, tmp_path_factory, monkeypatch):
     assert outcomes[0]["receipt"].startswith(b"version: 1")
     # Neither the reminder store nor a reminder trace is in the vault.
     assert not any("reminder" in name for name in outcomes[0]["tree"])
+
+
+# --- review flags ----------------------------------------------------------
+
+
+def _flag(entity: str, name: str, comment: str | None = "Look again", **kw) -> ReviewFlag:
+    return ReviewFlag(kw.get("key", _path(entity, name)), kw.get("entity", entity), comment, NOW)
+
+
+def _flags(*flags: ReviewFlag) -> dict[str, ReviewFlag]:
+    return {f.key: f for f in flags}
+
+
+def _titles(page, key):
+    return [m.card.title for c in page.columns if c.key == key for m in c.cards]
+
+
+def test_a_flagged_filed_card_is_in_to_review_only_and_keeps_its_status(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _note(tmp_path, "alpha", "02-work", "Shut", status="done")
+    _note(tmp_path, "alpha", "02-work", "Odd", status="open")
+    _note(tmp_path, "alpha", "00-inbox", "Fresh", sub="triage")
+    page = _load(vault, main, {}, flags=_flags(
+        _flag("alpha", "Spec"), _flag("alpha", "Chase", None), _flag("alpha", "Shut"), _flag("alpha", "Odd"),
+    ))
+    assert sorted(_titles(page, "review")) == ["Chase", "Fresh", "Odd", "Shut", "Spec"]
+    for key in ("draft", "waiting", "done"):
+        assert _titles(page, key) == []
+    assert page.other == ()
+    review = {m.card.title: m for c in page.columns if c.key == "review" for m in c.cards}
+    assert review["Spec"].card.status == "draft" and review["Chase"].card.status == "waiting"
+    assert review["Odd"].card.status == "open"
+    assert review["Spec"].flag.comment == "Look again" and review["Chase"].flag.comment is None
+    assert review["Fresh"].flag is None
+    assert next(c for c in page.columns if c.key == "review").total == 5
+
+
+def test_unflagging_returns_the_card_to_its_stage_column(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+    flagged = _load(vault, main, {}, flags=_flags(_flag("alpha", "Spec")))
+    assert _titles(flagged, "draft") == [] and _titles(flagged, "review") == ["Spec"]
+    for flags in ({}, None):
+        page = _load(vault, main, {}, flags=flags)
+        assert _titles(page, "draft") == ["Spec"] and _titles(page, "review") == []
+        assert page.columns[0].cards[0].flag is None
+
+
+def test_a_flagged_card_shows_its_review_by_reminder_in_to_review(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+    _note(tmp_path, "alpha", "02-work", "Other", status="draft")
+    _note(tmp_path, "alpha", "00-inbox", "Fresh", sub="triage", updated="2026-10-30")
+    mine = _reminder("alpha", "Spec", NOW + timedelta(hours=3), "Review by Thursday")
+    page = _load(vault, main, _by_key(mine), flags=_flags(_flag("alpha", "Spec"), _flag("alpha", "Other")))
+    cards = next(c for c in page.columns if c.key == "review").cards
+    assert cards[0].card.title == "Spec"  # a reminder puts it first
+    assert cards[0].reminder == mine and cards[0].flag is not None
+    assert page.attention[0].card is cards[0]  # strip links to the To review card
+    assert "Spec" not in _titles(page, "draft")
+
+
+def test_a_flag_on_an_inbox_or_proposed_card_is_ignored(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
+    _note(tmp_path, "alpha", "00-inbox", "Fresh", sub="triage")
+    _inbox_with_proposal(tmp_path, "beta1", "Proposed.md")
+    paths = {m.card.title: m.card.relative_path
+             for c in _load(vault, main, {}).columns if c.key == "review" for m in c.cards}
+    flags = {path: ReviewFlag(path, path.split("/")[0], "ignored", NOW) for path in paths.values()}
+    page = _load(vault, main, {}, flags=flags)
+    review = [m for c in page.columns if c.key == "review" for m in c.cards]
+    assert len(review) == len(paths) == 2
+    assert all(m.flag is None for m in review)
+
+
+def test_a_flag_matching_no_card_is_ignored_and_is_not_an_attention_entry(tmp_path, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+    stray = _flag("alpha", "Gone")
+    wrong_entity = ReviewFlag(_path("alpha", "Spec"), "beta1", "x", NOW)
+    page = _load(vault, main, {}, flags=_flags(stray, wrong_entity))
+    assert _titles(page, "draft") == ["Spec"] and _titles(page, "review") == []
+    assert page.attention == ()
+
+
+def test_store_unavailable_flags_are_ignored_and_the_page_renders(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch, mode=0o755)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+    response = client.get("/")
+    assert response.status_code == 200 and "Spec" in response.text
+    assert list(directory.iterdir()) == []
+    monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
+    assert client.get("/").status_code == 200
+
+
+def test_the_home_page_reads_flags_from_the_store_without_writing(tmp_path, tmp_path_factory, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status="draft")
+    path = _card_path(main, "alpha", "Spec")
+    before = client.get("/").text
+    assert list(directory.iterdir()) == []  # a read creates nothing
+    ReminderStore(directory).flag(ReviewFlag(path, "alpha", "Look <b>again</b>", NOW))
+    flagged = client.get("/").text
+    assert flagged != before
+    page_flags = main._page_flags()
+    assert set(page_flags) == {path}
+    ReminderStore(directory).unflag(path)
+    assert client.get("/").text == before
