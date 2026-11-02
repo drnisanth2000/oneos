@@ -74,7 +74,14 @@ from .git_transaction import (
     execute_transaction,
 )
 from .inbox import split_front_matter
-from .note_text import NoteTextError, _header_mapping, edit_note, split_note
+from .note_text import (
+    NoteTextError,
+    _header_mapping,
+    _key_lines,
+    _lines,
+    edit_note,
+    split_note,
+)
 from .outbox import (
     MissingProposalSource,
     OutboxDestinationError,
@@ -290,6 +297,13 @@ def _set_sub(text: str, sub: str | None) -> str:
     unchanged, and the header must mean what it meant except for `sub`.
     """
     header_raw, body_raw = split_note(text)
+    inner = _lines(header_raw)[1:-1]
+    placed = _key_lines("".join(inner))
+    # `_apply_sub` only sees a key written exactly `sub:` at the start of a
+    # line. A `"sub":` or `sub :` spelling would get a second `sub:` line
+    # (PyYAML keeps the last), so such a header is refused, never rewritten.
+    if "sub" in placed and not inner[placed["sub"][0]].startswith("sub:"):
+        raise NoteTextError("header 'sub' key is not written as 'sub:'; refusing to edit it")
     new_header = _apply_sub(header_raw, sub)
     expected = {key: value for key, value in _header_mapping(header_raw).items() if key != "sub"}
     if sub is not None:
@@ -297,6 +311,9 @@ def _set_sub(text: str, sub: str | None) -> str:
     if _header_mapping(new_header) != expected:
         raise NoteTextError("could not set 'sub:' safely")
     result = new_header + body_raw
+    # The only guard against `_apply_sub`'s `\s*` eating the closing fence
+    # (an empty `sub:` value): the mapping check can pass when a comment
+    # line is lost instead, and the body would then leak into the header.
     if split_note(result) != (new_header, body_raw):
         raise NoteTextError("setting 'sub:' would move the front-matter fence")
     return result

@@ -1045,3 +1045,79 @@ def test_the_outbox_screen_offers_only_reject_for_a_malformed_stage_record(
     assert response.status_code == 200
     assert not path.exists()
     assert (tmp_path / "alpha/outbox" / f"{classify_id}.yaml").exists()
+
+
+# --- review round 2: the fence guard, odd sub spellings, parse-safe records --
+
+
+def test_a_sub_change_that_would_swallow_the_closing_fence_is_refused(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    # `_apply_sub`'s `\s*` eats the empty `sub:` value's newline and the
+    # closing fence; the comment line hides it from the mapping check, so
+    # only the fence/body check stops `zz: 1` moving into the header.
+    text = _note("Inbox note", "active", body="zz: 1\n---\ntail\n").replace(
+        "updated: 2026-10-02\n---\n", "updated: 2026-10-02\n# c\nsub:\n---\n"
+    )
+    (vault / INBOX).write_text(text, encoding="utf-8")
+    with pytest.raises(NoteTextError):
+        propose_stage(
+            scope, src=INBOX, source_sha256=_sha(text.encode()), set_status="draft",
+            updated=TODAY, module="02-work", sub=None,
+        )
+    assert _records(vault) == []
+
+
+@pytest.mark.parametrize("spelling", ['"sub": triage', "sub : triage", "'sub': triage"])
+@pytest.mark.parametrize("sub", ["kb", None])
+def test_a_sub_key_not_written_plainly_is_refused(tmp_path, spelling, sub):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    text = _note("Inbox note", "active", sub="triage").replace("sub: triage", spelling)
+    (vault / INBOX).write_text(text, encoding="utf-8")
+    module = "11-knowledge" if sub else "02-work"
+    with pytest.raises(NoteTextError):
+        propose_stage(
+            scope, src=INBOX, source_sha256=_sha(text.encode()), set_status="draft",
+            updated=TODAY, module=module, sub=sub,
+        )
+    assert _records(vault) == []
+
+
+@pytest.mark.parametrize("value", ["2026-02-30", "!!timestamp nope"])
+def test_an_unconstructible_stage_record_is_row_local_and_only_rejectable(tmp_path, value):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    classify, classify_digest = _classify(scope, OTHER_INBOX)
+    proposal_id, _ = _stage_filed(scope)
+    path = vault / "demo1/outbox" / f"{proposal_id}.yaml"
+    raw = path.read_text()
+    assert f"updated: '{TODAY}'" in raw
+    path.write_text(raw.replace(f"updated: '{TODAY}'", f"updated: {value}"))
+    digest = _sha(path.read_bytes())
+
+    listing = project_outbox(scope)
+    assert not listing.blocked
+    rows = {row.proposal.id: row for row in listing.rows}
+    assert (rows[proposal_id].can_approve, rows[proposal_id].can_reject) == (False, True)
+    assert rows[proposal_id].review_sha256 == digest
+    with pytest.raises(UnreadableProposalRecord):
+        approve(scope, proposal_id, digest)
+    reject(scope, proposal_id, digest)
+    assert not path.exists()
+    approve(scope, classify.id, classify_digest)
+
+
+def test_an_unconstructible_classify_record_blocks_instead_of_crashing(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    classify, _ = _classify(scope)
+    raw = classify.path.read_text()
+    created = yaml.safe_load(raw)["created"]
+    classify.path.write_text(raw.replace(f"created: '{created}'", "created: 2026-02-30"))
+    assert "created: 2026-02-30" in classify.path.read_text()
+
+    listing = project_outbox(scope)
+    assert listing.blocked
+    with pytest.raises(OutboxDestinationError):
+        load_proposals(scope)

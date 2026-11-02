@@ -561,7 +561,11 @@ def _parse_record_bytes(contents: bytes) -> object:
         ) from exc
     try:
         return yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, ValueError, TypeError, AttributeError, KeyError) as exc:
+        # Scalar construction (an unquoted impossible date such as
+        # `2026-02-30`, an explicit `!!timestamp` tag) raises outside
+        # YAMLError. Either way the record is unreadable — never a crash of
+        # the whole listing.
         raise UnreadableProposalRecord(
             "proposal record is invalid YAML"
         ) from exc
@@ -592,8 +596,34 @@ def _validate_record(path: Path, record: object) -> Proposal | None:
         ) from exc
 
 
+#: A top-level `action: stage` line in raw record text. Used only when the
+#: record cannot be parsed at all, to keep a damaged stage record row-local.
+_RAW_STAGE_ACTION = re.compile(
+    rb"""^action:[ \t]*(?:stage|'stage'|"stage")[ \t]*(?:#[^\r\n]*)?\r?$""",
+    re.MULTILINE,
+)
+
+
+def _malformed_stage(path: Path, exc: UnreadableProposalRecord) -> MalformedStageProposal:
+    """The reject-only row for a stage record that cannot be validated.
+
+    Only a record whose *filename* is a canonical id qualifies; anything
+    else keeps the original, entity-blocking refusal.
+    """
+    try:
+        proposal_id = require_proposal_id(path.stem)
+    except ProposalIdentityError as identity_error:
+        raise exc from identity_error
+    return MalformedStageProposal(proposal_id, path, path.parent.parent.name, exc)
+
+
 def _proposal_from_contents(path: Path, contents: bytes) -> OutboxProposal | None:
-    record = _parse_record_bytes(contents)
+    try:
+        record = _parse_record_bytes(contents)
+    except UnreadableProposalRecord as exc:
+        if _RAW_STAGE_ACTION.search(contents):
+            return _malformed_stage(path, exc)
+        raise
     if isinstance(record, dict) and record.get("action") == "stage":
         # Recognised before the unknown-action refusal, in the same change
         # that can write the kind, so a stage record never blocks the Outbox.
@@ -601,13 +631,7 @@ def _proposal_from_contents(path: Path, contents: bytes) -> OutboxProposal | Non
         try:
             return stage_from_record(path, record)
         except UnreadableProposalRecord as exc:
-            try:
-                proposal_id = require_proposal_id(path.stem)
-            except ProposalIdentityError as identity_error:
-                raise exc from identity_error
-            return MalformedStageProposal(
-                proposal_id, path, path.parent.parent.name, exc
-            )
+            return _malformed_stage(path, exc)
     if isinstance(record, dict) and record.get("action") in ("lifecycle_repair", "lifecycle_rollback"):
         from .lifecycle_receipts import parse_proposal
         try:
