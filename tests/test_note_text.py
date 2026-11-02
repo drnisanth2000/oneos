@@ -49,7 +49,7 @@ def test_status_inserted_before_closing_fence_when_missing():
     out = edit(text)
     assert out == text.replace(
         "updated: 2026-10-02\n---\n", f"updated: {TODAY}\nstatus: waiting\n---\n"
-    ) or out.index("status: waiting") < out.index("---\n", 4)
+    )
     header, body = split_note(out)
     assert "status: waiting\n" in header
     assert body == "\nBody line one.\n\nBody line two.\n"
@@ -319,3 +319,85 @@ def test_other_header_content_is_preserved_byte_for_byte():
         )
         + "\nbody\n"
     )
+
+
+def _adversarial(old: str, new: str) -> str:
+    assert old in NOTE
+    return NOTE.replace(old, new, 1)
+
+
+ADVERSARIAL_HEADERS = {
+    # A quoted scalar whose continuation line looks like a header key.
+    "double-quoted-multiline-with-status": _adversarial(
+        "title: Plan the thing\n", 'title: "Plan\nstatus: x"\n'
+    ),
+    "single-quoted-multiline-with-status": _adversarial(
+        "title: Plan the thing\n", "title: 'Plan\nstatus: x'\n"
+    ),
+    "quoted-multiline-is-the-only-status": _adversarial(
+        "status: active\n", 'note: "a\nstatus: x"\n'
+    ),
+    "double-quoted-multiline": _adversarial(
+        "title: Plan the thing\n", 'title: "Plan\n  the thing"\n'
+    ),
+    "flow-mapping-multiline-with-status": _adversarial(
+        "product: null\n", "product: null\nmeta: {a: 1,\nstatus: x}\n"
+    ),
+    "flow-mapping-multiline": _adversarial(
+        "product: null\n", "product: null\nmeta: {a: 1,\n  b: 2}\n"
+    ),
+    "flow-sequence-multiline": _adversarial(
+        "product: null\n", "product: null\ntags: [a,\n  b]\n"
+    ),
+    "anchor-and-alias": _adversarial(
+        "product: null\n", "product: &p null\nmirror: *p\n"
+    ),
+    "anchor-on-status": _adversarial("status: active", "status: &s active"),
+    "alias-as-status": _adversarial(
+        "product: null\n", "product: null\nother: &s waiting\n"
+    ).replace("status: active", "status: *s"),
+    "tab-after-status-colon": _adversarial("status: active", "status:\tactive"),
+    "tab-after-updated-colon": _adversarial(
+        "updated: 2026-10-02", "updated:\t2026-10-02"
+    ),
+    "document-end-marker": _adversarial("product: null\n", "product: null\n...\n"),
+    "indented-header": "---\n" + "".join(
+        f"  {line}\n" for line in HEADER.split("\n")[1:-2]
+    ) + "---\n\nbody\n",
+    "indented-status-only": _adversarial("status: active", " status: active"),
+    "byte-order-mark": "\ufeff" + NOTE,
+    "next-line-in-header": _adversarial("title: Plan the thing", "title: Plan\x85thing"),
+    "line-separator-in-header": _adversarial(
+        "title: Plan the thing", "title: Plan\u2028thing"
+    ),
+    "paragraph-separator-in-header": _adversarial(
+        "title: Plan the thing", "title: Plan\u2029thing"
+    ),
+    "quoted-line-separator-in-header": _adversarial(
+        "title: Plan the thing", 'title: "Plan\u2028thing"'
+    ),
+}
+
+
+@pytest.mark.parametrize("text", ADVERSARIAL_HEADERS.values(), ids=ADVERSARIAL_HEADERS.keys())
+@pytest.mark.parametrize("status", ["waiting", None])
+def test_adversarial_headers_are_refused_never_rewritten(text, status):
+    with pytest.raises(NoteTextError):
+        edit(text, status=status)
+
+
+def test_plain_block_lists_and_scalars_in_the_header_are_still_edited():
+    text = NOTE.replace(
+        "product: null\n",
+        "product: null\ntags:\n  - a\n  - b\nsummary: >\n  folded\n  status: not a key\n",
+    )
+    out = edit(text)
+    assert out == text.replace("status: active", "status: waiting").replace(
+        "updated: 2026-10-02", f"updated: {TODAY}"
+    )
+
+
+@pytest.mark.parametrize("field", ["body", "comment"])
+def test_result_that_cannot_be_utf8_is_refused(field):
+    with pytest.raises(NoteTextError):
+        edit(NOTE, **{field: "lone \ud800 surrogate"})

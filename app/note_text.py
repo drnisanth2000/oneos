@@ -19,6 +19,13 @@ Rules (each one is pinned in tests/test_note_text.py):
   bytes alone, so a no-op save is a no-op even for CRLF files.
 * The result must pass ``schema.validate_file_text`` and must parse to the
   same header as before except for the two keys.
+* A header this module cannot reason about line by line is refused: anchors
+  or aliases, document markers or directives, a quoted scalar or flow
+  collection spread over several lines, an indented top-level mapping, a
+  ``status:``/``updated:`` value that does not sit on its own key line, or a
+  Unicode line separator (U+0085, U+2028, U+2029 and friends) that other
+  readers would split on.
+* The result must encode as UTF-8.
 """
 from __future__ import annotations
 
@@ -119,11 +126,87 @@ def _line_value(line: str):
     return next(iter(loaded.values()))
 
 
-def _set_key(inner: list[str], key: str, value: str, fence: str) -> list[str]:
+#: Line breaks other than CR and LF. YAML, ``str.splitlines`` and the policy
+#: enforcer do not agree on them, so a header holding one has no single
+#: meaning to preserve.
+_FOREIGN_LINE_BREAKS = _LINE_BREAKS - {"\r", "\n"}
+_REFUSED_TOKENS = (
+    yaml.AnchorToken,
+    yaml.AliasToken,
+    yaml.DirectiveToken,
+    yaml.DocumentStartToken,
+    yaml.DocumentEndToken,
+)
+_FLOW_OPEN = (yaml.FlowMappingStartToken, yaml.FlowSequenceStartToken)
+_FLOW_CLOSE = (yaml.FlowMappingEndToken, yaml.FlowSequenceEndToken)
+
+
+@structured_reader(category="front-matter")
+def _key_lines(inner_text: str) -> dict[str, tuple[int, int, int]]:
+    """Map each top-level key to ``(key line, value start line, value end line)``.
+
+    Refuses every header shape whose lines cannot be edited one at a time.
+    """
+    if any(char in _FOREIGN_LINE_BREAKS for char in inner_text):
+        raise NoteTextError("front matter contains a Unicode line separator")
+    try:
+        tokens = list(yaml.scan(inner_text, Loader=yaml.SafeLoader))
+        node = yaml.compose(inner_text, Loader=yaml.SafeLoader)
+    except yaml.YAMLError as error:
+        raise NoteTextError(f"front matter is not valid YAML: {error}") from error
+    flow_starts: list[int] = []
+    for token in tokens:
+        if isinstance(token, _REFUSED_TOKENS):
+            raise NoteTextError(
+                "front matter uses anchors, aliases or document markers; "
+                "refusing to edit it"
+            )
+        if isinstance(token, _FLOW_OPEN):
+            flow_starts.append(token.start_mark.line)
+        elif isinstance(token, _FLOW_CLOSE):
+            if flow_starts and flow_starts.pop() != token.end_mark.line:
+                raise NoteTextError("front matter has a multi-line flow collection")
+        elif (
+            isinstance(token, yaml.ScalarToken)
+            and not token.plain
+            and token.style in ("'", '"')
+            and token.start_mark.line != token.end_mark.line
+        ):
+            raise NoteTextError("front matter has a multi-line quoted value")
+    if node is None:
+        return {}
+    if not isinstance(node, yaml.MappingNode):
+        raise NoteTextError("front matter is not a mapping")
+    lines: dict[str, tuple[int, int, int]] = {}
+    for key, value in node.value:
+        if key.start_mark.column != 0:
+            raise NoteTextError("front matter keys are indented; refusing to edit it")
+        if isinstance(key.value, str):
+            lines[key.value] = (
+                key.start_mark.line, value.start_mark.line, value.end_mark.line
+            )
+    return lines
+
+
+def _set_key(
+    inner: list[str],
+    key: str,
+    value: str,
+    fence: str,
+    placed: tuple[int, int, int] | None,
+) -> list[str]:
     pattern = _key_pattern(key)
     hits = [i for i, line in enumerate(inner) if pattern.match(line)]
     if len(hits) > 1:
         raise NoteTextError(f"header has more than one '{key}:' line")
+    # The line the regex found must be the line YAML says holds the key, and
+    # its value must sit on that same line; anything else is a guess.
+    if placed is None and hits:
+        raise NoteTextError(f"header line '{key}:' is not a top-level key")
+    if placed is not None and (
+        hits != [placed[0]] or placed[1] != placed[0] or placed[2] != placed[0]
+    ):
+        raise NoteTextError(f"header '{key}:' value is not on its own line")
     eol = _eol(inner[-1]) if inner else ""
     eol = eol or _eol(fence) or "\n"
     if hits:
@@ -197,9 +280,12 @@ def edit_note(
     before = _header_mapping(header_raw)
     lines = _lines(header_raw)
     opening, inner, fence = lines[0], lines[1:-1], lines[-1]
+    placed = _key_lines("".join(inner))
     if status is not None:
-        inner = _set_key(inner, "status", status, fence)
-    inner = _set_key(inner, "updated", updated, fence)
+        inner = _set_key(inner, "status", status, fence, placed.get("status"))
+    # Inserting `status:` appends after every existing line, so the line
+    # numbers YAML gave for `updated:` are still right.
+    inner = _set_key(inner, "updated", updated, fence, placed.get("updated"))
     new_header = "".join([opening, *inner, fence])
 
     # Whatever the edit did to the lines, the header must still mean the same
@@ -230,6 +316,10 @@ def edit_note(
         separator = "\n"
 
     result = new_header + separator + content
+    try:
+        result.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise NoteTextError("edited note is not valid UTF-8 text") from error
     ok, problems = schema.validate_file_text(result)
     if not ok:
         raise NoteTextError("edited note would be invalid: " + "; ".join(problems))

@@ -156,6 +156,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         rename,
         review_tokens,
         scope,
+        stage,
         vault,
     )
     from app.console_errors import describe
@@ -239,6 +240,7 @@ def test_every_application_exception_resolves_to_its_designed_code():
         reminders.ReminderStoreUnavailable: "E-UNAVAILABLE",
         reminders.InvalidReminder: "E-REQUEST",
         note_text.NoteTextError: "E-REQUEST",
+        stage.StageUnchanged: "E-INVALID",
         review_tokens.ReviewedProposalChanged: "E-REVIEW",
         review_tokens.InvalidReviewToken: "E-REQUEST",
         review_tokens.ReviewContractViolation: "E-INTERNAL",
