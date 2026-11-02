@@ -233,6 +233,11 @@ stored). Front-matter is not in the editor; the stage buttons own
 `status`, and the other required fields stay untouched. *(My call, so an
 edit cannot break the policy enforcer's required fields.)*
 
+Every vault change made from the master view (a move, an edit, or a
+comment) also sets the existing `updated` field to the owner's local date,
+so "Updated" sorting and card dates show what was just worked on (owner
+decision, 2026-11-02).
+
 - Any stage button, including Save as Draft, saves the edited body
   together with the stage change and comment, as one action and one
   commit, bound to the bytes the popup opened with. If the note changed
