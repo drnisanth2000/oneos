@@ -615,22 +615,78 @@ def test_staging_debris_from_a_real_crash_is_invisible_to_the_outbox(tmp_path):
     assert git_head_message(vault).startswith("outbox: approve")
 
 
-def test_the_loader_validates_stage_records_strictly(tmp_path):
+def test_the_stage_validator_refuses_every_malformed_shape(tmp_path):
     vault = _vault(tmp_path)
     scope = Scope(vault, "demo1")
     proposal_id, _ = _stage_filed(scope)
     path = vault / "demo1/outbox" / f"{proposal_id}.yaml"
     record = yaml.safe_load(path.read_bytes())
-    for key, value in (
-        ("extra", "x"),
-        ("set_status", "active"),
-        ("src", "demo1/.sensitive/secret.md"),
-        ("dst", "demo1/02-work/active/other.md"),
-        ("updated", "2026-11-31"),
-    ):
-        broken = dict(record, **{key: value})
+    for broken in _MALFORMED(record):
         with pytest.raises(UnreadableProposalRecord):
-            outbox._proposal_from_contents(path, yaml.safe_dump(broken).encode())
+            stage.stage_from_record(path, broken)
+
+
+def _MALFORMED(record: dict) -> list[dict]:
+    """Every way a tampered or version-skewed stage record can be wrong."""
+    missing = dict(record)
+    del missing["comment"]
+    return [
+        dict(record, extra="x"),
+        missing,
+        dict(record, set_status="active"),
+        dict(record, set_status=["draft"]),
+        dict(record, set_status={"a": 1}),
+        dict(record, src="demo1/.sensitive/secret.md"),
+        dict(record, dst="demo1/02-work/active/other.md"),
+        dict(record, updated="2026-11-31"),
+        dict(record, body=["not", "text"]),
+        {**record, 1: "non-string key"},
+        dict(record, id="20260101T000000-" + "b" * 32),
+    ]
+
+
+@pytest.mark.parametrize("index", range(11))
+def test_a_malformed_stage_record_is_row_local_and_only_rejectable(tmp_path, index):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    classify, classify_digest = _classify(scope, OTHER_INBOX)
+    proposal_id, _ = _stage_filed(scope)
+    path = vault / "demo1/outbox" / f"{proposal_id}.yaml"
+    broken = _MALFORMED(yaml.safe_load(path.read_bytes()))[index]
+    path.write_bytes(yaml.safe_dump(broken, sort_keys=False).encode())
+    digest = _sha(path.read_bytes())
+    head = git_head(vault)
+
+    listing = project_outbox(scope)
+    assert not listing.blocked
+    rows = {row.proposal.id: row for row in listing.rows}
+    bad = rows[proposal_id]
+    assert bad.error is not None and bad.diff is None
+    assert (bad.can_approve, bad.can_reject, bad.review_sha256) == (False, True, digest)
+    assert rows[classify.id].can_approve
+
+    with pytest.raises(UnreadableProposalRecord):
+        approve(scope, proposal_id, digest)
+    assert git_head(vault) == head
+    with pytest.raises(ReviewedProposalChanged):
+        reject(scope, proposal_id, "0" * 64)
+    assert path.exists()
+
+    reject(scope, proposal_id, digest)
+    assert not path.exists()
+    assert f"{proposal_id}.yaml" in _quarantined(vault)
+    approve(scope, classify.id, classify_digest)
+    assert git_head_message(vault).startswith("outbox: approve")
+
+
+def test_an_unknown_non_stage_action_still_blocks(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    proposal_id, _ = _stage_filed(scope)
+    path = vault / "demo1/outbox" / f"{proposal_id}.yaml"
+    record = yaml.safe_load(path.read_bytes())
+    path.write_bytes(yaml.safe_dump(dict(record, action="restage")).encode())
+    assert project_outbox(scope).blocked
 
 
 # --- refusals -------------------------------------------------------------
@@ -810,3 +866,182 @@ def test_the_outbox_screen_lists_and_approves_a_stranded_stage_record(
     assert response.status_code == 200
     assert git_head_message(tmp_path) == f"outbox: stage {proposal_id} ({note})"
     assert "status: waiting\n" in (tmp_path / note).read_text()
+
+
+# --- review fixes: header-scoped sub, approval-time supersede checks -------
+
+
+def _inbox_note(vault: Path, header_sub: str | None, body: str) -> bytes:
+    text = _note("Inbox note", "active", sub=header_sub, body=body)
+    (vault / INBOX).write_text(text, encoding="utf-8")
+    git_bytes(vault, "add", INBOX)
+    git_bytes(vault, "commit", "-q", "-m", "inbox shape")
+    return text.encode()
+
+
+@pytest.mark.parametrize("header_sub", [None, "triage"])
+def test_moving_without_a_sub_never_touches_a_body_sub_line(tmp_path, header_sub):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    body = "First.\nsub: keep me\nLast.\n"
+    before = _inbox_note(vault, header_sub, body)
+
+    result = propose_and_approve_stage(
+        scope, src=INBOX, source_sha256=_sha(before), set_status="draft",
+        updated=TODAY, module="02-work", sub=None,
+    )
+
+    moved = (vault / result.dst).read_text()
+    assert moved.endswith("\n" + body)
+    header = moved[: moved.index("---\n", 4)]
+    assert "sub:" not in header
+
+
+def test_setting_a_sub_on_a_header_without_one_never_touches_the_body(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    body = "First.\nsub: keep me\nLast.\n"
+    before = _inbox_note(vault, None, body)
+
+    result = propose_and_approve_stage(
+        scope, src=INBOX, source_sha256=_sha(before), set_status="draft",
+        updated=TODAY, module="11-knowledge", sub="kb",
+    )
+
+    moved = (vault / result.dst).read_text()
+    assert moved.endswith("\n" + body)
+    header = moved[: moved.index("---\n", 4)]
+    assert header.count("sub: kb\n") == 1
+
+
+def test_an_empty_header_sub_that_would_swallow_a_line_is_refused(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    text = _note("Inbox note", "active", body="Body.\n").replace(
+        "updated: 2026-10-02\n", "updated: 2026-10-02\nsub:\nsource: folder\n"
+    )
+    (vault / INBOX).write_text(text, encoding="utf-8")
+    with pytest.raises(NoteTextError):
+        propose_stage(
+            scope, src=INBOX, source_sha256=_sha(text.encode()), set_status="draft",
+            updated=TODAY, module="11-knowledge", sub="kb",
+        )
+    assert _records(vault) == []
+
+
+@pytest.mark.parametrize("src", [FILED, INBOX])
+def test_an_impossible_header_date_is_a_note_text_error(tmp_path, src):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    text = (vault / src).read_text().replace("created: 2026-10-01", "created: 2026-02-30")
+    (vault / src).write_text(text, encoding="utf-8")
+    extra = {} if src == FILED else {"module": "11-knowledge", "sub": "kb"}
+    with pytest.raises(NoteTextError):
+        propose_stage(
+            scope, src=src, source_sha256=_sha(text.encode()), set_status="done",
+            updated=TODAY, **extra,
+        )
+    assert _records(vault) == []
+
+
+def _rewrite(path: Path, **changes) -> str:
+    record = yaml.safe_load(path.read_bytes())
+    record.update(changes)
+    path.write_bytes(yaml.safe_dump(record, sort_keys=False).encode())
+    return _sha(path.read_bytes())
+
+
+def test_a_superseded_record_that_no_longer_matches_is_refused_at_approval(tmp_path):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    classify, classify_digest = _classify(scope)
+    proposal_id, _ = propose_stage(
+        scope, src=INBOX, source_sha256=_source_sha(vault, INBOX),
+        set_status="waiting", updated=TODAY,
+        supersedes=classify.id, supersedes_review_sha256=classify_digest,
+    )
+    # The classification is rewritten (still a valid, canonical record) and
+    # the stage record re-reviewed against it: both digests now match, so
+    # only the approval-time identity check can refuse.
+    new_classify_digest = _rewrite(classify.path, sub=None)
+    stage_path = vault / "demo1/outbox" / f"{proposal_id}.yaml"
+    digest = _rewrite(stage_path, supersedes_review_sha256=new_classify_digest)
+    head = git_head(vault)
+
+    with pytest.raises(OutboxDestinationError):
+        approve(scope, proposal_id, digest)
+
+    assert git_head(vault) == head
+    assert (vault / INBOX).exists() and not (vault / INBOX_DST).exists()
+    assert len(_records(vault)) == 2
+
+
+def test_a_superseded_id_spent_before_the_lock_is_refused_under_it(tmp_path, monkeypatch):
+    from app.action_receipts import make_action_receipt, render_action_receipt
+
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    classify, classify_digest = _classify(scope)
+    proposal_id, digest = propose_stage(
+        scope, src=INBOX, source_sha256=_source_sha(vault, INBOX),
+        set_status="waiting", updated=TODAY,
+        supersedes=classify.id, supersedes_review_sha256=classify_digest,
+    )
+    # Another action spends the classification id after the unlocked check.
+    receipt_rel = receipt_relative_path("demo1", classify.id)
+    (vault / receipt_rel).parent.mkdir(parents=True, exist_ok=True)
+    (vault / receipt_rel).write_bytes(
+        render_action_receipt(make_action_receipt(classify.id, classify_digest, "approval"))
+    )
+    git_bytes(vault, "add", receipt_rel)
+    git_bytes(vault, "commit", "-q", "-m", "concurrent approval")
+    monkeypatch.setattr(stage, "_spent_action_before_review", lambda scope_, id_: None)
+    head = git_head(vault)
+
+    with pytest.raises(OutboxDestinationError):
+        approve(scope, proposal_id, digest)
+
+    assert git_head(vault) == head
+    assert (vault / INBOX).exists()
+    assert len(_records(vault)) == 2
+
+
+def test_a_record_that_does_not_round_trip_is_never_published(tmp_path, monkeypatch):
+    vault = _vault(tmp_path)
+    scope = Scope(vault, "demo1")
+    real = stage._render_record
+    monkeypatch.setattr(
+        stage, "_render_record", lambda record: real(dict(record, comment="altered"))
+    )
+    with pytest.raises(OutboxError):
+        _stage_filed(scope)
+    assert _records(vault) == [] and _staging_debris(vault) == []
+
+
+def test_the_outbox_screen_offers_only_reject_for_a_malformed_stage_record(
+    tmp_path, monkeypatch
+):
+    from tests.test_console_routes import _action_data, _outbox_proposal_client
+
+    _main, client, classify_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    note = "alpha/02-work/active/plan.md"
+    (tmp_path / note).write_text(
+        _note("Plan", "draft").replace("entity: demo1", "entity: alpha"), encoding="utf-8"
+    )
+    git_bytes(tmp_path, "add", note)
+    git_bytes(tmp_path, "commit", "-q", "-m", "note")
+    proposal_id, _ = _stage_filed(Scope(tmp_path, "alpha"), src=note)
+    path = tmp_path / "alpha/outbox" / f"{proposal_id}.yaml"
+    _rewrite(path, set_status=["draft"])
+
+    page = client.get("/outbox/alpha")
+    assert page.status_code == 200
+    assert "E-UNREADABLE" not in page.text
+    assert "E-INVALID" in page.text
+    assert page.text.count('class="approve"') == 1  # the classification's only
+    assert page.text.count('class="reject"') == 2
+
+    response = client.post("/outbox/alpha/reject", data=_action_data(tmp_path, proposal_id))
+    assert response.status_code == 200
+    assert not path.exists()
+    assert (tmp_path / "alpha/outbox" / f"{classify_id}.yaml").exists()

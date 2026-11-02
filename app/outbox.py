@@ -197,7 +197,33 @@ class StageProposal:
     action: str = "stage"
 
 
-OutboxProposal = Proposal | LifecycleProposal | StageProposal
+@dataclass(frozen=True)
+class MalformedStageProposal:
+    """An `action: stage` record that `stage_from_record` refuses.
+
+    A stage record is written whole by one OneOS action, so a malformed one
+    was tampered with or written by a different version. It must not block
+    the entity's Outbox the way an unreadable classification does, and it
+    must never be approved: it is a row-local error that can only be
+    rejected, through the same S7 sequence (capture once, compare its digest,
+    parse those bytes). Its id is the scan-validated filename, never a value
+    read from the record, and nothing from the record is displayed.
+    """
+    id: str
+    path: Path
+    entity: str
+    error: UnreadableProposalRecord
+    action: str = "stage"
+    # Inert display values for the shared review card.
+    src: str = ""
+    dst: str = ""
+    module: str = ""
+    sub: str | None = None
+    block: str = ""
+    source_sha256: str = ""
+
+
+OutboxProposal = Proposal | LifecycleProposal | StageProposal | MalformedStageProposal
 ClassificationActionResult = OutboxProposal | SpentAction
 
 
@@ -206,7 +232,7 @@ class OutboxRow:
     """One outbox entry as the Console can safely present it. Rows carry
     **capabilities**, not kinds (design §3): a row that cannot be diffed or
     approved is still a row, and it never withholds another row's controls."""
-    proposal: Proposal | LifecycleProposal | StageProposal | None
+    proposal: OutboxProposal | None
     diff: str | None
     error: BaseException | None
     can_approve: bool
@@ -572,7 +598,16 @@ def _proposal_from_contents(path: Path, contents: bytes) -> OutboxProposal | Non
         # Recognised before the unknown-action refusal, in the same change
         # that can write the kind, so a stage record never blocks the Outbox.
         from .stage import stage_from_record
-        return stage_from_record(path, record)
+        try:
+            return stage_from_record(path, record)
+        except UnreadableProposalRecord as exc:
+            try:
+                proposal_id = require_proposal_id(path.stem)
+            except ProposalIdentityError as identity_error:
+                raise exc from identity_error
+            return MalformedStageProposal(
+                proposal_id, path, path.parent.parent.name, exc
+            )
     if isinstance(record, dict) and record.get("action") in ("lifecycle_repair", "lifecycle_rollback"):
         from .lifecycle_receipts import parse_proposal
         try:
@@ -682,6 +717,12 @@ def _render_review(scope: Scope, proposal: OutboxProposal) -> tuple[str, str]:
     uses, and translates failures into the same domain types `approve` raises
     for the identical physical cause — so a projected row and its approve
     button never describe different conditions for one cause."""
+    if isinstance(proposal, MalformedStageProposal):
+        # Unchained on purpose: the operator outcome is a rejectable invalid
+        # row (E-INVALID), not E-UNREADABLE's "remove it outside the Console".
+        raise OutboxDestinationError(
+            "stage proposal record is malformed; it can only be rejected"
+        ) from None
     if isinstance(proposal, StageProposal):
         from .stage import render_stage_review
         return render_stage_review(scope, proposal)
@@ -753,16 +794,20 @@ def preview_diff(scope: Scope, proposal: OutboxProposal) -> str:
 
     `test_approval_route_visibly_refuses_unfresh_source` now observes
     `approve`'s own refusal rendered through the projection's listing. Its
-    missing-source case additionally produces a row-level `E-MISSING`; there
-    is no row-level `E-STALE`, because staleness is a revalidation concern
-    rather than a read-boundary one, so a stale row keeps `can_approve` and
-    renders a normal diff."""
+    missing-source case additionally produces a row-level `E-MISSING`. A
+    stale *classification* has no row-level `E-STALE`: its staleness is a
+    revalidation concern, so the row keeps `can_approve` and renders a normal
+    diff. A stale *stage* record is different. Its diff must equal the bytes
+    approval would write, and approval would refuse, so its row carries
+    `E-STALE` and can only be rejected (`tests/test_stage.py`).
+
+    Stage records, including malformed ones, render through `_render_review`."""
     _require_outbox_path(scope, proposal.path, require_leaf=True)
     reloaded = get_proposal(scope, proposal.id)
     if reloaded.id != proposal.id or reloaded.path != proposal.path:
         raise OutboxDestinationError("proposal changed since it was loaded")
     proposal = reloaded
-    if isinstance(proposal, (LifecycleProposal, StageProposal)):
+    if isinstance(proposal, (LifecycleProposal, StageProposal, MalformedStageProposal)):
         return _render_review(scope, proposal)[0]
     src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
@@ -954,7 +999,7 @@ def _require_destination(scope: Scope, proposal: OutboxProposal) -> OutboxPropos
     _require_outbox_path(scope, proposal.path, require_leaf=True)
     if isinstance(proposal, LifecycleProposal):
         return proposal
-    if isinstance(proposal, StageProposal):
+    if isinstance(proposal, (StageProposal, MalformedStageProposal)):
         # A stage record's paths depend on the registries and the disk, and
         # are checked where they are used — row-locally in the projection,
         # and before the transaction in approval — never here. Here a
@@ -1151,6 +1196,10 @@ def approve(
     )
     _require_destination(scope, prop)
     _require_outbox_path(scope, prop.path, require_leaf=True)
+    if isinstance(prop, MalformedStageProposal):
+        raise UnreadableProposalRecord(
+            "stage proposal record is malformed; it can only be rejected"
+        ) from prop.error
     if isinstance(prop, LifecycleProposal):
         from .lifecycle_repair import approve_lifecycle
         try:

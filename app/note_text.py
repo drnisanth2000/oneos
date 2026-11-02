@@ -51,6 +51,12 @@ class NoteTextError(ValueError):
     """The note cannot be edited safely; nothing was changed."""
 
 
+#: What PyYAML raises for a header it cannot construct. Scalar construction
+#: (an impossible date such as ``2026-02-30``, an explicit ``!!timestamp``
+#: tag) raises plain ``ValueError``/``AttributeError`` instead of YAMLError.
+_YAML_FAILURES = (yaml.YAMLError, ValueError, TypeError, AttributeError, KeyError)
+
+
 def _lines(text: str) -> list[str]:
     return _LINE_RE.findall(text)
 
@@ -119,7 +125,7 @@ def _line_value(line: str):
     """The YAML value one header line parses to, or raise NoteTextError."""
     try:
         loaded = yaml.safe_load(line)
-    except yaml.YAMLError as error:
+    except _YAML_FAILURES as error:
         raise NoteTextError(f"header line is not valid YAML: {error}") from error
     if not isinstance(loaded, dict) or len(loaded) != 1:
         raise NoteTextError("header line is not a single key")
@@ -225,7 +231,7 @@ def _header_mapping(header_raw: str) -> dict:
     lines = _lines(header_raw)
     try:
         loaded = yaml.safe_load("".join(lines[1:-1])) or {}
-    except yaml.YAMLError as error:
+    except _YAML_FAILURES as error:
         raise NoteTextError(f"front matter is not valid YAML: {error}") from error
     if not isinstance(loaded, dict):
         raise NoteTextError("front matter is not a mapping")
@@ -320,7 +326,10 @@ def edit_note(
         result.encode("utf-8")
     except UnicodeEncodeError as error:
         raise NoteTextError("edited note is not valid UTF-8 text") from error
-    ok, problems = schema.validate_file_text(result)
+    try:
+        ok, problems = schema.validate_file_text(result)
+    except _YAML_FAILURES as error:
+        raise NoteTextError(f"edited note would be invalid: {error}") from error
     if not ok:
         raise NoteTextError("edited note would be invalid: " + "; ".join(problems))
     new_split = split_note(result)

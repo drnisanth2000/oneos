@@ -74,7 +74,7 @@ from .git_transaction import (
     execute_transaction,
 )
 from .inbox import split_front_matter
-from .note_text import NoteTextError, edit_note, split_note
+from .note_text import NoteTextError, _header_mapping, edit_note, split_note
 from .outbox import (
     MissingProposalSource,
     OutboxDestinationError,
@@ -185,7 +185,8 @@ def _optional_text(record: dict, key: str) -> str | None:
 
 def _validated(path: Path, record: dict) -> StageProposal:
     """The record's own consistency; raises `OutboxDestinationError`."""
-    if tuple(sorted(record)) != tuple(sorted(_RECORD_KEYS)):
+    # A set comparison, not `sorted`: a non-string key is simply unequal.
+    if set(record) != set(_RECORD_KEYS):
         raise OutboxDestinationError("stage record fields are not the stage schema")
     try:
         proposal_id = require_proposal_identity(path, record["id"])
@@ -210,7 +211,9 @@ def _validated(path: Path, record: dict) -> StageProposal:
     if not isinstance(source_sha256, str) or _SHA256.fullmatch(source_sha256) is None:
         raise OutboxDestinationError("stage source hash is malformed")
     set_status = record["set_status"]
-    if set_status is not None and set_status not in STAGE_STATUSES:
+    if set_status is not None and (
+        not isinstance(set_status, str) or set_status not in STAGE_STATUSES
+    ):
         raise OutboxDestinationError("stage status is not a stage value")
     supersedes = record["supersedes"]
     supersedes_sha = record["supersedes_review_sha256"]
@@ -268,24 +271,35 @@ def stage_from_record(path: Path, record: object) -> StageProposal:
         raise UnreadableProposalRecord("proposal record must be a mapping")
     try:
         return _validated(path, record)
-    except OutboxDestinationError as exc:
+    except (OutboxDestinationError, TypeError, ValueError) as exc:
+        # TypeError/ValueError: a value of a type no check above anticipated
+        # (an unhashable list, say). Any tampered shape is malformed, never a
+        # crash of the loader.
         raise UnreadableProposalRecord("stage proposal record is malformed") from exc
 
 
 # --- the new bytes ------------------------------------------------------
 
 
-@structured_reader(category="front-matter")
-def _header(text: str) -> dict:
-    header_raw, _ = split_note(text)
-    lines = header_raw.splitlines(True)
-    try:
-        loaded = yaml.safe_load("".join(lines[1:-1])) or {}
-    except yaml.YAMLError as exc:
-        raise NoteTextError("front matter is not valid YAML") from exc
-    if not isinstance(loaded, dict):
-        raise NoteTextError("front matter is not a mapping")
-    return loaded
+def _set_sub(text: str, sub: str | None) -> str:
+    """Classification's `sub:` change, scoped to the header.
+
+    `outbox._apply_sub` matches the first `^sub:` line anywhere in the file,
+    so on a note whose header has no `sub:` it would rewrite or delete a body
+    line. Here it only ever sees the header, the body bytes are appended
+    unchanged, and the header must mean what it meant except for `sub`.
+    """
+    header_raw, body_raw = split_note(text)
+    new_header = _apply_sub(header_raw, sub)
+    expected = {key: value for key, value in _header_mapping(header_raw).items() if key != "sub"}
+    if sub is not None:
+        expected["sub"] = sub
+    if _header_mapping(new_header) != expected:
+        raise NoteTextError("could not set 'sub:' safely")
+    result = new_header + body_raw
+    if split_note(result) != (new_header, body_raw):
+        raise NoteTextError("setting 'sub:' would move the front-matter fence")
+    return result
 
 
 def stage_new_bytes(prop: StageProposal, source_bytes: bytes) -> bytes:
@@ -295,16 +309,10 @@ def stage_new_bytes(prop: StageProposal, source_bytes: bytes) -> bytes:
     except UnicodeDecodeError as exc:
         raise NoteTextError("note is not UTF-8 text") from exc
     if prop.src != prop.dst:
-        # Classification approval's one content change, so a stage move from
-        # the inbox files the item exactly as approving its proposal would.
-        before = _header(text)
-        text = _apply_sub(text, prop.sub)
-        after = _header(text)
-        expected = {key: value for key, value in before.items() if key != "sub"}
-        if prop.sub is not None:
-            expected["sub"] = prop.sub
-        if after != expected:
-            raise NoteTextError("could not set 'sub:' safely")
+        # Classification approval's one content change, applied to the
+        # header only, so a stage move from the inbox files the item as
+        # approving its proposal would without ever touching the body.
+        text = _set_sub(text, prop.sub)
     new = edit_note(
         text,
         status=prop.set_status,

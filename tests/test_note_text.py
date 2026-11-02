@@ -401,3 +401,16 @@ def test_plain_block_lists_and_scalars_in_the_header_are_still_edited():
 def test_result_that_cannot_be_utf8_is_refused(field):
     with pytest.raises(NoteTextError):
         edit(NOTE, **{field: "lone \ud800 surrogate"})
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("created: 2026-10-01", "created: 2026-02-30"),
+        ("updated: 2026-10-02", "updated: 2026-13-01"),
+        ("product: null", "product: !!timestamp not-a-date"),
+    ],
+)
+def test_impossible_header_values_raise_note_text_error_not_value_error(old, new):
+    with pytest.raises(NoteTextError):
+        edit(NOTE.replace(old, new))
