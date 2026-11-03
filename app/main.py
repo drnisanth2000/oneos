@@ -82,6 +82,7 @@ from .outbox import (
     OutboxRow,
     LifecycleProposal,
     Proposal,
+    StageProposal,
     StaleProposalSource,
     get_proposal_review,
     lifecycle_review_journal,
@@ -2358,7 +2359,19 @@ def _reminder_follows_approval(result) -> None:
     SpentAction (nothing new filed) or a lifecycle proposal (no source move)
     has nothing to follow. If the store is missing or unsafe the reminder
     stays under its old key and the strip shows it as "Card moved or removed".
+
+    A stage record approved here (one left pending when a stage press's
+    reject failed) gets the same follow-up as after the press itself: the
+    reminder follows the move, a status change clears the To review flag,
+    and Done resolves the reminder. A record with no status change and no
+    move (a body or comment edit only) does not say which stage was pressed,
+    so its flag and reminder are left as they are.
     """
+    if isinstance(result, StageProposal):
+        if result.set_status is None and result.src == result.dst:
+            return
+        _stage_follows_move(result.src, result.dst, resolve=result.set_status == "done")
+        return
     if not isinstance(result, Proposal):
         return
     try:

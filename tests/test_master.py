@@ -2916,3 +2916,94 @@ def test_drop_script_decides_where_a_card_goes(tmp_path):
     result = subprocess.run([node, str(harness), str(_DRAG_JS)], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "ok"
+
+
+# --- a stranded stage record approved on the Outbox screen ----------------------
+
+
+def _strand_stage(root, src, **kwargs):
+    """A pending stage record, as left when a press's reject failed after a
+    refusal. Returns the POST /outbox approve form for it."""
+    from app.scope import Scope
+    from app.stage import propose_stage
+
+    source_sha256 = hashlib.sha256((root / src).read_bytes()).hexdigest()
+    proposal_id, digest = propose_stage(
+        Scope(root, "alpha"), src=src, source_sha256=source_sha256, updated=_today(), **kwargs
+    )
+    return {"id": proposal_id, "review_sha256": digest}
+
+
+def test_outbox_approval_of_a_stage_record_to_done_clears_the_flag_and_resolves(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _note(tmp_path, "alpha", "02-work", "Other", status="waiting")
+    _git_commit_all(tmp_path)
+    path, other = _path("alpha", "Chase"), _path("alpha", "Other")
+    due = datetime.now(timezone.utc) + timedelta(days=1)
+    _seed(directory, _reminder("alpha", "Chase", due), _reminder("alpha", "Other", due))
+    store = ReminderStore(directory)
+    store.flag(_flag("alpha", "Chase"))
+    store.flag(_flag("alpha", "Other"))
+    form = _strand_stage(tmp_path, path, set_status="done")
+    before = _commits(tmp_path)
+    response = client.post("/outbox/alpha/approve", data=form)
+    assert response.status_code == 200, response.text
+    _assert_one_stage_commit(tmp_path, before, [path])
+    assert "\nstatus: done\n" in (tmp_path / path).read_text(encoding="utf-8")
+    # As after a Done press: the flag is cleared and the reminder resolved.
+    assert set(store.flags()) == {other}
+    assert set(store.all()) == {other}
+
+
+def test_outbox_approval_of_a_stage_record_moving_status_clears_the_flag_keeps_the_reminder(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="draft")
+    _git_commit_all(tmp_path)
+    path = _path("alpha", "Chase")
+    _seed(directory, _reminder("alpha", "Chase", datetime.now(timezone.utc) + timedelta(days=1)))
+    store = ReminderStore(directory)
+    store.flag(_flag("alpha", "Chase"))
+    response = client.post("/outbox/alpha/approve", data=_strand_stage(tmp_path, path, set_status="waiting"))
+    assert response.status_code == 200, response.text
+    assert store.flags() == {}
+    assert set(store.all()) == {path}
+
+
+def test_outbox_approval_of_an_inbox_stage_record_moves_the_reminder(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    src, dst = "alpha/00-inbox/active/mail.md", "alpha/02-work/active/mail.md"
+    _note(tmp_path, "alpha", "00-inbox", "mail", sub="triage", status="active")
+    _git_commit_all(tmp_path)
+    _seed(directory, Reminder(src, "alpha", "Answer it", datetime.now(timezone.utc) + timedelta(days=1)))
+    form = _strand_stage(tmp_path, src, set_status="waiting", module="02-work", sub="general")
+    before = _commits(tmp_path)
+    response = client.post("/outbox/alpha/approve", data=form)
+    assert response.status_code == 200, response.text
+    _assert_one_stage_commit(tmp_path, before, [dst])
+    found = ReminderStore(directory).all()
+    assert list(found) == [dst] and found[dst].subject == "Answer it"
+
+
+def test_outbox_approval_of_a_stage_record_survives_an_unsafe_store(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _git_commit_all(tmp_path)
+    path = _path("alpha", "Chase")
+    _seed(directory, _reminder("alpha", "Chase", datetime.now(timezone.utc) + timedelta(days=1)))
+    form = _strand_stage(tmp_path, path, set_status="done")
+    before = _commits(tmp_path)
+    directory.chmod(0o755)  # an unsafe store: the follow-up cannot run
+    response = client.post("/outbox/alpha/approve", data=form)
+    assert response.status_code == 200, response.text
+    _assert_one_stage_commit(tmp_path, before, [path])
+    directory.chmod(0o700)
+    assert set(ReminderStore(directory).all()) == {path}  # nothing lost
