@@ -13,7 +13,8 @@
 <div class="proposal classification-review"
      id="review-card-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
-  <h2 class="review-title">{{ row.title or row.proposal.src.split('/')[-1] }}</h2>
+  {# A malformed stage row has neither a title nor a source to name it by. #}
+  <h2 class="review-title">{{ row.title or row.proposal.src.split('/')[-1] or "Unreadable change" }}</h2>
   {% if row.proposal.action == "stage" %}
   {# A stage record (a master view press whose record was left pending): say
      what approval does to the note in plain words, not as a module move.

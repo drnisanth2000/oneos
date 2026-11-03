@@ -1084,6 +1084,14 @@ def test_the_outbox_screen_offers_only_reject_for_a_malformed_stage_record(
     assert "E-INVALID" in page.text
     assert page.text.count('class="approve"') == 1  # the classification's only
     assert page.text.count('class="reject"') == 2
+    # The malformed row has a plain title (nothing read from the record) and
+    # says what Reject does.
+    row = page.text.split(f'id="review-card-{proposal_id}-')[1].split('<details')[0]
+    title = re.search(r'<h2 class="review-title">(.*?)</h2>', row, re.S)
+    assert title and title.group(1).strip() == "Unreadable change"
+    copy = re.sub(r"\s+", " ", row)
+    assert "This change could not be read, so it cannot be approved." in copy
+    assert "Reject removes it and leaves the note as it is." in copy
 
     response = client.post("/outbox/alpha/reject", data=_action_data(tmp_path, proposal_id))
     assert response.status_code == 200
