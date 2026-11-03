@@ -1105,7 +1105,7 @@ def test_the_outbox_screen_offers_only_reject_for_a_malformed_stage_record(
 def test_a_sub_change_that_would_swallow_the_closing_fence_is_refused(tmp_path):
     vault = _vault(tmp_path)
     scope = Scope(vault, "demo1")
-    # `_apply_sub`'s `\s*` eats the empty `sub:` value's newline and the
+    # `_apply_sub_to_header`'s `\s*` eats the empty `sub:` value's newline and the
     # closing fence; the comment line hides it from the mapping check, so
     # only the fence/body check stops `zz: 1` moving into the header.
     text = _note("Inbox note", "active", body="zz: 1\n---\ntail\n").replace(

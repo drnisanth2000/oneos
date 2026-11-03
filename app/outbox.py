@@ -57,6 +57,7 @@ from .git_transaction import (
     consume_reviewed_proposal,
 )
 from .inbox import split_front_matter
+from .note_text import NoteTextError, _header_mapping, _key_lines, _lines, split_note
 from .destinations import DestinationError, resolve_classification_destination
 from .proposal_identity import (
     ProposalIdentityError,
@@ -705,18 +706,62 @@ def load_proposals(scope: Scope) -> list[OutboxProposal]:
     return [review.value for review in _load_proposal_reviews(scope)]
 
 
+def _apply_sub_to_header(header_raw: str, sub: str | None) -> str:
+    """The `sub:` line edit itself. It matches the first `^sub:` line, so it
+    is only ever handed a header (`_apply_sub`), never a whole note."""
+    if sub is None:
+        return re.sub(r"(?m)^sub:\s*.*\n?", "", header_raw, count=1)
+    if re.search(r"(?m)^sub:\s*.*$", header_raw):
+        return re.sub(r"(?m)^sub:\s*.*$", f"sub: {sub}", header_raw, count=1)
+    # no sub line yet — insert one just before the closing front-matter fence
+    fm_end = header_raw.find("---", 3)
+    if fm_end != -1:
+        return header_raw[:fm_end] + f"sub: {sub}\n" + header_raw[fm_end:]
+    return header_raw
+
+
 def _apply_sub(text: str, sub: str | None) -> str:
     """The move's only content change: the `sub:` front-matter value. `block`
-    is derived from the module, never written per file (conventions v2 §1)."""
-    if sub is None:
-        return re.sub(r"(?m)^sub:\s*.*\n?", "", text, count=1)
-    if re.search(r"(?m)^sub:\s*.*$", text):
-        return re.sub(r"(?m)^sub:\s*.*$", f"sub: {sub}", text, count=1)
-    # no sub line yet — insert one just before the closing front-matter fence
-    fm_end = text.find("---", 3)
-    if fm_end != -1:
-        return text[:fm_end] + f"sub: {sub}\n" + text[fm_end:]
-    return text
+    is derived from the module, never written per file (conventions v2 §1).
+
+    Scoped to the header: on a note whose header has no `sub:`, a body line
+    that starts with `sub:` is never rewritten or deleted. The body bytes are
+    appended unchanged, and the header must mean what it meant except for
+    `sub`. Raises `NoteTextError` when that cannot be done safely.
+    """
+    header_raw, body_raw = split_note(text)
+    inner = _lines(header_raw)[1:-1]
+    placed = _key_lines("".join(inner))
+    # `_apply_sub_to_header` only sees a key written exactly `sub:` at the
+    # start of a line. A `"sub":` or `sub :` spelling would get a second
+    # `sub:` line (PyYAML keeps the last), so such a header is refused,
+    # never rewritten.
+    if "sub" in placed and not inner[placed["sub"][0]].startswith("sub:"):
+        raise NoteTextError("header 'sub' key is not written as 'sub:'; refusing to edit it")
+    new_header = _apply_sub_to_header(header_raw, sub)
+    expected = {key: value for key, value in _header_mapping(header_raw).items() if key != "sub"}
+    if sub is not None:
+        expected["sub"] = sub
+    if _header_mapping(new_header) != expected:
+        raise NoteTextError("could not set 'sub:' safely")
+    result = new_header + body_raw
+    # The only guard against `_apply_sub_to_header`'s `\s*` eating the
+    # closing fence (an empty `sub:` value): the mapping check can pass when
+    # a comment line is lost instead, and the body would then leak into the
+    # header.
+    if split_note(result) != (new_header, body_raw):
+        raise NoteTextError("setting 'sub:' would move the front-matter fence")
+    return result
+
+
+def _classified_text(old: str, sub: str | None) -> str:
+    """`_apply_sub` for a classification, refusing in the outbox's own terms."""
+    try:
+        return _apply_sub(old, sub)
+    except NoteTextError as exc:
+        raise OutboxDestinationError(
+            "proposal source front matter cannot be edited safely"
+        ) from exc
 
 
 def _diff_text(proposal: Proposal, old: str) -> str:
@@ -726,7 +771,9 @@ def _diff_text(proposal: Proposal, old: str) -> str:
     policy** — the diff production itself is identical, and duplicating it let
     the two drift with no test able to notice.
     """
-    new = _apply_sub(old, proposal.sub)
+    # An empty `old` is `preview_diff`'s missing-source fallback: nothing to
+    # change, so nothing to refuse.
+    new = _classified_text(old, proposal.sub) if old else old
     diff = difflib.unified_diff(
         old.splitlines(True), new.splitlines(True),
         fromfile=f"a/{proposal.src}", tofile=f"b/{proposal.dst}",
@@ -1253,7 +1300,7 @@ def approve(
     if actual_sha256 != prop.source_sha256:
         raise StaleProposalSource("proposal source has changed")
     try:
-        approved_bytes = _apply_sub(
+        approved_bytes = _classified_text(
             source_bytes.decode("utf-8"), prop.sub
         ).encode("utf-8")
     except UnicodeDecodeError as exc:

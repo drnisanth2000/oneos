@@ -633,6 +633,78 @@ def test_preview_diff_shows_move_and_sub_change(tmp_path):
     assert "-sub: triage" in diff and "+sub: kb" in diff
 
 
+_NO_HEADER_SUB_HEADER = textwrap.dedent(
+    """\
+    ---
+    type: inbox-item
+    title: Clinical study protocol
+    entity: demo1
+    status: active
+    created: 2026-01-01
+    updated: 2026-01-01
+    source: folder
+    """
+)
+_NO_HEADER_SUB_BODY = "Notes from the call.\nsub: something the owner wrote\n---\ntail\n"
+
+
+@pytest.mark.parametrize(
+    ("module", "sub", "header_line"),
+    [("11-knowledge", "kb", "sub: kb\n"), ("11-library", "", "")],
+    ids=("set-sub", "clear-sub"),
+)
+def test_classify_approval_leaves_a_body_sub_line_alone(
+    tmp_path, module, sub, header_line
+):
+    # The header has no `sub:`; the body has a line that starts with one.
+    # Only the header may change, so the body must arrive byte for byte.
+    text = _NO_HEADER_SUB_HEADER + "---\n" + _NO_HEADER_SUB_BODY
+    vault = _outbox_vault(
+        tmp_path,
+        ("demo1",),
+        {
+            "demo1/00-inbox/active/note.md": text,
+            "demo1/11-knowledge/active/.gitkeep": "",
+            "demo1/11-library/active/.gitkeep": "",
+        },
+    )
+    scope = Scope(vault, "demo1")
+    prop = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "note.md"), module=module, sub=sub
+    )
+    expected = _NO_HEADER_SUB_HEADER + header_line + "---\n" + _NO_HEADER_SUB_BODY
+
+    diff = preview_diff(scope, load_proposals(scope)[0])
+    assert "-sub: something the owner wrote" not in diff
+    approval = approve(scope, prop.id, _fp(scope, prop.id))
+
+    assert (vault / approval.dst).read_bytes() == expected.encode("utf-8")
+
+
+def test_classify_approval_refuses_a_sub_key_not_written_plainly(tmp_path):
+    # `"sub": triage` would get a second `sub:` line, so nothing is written.
+    text = _NO_HEADER_SUB_HEADER + '"sub": triage\n---\n' + _NO_HEADER_SUB_BODY
+    vault = _outbox_vault(
+        tmp_path,
+        ("demo1",),
+        {
+            "demo1/00-inbox/active/note.md": text,
+            "demo1/11-knowledge/active/.gitkeep": "",
+        },
+    )
+    scope = Scope(vault, "demo1")
+    prop = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "note.md"), module="11-knowledge", sub="kb"
+    )
+    before_head = git_head(vault)
+
+    with pytest.raises(outbox.OutboxDestinationError):
+        approve(scope, prop.id, _fp(scope, prop.id))
+
+    assert git_head(vault) == before_head
+    assert scope.resolve("00-inbox", "active", "note.md").read_text(encoding="utf-8") == text
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
