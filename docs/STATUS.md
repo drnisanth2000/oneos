@@ -10,10 +10,11 @@ Build order and rules: see `../BUILD.md` and the spec at
 
 Last reconciled: 2026-11-03, after the running install was updated to
 `604901f` (master view moves and editing). Earlier reconciliations:
-2026-11-02 (install update to `345f7a7`), 2026-10-30 (install updates to `75e6725` and `8df5979`), 2026-10-29
-(install update to `d28ea6b`), 2026-10-28 (install updates to `d3dd761` and
-`85afa63`), 2026-10-26 (Board, rules line, and local deployment acceptance)
-and 2026-09-11 (trusted-local live Gate 1 session).
+2026-11-02 (install update to `345f7a7`), 2026-10-30 (install updates to
+`75e6725` and `8df5979`), 2026-10-29 (install update to `d28ea6b`),
+2026-10-28 (install updates to `d3dd761` and `85afa63`), 2026-10-26 (Board,
+rules line, and local deployment acceptance) and 2026-09-11 (trusted-local
+live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
 
@@ -49,10 +50,11 @@ Afterwards `status` reported every component available and services running,
 `/healthz` answered 200, `/` redirected to sign-in, the running container holds
 the new stage and drag code, and the app log showed no errors. The vault's
 HEAD, status, worktree diff, and cached diff were byte-identical before and
-after. Before merging, one stage approval was run against a throwaway clone of
-the vault (tracked files only, with the vault's real pre-commit hook): draft to
-waiting plus a comment made one commit, the hook accepted it, and the clone was
-deleted. The owner's first real move from Home is pending.
+after. Before PR #60 was merged, one stage approval was run against a
+throwaway clone of the vault (tracked files only, with the vault's real
+pre-commit hook): draft to waiting plus a comment made one commit, the hook
+accepted it, and the clone was deleted. The owner's first real move from Home
+is pending.
 
 ## Running install update to `345f7a7` (2026-11-02)
 
@@ -75,7 +77,8 @@ store passes its validation unchanged (no passkeys yet; new tables are created
 on the first write that needs them), and the app log showed no errors. The
 vault's HEAD, status, worktree diff, and cached diff were byte-identical
 before and after. The owner confirmed on 2026-11-02 that Touch ID sign-in
-works.
+works. Still not recorded as checked: still signed in after 30 minutes, Remove
+Touch ID, and the password + code fallback.
 
 ## Running install update to `75e6725` (2026-10-30)
 
