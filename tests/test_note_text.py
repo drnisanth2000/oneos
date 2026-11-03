@@ -414,3 +414,21 @@ def test_result_that_cannot_be_utf8_is_refused(field):
 def test_impossible_header_values_raise_note_text_error_not_value_error(old, new):
     with pytest.raises(NoteTextError):
         edit(NOTE.replace(old, new))
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ('updated: "2026-07-19"', f'updated: "{TODAY}"'),
+        ("updated: '2026-07-19'", f"updated: '{TODAY}'"),
+        ("updated: 2026-07-19", f"updated: {TODAY}"),
+    ],
+)
+def test_replaced_updated_line_keeps_its_quote_style(old, new):
+    text = NOTE.replace("updated: 2026-10-02", old)
+    out = edit(text)
+    header, body = split_note(out)
+    assert f"\n{new}\n" in header
+    assert out == text.replace("status: active", "status: waiting").replace(old, new)
+    assert body == split_note(text)[1]
+    assert schema.validate_file_text(out)[0]

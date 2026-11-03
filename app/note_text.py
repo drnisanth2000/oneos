@@ -9,7 +9,7 @@ Rules (each one is pinned in tests/test_note_text.py):
 * Only the ``status:`` and ``updated:`` lines inside the front-matter block may
   change, and they change only when the value really differs. A missing line
   is inserted just before the closing fence. Nothing is re-dumped, reordered
-  or re-quoted. Keys are matched at the start of a header line only, so
+  or re-quoted; a replaced ``updated:`` keeps its old quote style. Keys are matched at the start of a header line only, so
   ``x_status:`` and indented (nested) keys are never touched.
 * The block ends at the first line whose stripped content is ``---``. If the
   first ``---`` that ``schema.validate_file_text`` would use is somewhere else
@@ -200,6 +200,8 @@ def _set_key(
     value: str,
     fence: str,
     placed: tuple[int, int, int] | None,
+    *,
+    keep_quotes: bool = False,
 ) -> list[str]:
     pattern = _key_pattern(key)
     hits = [i for i, line in enumerate(inner) if pattern.match(line)]
@@ -220,8 +222,15 @@ def _set_key(
         if str(_line_value(inner[index])) == value:
             return inner
         line_eol = _eol(inner[index]) or eol
+        written = value
+        if keep_quotes:
+            # Keep the old value's quoting: "x" stays "x", 'x' stays 'x'.
+            match = pattern.match(inner[index])
+            old_value = inner[index][match.end():].lstrip(" \t")
+            if old_value[:1] in ("'", '"'):
+                written = f"{old_value[0]}{value}{old_value[0]}"
         inner = list(inner)
-        inner[index] = f"{key}: {value}{line_eol}"
+        inner[index] = f"{key}: {written}{line_eol}"
         return inner
     return [*inner, f"{key}: {value}{eol}"]
 
@@ -291,7 +300,9 @@ def edit_note(
         inner = _set_key(inner, "status", status, fence, placed.get("status"))
     # Inserting `status:` appends after every existing line, so the line
     # numbers YAML gave for `updated:` are still right.
-    inner = _set_key(inner, "updated", updated, fence, placed.get("updated"))
+    inner = _set_key(
+        inner, "updated", updated, fence, placed.get("updated"), keep_quotes=True
+    )
     new_header = "".join([opening, *inner, fence])
 
     # Whatever the edit did to the lines, the header must still mean the same
