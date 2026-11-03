@@ -230,14 +230,14 @@ def test_oserror_reading_a_note_fails_only_its_entity(tmp_path, monkeypatch):
     main, vault = _vault(tmp_path, monkeypatch)
     locked = _note(tmp_path, "alpha", "02-work", "Locked", status="draft")
     _note(tmp_path, "beta1", "02-work", "Still here", status="draft")
-    real_read = Path.read_text
+    real_read = Path.read_bytes  # the card reader reads bytes so it can hash what it parsed
 
-    def read_text(self, *args, **kwargs):
+    def read_bytes(self, *args, **kwargs):
         if self == locked or self.resolve() == locked.resolve():
             raise PermissionError(13, "Permission denied", str(self))
         return real_read(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
     page = load_master(vault, main.build_scope, entities=(), sort="", done_all=False,
                        now=datetime(2026, 10, 29, 9, tzinfo=timezone.utc), reminders={})
     assert [f.entity_label for f in page.failures] == ["Alpha"]
@@ -2526,3 +2526,341 @@ def test_tomorrow_on_the_device_is_accepted(tmp_path, tmp_path_factory, monkeypa
     assert _commits(tmp_path) == before + 1
     text = note.read_text(encoding="utf-8")
     assert f"\nupdated: {tomorrow}\n" in text and f"Comment ({tomorrow}): Late" in text
+
+
+# --- Drag and drop on the home page (Task 5) ----------------------------------------
+
+_DRAG_JS = Path(__file__).resolve().parents[1] / "static" / "master_drag.js"
+
+
+def _card_tags(html: str) -> list[dict]:
+    """Each master card's opening tag as a dict of its attributes (unescaped)."""
+    tags = re.findall(r'<button type="button" class="board-card master-card"([^>]*)>', html, re.S)
+    return [
+        {name: _html.unescape(value) for name, value in re.findall(r'([a-z0-9-]+)="([^"]*)"', tag)}
+        for tag in tags
+    ]
+
+
+def test_cards_carry_what_a_drop_needs(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft")
+    _git_commit_all(tmp_path)
+    cards = _card_tags(client.get("/").text)
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["draggable"] == "true"
+    assert card["data-entity"] == "alpha"
+    assert card["data-path"] == _card_path(main, "alpha", "Plan")
+    assert card["data-lane"] == "filed"
+    assert card["data-source-sha256"] == hashlib.sha256(note.read_bytes()).hexdigest()
+    assert card["hx-get"].startswith("/master/card/alpha?path=")
+
+
+def test_board_card_sha256_is_the_hash_of_the_bytes_read(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    filed = _note(tmp_path, "alpha", "02-work", "Plan", status="draft")
+    crlf = _note(tmp_path, "alpha", "02-work", "Windows", status="waiting")
+    crlf.write_bytes(crlf.read_bytes().replace(b"\n", b"\r\n"))
+    inbox = tmp_path / "alpha" / "00-inbox" / "active" / "bare.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("---\ntype: inbox-item\ntitle: Bare\nsub: triage\n---\nbody\n", encoding="utf-8")
+    cards = main.entity_cards(main.build_scope("alpha"), main.Vault(main.current_catalog()))
+    by_title = {c.title: c for c in (*cards.inbox, *cards.filed)}
+    assert by_title["Plan"].sha256 == hashlib.sha256(filed.read_bytes()).hexdigest()
+    assert by_title["Windows"].sha256 == hashlib.sha256(crlf.read_bytes()).hexdigest()
+    assert by_title["Windows"].status == "waiting"  # CRLF still parses as it always did
+    assert by_title["Bare"].sha256 == hashlib.sha256(inbox.read_bytes()).hexdigest()
+
+
+def test_the_card_hash_is_the_one_the_note_snapshot_gives(tmp_path, monkeypatch):
+    """A direct drop posts the card's hash; the route compares it with note_snapshot."""
+    main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Plan", status="draft")
+    scope = main.build_scope("alpha")
+    card = next(c for c in main.entity_cards(scope, main.Vault(main.current_catalog())).filed)
+    assert card.sha256 == main.note_snapshot(scope, card.relative_path).sha256
+
+
+def test_proposed_and_inbox_cards_are_marked_with_their_lane(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    bare = tmp_path / "alpha" / "00-inbox" / "active" / "bare.md"
+    bare.parent.mkdir(parents=True, exist_ok=True)
+    bare.write_text("---\ntype: inbox-item\ntitle: Bare\nsub: triage\n---\nbody\n", encoding="utf-8")
+    _git_commit_all(tmp_path)
+    by_lane = {c["data-lane"]: c for c in _card_tags(client.get("/").text)}
+    assert by_lane["inbox"]["data-source-sha256"] == hashlib.sha256(bare.read_bytes()).hexdigest()
+
+
+def test_proposed_card_has_lane_proposed_and_no_invented_hash(tmp_path, monkeypatch):
+    main, _v = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
+    _inbox_with_proposal(tmp_path, "alpha", "marker.md")
+    client = TestClient(main.app)
+    cards = _card_tags(client.get("/").text)
+    assert [c["data-lane"] for c in cards] == ["proposed"]
+    assert cards[0]["data-source-sha256"] == ""
+
+
+def test_each_column_is_a_drop_target(tmp_path, monkeypatch):
+    _main, client = _client(tmp_path, monkeypatch)
+    html = client.get("/").text
+    assert re.findall(r'<section class="board-column master-col[^"]*"\s+data-stage="([a-z]+)"', html) == [
+        "draft", "waiting", "review", "done",
+    ]
+    assert '<script defer src="/static/master_drag.js"></script>' in html
+    # A swap into the popup (a drop's reply included) opens the dialog.
+    assert "@htmx:after-swap=\"if (!$el.open) $el.showModal()\"" in html
+
+
+def test_drag_script_never_writes_markup_and_sends_through_htmx():
+    source = _DRAG_JS.read_text(encoding="utf-8")
+    for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "fetch(",
+                      "localStorage", "sessionStorage", "import ", "require(", "http:", "https:"):
+        assert forbidden not in source, forbidden
+    # The CSRF header comes from the page head's htmx configRequest handler.
+    head = (Path(__file__).resolve().parents[1] / "templates" / "_head.html").read_text(encoding="utf-8")
+    assert "htmx:configRequest" in head and "X-CSRF-Token" in head
+    assert source.count("htmx.ajax(") == 2
+
+
+def test_drag_css_reuses_the_boards_drop_style_and_is_pointer_gated():
+    css = (Path(__file__).resolve().parents[1] / "static" / "app.css").read_text(encoding="utf-8")
+    assert ".board-column.drop-over {" in css  # the master columns are board columns
+    assert "@media (min-width: 768px) and (hover: hover) and (pointer: fine)" in css
+    assert re.search(r'\.master-card\.is-dragging \{ opacity', css)
+
+
+def test_board_page_keeps_its_own_drag_behaviour():
+    template = (Path(__file__).resolve().parents[1] / "templates" / "board.html").read_text(encoding="utf-8")
+    assert "master_drag" not in template
+    assert "drop($event, $el.dataset.module, $el.dataset.sub)" in template
+
+
+def test_a_drop_post_with_a_stale_hash_is_refused_and_writes_nothing(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft")
+    _git_commit_all(tmp_path)
+    card = _card_tags(client.get("/").text)[0]
+    # The note is edited elsewhere after the page was drawn.
+    note.write_text(note.read_text(encoding="utf-8") + "Added elsewhere\n", encoding="utf-8")
+    _git(tmp_path, "commit", "-qam", "edited elsewhere")
+    head = _git(tmp_path, "rev-parse", "HEAD")
+    response = client.post("/master/stage/alpha", data={
+        "path": card["data-path"], "source_sha256": card["data-source-sha256"],
+        "stage": "done", "today": _today(),
+    })
+    assert response.status_code == 200
+    assert "This note changed since you opened it" in response.text
+    assert "Added elsewhere" in response.text  # the popup shows the newer text
+    _nothing_written(tmp_path, head)
+    assert "\nstatus: draft\n" in note.read_text(encoding="utf-8")
+
+
+def test_a_drop_post_with_the_cards_own_values_moves_it_in_one_commit(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft")
+    _git_commit_all(tmp_path)
+    card = _card_tags(client.get("/").text)[0]
+    before = _commits(tmp_path)
+    response = client.post("/master/stage/alpha", data={
+        "path": card["data-path"], "source_sha256": card["data-source-sha256"],
+        "stage": "done", "today": _today(),
+    })
+    assert response.status_code == 200 and response.headers["HX-Trigger"] == "master-refresh"
+    _assert_one_stage_commit(tmp_path, before, [card["data-path"]])
+    assert "\nstatus: done\n" in note.read_text(encoding="utf-8")
+
+
+def _node_or_skip():
+    import shutil
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    return node
+
+
+_DRAG_HARNESS = r"""
+const assert = require('assert');
+const path = process.argv[2];
+const state = {canDrag: true, calls: [], listeners: {}, fail: false};
+
+function classList() {
+  const set = new Set();
+  return {add: (c) => set.add(c), remove: (c) => set.delete(c), contains: (c) => set.has(c), has: (c) => set.has(c)};
+}
+function column(stage) {
+  const col = {dataset: {stage}, classList: classList(), parent: null, children: []};
+  col.closest = (sel) => (sel === '[data-stage]' ? col : null);
+  col.contains = (node) => node === col || (node && node.parent === col);
+  return col;
+}
+function card(col, data, extra) {
+  const attrs = {draggable: 'true'};
+  const c = {
+    dataset: Object.assign({entity: 'alpha', path: 'alpha/02-work/active/Plan.md', sourceSha256: 'a'.repeat(64), lane: 'filed'}, data),
+    classList: classList(), parent: col,
+    getAttribute: (n) => (n === 'hx-get' ? '/master/card/alpha?path=alpha%2F02-work%2Factive%2FPlan.md' : attrs[n]),
+    setAttribute: (n, v) => { attrs[n] = v; },
+    removeAttribute: (n) => { delete attrs[n]; },
+    attrs,
+  };
+  c.closest = (sel) => (sel.startsWith('.master-card') ? c : (col ? col.closest(sel) : null));
+  return c;
+}
+const cols = {draft: column('draft'), waiting: column('waiting'), review: column('review'), done: column('done')};
+let cards = [];
+
+global.window = {matchMedia: () => ({matches: state.canDrag, addEventListener() {}})};
+global.document = {
+  readyState: 'complete',
+  addEventListener: (type, fn) => { state.listeners[type] = fn; },
+  querySelectorAll: (sel) => {
+    if (sel === '.drop-over') return Object.values(cols).filter((c) => c.classList.has('drop-over'));
+    if (sel === '.is-dragging') return cards.filter((c) => c.classList.has('is-dragging'));
+    if (sel.startsWith('.master-card')) return cards;
+    return [];
+  },
+};
+global.htmx = {ajax: (verb, url, opts) => { state.calls.push({verb, url, opts}); return state.fail && verb === 'POST' ? Promise.reject(new Error('down')) : Promise.resolve(); }};
+require(path);
+
+function ev(target, extra) {
+  const e = Object.assign({target, prevented: false, dataTransfer: {data: {}, setData(k, v) { this.data[k] = v; }}}, extra);
+  e.preventDefault = () => { e.prevented = true; };
+  return e;
+}
+async function drag(c, stage) {
+  state.listeners.dragstart(ev(c));
+  const over = ev(cols[stage]);
+  state.listeners.dragover(over);
+  const drop = ev(cols[stage]);
+  state.listeners.drop(drop);
+  state.listeners.dragend(ev(c));
+  await new Promise((r) => setImmediate(r));
+  return {over, drop};
+}
+function reset() { state.calls.length = 0; state.canDrag = true; state.fail = false; }
+const POPUP = '/master/card/alpha?path=alpha%2F02-work%2Factive%2FPlan.md';
+
+(async () => {
+  // A filed card dropped on Draft or Done posts its own path and hash with the browser's date.
+  for (const [from, to] of [['draft', 'done'], ['done', 'draft'], ['review', 'done'], ['waiting', 'draft']]) {
+    reset();
+    const c = card(cols[from]); cards = [c];
+    const {over} = await drag(c, to);
+    assert.strictEqual(over.prevented, true, 'a legal target accepts the drop');
+    assert.strictEqual(state.calls.length, 1);
+    const call = state.calls[0];
+    assert.strictEqual(call.verb, 'POST');
+    assert.strictEqual(call.url, '/master/stage/alpha');
+    assert.strictEqual(call.opts.target, '#master-popup');
+    const d = new Date();
+    const today = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    assert.deepStrictEqual(call.opts.values, {path: 'alpha/02-work/active/Plan.md', source_sha256: 'a'.repeat(64), stage: to, today});
+  }
+  // Waiting and To review open the popup for any card and never post.
+  for (const lane of ['filed', 'inbox', 'proposed']) {
+    for (const to of ['waiting', 'review']) {
+      reset();
+      const c = card(cols.draft, {lane}); cards = [c];
+      await drag(c, to);
+      assert.deepStrictEqual(state.calls.map((x) => [x.verb, x.url]), [['GET', POPUP]], lane + ' -> ' + to);
+      assert.strictEqual(state.calls[0].opts.target, '#master-popup');
+    }
+  }
+  // A bare inbox card, or one with a pending classify proposal, opens the popup instead of moving.
+  for (const lane of ['inbox', 'proposed']) {
+    for (const to of ['draft', 'done']) {
+      reset();
+      const c = card(cols.waiting, {lane, sourceSha256: lane === 'proposed' ? '' : 'b'.repeat(64)}); cards = [c];
+      await drag(c, to);
+      assert.deepStrictEqual(state.calls.map((x) => [x.verb, x.url]), [['GET', POPUP]], lane + ' -> ' + to);
+    }
+  }
+  // A filed card without a hash cannot post: the popup opens.
+  reset();
+  let c = card(cols.draft, {sourceSha256: ''}); cards = [c];
+  await drag(c, 'done');
+  assert.deepStrictEqual(state.calls.map((x) => x.verb), ['GET']);
+  // A card from the "another status" list has no column and can post to Draft or Done.
+  reset();
+  c = card(null); cards = [c];
+  await drag(c, 'done');
+  assert.deepStrictEqual(state.calls.map((x) => x.verb), ['POST']);
+  // A drop on the card's own column does nothing, and is not offered as a target.
+  for (const lane of ['filed', 'inbox', 'proposed']) {
+    for (const stage of ['draft', 'waiting', 'review', 'done']) {
+      reset();
+      c = card(cols[stage], {lane}); cards = [c];
+      const {over, drop} = await drag(c, stage);
+      assert.deepStrictEqual(state.calls, [], lane + ' on ' + stage);
+      assert.strictEqual(over.prevented, false);
+      assert.strictEqual(cols[stage].classList.has('drop-over'), false);
+    }
+  }
+  // The drop style shows over another column while dragging and is gone afterwards.
+  reset();
+  c = card(cols.draft); cards = [c];
+  state.listeners.dragstart(ev(c));
+  assert.strictEqual(c.classList.has('is-dragging'), true);
+  state.listeners.dragover(ev(cols.done));
+  assert.strictEqual(cols.done.classList.has('drop-over'), true);
+  state.listeners.dragover(ev(cols.draft));
+  assert.strictEqual(cols.draft.classList.has('drop-over'), false);
+  state.listeners.dragleave(ev(cols.done, {relatedTarget: null}));
+  assert.strictEqual(cols.done.classList.has('drop-over'), false);
+  state.listeners.dragover(ev(cols.waiting));
+  state.listeners.dragend(ev(c));
+  assert.strictEqual(cols.waiting.classList.has('drop-over'), false);
+  assert.strictEqual(c.classList.has('is-dragging'), false);
+  assert.deepStrictEqual(state.calls, []);
+  // A drop that did not start from a card (a file, text) does nothing.
+  reset();
+  const stray = ev(cols.done);
+  state.listeners.dragover(stray);
+  state.listeners.drop(stray);
+  assert.strictEqual(stray.prevented, false);
+  assert.deepStrictEqual(state.calls, []);
+  // Phone / touch / no hover: no drag handles, no drag, and a stray drop does nothing.
+  reset(); state.canDrag = false;
+  c = card(cols.draft); cards = [c];
+  window.OneOSMasterDrag.sync();
+  assert.strictEqual('draggable' in c.attrs, false);
+  const start = ev(c);
+  state.listeners.dragstart(start);
+  assert.strictEqual(start.prevented, true);
+  assert.strictEqual(c.classList.has('is-dragging'), false);
+  state.listeners.drop(ev(cols.done));
+  assert.deepStrictEqual(state.calls, []);
+  state.canDrag = true;
+  window.OneOSMasterDrag.sync();
+  assert.strictEqual(c.attrs.draggable, 'true');
+  // A failed send falls back to the popup (the note as it now stands).
+  reset(); state.fail = true;
+  c = card(cols.draft); cards = [c];
+  await drag(c, 'done');
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(state.calls.map((x) => x.verb), ['POST', 'GET']);
+  // Two drops in a row: the second waits until the first settles.
+  reset();
+  let release;
+  global.htmx.ajax = (verb, url, opts) => { state.calls.push({verb, url}); return new Promise((r) => { release = r; }); };
+  c = card(cols.draft); cards = [c];
+  state.listeners.dragstart(ev(c)); state.listeners.drop(ev(cols.done));
+  state.listeners.dragstart(ev(c)); state.listeners.drop(ev(cols.done));
+  assert.strictEqual(state.calls.length, 1);
+  release();
+  await new Promise((r) => setImmediate(r));
+  console.log('ok');
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+
+
+def test_drop_script_decides_where_a_card_goes(tmp_path):
+    node = _node_or_skip()
+    harness = tmp_path / "harness.js"
+    harness.write_text(_DRAG_HARNESS)
+    result = subprocess.run([node, str(harness), str(_DRAG_JS)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "ok"

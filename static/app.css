@@ -838,6 +838,12 @@ a.board-chip:hover { background: var(--fill-strong); }
 .review-surface .master-card:focus-visible {
   background: var(--panel); box-shadow: var(--shadow-md), 0 0 0 1px var(--line);
 }
+.master-card.is-dragging { opacity: .5; }
+/* Drag is for a mouse or trackpad on a wide screen; the script turns it off elsewhere. */
+@media (min-width: 768px) and (hover: hover) and (pointer: fine) {
+  .review-surface .master-card[draggable="true"] { cursor: grab; }
+  .review-surface .master-card[draggable="true"]:active { cursor: grabbing; }
+}
 .master-card-title {
   display: flex; gap: var(--space-2); align-items: flex-start; margin-bottom: var(--space-2);
   font-weight: 600; line-height: 1.35; overflow-wrap: anywhere;

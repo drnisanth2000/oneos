@@ -65,6 +65,8 @@ class BoardCard:
     filename: str | None = None
     proposal_id: str | None = None
     draggable: bool = False
+    # SHA-256 of the exact note bytes the reader parsed; "" when no read made this card.
+    sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,7 @@ def _scalar_card(
     filename: str | None,
     proposal_id: str | None,
     formula_result: str | None,
+    sha256: str = "",
 ) -> BoardCard:
     updated = _text(fm.get("updated")) or ""
     due = _text(fm.get("due"))
@@ -221,6 +224,7 @@ def _scalar_card(
         lane=lane,
         filename=filename,
         proposal_id=proposal_id,
+        sha256=sha256,
     )
 
 
@@ -275,10 +279,13 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
         for discovered in sorted(directory.glob("*.md")):
             path = _require_real_note(directory, discovered)
             try:
-                text = path.read_text(encoding="utf-8")
+                raw = path.read_bytes()
+                text = raw.decode("utf-8")
             except (UnicodeDecodeError, OSError) as exc:
                 raise NoteUnreadable("note could not be read") from exc
-            fm, _body = split_front_matter(text)
+            # Parsed as `read_text` always did (universal newlines); the hash
+            # is of the bytes of this one read.
+            fm, _body = split_front_matter(text.replace("\r\n", "\n").replace("\r", "\n"))
             title = _text(fm.get("title")) or path.stem
             relative = scope.vault_relative(path)
             cards.append(
@@ -293,6 +300,7 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
                     filename=None,
                     proposal_id=None,
                     formula_result=None,
+                    sha256=hashlib.sha256(raw).hexdigest(),
                 )
             )
     evaluated: list[BoardCard] = []
@@ -369,6 +377,7 @@ def _inbox_cards(scope: Scope, vault: Vault, items: list[InboxItem]) -> list[Boa
                 filename=item.path.name,
                 proposal_id=None,
                 formula_result=None,
+                sha256=item.sha256,
             )
         )
     return cards

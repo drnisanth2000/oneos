@@ -67,6 +67,8 @@
       }))
     })
   </script>
+  {# Drag a card to another column (desktop pointers only; see the file). #}
+  <script defer src="/static/master_drag.js"></script>
   {% include "_sidebar.html" %}
 
   <main class="main">
@@ -192,6 +194,7 @@
       <div class="master-cols">
         {% for column in page.columns %}
         <section class="board-column master-col{% if column.key == 'review' %} is-shown{% endif %}"
+                 data-stage="{{ column.key }}"
                  id="col-{{ column.key }}" aria-labelledby="col-{{ column.key }}-label"
                  :class="{ 'is-shown': stage === '{{ column.key }}' }">
           <h2><span class="column-label" id="col-{{ column.key }}-label">{{ column.label }}</span> <span class="count">{{ column.total }}</span></h2>
