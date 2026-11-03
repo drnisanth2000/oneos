@@ -47,6 +47,7 @@ from app.proposal_identity import (
 from app.registry import RegistryError, _validate_delete_record, get_delete_proposal
 from app.rename import AXES, RenameError, build_rename_plan
 from app.scope import CrossScopeError, Scope
+from app.stage import INBOX_MODULE, stage_from_record
 from app.vault import DestinationRegistryError, Vault
 
 
@@ -80,6 +81,10 @@ _REGISTRY_MESSAGE = re.compile(
     r"^registry: (add|edit|delete) (workspace|product|member)(?: .*)?$"
 )
 _OUTBOX_APPROVAL_MESSAGE = re.compile(r"^outbox: approve ([^ ]+) \(.*\)$")
+#: A master view stage approval (`app.stage.approve_stage`). Only the id is
+#: read from it; the whole message must then equal the one rendered from the
+#: commit's own paths, so the route text can never disagree with the change.
+_OUTBOX_STAGE_MESSAGE = re.compile(r"^outbox: stage ([^ ]+) \(.*\)$")
 _RENAME_MESSAGE = re.compile(
     r"^rename: ([a-z0-9]+(?:-[a-z0-9]+)*) → "
     r"([a-z0-9]+(?:-[a-z0-9]+)*)$"
@@ -231,6 +236,21 @@ class _ReceiptAuthorization:
     source: str | None = None
     destination: str | None = None
     registry_kind: str | None = None
+    #: The proposal action the approving commit's message names: "classify"
+    #: (`outbox: approve`) or "stage" (`outbox: stage`).
+    proposal_action: str | None = None
+
+
+@dataclass(frozen=True)
+class _OutboxApproval:
+    """The exact envelope of one sanctioned `outbox:` approval commit."""
+
+    action: str
+    proposal_id: str
+    receipt_path: str
+    receipt: ActionReceipt
+    source: str
+    destination: str
 
 
 @dataclass
@@ -1077,43 +1097,105 @@ def _receipt_from_commit(
         return None
 
 
+def _approval_receipt(
+    record: CommitRecord,
+    rules: AuditRules,
+    vault: Path,
+    change: PathChangeRecord,
+    entity: str,
+    proposal_id: str,
+) -> ActionReceipt | None:
+    """The commit's own "approval" receipt for exactly this proposal."""
+    if change.status != "A" or _receipt_path(change.path, rules) != (
+        entity,
+        proposal_id,
+    ):
+        return None
+    receipt = _receipt_from_commit(vault, record, change.path)
+    if (
+        receipt is None
+        or receipt.proposal_id != proposal_id
+        or receipt.action_kind != "approval"
+    ):
+        return None
+    return receipt
+
+
+def _filed_note(path: str, rules: AuditRules) -> tuple[str, str] | None:
+    """A note in an active lifecycle module other than the inbox."""
+    parts = _path_parts(path)
+    if parts is None or len(parts) != 4 or parts[1] == INBOX_MODULE:
+        return None
+    return _active_destination(path, rules)
+
+
+def _outbox_approval(
+    record: CommitRecord, rules: AuditRules, vault: Path
+) -> _OutboxApproval | None:
+    """The envelope of an approval commit exactly as `app.outbox.approve`
+    (classification) or `app.stage.approve_stage` (stage) writes it, else None.
+
+    Classification and an inbox stage move: the inbox source removed, the
+    same leaf added to an active lifecycle module of the same entity, and
+    that entity's receipt for the message's id. A filed stage edit: the note
+    changed in place, outside the inbox, and the receipt. Nothing else.
+    """
+    approval = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
+    stage = _OUTBOX_STAGE_MESSAGE.fullmatch(record.message)
+    match = approval or stage
+    if match is None or len(record.parents) != 1:
+        return None
+    proposal_id = match.group(1)
+    receipts = [
+        change
+        for change in record.changes
+        if _receipt_path(change.path, rules) is not None
+    ]
+    notes = [change for change in record.changes if change not in receipts]
+    if len(receipts) != 1:
+        return None
+    statuses = sorted(change.status for change in notes)
+    if statuses == ["A", "D"]:
+        source = next(change.path for change in notes if change.status == "D")
+        destination = next(change.path for change in notes if change.status == "A")
+        moved = _inbox_path(source, rules)
+        filed = _filed_note(destination, rules) if stage else _active_destination(
+            destination, rules
+        )
+        if moved is None or moved != filed:
+            return None
+        entity = moved[0]
+        expected = f"outbox: stage {proposal_id} ({source} → {destination})"
+    elif stage is not None and statuses == ["M"]:
+        source = destination = notes[0].path
+        filed = _filed_note(source, rules)
+        if filed is None:
+            return None
+        entity = filed[0]
+        expected = f"outbox: stage {proposal_id} ({source})"
+    else:
+        return None
+    if stage is not None and record.message != expected:
+        return None
+    receipt = _approval_receipt(
+        record, rules, vault, receipts[0], entity, proposal_id
+    )
+    if receipt is None:
+        return None
+    return _OutboxApproval(
+        action="stage" if stage is not None else "classify",
+        proposal_id=proposal_id,
+        receipt_path=receipts[0].path,
+        receipt=receipt,
+        source=source,
+        destination=destination,
+    )
+
+
 def _sanctioned_outbox(
     record: CommitRecord, rules: AuditRules, vault: Path
 ) -> bool:
-    message = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
-    if message is None or len(record.parents) != 1 or len(record.changes) != 3:
-        return False
-    deleted = [change for change in record.changes if change.status == "D"]
-    added = [change for change in record.changes if change.status == "A"]
-    if len(deleted) != 1 or len(added) != 2:
-        return False
-    source = _inbox_path(deleted[0].path, rules)
-    destinations = [
-        value
-        for change in added
-        if (value := _active_destination(change.path, rules)) is not None
-    ]
-    receipts = [
-        (change, value)
-        for change in added
-        if (value := _receipt_path(change.path, rules)) is not None
-    ]
-    receipt = (
-        _receipt_from_commit(vault, record, receipts[0][0].path)
-        if len(receipts) == 1
-        else None
-    )
-    return (
-        source is not None
-        and len(destinations) == 1
-        and len(receipts) == 1
-        and source == destinations[0]
-        and source[0] == receipts[0][1][0]
-        and receipts[0][1][1] == message.group(1)
-        and receipt is not None
-        and receipt.proposal_id == message.group(1)
-        and receipt.action_kind == "approval"
-    )
+    return _outbox_approval(record, rules, vault) is not None
 
 
 def _sanctioned_registry(
@@ -1983,6 +2065,47 @@ def _load_consumed_record(
                 source=proposal.src,
                 destination=proposal.dst,
             )
+        if action == "stage":
+            if not _canonical_created(loaded.get("id"), loaded.get("created")):
+                return None
+            # The loader's own bytes-only validation, then the paths against
+            # the registries exactly as classification's are (the source need
+            # not exist any more).
+            stage = stage_from_record(pending_path, loaded)
+            if stage.entity != entity:
+                return None
+            if stage.src == stage.dst:
+                runtime = Vault(EntityCatalog.load(vault))
+                if (
+                    _filed_note(stage.src, rules) is None
+                    or runtime.require_block(stage.module) != stage.block
+                ):
+                    return None
+            else:
+                canonical = resolve_classification_destination(
+                    scope,
+                    vault / stage.src,
+                    module=stage.module,
+                    sub=stage.sub,
+                    claimed_block=stage.block,
+                    require_source=False,
+                )
+                if (canonical.src, canonical.dst, canonical.sub) != (
+                    stage.src,
+                    stage.dst,
+                    stage.sub,
+                ):
+                    return None
+            return _ConsumedRecord(
+                relative=relative,
+                pending_relative=pending_relative,
+                entity=entity,
+                proposal_id=canonical_id,
+                action=action,
+                digest=digest,
+                source=stage.src,
+                destination=stage.dst,
+            )
         if action == "delete" and _canonical_delete_record(loaded):
             proposal = _validate_delete_record(scope, pending_path, loaded)
             return _ConsumedRecord(
@@ -2015,7 +2138,10 @@ def _load_consumed_record(
 
 def _receipt_bearing(record: CommitRecord) -> bool:
     """Whether this commit's envelope can carry a receipt authorization."""
-    if _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message) is not None:
+    if (
+        _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message) is not None
+        or _OUTBOX_STAGE_MESSAGE.fullmatch(record.message) is not None
+    ):
         return True
     registry = _REGISTRY_MESSAGE.fullmatch(record.message)
     return registry is not None and registry.group(1) == "delete"
@@ -2062,37 +2188,21 @@ def _receipt_authorizations(
         # into the next iteration: a later rename must not erase an
         # authorization this session actually issued.
         record_rules = commit_rules.get(record.oid, rules)
-        approval = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
-        if approval is not None and _sanctioned_outbox(record, record_rules, vault):
-            deleted = [change.path for change in record.changes if change.status == "D"]
-            destinations = [
-                change.path
-                for change in record.changes
-                if change.status == "A"
-                and _active_destination(change.path, record_rules) is not None
-            ]
-            receipt_changes = [
-                change.path
-                for change in record.changes
-                if change.status == "A"
-                and _receipt_path(change.path, record_rules) is not None
-            ]
-            if len(deleted) != 1 or len(destinations) != 1 or len(receipt_changes) != 1:
-                continue
-            receipt_path = receipt_changes[0]
-            receipt_identity = _receipt_path(receipt_path, record_rules)
-            receipt = _receipt_from_commit(vault, record, receipt_path)
-            if receipt_identity is None or receipt is None:
+        approval = _outbox_approval(record, record_rules, vault)
+        if approval is not None:
+            identity = _receipt_path(approval.receipt_path, record_rules)
+            if identity is None:
                 continue
             authorizations.append(
                 _ReceiptAuthorization(
-                    key=(record.oid, receipt_path),
-                    entity=receipt_identity[0],
-                    proposal_id=receipt.proposal_id,
-                    action_kind=receipt.action_kind,
-                    review_sha256=receipt.review_sha256,
-                    source=deleted[0],
-                    destination=destinations[0],
+                    key=(record.oid, approval.receipt_path),
+                    entity=identity[0],
+                    proposal_id=approval.receipt.proposal_id,
+                    action_kind=approval.receipt.action_kind,
+                    review_sha256=approval.receipt.review_sha256,
+                    source=approval.source,
+                    destination=approval.destination,
+                    proposal_action=approval.action,
                 )
             )
             continue
@@ -2138,10 +2248,11 @@ def _authorization_matches(
         and consumed.proposal_id == authorization.proposal_id
         and consumed.digest == authorization.review_sha256
     )
-    if consumed.action == "classify":
+    if consumed.action in {"classify", "stage"}:
         return (
             common
             and authorization.action_kind == "approval"
+            and authorization.proposal_action == consumed.action
             and consumed.source == authorization.source
             and consumed.destination == authorization.destination
         )
@@ -2166,9 +2277,10 @@ def _record_mentions_proposal(
     a receipt written under a slug a later rename retired still mentions its
     proposal, and missing that would let the reject branch adopt it.
     """
-    approval = _OUTBOX_APPROVAL_MESSAGE.fullmatch(record.message)
-    if approval is not None and approval.group(1) == proposal_id:
-        return True
+    for pattern in (_OUTBOX_APPROVAL_MESSAGE, _OUTBOX_STAGE_MESSAGE):
+        approval = pattern.fullmatch(record.message)
+        if approval is not None and approval.group(1) == proposal_id:
+            return True
     record_rules = commit_rules.get(record.oid, rules)
     return any(
         _receipt_path(change.path, record_rules) == (entity, proposal_id)
