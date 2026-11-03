@@ -2725,13 +2725,22 @@ global.document = {
 global.htmx = {ajax: (verb, url, opts) => { state.calls.push({verb, url, opts}); return state.fail && verb === 'POST' ? Promise.reject(new Error('down')) : Promise.resolve(); }};
 require(path);
 
+function newTransfer() {
+  return {data: {}, setData(k, v) { this.data[k] = v; }, get types() { return Object.keys(this.data); }};
+}
+// One transfer object per drag, shared by the events of that drag (as in a browser).
+state.dt = newTransfer();
 function ev(target, extra) {
-  const e = Object.assign({target, prevented: false, dataTransfer: {data: {}, setData(k, v) { this.data[k] = v; }}}, extra);
+  const e = Object.assign({target, prevented: false, dataTransfer: state.dt}, extra);
   e.preventDefault = () => { e.prevented = true; };
   return e;
 }
-async function drag(c, stage) {
+function start(c) {
+  state.dt = newTransfer();
   state.listeners.dragstart(ev(c));
+}
+async function drag(c, stage) {
+  start(c);
   const over = ev(cols[stage]);
   state.listeners.dragover(over);
   const drop = ev(cols[stage]);
@@ -2802,7 +2811,7 @@ const POPUP = '/master/card/alpha?path=alpha%2F02-work%2Factive%2FPlan.md';
   // The drop style shows over another column while dragging and is gone afterwards.
   reset();
   c = card(cols.draft); cards = [c];
-  state.listeners.dragstart(ev(c));
+  start(c);
   assert.strictEqual(c.classList.has('is-dragging'), true);
   state.listeners.dragover(ev(cols.done));
   assert.strictEqual(cols.done.classList.has('drop-over'), true);
@@ -2817,19 +2826,62 @@ const POPUP = '/master/card/alpha?path=alpha%2F02-work%2Factive%2FPlan.md';
   assert.deepStrictEqual(state.calls, []);
   // A drop that did not start from a card (a file, text) does nothing.
   reset();
-  const stray = ev(cols.done);
+  const stray = ev(cols.done, {dataTransfer: newTransfer()});
   state.listeners.dragover(stray);
   state.listeners.drop(stray);
   assert.strictEqual(stray.prevented, false);
+  assert.deepStrictEqual(state.calls, []);
+  // The drag uses the card as it was when picked up: a morph that rewrites the node mid-drag changes nothing.
+  for (const to of ['done', 'waiting']) {
+    reset();
+    c = card(cols.draft); cards = [c];
+    start(c);
+    Object.assign(c.dataset, {entity: 'beta', path: 'beta/02-work/active/Other.md', sourceSha256: 'c'.repeat(64), lane: 'inbox'});
+    c.getAttribute = (n) => (n === 'hx-get' ? '/master/card/beta?path=other' : c.attrs[n]);
+    state.listeners.dragover(ev(cols[to]));
+    state.listeners.drop(ev(cols[to]));
+    state.listeners.dragend(ev(c));
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(state.calls.length, 1, to);
+    if (to === 'done') {
+      assert.strictEqual(state.calls[0].verb, 'POST');
+      assert.strictEqual(state.calls[0].url, '/master/stage/alpha');
+      assert.strictEqual(state.calls[0].opts.values.path, 'alpha/02-work/active/Plan.md');
+      assert.strictEqual(state.calls[0].opts.values.source_sha256, 'a'.repeat(64));
+    } else {
+      assert.deepStrictEqual([state.calls[0].verb, state.calls[0].url], ['GET', POPUP]);
+    }
+  }
+  // The drag is tagged: a drop that does not carry the origin tag does nothing, even with a leftover snapshot.
+  reset();
+  c = card(cols.draft); cards = [c];
+  start(c);
+  assert.deepStrictEqual(Object.keys(state.dt.data), ['application/x-oneos-card']);
+  assert.strictEqual(state.dt.data['application/x-oneos-card'], 'alpha');
+  const foreignOver = ev(cols.done, {dataTransfer: newTransfer()});
+  state.listeners.dragover(foreignOver);
+  assert.strictEqual(foreignOver.prevented, false);
+  assert.strictEqual(cols.done.classList.has('drop-over'), false);
+  const foreignDrop = ev(cols.done, {dataTransfer: newTransfer()});
+  state.listeners.drop(foreignDrop);
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(foreignDrop.prevented, false);
+  assert.deepStrictEqual(state.calls, []);
+  state.listeners.dragend(ev(c));
+  // The snapshot is gone after dragend and after every drop.
+  state.listeners.drop(ev(cols.done, {dataTransfer: state.dt}));
+  assert.deepStrictEqual(state.calls, []);
+  start(c); state.listeners.drop(ev(cols.draft)); // own column: nothing, and the snapshot is cleared
+  state.listeners.drop(ev(cols.done, {dataTransfer: state.dt}));
   assert.deepStrictEqual(state.calls, []);
   // Phone / touch / no hover: no drag handles, no drag, and a stray drop does nothing.
   reset(); state.canDrag = false;
   c = card(cols.draft); cards = [c];
   window.OneOSMasterDrag.sync();
   assert.strictEqual('draggable' in c.attrs, false);
-  const start = ev(c);
-  state.listeners.dragstart(start);
-  assert.strictEqual(start.prevented, true);
+  const refused = ev(c);
+  state.listeners.dragstart(refused);
+  assert.strictEqual(refused.prevented, true);
   assert.strictEqual(c.classList.has('is-dragging'), false);
   state.listeners.drop(ev(cols.done));
   assert.deepStrictEqual(state.calls, []);
@@ -2847,8 +2899,8 @@ const POPUP = '/master/card/alpha?path=alpha%2F02-work%2Factive%2FPlan.md';
   let release;
   global.htmx.ajax = (verb, url, opts) => { state.calls.push({verb, url}); return new Promise((r) => { release = r; }); };
   c = card(cols.draft); cards = [c];
-  state.listeners.dragstart(ev(c)); state.listeners.drop(ev(cols.done));
-  state.listeners.dragstart(ev(c)); state.listeners.drop(ev(cols.done));
+  start(c); state.listeners.drop(ev(cols.done));
+  start(c); state.listeners.drop(ev(cols.done));
   assert.strictEqual(state.calls.length, 1);
   release();
   await new Promise((r) => setImmediate(r));

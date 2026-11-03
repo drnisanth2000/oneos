@@ -23,6 +23,10 @@
   var POPUP = '#master-popup';
   var DIRECT = {draft: true, done: true};
   var ASKS = {waiting: true, review: true};
+  var TAG = 'application/x-oneos-card';
+  // The card as it was when picked up: {entity, path, sha, lane, stage, hxGet}.
+  // The page may refresh and rewrite the dragged node mid-drag, so a drop reads
+  // only this copy, never the node.
   var dragging = null;
   var busy = false;
 
@@ -45,27 +49,44 @@
     return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
   }
 
-  // 'none' | 'popup' | 'post' for this card dropped on this stage.
-  function decide(card, stage) {
+  function snapshot(card) {
     var own = columnOf(card);
-    if (own && own.dataset.stage === stage) return 'none';
+    return {
+      entity: card.dataset.entity || '',
+      path: card.dataset.path || '',
+      sha: card.dataset.sourceSha256 || '',
+      lane: card.dataset.lane || '',
+      stage: own && own.dataset ? own.dataset.stage : '',
+      hxGet: card.getAttribute('hx-get') || '',
+    };
+  }
+
+  function hasTag(event) {
+    var types = event.dataTransfer && event.dataTransfer.types;
+    if (!types) return false;
+    if (types.contains) return types.contains(TAG);
+    return Array.prototype.indexOf.call(types, TAG) >= 0;
+  }
+
+  // 'none' | 'popup' | 'post' for this snapshot dropped on this stage.
+  function decide(card, stage) {
+    if (card.stage === stage) return 'none';
     if (ASKS[stage]) return 'popup';
     if (!DIRECT[stage]) return 'none';
-    if (card.dataset.lane !== 'filed' || !card.dataset.sourceSha256) return 'popup';
+    if (card.lane !== 'filed' || !card.sha) return 'popup';
     return 'post';
   }
 
   function openPopup(card) {
-    var url = card.getAttribute('hx-get');
-    if (!url) return Promise.resolve();
-    return htmx.ajax('GET', url, {target: POPUP});
+    if (!card.hxGet) return Promise.resolve();
+    return htmx.ajax('GET', card.hxGet, {target: POPUP});
   }
 
   function post(card, stage) {
-    var url = '/master/stage/' + encodeURIComponent(card.dataset.entity);
+    var url = '/master/stage/' + encodeURIComponent(card.entity);
     var values = {
-      path: card.dataset.path,
-      source_sha256: card.dataset.sourceSha256,
+      path: card.path,
+      source_sha256: card.sha,
       stage: stage,
       today: localDay(),
     };
@@ -84,17 +105,18 @@
       event.preventDefault();
       return;
     }
-    dragging = card;
+    dragging = snapshot(card);
     card.classList.add('is-dragging');
     if (event.dataTransfer) {
       event.dataTransfer.effectAllowed = 'move';
-      // Firefox starts no drag without data.
-      event.dataTransfer.setData('text/plain', card.dataset.path || '');
+      // Firefox starts no drag without data. The tag marks a drag that began on
+      // a card of this page; nothing else (a file, text, another page) carries it.
+      event.dataTransfer.setData(TAG, dragging.entity);
     }
   }
 
   function onDragOver(event) {
-    if (!dragging) return;
+    if (!dragging || !hasTag(event)) return;
     var column = columnOf(event.target);
     if (!column) return;
     if (decide(dragging, column.dataset.stage) === 'none') {
@@ -118,7 +140,7 @@
     var column = columnOf(event.target);
     clearOver();
     dragging = null;
-    if (!card || !column) return;
+    if (!card || !hasTag(event) || !column) return;
     event.preventDefault();
     var action = decide(card, column.dataset.stage);
     if (action === 'none' || busy) return;
@@ -135,7 +157,6 @@
 
   function onDragEnd() {
     clearOver();
-    if (dragging && dragging.classList) dragging.classList.remove('is-dragging');
     var marked = document.querySelectorAll('.is-dragging');
     for (var i = 0; i < marked.length; i++) marked[i].classList.remove('is-dragging');
     dragging = null;
