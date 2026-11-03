@@ -1158,6 +1158,16 @@ def _refused(response):
     assert "Traceback" not in response.text and "E-UNKNOWN" not in response.text
 
 
+def _reminder_refused(response):
+    """A refused reminder save or remove is shown inside the reminder box only,
+    so the stage form (and any draft typed into it) is left as it is."""
+    assert response.status_code == 200
+    assert response.text.lstrip().startswith('<div id="master-reminder"'), response.text
+    assert 'class="alert' in response.text and "stage-form" not in response.text
+    assert "<textarea" not in response.text and "HX-Trigger" not in response.headers
+    assert "Traceback" not in response.text and "E-UNKNOWN" not in response.text
+
+
 def test_save_reminder_from_the_popup(tmp_path, tmp_path_factory, monkeypatch):
     main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
     before = _vault_state(tmp_path)
@@ -1237,7 +1247,7 @@ def test_remove_refuses_another_entitys_reminder(tmp_path, tmp_path_factory, mon
     row = Reminder("alpha/02-work/active/Odd.md", "beta1", "Not yours", datetime.now(timezone.utc) + timedelta(days=2))
     _seed(directory, row)
     response = _remove(client, "alpha", row.key)
-    _refused(response)
+    _reminder_refused(response)
     assert "HX-Trigger" not in response.headers
     assert ReminderStore(directory).all() == {row.key: row}
 
@@ -1246,7 +1256,7 @@ def test_remove_without_a_store_is_refused_not_500(tmp_path, monkeypatch):
     main, client = _client(tmp_path, monkeypatch)
     monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
     response = _remove(client, "alpha", "alpha/02-work/active/X.md")
-    _refused(response)
+    _reminder_refused(response)
     assert "E-UNAVAILABLE" in response.text
 
 
@@ -1254,7 +1264,7 @@ def test_save_is_refused_for_a_draft_or_done_card(tmp_path, tmp_path_factory, mo
     for status in ("draft", "done", "active", "open"):
         main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch, status=status)
         response = _save(client, "alpha", path)
-        _refused(response)
+        _reminder_refused(response)
         assert "HX-Trigger" not in response.headers
         assert list(directory.iterdir()) == [], status
 
@@ -1262,7 +1272,7 @@ def test_save_is_refused_for_a_draft_or_done_card(tmp_path, tmp_path_factory, mo
 def test_save_is_refused_for_a_path_that_is_not_a_card(tmp_path, tmp_path_factory, monkeypatch):
     main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
     for forged in ("alpha/02-work/active/Nope.md", "../alpha/02-work/active/Chase.md", "", "alpha/outbox"):
-        _refused(_save(client, "alpha", forged))
+        _reminder_refused(_save(client, "alpha", forged))
     assert list(directory.iterdir()) == []
 
 
@@ -1270,8 +1280,8 @@ def test_save_is_refused_for_another_entitys_path(tmp_path, tmp_path_factory, mo
     main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
     _note(tmp_path, "beta1", "02-work", "Theirs", status="waiting")
     theirs = _card_path(main, "beta1", "Theirs")
-    _refused(_save(client, "alpha", theirs))
-    _refused(_save(client, "beta1", path))
+    _reminder_refused(_save(client, "alpha", theirs))
+    _reminder_refused(_save(client, "beta1", path))
     # An entity outside the registry is refused by the scope dependency, described.
     ghost = _save(client, "ghost", path)
     assert ghost.status_code == 200 and "E-ENTITY" in ghost.text
@@ -1281,7 +1291,7 @@ def test_save_is_refused_for_another_entitys_path(tmp_path, tmp_path_factory, mo
 def test_save_is_refused_for_an_empty_or_multiline_subject(tmp_path, tmp_path_factory, monkeypatch):
     main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
     for subject in ("", "   ", "one\ntwo", "one\rtwo", "x" * 121):
-        _refused(_save(client, "alpha", path, subject=subject))
+        _reminder_refused(_save(client, "alpha", path, subject=subject))
     assert list(directory.iterdir()) == []
     assert ReminderStore(directory).all() == {}
 
@@ -1292,7 +1302,7 @@ def test_save_is_refused_for_a_bad_date_or_offset(tmp_path, tmp_path_factory, mo
         {"date": "2026-02-30"}, {"date": ""}, {"date": "not a date"}, {"time": "25:00"},
         {"time": ""}, {"offset": ""}, {"offset": "x"}, {"offset": "9999"},
     ):
-        _refused(_save(client, "alpha", path, **bad))
+        _reminder_refused(_save(client, "alpha", path, **bad))
     assert list(directory.iterdir()) == []
 
 
@@ -1300,7 +1310,7 @@ def test_a_refused_save_keeps_the_existing_reminder(tmp_path, tmp_path_factory, 
     main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
     _save(client, "alpha", path)
     before = ReminderStore(directory).all()
-    _refused(_save(client, "alpha", path, subject=""))
+    _reminder_refused(_save(client, "alpha", path, subject=""))
     assert ReminderStore(directory).all() == before
 
 
@@ -1309,7 +1319,7 @@ def test_save_without_a_store_is_refused_not_500(tmp_path, monkeypatch):
     _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
     monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
     response = _save(client, "alpha", _card_path(main, "alpha", "Chase"))
-    _refused(response)
+    _reminder_refused(response)
     assert "E-UNAVAILABLE" in response.text
 
 
@@ -1317,7 +1327,7 @@ def test_save_with_an_unsafe_store_is_refused_not_500(tmp_path, tmp_path_factory
     main, client = _client(tmp_path, monkeypatch)
     _auth_dir(tmp_path_factory, monkeypatch, mode=0o755)
     _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
-    _refused(_save(client, "alpha", _card_path(main, "alpha", "Chase")))
+    _reminder_refused(_save(client, "alpha", _card_path(main, "alpha", "Chase")))
 
 
 def test_save_stores_the_wall_time_without_converting_it(tmp_path, tmp_path_factory, monkeypatch):
@@ -1469,7 +1479,7 @@ def test_saving_for_a_card_that_left_waiting_is_still_refused(tmp_path, tmp_path
     _save(client, "alpha", path)
     _restage(tmp_path, "Chase", "draft")
     before = ReminderStore(directory).all()
-    _refused(_save(client, "alpha", path, subject="Changed"))
+    _reminder_refused(_save(client, "alpha", path, subject="Changed"))
     assert ReminderStore(directory).all() == before
 
 
@@ -2166,9 +2176,13 @@ def test_forged_path_or_source_hash_is_refused_and_writes_nothing(tmp_path, tmp_
     for forged in (_path("beta1", "Beta"), f"../{_path('beta1', 'Beta')}", "alpha/02-work/active/nope.md", ""):
         response = _press(client, "alpha", forged, "done", {**form, "path": forged})
         assert "no longer here" in response.text, forged
-    for forged_hash in ("0" * 64, "not-a-hash", ""):
+    for forged_hash in ("0" * 64, "not-a-hash"):
         response = _press(client, "alpha", path, "done", form, source_sha256=forged_hash)
         assert _notice(response) == _STALE
+    # The hash is required (S7): an empty or missing one is a form refusal.
+    for missing in ("", None):
+        response = _press(client, "alpha", path, "done", form, source_sha256=missing)
+        assert "E-REQUEST" in response.text and 'class="alert' in response.text
     _refused(_press(client, "alpha", path, "sideways", form))
     _nothing_written(tmp_path, head)
     assert list(directory.iterdir()) == []
@@ -2309,3 +2323,206 @@ def test_a_header_the_editor_cannot_split_is_shown_read_only(tmp_path, tmp_path_
     assert "stage-form" not in page and "<textarea" not in page
     assert '<pre class="master-body">Kept &lt;body&gt;' in page
     assert "This note&#39;s header can&#39;t be edited safely here. Edit it in the vault." in page
+
+
+# --- review follow-ups (Task 4, fix round 1) ----------------------------------
+
+
+def test_reminder_save_and_remove_swap_only_the_reminder_box(tmp_path, tmp_path_factory, monkeypatch):
+    """Saving or removing a reminder must not re-render the stage form: an
+    unsaved draft edit and comment stay in the browser untouched."""
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+    page = client.get("/master/card/alpha", params={"path": path}).text
+    box = re.search(r'<div id="master-reminder".*?</div>\s*</article>', page, re.S)
+    assert box, page
+    # Every reminder control (Save, Enter in a field, Remove) targets the box only.
+    targets = re.findall(r'hx-post="/master/reminder/[^"]*"\s+hx-target="([^"]*)" hx-swap="([^"]*)"', page)
+    assert targets and set(targets) == {("#master-reminder", "outerHTML")}, targets
+    assert "stage-form" not in box.group(0)
+    saved = _save(client, "alpha", path)
+    assert saved.headers["HX-Trigger"] == "master-refresh"  # the strip still redraws
+    assert saved.text.lstrip().startswith('<div id="master-reminder"')
+    assert "stage-form" not in saved.text and "<textarea" not in saved.text
+    assert "Remove" in saved.text and "Save reminder" in saved.text
+    # A refusal keeps what was typed in the box.
+    refused = _save(client, "alpha", path, subject="Second\nline", date="2099-12-01")
+    _reminder_refused(refused)
+    assert 'value="2099-12-01"' in refused.text and "Save reminder" in refused.text
+    removed = _remove(client, "alpha", path)
+    assert removed.headers["HX-Trigger"] == "master-refresh"
+    assert removed.text.lstrip().startswith('<div id="master-reminder"')
+    assert "stage-form" not in removed.text and ReminderStore(directory).all() == {}
+
+
+def test_reminder_routes_do_not_read_the_note(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, path = _setup(tmp_path, tmp_path_factory, monkeypatch)
+
+    def no_read(scope, relative):
+        raise AssertionError("a reminder route read the note")
+
+    monkeypatch.setattr(main, "note_snapshot", no_read)
+    assert _save(client, "alpha", path).headers["HX-Trigger"] == "master-refresh"
+    assert _remove(client, "alpha", path).headers["HX-Trigger"] == "master-refresh"
+
+
+@pytest.mark.parametrize("raw", ["A\rB\n", "A\x00B\n"])
+def test_a_body_the_browser_would_rewrite_is_not_offered_for_editing(
+    tmp_path, tmp_path_factory, monkeypatch, raw
+):
+    """A lone CR or a NUL cannot survive a round trip through a textarea (the
+    HTML parser turns them into LF and U+FFFD). A press must not rewrite them."""
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Raw", status="draft", body="")
+    note.write_bytes(note.read_bytes() + raw.encode())
+    _git_commit_all(tmp_path)
+    path, before = _path("alpha", "Raw"), _commits(tmp_path)
+    page = client.get("/master/card/alpha", params={"path": path}).text
+    assert "stage-form" in page and "<textarea" not in page
+    assert "Edit it in the vault" in page
+    sha = hashlib.sha256(note.read_bytes()).hexdigest()
+    base = {"path": path, "source_sha256": sha, "today": _today()}
+    # What a browser would post had it shown the body in a textarea.
+    browser = raw.replace("\r", "\r\n").replace("\x00", "�")
+    response = client.post("/master/stage/alpha", data={**base, "stage": "waiting", "body": browser})
+    assert response.status_code == 200, response.text
+    assert _commits(tmp_path) == before + 1
+    text = note.read_bytes().decode()
+    assert text.endswith(raw) and "\nstatus: waiting\n" in text
+    # A real edit of such a body is refused, never saved with the characters changed.
+    sha = hashlib.sha256(note.read_bytes()).hexdigest()
+    head, status = _git(tmp_path, "rev-parse", "HEAD"), _git(tmp_path, "status", "--porcelain")
+    refused = client.post("/master/stage/alpha", data={**base, "source_sha256": sha, "stage": "waiting",
+                                                         "body": "Rewritten\n"})
+    assert "Edit it in the vault" in _notice(refused)
+    assert _git(tmp_path, "rev-parse", "HEAD") == head
+    assert _git(tmp_path, "status", "--porcelain") == status
+    assert note.read_bytes().decode().endswith(raw)
+
+
+def test_a_read_failure_after_the_commit_still_reports_the_move(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Plan", status="draft")
+    _git_commit_all(tmp_path)
+    path, before = _path("alpha", "Plan"), _commits(tmp_path)
+    form = _popup_form(client, "alpha", path)
+    real = main.entity_cards
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) > 1:  # the listing after the commit
+            raise main.NoteUnreadable("synthetic")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(main, "entity_cards", flaky)
+    response = _press(client, "alpha", path, "done", form)
+    assert _commits(tmp_path) == before + 1
+    assert response.headers.get("HX-Trigger") == "master-refresh"
+    assert "Moved. Refresh to see the note." in response.text
+    assert 'class="alert' not in response.text
+
+
+def test_proposed_destination_is_shown_from_the_reviewed_record(tmp_path, tmp_path_factory, monkeypatch):
+    import dataclasses
+
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _inbox_with_proposal(tmp_path, "alpha", "marker.md", status="active", full=True)
+    real = main.get_proposal_review
+
+    def replaced(scope, proposal_id):
+        review = real(scope, proposal_id)
+        return dataclasses.replace(review, value=dataclasses.replace(review.value, module="01-core", sub=None))
+
+    monkeypatch.setattr(main, "get_proposal_review", replaced)
+    page = client.get("/master/card/alpha", params={"path": _SRC}).text
+    # The digest the buttons carry and the destination shown come from one read.
+    assert "proposed for 01-core" in page and "02-work" not in page
+
+
+def test_flag_store_failure_after_the_commit_keeps_the_edit_and_says_so(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft", body="Old body")
+    _git_commit_all(tmp_path)
+    path, before = _path("alpha", "Plan"), _commits(tmp_path)
+
+    def unavailable(self, flag):
+        raise main.ReminderStoreUnavailable()
+
+    monkeypatch.setattr(ReminderStore, "flag", unavailable)
+    response = _press(client, "alpha", path, "review", body="New body\n")
+    _assert_one_stage_commit(tmp_path, before, [path])
+    assert note.read_text(encoding="utf-8").endswith("---\nNew body\n")
+    assert _notice(response) == (
+        "The edit was saved, but the To review flag could not be stored. Press To review again."
+    )
+    assert response.headers["HX-Trigger"] == "master-refresh"
+    assert ReminderStore(directory).flags() == {}
+
+
+def test_done_with_an_unsafe_store_still_commits_and_keeps_the_reminder(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _git_commit_all(tmp_path)
+    path, before = _path("alpha", "Chase"), _commits(tmp_path)
+    _seed(directory, _reminder("alpha", "Chase", datetime.now(timezone.utc) + timedelta(days=1)))
+    form = _popup_form(client, "alpha", path)
+    directory.chmod(0o755)
+    try:
+        response = _press(client, "alpha", path, "done", form)
+    finally:
+        directory.chmod(0o700)
+    _assert_one_stage_commit(tmp_path, before, [path])
+    assert _notice(response) == "Moved to Done."
+    assert set(ReminderStore(directory).all()) == {path}  # nothing lost; shown as moved or removed
+
+
+def test_rekey_with_an_unsafe_store_still_files_and_keeps_the_reminder(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    src = "alpha/00-inbox/active/mail.md"
+    _note(tmp_path, "alpha", "00-inbox", "mail", sub="triage", status="active")
+    _git_commit_all(tmp_path)
+    _seed(directory, Reminder(src, "alpha", "Answer it", datetime.now(timezone.utc) + timedelta(days=1)))
+    form, before = _popup_form(client, "alpha", src), _commits(tmp_path)
+    directory.chmod(0o755)
+    try:
+        response = _press(client, "alpha", src, "waiting", form, module="02-work")
+    finally:
+        directory.chmod(0o700)
+    _assert_one_stage_commit(tmp_path, before, ["alpha/02-work/active/mail.md"])
+    assert _notice(response) == "Moved to Waiting."
+    assert set(ReminderStore(directory).all()) == {src}
+
+
+def test_proposed_card_with_an_edited_body_is_one_commit(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _inbox_with_proposal(tmp_path, "alpha", "marker.md", status="active", full=True)
+    original, before = (tmp_path / _SRC).read_bytes(), _commits(tmp_path)
+    response = _press(client, "alpha", _SRC, "waiting", body="Edited before filing\n", comment="Filed by hand")
+    assert response.status_code == 200, response.text
+    # The edit is large next to this tiny note, so git records a delete and an add.
+    _assert_one_stage_commit(tmp_path, before, [_SRC, _DST])
+    assert ("D", _SRC) in _head_files(tmp_path) and ("A", _DST) in _head_files(tmp_path)
+    text = (tmp_path / _DST).read_text(encoding="utf-8")
+    assert "\nstatus: waiting\n" in text and "\nsub: general\n" in text
+    assert text.endswith(f"---\nEdited before filing\n\nComment ({_today()}): Filed by hand\n")
+    assert not (tmp_path / "alpha" / "outbox" / f"{_PROPOSAL_ID}.yaml").exists()
+    _revert_restores(tmp_path, _SRC, original, gone=_DST)
+
+
+def test_tomorrow_on_the_device_is_accepted(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft")
+    _git_commit_all(tmp_path)
+    before = _commits(tmp_path)
+    tomorrow = _today(1)
+    response = _press(client, "alpha", _path("alpha", "Plan"), "waiting", comment="Late", today=tomorrow)
+    assert response.status_code == 200 and _notice(response) == "Moved to Waiting."
+    assert _commits(tmp_path) == before + 1
+    text = note.read_text(encoding="utf-8")
+    assert f"\nupdated: {tomorrow}\n" in text and f"Comment ({tomorrow}): Late" in text

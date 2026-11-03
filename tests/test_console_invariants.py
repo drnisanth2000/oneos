@@ -2124,16 +2124,16 @@ def _expected_route_services(main):
         health_endpoints["/readyz"]: (main.Vault.bundles,),
         main.shell: (main.load_master, main.Vault.bundles),
         main.master_card: (main.entity_cards, main.note_snapshot),
+        # The reminder routes answer with the reminder box alone and never
+        # read the note.
         main.master_reminder_save: (
             main.entity_cards,
-            main.note_snapshot,
             main.reminder_store,
             main.ReminderStore.save,
         ),
         main.master_reminder_remove: (
             main.build_scope,
             main.entity_cards,
-            main.note_snapshot,
             main.reminder_store,
             main.ReminderStore.all,
             main.ReminderStore.remove,
@@ -2208,7 +2208,7 @@ def test_registered_routes_declare_the_exact_body_service_inventory(
 ):
     main = _load_console_app(tmp_path, monkeypatch)
     expected = _expected_route_services(main)
-    assert sum(len(services) for services in expected.values()) == 69
+    assert sum(len(services) for services in expected.values()) == 67
     endpoints = list(_registered_console_endpoints(main.app))
     assert len(endpoints) == 27, endpoints
     assert set(endpoints) == set(expected), (
@@ -3935,3 +3935,54 @@ def test_safe_read_refuses_a_path_through_the_git_directory(tmp_path):
 
     with pytest.raises(RedirectedPathError):
         _read_no_follow_bytes(tmp_path, ".git/config")
+
+
+def test_master_stage_forwards_the_popups_own_fingerprints(tmp_path, monkeypatch):
+    """S7 on the master view: a stage press is bound to the bytes the popup
+    showed (`source_sha256`) and, for a proposed card, to the classify record
+    it reviewed (`proposal_review_sha256`). The route must forward exactly the
+    posted values to the acting call, never derive or replace them."""
+    import ast
+    import inspect
+
+    main = _load_console_main(tmp_path, monkeypatch)
+    route = main.master_stage
+    parameters = inspect.signature(route).parameters
+    for name in ("source_sha256", "proposal_review_sha256"):
+        assert name in parameters, name
+    field = parameters["source_sha256"].default
+    assert getattr(field, "is_required", lambda: False)(), "source_sha256 is not required"
+    source = _executable_source(route)
+    tree = ast.parse(source)
+    # Neither fingerprint is ever reassigned in the route.
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            for name in ast.walk(target):
+                assert not (
+                    isinstance(name, ast.Name)
+                    and name.id in ("source_sha256", "proposal_review_sha256")
+                ), "the route reassigns a fingerprint"
+    calls = [
+        call for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and getattr(call.func, "id", getattr(call.func, "attr", "")) == "propose_and_approve_stage"
+    ]
+    assert calls, "master_stage never acts"
+
+    def keyword(call, key):
+        return next((k.value for k in call.keywords if k.arg == key), None)
+
+    for call in calls:
+        bound = keyword(call, "source_sha256")
+        assert isinstance(bound, ast.Name) and bound.id == "source_sha256", ast.unparse(call)
+    superseding = [call for call in calls if keyword(call, "supersedes") is not None]
+    assert superseding, "no superseding call"
+    for call in superseding:
+        review = keyword(call, "supersedes_review_sha256")
+        assert isinstance(review, ast.Name) and review.id == "proposal_review_sha256", ast.unparse(call)
+    # No fresh digest in the acting route: no review read, no hashing.
+    for forbidden in ("get_proposal_review(", "hashlib", "sha256(", "get_proposal(", "load_proposals("):
+        assert forbidden not in source, forbidden
