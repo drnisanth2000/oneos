@@ -706,6 +706,85 @@ def test_classify_approval_refuses_a_sub_key_not_written_plainly(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("module", "sub", "new_sub_line"),
+    [("11-knowledge", "kb", "sub: kb\n"), ("11-library", "", "")],
+    ids=("set-sub", "clear-sub"),
+)
+@pytest.mark.parametrize("empty_sub", ["sub:\n", "sub:   \n"], ids=("bare", "spaces"))
+def test_classify_approval_keeps_a_header_comment_after_an_empty_sub(
+    tmp_path, module, sub, new_sub_line, empty_sub
+):
+    # An empty `sub:` value must not reach past its own line: the comment
+    # below it parses to nothing, so only a byte comparison can see it go.
+    before = _NO_HEADER_SUB_HEADER + empty_sub + "# owner note\n---\n" + _NO_HEADER_SUB_BODY
+    vault = _outbox_vault(
+        tmp_path,
+        ("demo1",),
+        {
+            "demo1/00-inbox/active/note.md": before,
+            "demo1/11-knowledge/active/.gitkeep": "",
+            "demo1/11-library/active/.gitkeep": "",
+        },
+    )
+    scope = Scope(vault, "demo1")
+    prop = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "note.md"), module=module, sub=sub
+    )
+
+    approval = approve(scope, prop.id, _fp(scope, prop.id))
+
+    expected = before.replace(empty_sub, new_sub_line)
+    assert (vault / approval.dst).read_bytes() == expected.encode("utf-8")
+
+
+_CRLF_HEADER = "---\r\ntype: inbox-item\r\ntitle: Synthetic note\r\n"
+
+
+@pytest.mark.parametrize(
+    ("before", "sub", "after"),
+    [
+        ("sub: triage\r\n", "kb", "sub: kb\r\n"),
+        ("sub: triage\r\n", None, ""),
+        ("", "kb", "sub: kb\r\n"),
+    ],
+    ids=("replace", "remove", "insert"),
+)
+def test_apply_sub_keeps_crlf_line_endings(before, sub, after):
+    body = "line one\r\nsub: body line\r\n"
+    text = _CRLF_HEADER + before + "---\r\n" + body
+    assert outbox._apply_sub(text, sub) == _CRLF_HEADER + after + "---\r\n" + body
+
+
+@pytest.mark.parametrize("sub", ["yes", "no", "on", "off", "null", "1", "true", "2026-01-01", "2026-02-30"])
+@pytest.mark.parametrize("existing", ["sub: triage\n", ""], ids=("replace", "insert"))
+def test_apply_sub_quotes_a_sub_id_yaml_would_read_as_another_type(sub, existing):
+    text = "---\ntitle: Synthetic note\n" + existing + "---\nbody\n"
+    new = outbox._apply_sub(text, sub)
+    assert new == "---\ntitle: Synthetic note\n" + f"sub: '{sub}'\n" + "---\nbody\n"
+    assert outbox._header_mapping(new.split("body")[0])["sub"] == sub
+
+
+def test_an_empty_source_cannot_be_previewed_or_approved(tmp_path):
+    vault = _outbox_vault(
+        tmp_path,
+        ("demo1",),
+        {
+            "demo1/00-inbox/active/note.md": "",
+            "demo1/11-knowledge/active/.gitkeep": "",
+        },
+    )
+    scope = Scope(vault, "demo1")
+    prop = propose_classification(
+        scope, scope.resolve("00-inbox", "active", "note.md"), module="11-knowledge", sub="kb"
+    )
+
+    with pytest.raises(outbox.OutboxDestinationError):
+        preview_diff(scope, prop)
+    (row,) = outbox.project_outbox(scope).rows
+    assert not row.can_approve and row.can_reject
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("id", "20260815T090703-" + "22" * 16),

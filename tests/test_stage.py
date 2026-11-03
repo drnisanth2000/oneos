@@ -958,19 +958,19 @@ def test_setting_a_sub_on_a_header_without_one_never_touches_the_body(tmp_path):
     assert header.count("sub: kb\n") == 1
 
 
-def test_an_empty_header_sub_that_would_swallow_a_line_is_refused(tmp_path):
+def test_an_empty_header_sub_keeps_the_next_header_line(tmp_path):
     vault = _vault(tmp_path)
     scope = Scope(vault, "demo1")
     text = _note("Inbox note", "active", body="Body.\n").replace(
         "updated: 2026-10-02\n", "updated: 2026-10-02\nsub:\nsource: folder\n"
     )
     (vault / INBOX).write_text(text, encoding="utf-8")
-    with pytest.raises(NoteTextError):
-        propose_stage(
-            scope, src=INBOX, source_sha256=_sha(text.encode()), set_status="draft",
-            updated=TODAY, module="11-knowledge", sub="kb",
-        )
-    assert _records(vault) == []
+    result = propose_and_approve_stage(
+        scope, src=INBOX, source_sha256=_sha(text.encode()), set_status="draft",
+        updated=TODAY, module="11-knowledge", sub="kb",
+    )
+    new = (vault / result.dst).read_text()
+    assert new.endswith("\nsub: kb\nsource: folder\n---\n\nBody.\n")
 
 
 @pytest.mark.parametrize("src", [FILED, INBOX])
@@ -1099,25 +1099,26 @@ def test_the_outbox_screen_offers_only_reject_for_a_malformed_stage_record(
     assert (tmp_path / "alpha/outbox" / f"{classify_id}.yaml").exists()
 
 
-# --- review round 2: the fence guard, odd sub spellings, parse-safe records --
+# --- review round 2: the empty sub line, odd sub spellings, parse-safe records --
 
 
-def test_a_sub_change_that_would_swallow_the_closing_fence_is_refused(tmp_path):
+def test_clearing_an_empty_sub_keeps_the_comment_and_the_fence(tmp_path):
     vault = _vault(tmp_path)
     scope = Scope(vault, "demo1")
-    # `_apply_sub_to_header`'s `\s*` eats the empty `sub:` value's newline and the
-    # closing fence; the comment line hides it from the mapping check, so
-    # only the fence/body check stops `zz: 1` moving into the header.
+    # The edit stays on the `sub:` line: the empty value's newline, the
+    # closing fence and the comment above it all survive, and `zz: 1` stays
+    # in the body.
     text = _note("Inbox note", "active", body="zz: 1\n---\ntail\n").replace(
         "updated: 2026-10-02\n---\n", "updated: 2026-10-02\n# c\nsub:\n---\n"
     )
     (vault / INBOX).write_text(text, encoding="utf-8")
-    with pytest.raises(NoteTextError):
-        propose_stage(
-            scope, src=INBOX, source_sha256=_sha(text.encode()), set_status="draft",
-            updated=TODAY, module="02-work", sub=None,
-        )
-    assert _records(vault) == []
+    result = propose_and_approve_stage(
+        scope, src=INBOX, source_sha256=_sha(text.encode()), set_status="draft",
+        updated=TODAY, module="02-work", sub=None,
+    )
+    new = (vault / result.dst).read_text()
+    assert new.endswith("\n# c\n---\n\nzz: 1\n---\ntail\n")
+    assert "\nsub:" not in new
 
 
 @pytest.mark.parametrize("spelling", ['"sub": triage', "sub : triage", "'sub': triage"])
