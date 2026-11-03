@@ -1818,6 +1818,7 @@ from app.action_receipts import parse_action_receipt  # noqa: E402
 
 _STALE = "This note changed since you opened it. Here is the newer version."
 _UNCHANGED = "Nothing changed."
+_CARD_CHANGED = "This card changed since you opened it. Here is the newer version."
 _HEADER = "This note's header can't be edited safely here. Edit it in the vault, then try again."
 
 
@@ -2194,8 +2195,10 @@ def test_forged_proposal_tokens_are_refused_and_write_nothing(tmp_path, tmp_path
     form = _popup_form(client, "alpha", _SRC)
     head = _git(tmp_path, "rev-parse", "HEAD")
     record = (tmp_path / "alpha" / "outbox" / f"{_PROPOSAL_ID}.yaml").read_bytes()
+    # A well-formed digest that does not match is the same as a proposal that
+    # changed: the newer card, bound to the record as it is, and no write.
+    assert _notice(_press(client, "alpha", _SRC, "done", form, proposal_review_sha256="0" * 64)) == _CARD_CHANGED
     for overrides in (
-        {"proposal_review_sha256": "0" * 64},
         {"proposal_review_sha256": "nope"},
         {"proposal_review_sha256": None},
         {"proposal_id": "20260815T090703-" + "22" * 16},
@@ -3007,3 +3010,33 @@ def test_outbox_approval_of_a_stage_record_survives_an_unsafe_store(
     _assert_one_stage_commit(tmp_path, before, [path])
     directory.chmod(0o700)
     assert set(ReminderStore(directory).all()) == {path}  # nothing lost
+
+
+# --- a classify record that changed after the popup opened ---------------------
+
+
+def test_a_changed_proposal_shows_the_newer_card_and_writes_nothing(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _inbox_with_proposal(tmp_path, "alpha", "marker.md", status="active", full=True)
+    form = _popup_form(client, "alpha", _SRC)
+    # The pending classification is rewritten after the popup opened.
+    record = tmp_path / "alpha" / "outbox" / f"{_PROPOSAL_ID}.yaml"
+    record.write_text(record.read_text(encoding="utf-8").replace("sub: general\n", "sub:\n"), encoding="utf-8")
+    head, newer = _git(tmp_path, "rev-parse", "HEAD"), record.read_bytes()
+    response = _press(client, "alpha", _SRC, "done", form, comment="Mine")
+    assert response.status_code == 200
+    assert _notice(response) == _CARD_CHANGED
+    assert "E-REVIEW" not in response.text and 'class="alert' not in response.text
+    # The refreshed form binds the newer record, and keeps what was typed.
+    again = {
+        name: _html.unescape(value)
+        for name, value in re.findall(r'<input type="hidden" name="([a-z0-9_]+)" value="([^"]*)"', response.text)
+    }
+    assert again["proposal_review_sha256"] == hashlib.sha256(newer).hexdigest()
+    assert 'value="Mine"' in response.text
+    _nothing_written(tmp_path, head)
+    assert record.read_bytes() == newer
+    assert sorted(p.name for p in record.parent.iterdir()) == [record.name]
+    assert list(directory.iterdir()) == []

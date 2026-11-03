@@ -759,6 +759,7 @@ _STAGE_KEYS = frozenset(key for key, _label in _STAGE_BUTTONS)
 #: The popup's own words for what an owner can meet in normal use. Anything
 #: else is a described refusal in `master_popup_error.html`.
 _STALE_NOTICE = "This note changed since you opened it. Here is the newer version."
+_CARD_CHANGED_NOTICE = "This card changed since you opened it. Here is the newer version."
 _UNCHANGED_NOTICE = "Nothing changed."
 _HEADER_NOTICE = (
     "This note's header can't be edited safely here. Edit it in the vault, then try again."
@@ -1343,12 +1344,23 @@ def master_stage(
                         raise StageRequestError("not this card's proposal")
                     # The proposal's destination, superseded in the same commit,
                     # bound to the record digest the popup carried.
-                    result = propose_and_approve_stage(
-                        scope, source_sha256=source_sha256, set_status=stage,
-                        supersedes=proposal_id,
-                        supersedes_review_sha256=proposal_review_sha256,
-                        **stage_args,
-                    )
+                    try:
+                        result = propose_and_approve_stage(
+                            scope, source_sha256=source_sha256, set_status=stage,
+                            supersedes=proposal_id,
+                            supersedes_review_sha256=proposal_review_sha256,
+                            **stage_args,
+                        )
+                    except ReviewedProposalChanged:
+                        # The pending proposal changed since the popup opened
+                        # (S7 refused it; nothing was written). Show the card
+                        # as it is now, bound to the newer record, and keep
+                        # what the owner typed.
+                        newer = {k: v for k, v in typed.items() if k != "proposal_review_sha256"}
+                        return _stage_again(
+                            request, scope, catalog, card,
+                            _notice(_CARD_CHANGED_NOTICE, "error"), newer, refresh=True,
+                        )
                 else:
                     if not module:
                         return _stage_again(
