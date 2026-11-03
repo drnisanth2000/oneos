@@ -57,6 +57,15 @@ from .git_transaction import (
     consume_reviewed_proposal,
 )
 from .inbox import split_front_matter
+from .note_text import (
+    _YAML_FAILURES,
+    NoteTextError,
+    _eol,
+    _header_mapping,
+    _key_lines,
+    _lines,
+    split_note,
+)
 from .destinations import DestinationError, resolve_classification_destination
 from .proposal_identity import (
     ProposalIdentityError,
@@ -705,28 +714,100 @@ def load_proposals(scope: Scope) -> list[OutboxProposal]:
     return [review.value for review in _load_proposal_reviews(scope)]
 
 
+#: One `sub:` header line, never more: `[ \t]` and `[^\r\n]` stop at the line
+#: end, so an empty value cannot reach into the next line (a comment there
+#: parses to nothing, so the mapping check would not see it go).
+_SUB_LINE_RE = re.compile(r"(?m)^sub:[ \t]*[^\r\n]*")
+
+
+@structured_reader(category="front-matter")
+def _sub_scalar(sub: str) -> str:
+    """`sub` as YAML reads it back as the same string: plain when it already
+    does, single-quoted when YAML would read it as a bool, null, number or
+    date (`yes`, `null`, `1`), or cannot read it at all."""
+    try:
+        if yaml.safe_load(sub) == sub:
+            return sub
+    except _YAML_FAILURES:
+        pass
+    return "'" + sub.replace("'", "''") + "'"
+
+
+def _apply_sub_to_header(header_raw: str, sub: str | None) -> str:
+    """The `sub:` line edit itself. It matches the first `^sub:` line, so it
+    is only ever handed a header (`_apply_sub`), never a whole note. Line
+    endings are kept as written."""
+    match = _SUB_LINE_RE.search(header_raw)
+    if sub is None:
+        if match is None:
+            return header_raw
+        eol = re.match(r"\r\n|\r|\n", header_raw[match.end():])
+        end = match.end() + (len(eol.group()) if eol else 0)
+        return header_raw[:match.start()] + header_raw[end:]
+    line = f"sub: {_sub_scalar(sub)}"
+    if match is not None:
+        return header_raw[:match.start()] + line + header_raw[match.end():]
+    # no sub line yet — insert one just before the closing front-matter fence
+    fm_end = header_raw.find("---", 3)
+    if fm_end != -1:
+        eol = _eol(_lines(header_raw)[0]) or "\n"
+        return header_raw[:fm_end] + line + eol + header_raw[fm_end:]
+    return header_raw
+
+
 def _apply_sub(text: str, sub: str | None) -> str:
     """The move's only content change: the `sub:` front-matter value. `block`
-    is derived from the module, never written per file (conventions v2 §1)."""
-    if sub is None:
-        return re.sub(r"(?m)^sub:\s*.*\n?", "", text, count=1)
-    if re.search(r"(?m)^sub:\s*.*$", text):
-        return re.sub(r"(?m)^sub:\s*.*$", f"sub: {sub}", text, count=1)
-    # no sub line yet — insert one just before the closing front-matter fence
-    fm_end = text.find("---", 3)
-    if fm_end != -1:
-        return text[:fm_end] + f"sub: {sub}\n" + text[fm_end:]
-    return text
+    is derived from the module, never written per file (conventions v2 §1).
+
+    Scoped to the header: on a note whose header has no `sub:`, a body line
+    that starts with `sub:` is never rewritten or deleted. The body bytes are
+    appended unchanged, and the header must mean what it meant except for
+    `sub`. Raises `NoteTextError` when that cannot be done safely.
+    """
+    header_raw, body_raw = split_note(text)
+    inner = _lines(header_raw)[1:-1]
+    placed = _key_lines("".join(inner))
+    # `_apply_sub_to_header` only sees a key written exactly `sub:` at the
+    # start of a line. A `"sub":` or `sub :` spelling would get a second
+    # `sub:` line (PyYAML keeps the last), so such a header is refused,
+    # never rewritten.
+    if "sub" in placed and not inner[placed["sub"][0]].startswith("sub:"):
+        raise NoteTextError("header 'sub' key is not written as 'sub:'; refusing to edit it")
+    new_header = _apply_sub_to_header(header_raw, sub)
+    expected = {key: value for key, value in _header_mapping(header_raw).items() if key != "sub"}
+    if sub is not None:
+        expected["sub"] = sub
+    if _header_mapping(new_header) != expected:
+        raise NoteTextError("could not set 'sub:' safely")
+    result = new_header + body_raw
+    # Belt and braces: the edit stays on one line, but if the fence ever
+    # moved the body would leak into the header.
+    if split_note(result) != (new_header, body_raw):
+        raise NoteTextError("setting 'sub:' would move the front-matter fence")
+    return result
 
 
-def _diff_text(proposal: Proposal, old: str) -> str:
+def _classified_text(old: str, sub: str | None) -> str:
+    """`_apply_sub` for a classification, refusing in the outbox's own terms."""
+    try:
+        return _apply_sub(old, sub)
+    except NoteTextError as exc:
+        raise OutboxDestinationError(
+            "proposal source front matter cannot be edited safely"
+        ) from exc
+
+
+def _diff_text(proposal: Proposal, old: str, *, missing: bool = False) -> str:
     """Render the move diff from already-decoded source text.
 
     Shared by `_render_review` and `preview_diff`, which differ only in **read
     policy** — the diff production itself is identical, and duplicating it let
     the two drift with no test able to notice.
     """
-    new = _apply_sub(old, proposal.sub)
+    # `missing` is `preview_diff`'s missing-source fallback: nothing to
+    # change, so nothing to refuse. An empty file that exists is refused, as
+    # approval would refuse it.
+    new = old if missing else _classified_text(old, proposal.sub)
     diff = difflib.unified_diff(
         old.splitlines(True), new.splitlines(True),
         fromfile=f"a/{proposal.src}", tofile=f"b/{proposal.dst}",
@@ -834,8 +915,9 @@ def preview_diff(scope: Scope, proposal: OutboxProposal) -> str:
     if isinstance(proposal, (LifecycleProposal, StageProposal, MalformedStageProposal)):
         return _render_review(scope, proposal)[0]
     src_path = scope.resolve_stored(proposal.src)
-    old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
-    return _diff_text(proposal, old)
+    if not src_path.exists():
+        return _diff_text(proposal, "", missing=True)
+    return _diff_text(proposal, src_path.read_text(encoding="utf-8"))
 
 
 @failure_contract(
@@ -1253,7 +1335,7 @@ def approve(
     if actual_sha256 != prop.source_sha256:
         raise StaleProposalSource("proposal source has changed")
     try:
-        approved_bytes = _apply_sub(
+        approved_bytes = _classified_text(
             source_bytes.decode("utf-8"), prop.sub
         ).encode("utf-8")
     except UnicodeDecodeError as exc:
