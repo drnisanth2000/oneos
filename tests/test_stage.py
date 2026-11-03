@@ -868,6 +868,50 @@ def test_the_outbox_screen_lists_and_approves_a_stranded_stage_record(
     assert "status: waiting\n" in (tmp_path / note).read_text()
 
 
+def _card_html(page: str, proposal_id: str) -> str:
+    start = page.index(f'id="review-card-{proposal_id}-')
+    end = page.find('id="review-card-', start + 1)
+    return page[start:] if end == -1 else page[start:end]
+
+
+def test_a_stranded_stage_row_says_what_approval_does_in_plain_words(
+    tmp_path, monkeypatch
+):
+    from tests.test_console_routes import _outbox_proposal_client
+
+    _main, client, _classify_id = _outbox_proposal_client(tmp_path, monkeypatch)
+    plan, notes = "alpha/02-work/active/plan.md", "alpha/02-work/active/notes.md"
+    mail = "alpha/00-inbox/active/mail.md"
+    for rel, title, status in ((plan, "Plan", "draft"), (notes, "Notes", "draft"), (mail, "Mail", "active")):
+        (tmp_path / rel).write_text(
+            _note(title, status).replace("entity: demo1", "entity: alpha"), encoding="utf-8"
+        )
+        git_bytes(tmp_path, "add", rel)
+    git_bytes(tmp_path, "commit", "-q", "-m", "notes")
+    scope = Scope(tmp_path, "alpha")
+    status_id, _ = _stage_filed(scope, src=plan, set_status="waiting")
+    body_id, _ = _stage_filed(scope, src=notes, set_status=None, body="New body.\n")
+    inbox_id, _ = _stage_filed(scope, src=mail, set_status="draft", module="02-work")
+
+    page = client.get("/outbox/alpha")
+    assert page.status_code == 200
+
+    status_card = _card_html(page.text, status_id)
+    assert "Approval changes this note's status to Waiting" in status_card
+    assert "moves this document" not in status_card
+    assert "<dt>From</dt>" not in status_card
+    assert f"stage: {plan}" in status_card  # the technical diff is unchanged
+
+    body_card = _card_html(page.text, body_id)
+    assert "Approval updates this note" in body_card
+    assert "moves this document" not in body_card and "status to" not in body_card
+
+    inbox_card = _card_html(page.text, inbox_id)
+    assert "Approval files this note into 02-work" in inbox_card
+    assert "moves this document" not in inbox_card
+    assert f"stage: {mail} → " in inbox_card
+
+
 # --- review fixes: header-scoped sub, approval-time supersede checks -------
 
 

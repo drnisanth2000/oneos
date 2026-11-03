@@ -171,6 +171,7 @@ templates.env.globals["new_issue"] = _new_issue
 # a converted instant) and the stage a card sits in ("Due" or "Review by").
 templates.env.globals["due_label"] = due_label
 templates.env.globals["stage_of"] = stage_of
+templates.env.globals["stage_label"] = stage_label
 
 app = FastAPI(title="OneOS")
 app.router.route_class = AuthenticatedFormRoute
