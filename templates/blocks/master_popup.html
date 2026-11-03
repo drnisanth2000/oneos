@@ -48,6 +48,8 @@
     {% endif %}
     {% if body_editable %}
     <label class="stage-field" for="stage-body">Note</label>
+    {# An emptied textarea posts `body=`; this marker says the body was sent. #}
+    <input type="hidden" name="body_sent" value="1">
     <textarea id="stage-body" class="master-body master-body-edit" name="body" rows="10" spellcheck="true">{{ body }}</textarea>
     {% else %}
     <p class="stage-field">Note</p>

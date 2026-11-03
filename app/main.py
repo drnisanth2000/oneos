@@ -1216,6 +1216,7 @@ def master_stage(
     stage: Annotated[str, Form()] = "",
     today: Annotated[str, Form()] = "",
     body: Annotated[str | None, Form()] = None,
+    body_sent: Annotated[str, Form()] = "",
     comment: Annotated[str, Form()] = "",
     module: Annotated[str, Form()] = "",
     sub: Annotated[str, Form()] = "",
@@ -1236,6 +1237,11 @@ def master_stage(
     popup carried, nothing is written and the newer text is shown.
     """
     slug = scope.current_entity()
+    # An emptied textarea posts `body=`, which the form parser hands over as
+    # None, the same as no body at all (a drag, a read-only body). The editable
+    # textarea's `body_sent` marker tells the two apart: emptied is an edit.
+    if body is None and body_sent:
+        body = ""
     typed = {
         "body": body, "comment": comment, "module": module, "sub": sub,
         "source_sha256": source_sha256, "proposal_review_sha256": proposal_review_sha256,

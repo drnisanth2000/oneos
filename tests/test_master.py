@@ -1996,6 +1996,41 @@ def test_body_comment_and_stage_are_one_commit_with_the_posted_date(tmp_path, tm
     _revert_restores(tmp_path, path, original)
 
 
+def test_clearing_the_draft_saves_an_empty_body(tmp_path, tmp_path_factory, monkeypatch):
+    """The browser posts an emptied textarea as `body=`; that is an edit to an
+    empty body, not "no body sent"."""
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft", body="Old draft text.")
+    _git_commit_all(tmp_path)
+    path, original, before = _path("alpha", "Plan"), note.read_text(encoding="utf-8"), _commits(tmp_path)
+    form = _popup_form(client, "alpha", path)
+    assert form["body"] == "Old draft text.\n"
+    response = _press(client, "alpha", path, "draft", form, body="")
+    assert response.status_code == 200, response.text
+    assert _notice(response) != _UNCHANGED
+    _assert_one_stage_commit(tmp_path, before, [path])
+    text = note.read_text(encoding="utf-8")
+    header, body = text.split("---\n", 2)[1:]
+    assert body == ""
+    assert header == original.split("---\n", 2)[1].replace("updated: 2026-01-02", f"updated: {_today()}")
+
+
+def test_a_post_without_a_body_field_keeps_the_body(tmp_path, tmp_path_factory, monkeypatch):
+    """A drag (or a read-only body) sends no body at all: the body stays."""
+    main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
+    note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft", body="Keep me.")
+    _git_commit_all(tmp_path)
+    path, before = _path("alpha", "Plan"), _commits(tmp_path)
+    sha = hashlib.sha256(note.read_bytes()).hexdigest()
+    response = client.post("/master/stage/alpha", data={
+        "path": path, "source_sha256": sha, "today": _today(), "stage": "waiting",
+    })
+    assert response.status_code == 200, response.text
+    _assert_one_stage_commit(tmp_path, before, [path])
+    text = note.read_text(encoding="utf-8")
+    assert text.endswith("---\nKeep me.\n") and "\nstatus: waiting\n" in text
+
+
 def test_a_comment_alone_is_a_commit_and_keeps_the_stage(tmp_path, tmp_path_factory, monkeypatch):
     main, client, directory = _stage_setup(tmp_path, tmp_path_factory, monkeypatch)
     note = _note(tmp_path, "alpha", "02-work", "Plan", status="draft", body="Body")
@@ -2381,6 +2416,8 @@ def test_a_body_the_browser_would_rewrite_is_not_offered_for_editing(
     path, before = _path("alpha", "Raw"), _commits(tmp_path)
     page = client.get("/master/card/alpha", params={"path": path}).text
     assert "stage-form" in page and "<textarea" not in page
+    # No body is sent, so none can be applied (not even an empty one).
+    assert 'name="body_sent"' not in page
     assert "Edit it in the vault" in page
     sha = hashlib.sha256(note.read_bytes()).hexdigest()
     base = {"path": path, "source_sha256": sha, "today": _today()}
