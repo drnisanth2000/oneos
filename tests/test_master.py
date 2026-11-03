@@ -1806,6 +1806,24 @@ def test_the_home_page_reads_flags_from_the_store_without_writing(tmp_path, tmp_
     assert client.get("/").text == before
 
 
+@pytest.mark.parametrize("status", ["draft", "waiting"])
+def test_a_flagged_card_in_to_review_shows_review_by(tmp_path, tmp_path_factory, monkeypatch, status):
+    """A flagged filed note is in To review, so its reminder reads "Review by"
+    (the card's effective stage, as the popup has it), never "Due" or nothing."""
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Spec", status=status)
+    path = _card_path(main, "alpha", "Spec")
+    due = datetime(2099, 11, 4, 11, 0, tzinfo=timezone(timedelta(hours=2)))
+    store = _seed(directory, _reminder("alpha", "Spec", due))
+    store.flag(ReviewFlag(path, "alpha", None, NOW))
+    board = client.get("/").text.split('class="master-cols"')[1]
+    card = re.search(rf'<button[^>]*data-path="{re.escape(path)}".*?</button>', board, re.S)
+    assert card, board
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", card.group(0)))
+    assert f"Review by {due_label(due)}" in text
+    assert "Due " not in text
+
 # --- stage buttons, draft editing and comments in the popup ------------------
 #
 # Every press is one approved Outbox action: one commit holding the note change

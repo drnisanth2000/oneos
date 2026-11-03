@@ -68,6 +68,12 @@ def stage_of(card: BoardCard) -> str:
     return _FILED_STAGE.get(card.status.strip().lower(), OTHER_STAGE)
 
 
+def card_stage(card: BoardCard, flag: object | None) -> str:
+    """The stage a card is shown in: To review while it carries a review flag,
+    else its own. The board, the popup and the card's reminder line agree."""
+    return "review" if flag is not None else stage_of(card)
+
+
 def stage_label(stage: str) -> str:
     return _LABELS.get(stage, "Another status")
 

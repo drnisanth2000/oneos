@@ -51,7 +51,7 @@ from .entities import (
     EntitySelectionError,
 )
 from .inbox import read_inbox
-from .master import due_label, entity_tone, load_master, stage_label, stage_of
+from .master import card_stage, due_label, entity_tone, load_master, stage_label, stage_of
 from .note_text import NoteTextError, normalise_body, shown_body
 from .reminders import (
     InvalidReminder,
@@ -170,7 +170,7 @@ templates.env.globals["new_issue"] = _new_issue
 # Presentation helpers for the master view: the stored wall time as a label (never
 # a converted instant) and the stage a card sits in ("Due" or "Review by").
 templates.env.globals["due_label"] = due_label
-templates.env.globals["stage_of"] = stage_of
+templates.env.globals["card_stage"] = card_stage
 templates.env.globals["stage_label"] = stage_label
 
 app = FastAPI(title="OneOS")
@@ -803,10 +803,6 @@ def _card_flag(card, flags: dict | None, slug: str):
     return flag if flag is not None and flag.entity == slug else None
 
 
-def _card_stage(card, flag) -> str:
-    return "review" if flag is not None else stage_of(card)
-
-
 def _manual_destinations(vault: Vault, scope: Scope, exclude) -> dict[str, list[str]]:
     """Triage's manual destination choices: every active module with a
     lifecycle, and its active subs, minus `exclude` (the inbox itself).
@@ -842,7 +838,7 @@ def _reminder_context(
     """What `master_reminder.html` needs. It never reads the note, so the
     reminder routes, which answer with that block alone, never do either."""
     slug = scope.current_entity()
-    stage = _card_stage(card, _card_flag(card, flags, slug))
+    stage = card_stage(card, _card_flag(card, flags, slug))
     reminder = (reminders or {}).get(card.relative_path)
     if reminder is not None and reminder.entity != slug:
         reminder = None
@@ -889,7 +885,7 @@ def _popup_context(
         (None, slug),
     )
     flag = _card_flag(card, flags, slug)
-    stage = _card_stage(card, flag)
+    stage = card_stage(card, flag)
     if snapshot is None:
         snapshot = note_snapshot(scope, card.relative_path)
     try:
@@ -1015,7 +1011,7 @@ def master_reminder_save(
         if store is None:
             raise ReminderStoreUnavailable()
         flags = _page_flags()
-        if card is None or _card_stage(
+        if card is None or card_stage(
             card, _card_flag(card, flags, scope.current_entity())
         ) not in ("waiting", "review"):
             raise InvalidReminder("not a card that takes a reminder")
@@ -1283,7 +1279,7 @@ def master_stage(
             edited = body
         flag = _card_flag(card, _page_flags(), slug)
         moved_to = _notice(
-            f"Moved to {stage_label(stage)}." if stage != _card_stage(card, flag) else "Saved.",
+            f"Moved to {stage_label(stage)}." if stage != card_stage(card, flag) else "Saved.",
             "done",
         )
         stage_args = {

@@ -20,10 +20,11 @@
     {% if item.card.updated %}<time class="master-date" datetime="{{ item.card.updated }}">{{ item.card.updated }}</time>{% endif %}
   </span>
   {# The stored wall time, as typed; never converted here. #}
-  {% set card_stage = stage_of(item.card) if item.reminder else "" %}
-  {% if card_stage in ("waiting", "review") %}
+  {# The effective stage: a flagged filed note is in To review. #}
+  {% set shown_stage = card_stage(item.card, item.flag) if item.reminder else "" %}
+  {% if shown_stage in ("waiting", "review") %}
   <span class="master-reminder">
-    {{ icon("bell") }}<span>{{ "Review by" if card_stage == "review" else "Due" }} <time datetime="{{ item.reminder.due_at.isoformat() }}">{{ due_label(item.reminder.due_at) }}</time></span>
+    {{ icon("bell") }}<span>{{ "Review by" if shown_stage == "review" else "Due" }} <time datetime="{{ item.reminder.due_at.isoformat() }}">{{ due_label(item.reminder.due_at) }}</time></span>
   </span>
   {% endif %}
 </button>
