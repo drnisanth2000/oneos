@@ -6,6 +6,10 @@ landed and when. The published history starts at the 2026-08-07 baseline.
 
 ## Unreleased
 
+- Master view moves and editing (plan 3 of 4): stage buttons in the card popup,
+  drag a card to Draft or Done on a computer, edit a draft's text, add a dated
+  comment, and flag a filed note To review. Every change is one approved,
+  revertible commit through the Outbox, refused if the note changed meanwhile.
 - Home is the master view (read-only, plan 1 of 4): every entity's notes in
   Draft, Waiting, To review and Done, with entity chips, sort, a read-only card
   popup, a sidebar Home row, and phone and tablet layouts.
