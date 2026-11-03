@@ -11,7 +11,7 @@ import hashlib
 import re
 import secrets
 
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -24,7 +24,14 @@ from fastapi.templating import Jinja2Templates
 from fastapi.utils import is_body_allowed_for_status_code
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .board import NoteUnreadable, capture_note, entity_cards, load_board, note_body
+from .board import (
+    NoteUnreadable,
+    capture_note,
+    entity_cards,
+    load_board,
+    note_snapshot,
+    snapshot_body,
+)
 from .action_receipts import (
     ActionReceipt,
     InvalidActionReceipt,
@@ -44,17 +51,21 @@ from .entities import (
     EntitySelectionError,
 )
 from .inbox import read_inbox
-from .master import due_label, entity_tone, load_master, stage_label, stage_of
+from .master import card_stage, due_label, entity_tone, load_master, stage_label, stage_of
+from .note_text import NoteTextError, normalise_body, shown_body
 from .reminders import (
     InvalidReminder,
     Reminder,
     ReminderStore,
     ReminderStoreUnavailable,
+    ReviewFlag,
+    clean_flag_comment,
     clean_subject,
     default_subject,
     parse_due,
     reminder_store,
 )
+from .stage import INBOX_MODULE, StageRequestError, StageUnchanged, propose_and_approve_stage
 from .ingest.base import IngestError
 from .phase3 import (
     CleanupError,
@@ -65,11 +76,15 @@ from .phase3 import (
     render_mailbox,
 )
 from .outbox import (
+    MissingProposalSource,
     OutboxDestinationError,
     OutboxError,
     OutboxRow,
     LifecycleProposal,
     Proposal,
+    StageProposal,
+    StaleProposalSource,
+    get_proposal_review,
     lifecycle_review_journal,
     UnreadableProposalRecord,
     approve,
@@ -155,7 +170,8 @@ templates.env.globals["new_issue"] = _new_issue
 # Presentation helpers for the master view: the stored wall time as a label (never
 # a converted instant) and the stage a card sits in ("Due" or "Review by").
 templates.env.globals["due_label"] = due_label
-templates.env.globals["stage_of"] = stage_of
+templates.env.globals["card_stage"] = card_stage
+templates.env.globals["stage_label"] = stage_label
 
 app = FastAPI(title="OneOS")
 app.router.route_class = AuthenticatedFormRoute
@@ -441,6 +457,18 @@ def _page_reminders() -> dict | None:
         return None
 
 
+def _page_flags() -> dict | None:
+    """Every review flag, or None when the store is missing or unsafe (the
+    page then ignores flags and still renders); a read creates nothing."""
+    try:
+        store = reminder_store()
+        if store is None:
+            return None
+        return store.flags()
+    except ReminderStoreUnavailable:
+        return None
+
+
 @app.get("/", response_class=HTMLResponse)
 @console_route(
     catches=_SIDEBAR_CATCHES,
@@ -469,6 +497,7 @@ def shell(request: Request) -> HTMLResponse:
             done_all=params.get("done") == "all",
             now=datetime.now().astimezone(),
             reminders=_page_reminders(),
+            flags=_page_flags(),
         )
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))
@@ -718,26 +747,105 @@ def _find_card(cards, path: str):
     )
 
 
-def _popup_context(scope: Scope, catalog, card, reminders: dict | None) -> dict:
-    """The popup's template context. `reminders` is every stored reminder, or
-    None when the store is unavailable (the reminder box is then disabled)."""
+#: The popup's four stage buttons, in board order (exact copy, plan constraint).
+_STAGE_BUTTONS = (
+    ("draft", "Save as Draft"),
+    ("waiting", "Waiting"),
+    ("review", "To review"),
+    ("done", "Done"),
+)
+_STAGE_KEYS = frozenset(key for key, _label in _STAGE_BUTTONS)
+
+#: The popup's own words for what an owner can meet in normal use. Anything
+#: else is a described refusal in `master_popup_error.html`.
+_STALE_NOTICE = "This note changed since you opened it. Here is the newer version."
+_CARD_CHANGED_NOTICE = "This card changed since you opened it. Here is the newer version."
+_UNCHANGED_NOTICE = "Nothing changed."
+_HEADER_NOTICE = (
+    "This note's header can't be edited safely here. Edit it in the vault, then try again."
+)
+_HEADER_READ_ONLY = "This note's header can't be edited safely here. Edit it in the vault."
+_TODAY_NOTICE = (
+    "This device's date is more than a day away from OneOS's date. "
+    "Check the date on this device, then try again."
+)
+_COMMENT_NOTICE = "A comment is one line of up to 500 characters."
+_FILE_TO_NOTICE = "Choose where to file it first."
+_INBOX_REVIEW_HINT = " To save an edit or a comment, file it with Save as Draft, Waiting or Done."
+_FLAG_NOT_STORED = (
+    "The edit was saved, but the To review flag could not be stored. "
+    "Press To review again."
+)
+_SPENT_NOTICE = "This move was already made."
+_BODY_READ_ONLY = (
+    "This note has characters the editor can't keep, so its text is shown read-only. "
+    "Edit it in the vault."
+)
+_BODY_NOTICE = (
+    "This note has characters the editor can't keep. Edit it in the vault, then try again."
+)
+_MOVED_UNSHOWN = "Moved. Refresh to see the note."
+_OWNER_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+
+
+def _notice(text: str, tone: str = "info") -> dict:
+    """`tone` is "error" (an alert), "done" or "info" (a status line)."""
+    return {"text": text, "tone": tone}
+
+
+def _card_flag(card, flags: dict | None, slug: str):
+    """The review flag that puts a filed card in To review, or None. A flag on
+    an inbox or proposed card, or stored for another entity, is ignored, as
+    `load_master` ignores it."""
+    if card.lane != "filed" or not flags:
+        return None
+    flag = flags.get(card.relative_path)
+    return flag if flag is not None and flag.entity == slug else None
+
+
+def _manual_destinations(vault: Vault, scope: Scope, exclude) -> dict[str, list[str]]:
+    """Triage's manual destination choices: every active module with a
+    lifecycle, and its active subs, minus `exclude` (the inbox itself).
+
+    Choices are hints, not authority: the resolver rechecks scope, flags,
+    source and destination paths when a move or proposal is submitted. Keep
+    missing modules visible; the sidebar reports E4 and the resolver refuses
+    them. A directory scan would silently hide that configuration error.
+    """
+    choices = {}
+    for module in sorted(vault.active_modules_for(scope)):
+        if module not in exclude and vault.module_spec(module).get("lifecycle_pattern", True):
+            choices[module] = sorted(vault.active_submodules_for(scope, module))
+    return choices
+
+
+def _as_browser(text: str) -> str:
+    """`text` as a browser hands a textarea's value back: the HTML parser turns
+    CRLF and a lone CR into LF and NUL into U+FFFD (and the form post's CRLF is
+    the same LF again)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "\ufffd")
+
+
+def _browser_keeps(text: str) -> bool:
+    """Whether a textarea round trip leaves `text` (a shown body, already LF)
+    exactly as it is. A lone CR or a NUL would come back changed."""
+    return "\r" not in text and "\x00" not in text
+
+
+def _reminder_context(
+    scope: Scope, card, reminders: dict | None, flags: dict | None, *, typed: dict | None = None
+) -> dict:
+    """What `master_reminder.html` needs. It never reads the note, so the
+    reminder routes, which answer with that block alone, never do either."""
     slug = scope.current_entity()
-    # Registry order, as `load_master` colours its chips.
-    index, label = next(
-        ((i, e.label) for i, e in enumerate(catalog.entities) if e.slug == slug),
-        (None, slug),
-    )
-    stage = stage_of(card)
+    stage = card_stage(card, _card_flag(card, flags, slug))
     reminder = (reminders or {}).get(card.relative_path)
     if reminder is not None and reminder.entity != slug:
         reminder = None
     return {
         "card": card,
-        "stage": stage_label(stage),
         "entity": slug,
-        "entity_label": label,
-        "tone": entity_tone(index) if index is not None else 0,
-        "body": note_body(scope, card.relative_path),
+        "stage": stage_label(stage),
         "reminder_box": stage in ("waiting", "review"),
         # A reminder on a card that has since left those stages (the owner
         # edited `status:`) is shown read-only, with Remove and no Save.
@@ -745,30 +853,113 @@ def _popup_context(scope: Scope, catalog, card, reminders: dict | None) -> dict:
         "reminders_available": reminders is not None,
         "reminder": reminder,
         "default_subject": default_subject(card.title),
+        "typed_reminder": typed or {},
     }
 
 
-def _empty_popup() -> dict:
+def _popup_context(
+    scope: Scope,
+    catalog,
+    card,
+    reminders: dict | None,
+    flags: dict | None = None,
+    *,
+    snapshot=None,
+    notice: dict | None = None,
+    typed: dict | None = None,
+) -> dict:
+    """The popup's template context. `reminders` is every stored reminder, or
+    None when the store is unavailable (the reminder box is then disabled);
+    `flags` likewise for review flags.
+
+    The editor shows `shown_body` of one capture of the note and carries the
+    SHA-256 of that same capture (`snapshot`, read here unless given), so a
+    stage button is bound to exactly the bytes the owner saw. `typed` puts back
+    what the owner sent after a refusal that keeps it (body, comment, picker,
+    and the hashes their edit was based on, never fresher ones).
+    """
+    slug = scope.current_entity()
+    # Registry order, as `load_master` colours its chips.
+    index, label = next(
+        ((i, e.label) for i, e in enumerate(catalog.entities) if e.slug == slug),
+        (None, slug),
+    )
+    flag = _card_flag(card, flags, slug)
+    stage = card_stage(card, flag)
+    if snapshot is None:
+        snapshot = note_snapshot(scope, card.relative_path)
+    try:
+        body, editable = shown_body(snapshot.text), True
+    except NoteTextError:
+        # A header the editor cannot place: shown read-only, no stage form.
+        body, editable = snapshot_body(snapshot), False
+    # A body a textarea would hand back changed is shown read-only; the stage
+    # buttons still work, and the form sends no body.
+    body_editable = editable and _browser_keeps(body)
+    typed = typed or {}
+    if body_editable and typed.get("body") is not None:
+        body = normalise_body(typed["body"])
+    proposal_review_sha256 = None
+    proposed_module, proposed_sub = card.module, card.sub
+    if editable and card.lane == "proposed" and card.proposal_id:
+        # The destination shown and the digest the buttons carry come from
+        # the same read of the record, so the owner approves what they saw.
+        review = get_proposal_review(scope, card.proposal_id)
+        proposal_review_sha256 = review.sha256
+        proposed_module = getattr(review.value, "module", card.module)
+        proposed_sub = getattr(review.value, "sub", card.sub)
+    destinations = None
+    if editable and card.lane == "inbox":
+        destinations = _manual_destinations(Vault(catalog), scope, {INBOX_MODULE})
+    if notice is None and not editable:
+        notice = _notice(_HEADER_READ_ONLY)
+    elif notice is None and not body_editable:
+        notice = _notice(_BODY_READ_ONLY)
+    return {
+        **_reminder_context(scope, card, reminders, flags),
+        "stage_key": stage,
+        "entity_label": label,
+        "tone": entity_tone(index) if index is not None else 0,
+        "body": body,
+        "editable": editable,
+        "body_editable": body_editable,
+        "proposed_module": proposed_module,
+        "proposed_sub": proposed_sub,
+        "source_sha256": typed.get("source_sha256") or snapshot.sha256,
+        "proposal_review_sha256": typed.get("proposal_review_sha256") or proposal_review_sha256,
+        "destinations": destinations,
+        "typed_comment": typed.get("comment") or "",
+        "typed_module": typed.get("module") or "",
+        "typed_sub": typed.get("sub") or "",
+        "stage_buttons": _STAGE_BUTTONS,
+        "flag": flag,
+        "notice": notice,
+    }
+
+
+def _empty_popup(gone: str | None = None) -> dict:
     """A fresh context per call: Starlette adds `request` to the dict it is
-    given, so a shared one would pin the first request for the process."""
-    return {"card": None, "stage": "", "entity_label": "", "tone": 0, "body": ""}
+    given, so a shared one would pin the first request for the process.
+    `gone` replaces the "no longer here" line."""
+    return {"card": None, "stage": "", "entity_label": "", "tone": 0, "body": "", "gone": gone}
 
 
 @app.get("/master/card/{entity}", response_class=HTMLResponse)
 @console_route(
     catches=_BOARD_CATCHES,
     surface="fragment-only",
-    services=(entity_cards, note_body),
+    services=(entity_cards, note_snapshot),
 )
 def master_card(request: Request, scope: EntityScope, path: str = "") -> HTMLResponse:
-    """Popup for one card, with the reminder box on Waiting and To review
-    cards. Opening it reads the reminder store and writes nothing."""
+    """Popup for one card: the editable draft, the comment box, the four stage
+    buttons, and the reminder box on Waiting and To review cards. Opening it
+    reads the note and the reminder store and writes nothing."""
     try:
         catalog = current_catalog()
         card = _find_card(entity_cards(scope, Vault(catalog)), path)
         context = _empty_popup()
         if card is not None:
-            context = _popup_context(scope, catalog, card, _page_reminders())
+            context = _popup_context(scope, catalog, card, _page_reminders(), _page_flags())
     except _BOARD_CATCHES as exc:
         # The popup dialog has no other way to close than Escape and the
         # backdrop, so its error view carries the same close button.
@@ -789,7 +980,7 @@ _REMINDERS_CHANGED = "master-refresh"
 @console_route(
     catches=_REMINDER_CATCHES,
     surface="fragment-only",
-    services=(entity_cards, note_body, reminder_store, ReminderStore.save),
+    services=(entity_cards, reminder_store, ReminderStore.save),
 )
 def master_reminder_save(
     request: Request,
@@ -803,19 +994,26 @@ def master_reminder_save(
     """Set (or replace) the reminder on one Waiting or To review card.
 
     `path` is trusted only after it matches a card the entity's own reader
-    returned, in a stage that takes reminders; so a forged or stale form is
-    refused. The due time is the wall time the browser typed with the offset it
-    reported; it is stored as given and never converted here. Nothing is
-    written to the vault.
+    returned, in a stage that takes reminders (a filed note flagged To review
+    counts); so a forged or stale form is refused. The due time is the wall
+    time the browser typed with the offset it reported; it is stored as given
+    and never converted here. Nothing is written to the vault.
+
+    The answer is the reminder box alone (`#master-reminder`), refusals
+    included, so a draft typed into the stage form above it is never lost.
     """
+    card = None
     try:
         catalog = current_catalog()
         cards = entity_cards(scope, Vault(catalog))
+        card = _find_card(cards, path)
         store = reminder_store()
         if store is None:
             raise ReminderStoreUnavailable()
-        card = _find_card(cards, path)
-        if card is None or stage_of(card) not in ("waiting", "review"):
+        flags = _page_flags()
+        if card is None or card_stage(
+            card, _card_flag(card, flags, scope.current_entity())
+        ) not in ("waiting", "review"):
             raise InvalidReminder("not a card that takes a reminder")
         reminder = Reminder(
             key=card.relative_path,
@@ -826,14 +1024,30 @@ def master_reminder_save(
         # Bound-method calls are not what the route-service sweep resolves, so
         # the store is called through its class, which is what it declares.
         ReminderStore.save(store, reminder)
-        context = _popup_context(scope, catalog, card, {reminder.key: reminder})
+        context = _reminder_context(scope, card, {reminder.key: reminder}, flags)
     except _REMINDER_CATCHES as exc:
-        return _render_console_error(
-            request, describe(exc), fragment_template="blocks/master_popup_error.html"
-        )
-    response = templates.TemplateResponse(request, "blocks/master_popup.html", context)
+        typed = {"subject": subject, "date": date, "time": time}
+        return _reminder_refused(request, describe(exc), scope, card, typed)
+    response = templates.TemplateResponse(request, "blocks/master_reminder.html", context)
     response.headers["HX-Trigger"] = _REMINDERS_CHANGED
     return response
+
+
+def _reminder_refused(request: Request, error, scope: Scope, card, typed: dict) -> HTMLResponse:
+    """A described refusal inside the reminder box. When the card is known the
+    box comes back with what was typed, so the owner can correct and resend;
+    otherwise the box holds the refusal alone. Nothing was stored."""
+    context = {"error": error}
+    if card is not None:
+        context = {
+            **_reminder_context(scope, card, _page_reminders(), _page_flags(), typed=typed),
+            "error": error,
+        }
+    if not is_fragment(request, _endpoint_for(request)):
+        return _render_console_error(request, error)
+    return templates.TemplateResponse(
+        request, "blocks/master_reminder.html", context, status_code=status_for(error, True)
+    )
 
 
 @app.post("/master/reminder/{entity}/remove", response_class=HTMLResponse)
@@ -841,7 +1055,7 @@ def master_reminder_save(
     catches=_REMINDER_REMOVE_CATCHES,
     surface="fragment-only",
     services=(
-        build_scope, entity_cards, note_body, reminder_store, ReminderStore.all, ReminderStore.remove,
+        build_scope, entity_cards, reminder_store, ReminderStore.all, ReminderStore.remove,
     ),
 )
 def master_reminder_remove(
@@ -852,8 +1066,9 @@ def master_reminder_remove(
     No card check: a reminder whose card was moved or deleted outside the
     master view, or whose entity left the registry, must still be removable.
     The route has no scope dependency for the same reason. Once the row is
-    gone the popup comes back if the card is still there; otherwise the
-    response is empty (the strip card's button swaps nothing).
+    gone the reminder box (`#master-reminder`) comes back if the card is still
+    there; otherwise the response is empty (the strip card's button swaps
+    nothing). The stage form is never re-rendered.
     """
     try:
         store = reminder_store()
@@ -866,7 +1081,7 @@ def master_reminder_remove(
             ReminderStore.remove(store, path)
     except _REMINDER_REMOVE_CATCHES as exc:
         return _render_console_error(
-            request, describe(exc), fragment_template="blocks/master_popup_error.html"
+            request, describe(exc), fragment_template="blocks/master_reminder.html"
         )
     card = None
     try:
@@ -875,7 +1090,9 @@ def master_reminder_remove(
         card = _find_card(entity_cards(scope, Vault(catalog)), path)
         if card is not None:
             response = templates.TemplateResponse(
-                request, "blocks/master_popup.html", _popup_context(scope, catalog, card, {})
+                request,
+                "blocks/master_reminder.html",
+                _reminder_context(scope, card, {}, _page_flags()),
             )
     except (*_BOARD_CATCHES, VaultRootUnavailable):
         # The reminder is already gone; an entity that cannot be read right now
@@ -885,6 +1102,295 @@ def master_reminder_remove(
         response = HTMLResponse("")
     response.headers["HX-Trigger"] = _REMINDERS_CHANGED
     return response
+
+
+# --- stage buttons: one press, one approved change ----------------------------
+
+#: Every declared outcome of a press. The vault refusals come from
+#: `propose_and_approve_stage` (the Outbox family, the destination resolver,
+#: review tokens, receipts); the store ones from the flag.
+_STAGE_CATCHES = (
+    *_REMINDER_CATCHES, DestinationError, ReviewTokenError, NoteTextError, StageRequestError,
+)
+
+
+def _owner_today(value: str) -> str | None:
+    """The browser's local date, if it is a real `YYYY-MM-DD` within one day
+    of the server's UTC date (time zones put the owner up to a day either
+    side); otherwise None."""
+    if not isinstance(value, str) or _OWNER_DATE.fullmatch(value) is None:
+        return None
+    try:
+        day = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value if abs((day - datetime.now(timezone.utc).date()).days) <= 1 else None
+
+
+def _stage_popup(request: Request, context: dict, *, refresh: bool) -> HTMLResponse:
+    response = templates.TemplateResponse(request, "blocks/master_popup.html", context)
+    if refresh:
+        response.headers["HX-Trigger"] = _REMINDERS_CHANGED
+    return response
+
+
+def _stage_again(
+    request: Request, scope: Scope, catalog, card, notice: dict, typed: dict | None,
+    *, snapshot=None, refresh: bool = False,
+) -> HTMLResponse:
+    """The same card's popup again, with `notice`; nothing was written."""
+    context = _popup_context(
+        scope, catalog, card, _page_reminders(), _page_flags(),
+        snapshot=snapshot, notice=notice, typed=typed,
+    )
+    return _stage_popup(request, context, refresh=refresh)
+
+
+def _stage_follows_move(src: str, dst: str, *, resolve: bool) -> None:
+    """After a committed move: the card's reminder follows it to `dst`, any
+    review flag on it is cleared (moving a card to a stage clears its flag),
+    and Done resolves (deletes) its reminder.
+
+    The vault change is already committed and its receipt written; this only
+    updates the owner-private store and never changes what the move did. If
+    the store is missing or unsafe, the entries stay where they were, as
+    after an Outbox approval (`_reminder_follows_approval`). Clean-up writes
+    never create the store or its tables.
+    """
+    try:
+        store = reminder_store()
+        if store is None:
+            return
+        if src != dst:
+            ReminderStore.rekey(store, src, dst)
+        ReminderStore.unflag(store, dst)
+        if resolve:
+            ReminderStore.remove(store, dst)
+    except ReminderStoreUnavailable:
+        return
+
+
+def _stage_moved(
+    request: Request, scope: Scope, catalog, dst: str, notice: dict
+) -> HTMLResponse:
+    """The popup of the card where the move left it, and a board refresh.
+
+    The move is already committed (or the flag stored), so a failure to read
+    the card back must not report the move as failed: the owner is told it
+    moved and the board refreshes."""
+    try:
+        card = _find_card(entity_cards(scope, Vault(catalog)), dst)
+        if card is None:
+            return _stage_popup(request, _empty_popup(_MOVED_UNSHOWN), refresh=True)
+        context = _popup_context(
+            scope, catalog, card, _page_reminders(), _page_flags(), notice=notice
+        )
+    except _STAGE_CATCHES:
+        return _stage_popup(request, _empty_popup(_MOVED_UNSHOWN), refresh=True)
+    return _stage_popup(request, context, refresh=True)
+
+
+@app.post("/master/stage/{entity}", response_class=HTMLResponse)
+@console_route(
+    catches=_STAGE_CATCHES,
+    surface="fragment-only",
+    services=(
+        entity_cards,
+        note_snapshot,
+        reminder_store,
+        propose_and_approve_stage,
+        ReminderStore.flag,
+        ReminderStore.unflag,
+    ),
+)
+def master_stage(
+    request: Request,
+    scope: EntityScope,
+    path: Annotated[str, Form()] = "",
+    # Required, as on every S7 route: no form may act without the popup's hash.
+    source_sha256: str = Form(...),
+    stage: Annotated[str, Form()] = "",
+    today: Annotated[str, Form()] = "",
+    body: Annotated[str | None, Form()] = None,
+    body_sent: Annotated[str, Form()] = "",
+    comment: Annotated[str, Form()] = "",
+    module: Annotated[str, Form()] = "",
+    sub: Annotated[str, Form()] = "",
+    proposal_id: Annotated[str, Form()] = "",
+    proposal_review_sha256: Annotated[str, Form()] = "",
+) -> HTMLResponse:
+    """One stage button: Save as Draft, Waiting, To review or Done.
+
+    The press is the owner's approval (spec decision 9). Every vault change is
+    one `stage` record approved through `outbox.approve()` (S7): one commit
+    with the note change and an "approval" receipt, bound to `source_sha256`,
+    the hash of the bytes the popup showed. A filed note moved into To review
+    is a review flag in the private store (with no edit, no vault change). A
+    press that changes nothing writes nothing and says so.
+
+    `path` is trusted only after it matches a card the entity's own reader
+    returned. The note is captured once here; if its hash is not the one the
+    popup carried, nothing is written and the newer text is shown.
+    """
+    slug = scope.current_entity()
+    # An emptied textarea posts `body=`, which the form parser hands over as
+    # None, the same as no body at all (a drag, a read-only body). The editable
+    # textarea's `body_sent` marker tells the two apart: emptied is an edit.
+    if body is None and body_sent:
+        body = ""
+    typed = {
+        "body": body, "comment": comment, "module": module, "sub": sub,
+        "source_sha256": source_sha256, "proposal_review_sha256": proposal_review_sha256,
+    }
+    try:
+        catalog = current_catalog()
+        card = _find_card(entity_cards(scope, Vault(catalog)), path)
+        if card is None:
+            return _stage_popup(request, _empty_popup(), refresh=True)
+        if stage not in _STAGE_KEYS:
+            raise StageRequestError("not a stage")
+        updated = _owner_today(today)
+        if updated is None:
+            return _stage_again(request, scope, catalog, card, _notice(_TODAY_NOTICE, "error"), typed)
+        shown = note_snapshot(scope, card.relative_path)
+        if shown.sha256 != source_sha256:
+            return _stage_again(
+                request, scope, catalog, card, _notice(_STALE_NOTICE, "error"),
+                {"comment": comment}, snapshot=shown, refresh=True,
+            )
+        comment_text = None
+        if comment.strip():
+            try:
+                comment_text = clean_flag_comment(comment)
+            except InvalidReminder:
+                return _stage_again(
+                    request, scope, catalog, card, _notice(_COMMENT_NOTICE, "error"), typed
+                )
+        try:
+            shown_text = shown_body(shown.text)
+        except NoteTextError:
+            return _stage_again(request, scope, catalog, card, _notice(_HEADER_NOTICE, "error"), typed)
+        # Unedited means equal after the browser's own rewriting of the text
+        # it was shown (CR and NUL), so a press never rewrites what it did not touch.
+        edited = None
+        if body is not None and _as_browser(body) != _as_browser(shown_text):
+            if not _browser_keeps(shown_text):
+                return _stage_again(request, scope, catalog, card, _notice(_BODY_NOTICE, "error"), typed)
+            edited = body
+        flag = _card_flag(card, _page_flags(), slug)
+        moved_to = _notice(
+            f"Moved to {stage_label(stage)}." if stage != card_stage(card, flag) else "Saved.",
+            "done",
+        )
+        stage_args = {
+            "src": card.relative_path, "updated": updated, "body": edited, "comment": comment_text,
+        }
+        try:
+            if card.lane == "filed" and stage == "review":
+                if flag is not None and edited is None and comment_text is None:
+                    return _stage_again(request, scope, catalog, card, _notice(_UNCHANGED_NOTICE), typed)
+                store = reminder_store()
+                if store is None:
+                    raise ReminderStoreUnavailable()
+                committed = None
+                if edited is not None:
+                    # The edit is saved and the status kept; the flag does the move.
+                    committed = propose_and_approve_stage(
+                        scope, source_sha256=source_sha256, set_status=None, **stage_args
+                    )
+                    if isinstance(committed, SpentAction):
+                        return _stage_again(
+                            request, scope, catalog, card, _notice(_SPENT_NOTICE), None, refresh=True
+                        )
+                kept = comment_text if comment_text is not None else (flag.comment if flag else None)
+                try:
+                    ReminderStore.flag(
+                        store, ReviewFlag(card.relative_path, slug, kept, datetime.now(timezone.utc))
+                    )
+                except ReminderStoreUnavailable:
+                    if committed is None:
+                        raise
+                    return _stage_moved(
+                        request, scope, catalog, card.relative_path, _notice(_FLAG_NOT_STORED, "error")
+                    )
+                return _stage_moved(request, scope, catalog, card.relative_path, moved_to)
+
+            if card.lane == "filed":
+                # The same stage keeps the status line byte-for-byte (`active`
+                # stays `active` in Done).
+                set_status = None if stage == stage_of(card) else stage
+                if set_status is None and edited is None and comment_text is None:
+                    if flag is None:
+                        return _stage_again(
+                            request, scope, catalog, card, _notice(_UNCHANGED_NOTICE), typed
+                        )
+                    # Out of To review, back to its own stage: only the flag goes.
+                    store = reminder_store()
+                    if store is None:
+                        raise ReminderStoreUnavailable()
+                    ReminderStore.unflag(store, card.relative_path)
+                    _stage_follows_move(card.relative_path, card.relative_path, resolve=stage == "done")
+                    return _stage_moved(request, scope, catalog, card.relative_path, moved_to)
+                result = propose_and_approve_stage(
+                    scope, source_sha256=source_sha256, set_status=set_status, **stage_args
+                )
+            else:
+                if stage == "review":
+                    # Already in To review; an inbox card is never flagged.
+                    hint = _INBOX_REVIEW_HINT if edited is not None or comment_text is not None else ""
+                    return _stage_again(
+                        request, scope, catalog, card, _notice(_UNCHANGED_NOTICE + hint), typed
+                    )
+                if card.lane == "proposed":
+                    if not card.proposal_id or proposal_id != card.proposal_id:
+                        raise StageRequestError("not this card's proposal")
+                    # The proposal's destination, superseded in the same commit,
+                    # bound to the record digest the popup carried.
+                    try:
+                        result = propose_and_approve_stage(
+                            scope, source_sha256=source_sha256, set_status=stage,
+                            supersedes=proposal_id,
+                            supersedes_review_sha256=proposal_review_sha256,
+                            **stage_args,
+                        )
+                    except ReviewedProposalChanged:
+                        # The pending proposal changed since the popup opened
+                        # (S7 refused it; nothing was written). Show the card
+                        # as it is now, bound to the newer record, and keep
+                        # what the owner typed.
+                        newer = {k: v for k, v in typed.items() if k != "proposal_review_sha256"}
+                        return _stage_again(
+                            request, scope, catalog, card,
+                            _notice(_CARD_CHANGED_NOTICE, "error"), newer, refresh=True,
+                        )
+                else:
+                    if not module:
+                        return _stage_again(
+                            request, scope, catalog, card, _notice(_FILE_TO_NOTICE, "error"), typed
+                        )
+                    result = propose_and_approve_stage(
+                        scope, source_sha256=source_sha256, set_status=stage,
+                        module=module, sub=sub or None, **stage_args,
+                    )
+        except StaleProposalSource:
+            return _stage_again(
+                request, scope, catalog, card, _notice(_STALE_NOTICE, "error"),
+                {"comment": comment}, refresh=True,
+            )
+        except MissingProposalSource:
+            return _stage_popup(request, _empty_popup(), refresh=True)
+        except StageUnchanged:
+            return _stage_again(request, scope, catalog, card, _notice(_UNCHANGED_NOTICE), typed)
+        except NoteTextError:
+            return _stage_again(request, scope, catalog, card, _notice(_HEADER_NOTICE, "error"), typed)
+        if isinstance(result, SpentAction):
+            return _stage_again(request, scope, catalog, card, _notice(_SPENT_NOTICE), None, refresh=True)
+        _stage_follows_move(result.src, result.dst, resolve=stage == "done")
+        return _stage_moved(request, scope, catalog, result.dst, moved_to)
+    except _STAGE_CATCHES as exc:
+        return _render_console_error(
+            request, describe(exc), fragment_template="blocks/master_popup_error.html"
+        )
 
 
 _CAPTURE_CATCHES = (IngestError, CrossScopeError)
@@ -1002,21 +1508,11 @@ def _triage_page(request: Request, scope: Scope) -> HTMLResponse:
             # page rather than a per-row alert.
             error = describe(exc)
         rows.append((item, classification, destination, error))
-    # Choices are hints, not authority: the existing POST resolver rechecks
-    # scope, flags, source and destination paths when a proposal is submitted.
-    # Keep missing modules visible; the sidebar reports E4 and POST refuses
-    # them. A directory scan would silently hide that configuration error.
+    # The same choices the master popup's "File to" picker offers.
     manual_destinations = {}
     inbox_modules = {item.path.parent.parent.name for item, *_ in rows}
     if rows:
-        for module in sorted(vault.active_modules_for(scope)):
-            if (
-                module not in inbox_modules
-                and vault.module_spec(module).get("lifecycle_pattern", True)
-            ):
-                manual_destinations[module] = sorted(
-                    vault.active_submodules_for(scope, module)
-                )
+        manual_destinations = _manual_destinations(vault, scope, inbox_modules)
     return templates.TemplateResponse(
         request,
         "triage.html",
@@ -1878,7 +2374,19 @@ def _reminder_follows_approval(result) -> None:
     SpentAction (nothing new filed) or a lifecycle proposal (no source move)
     has nothing to follow. If the store is missing or unsafe the reminder
     stays under its old key and the strip shows it as "Card moved or removed".
+
+    A stage record approved here (one left pending when a stage press's
+    reject failed) gets the same follow-up as after the press itself: the
+    reminder follows the move, a status change clears the To review flag,
+    and Done resolves the reminder. A record with no status change and no
+    move (a body or comment edit only) does not say which stage was pressed,
+    so its flag and reminder are left as they are.
     """
+    if isinstance(result, StageProposal):
+        if result.set_status is None and result.src == result.dst:
+            return
+        _stage_follows_move(result.src, result.dst, resolve=result.set_status == "done")
+        return
     if not isinstance(result, Proposal):
         return
     try:

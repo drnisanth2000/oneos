@@ -24,6 +24,17 @@
           this.$refs.offset.value = String(-when.getTimezoneOffset())
         },
       }))
+      // The popup's stage form sends the owner's local date as `today` (the
+      // note's `updated:` and the comment's date); the server accepts it within
+      // a day of its own. Stamped on every click, so a popup left open over
+      // midnight still sends the right day.
+      Alpine.data('stageForm', () => ({
+        init() { this.stamp() },
+        stamp() {
+          const d = new Date()
+          this.$refs.today.value = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+        },
+      }))
       Alpine.data('masterHead', () => ({
         greeting: '', date: '', clock: '', loaded: '', stale: '',
         init() {
@@ -56,6 +67,8 @@
       }))
     })
   </script>
+  {# Drag a card to another column (desktop pointers only; see the file). #}
+  <script defer src="/static/master_drag.js"></script>
   {% include "_sidebar.html" %}
 
   <main class="main">
@@ -181,6 +194,7 @@
       <div class="master-cols">
         {% for column in page.columns %}
         <section class="board-column master-col{% if column.key == 'review' %} is-shown{% endif %}"
+                 data-stage="{{ column.key }}"
                  id="col-{{ column.key }}" aria-labelledby="col-{{ column.key }}-label"
                  :class="{ 'is-shown': stage === '{{ column.key }}' }">
           <h2><span class="column-label" id="col-{{ column.key }}-label">{{ column.label }}</span> <span class="count">{{ column.total }}</span></h2>

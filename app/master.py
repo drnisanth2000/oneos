@@ -22,7 +22,7 @@ from .config import VaultRootUnavailable
 from .console_routing import failure_contract
 from .entities import EntityManifestError, EntitySelectionError
 from .outbox import OutboxError
-from .reminders import Reminder
+from .reminders import Reminder, ReviewFlag
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
@@ -68,6 +68,12 @@ def stage_of(card: BoardCard) -> str:
     return _FILED_STAGE.get(card.status.strip().lower(), OTHER_STAGE)
 
 
+def card_stage(card: BoardCard, flag: object | None) -> str:
+    """The stage a card is shown in: To review while it carries a review flag,
+    else its own. The board, the popup and the card's reminder line agree."""
+    return "review" if flag is not None else stage_of(card)
+
+
 def stage_label(stage: str) -> str:
     return _LABELS.get(stage, "Another status")
 
@@ -84,6 +90,9 @@ class MasterCard:
     entity_label: str
     tone: int
     reminder: Reminder | None = None
+    #: The owner's review flag on a filed note (its comment shows on the card).
+    #: Only a filed card in To review because of the flag carries one.
+    flag: ReviewFlag | None = None
 
 
 @dataclass(frozen=True)
@@ -234,16 +243,22 @@ def load_master(
     done_all: bool,
     now: datetime,
     reminders: Mapping[str, Reminder] | None,
+    flags: Mapping[str, ReviewFlag] | None = None,
 ) -> MasterPage:
     """Read every selected entity's cards into the four stages. Reads only.
 
     ``now`` must be timezone-aware. ``reminders`` maps a card's relative path to
-    its reminder; ``None`` means the store is unavailable.
+    its reminder; ``None`` means the store is unavailable. ``flags`` maps a filed
+    note's relative path to its review flag: a flagged filed card is listed in
+    To review (and only there), keeping its status; ``None`` (store unavailable)
+    or a key matching no card changes nothing. A flag on an inbox or proposed
+    card is ignored: those are already in To review.
     """
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     available = reminders is not None
     reminders = reminders or {}
+    flags = flags or {}
     selected_sort = sort if sort in dict(_SORTS) else "updated"
     bundles = vault.bundles()
     on_disk = [(index, bundle) for index, bundle in enumerate(bundles) if bundle.on_disk]
@@ -276,6 +291,12 @@ def load_master(
                 reminder = None
             return MasterCard(card, bundle.slug, bundle.label, tone, reminder)
 
+        def wrap_flagged(card: BoardCard) -> MasterCard:
+            flag = flags.get(card.relative_path)
+            if flag is not None and flag.entity != bundle.slug:
+                flag = None
+            return replace(wrap(card), flag=flag)
+
         proposed_paths = {card.relative_path for card in cards.proposed}
         for card in cards.proposed:
             stages["review"].append(wrap(card))
@@ -283,8 +304,12 @@ def load_master(
             if card.relative_path not in proposed_paths:
                 stages["review"].append(wrap(card))
         for card in cards.filed:
+            master = wrap_flagged(card)
+            if master.flag is not None:
+                stages["review"].append(master)
+                continue
             stage = stage_of(card)
-            (other if stage == OTHER_STAGE else stages[stage]).append(wrap(card))
+            (other if stage == OTHER_STAGE else stages[stage]).append(master)
 
     columns = []
     for key in STAGES:

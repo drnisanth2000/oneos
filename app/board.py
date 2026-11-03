@@ -20,7 +20,7 @@ from .inbox import InboxItem, read_inbox, split_front_matter
 from .inbox import _require_real_directory as _require_real_lifecycle_directory
 from .inbox import _require_real_receipt as _require_real_entry
 from .ingest.base import IngestError, IngestResult, commit_inbox_item
-from .outbox import Proposal, project_outbox
+from .outbox import Proposal, _capture_source_state, project_outbox
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
 
@@ -65,6 +65,8 @@ class BoardCard:
     filename: str | None = None
     proposal_id: str | None = None
     draggable: bool = False
+    # SHA-256 of the exact note bytes the reader parsed; "" when no read made this card.
+    sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,7 @@ def _scalar_card(
     filename: str | None,
     proposal_id: str | None,
     formula_result: str | None,
+    sha256: str = "",
 ) -> BoardCard:
     updated = _text(fm.get("updated")) or ""
     due = _text(fm.get("due"))
@@ -221,6 +224,7 @@ def _scalar_card(
         lane=lane,
         filename=filename,
         proposal_id=proposal_id,
+        sha256=sha256,
     )
 
 
@@ -275,10 +279,13 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
         for discovered in sorted(directory.glob("*.md")):
             path = _require_real_note(directory, discovered)
             try:
-                text = path.read_text(encoding="utf-8")
+                raw = path.read_bytes()
+                text = raw.decode("utf-8")
             except (UnicodeDecodeError, OSError) as exc:
                 raise NoteUnreadable("note could not be read") from exc
-            fm, _body = split_front_matter(text)
+            # Parsed as `read_text` always did (universal newlines); the hash
+            # is of the bytes of this one read.
+            fm, _body = split_front_matter(text.replace("\r\n", "\n").replace("\r", "\n"))
             title = _text(fm.get("title")) or path.stem
             relative = scope.vault_relative(path)
             cards.append(
@@ -293,6 +300,7 @@ def _read_filed(scope: Scope, vault: Vault) -> list[BoardCard]:
                     filename=None,
                     proposal_id=None,
                     formula_result=None,
+                    sha256=hashlib.sha256(raw).hexdigest(),
                 )
             )
     evaluated: list[BoardCard] = []
@@ -319,6 +327,40 @@ def note_body(scope: Scope, relative: str) -> str:
     return body
 
 
+@dataclass(frozen=True)
+class NoteSnapshot:
+    """One capture of a note: its text, and the SHA-256 of those same bytes."""
+
+    text: str
+    sha256: str
+
+
+@failure_contract(raises=(CrossScopeError, NoteUnreadable))
+def note_snapshot(scope: Scope, relative: str) -> NoteSnapshot:
+    """Read a note once, on the Outbox's no-follow terms (every component
+    checked, no symlink, the same inode that was looked up), and fingerprint
+    the bytes of that one read. What the master popup shows and the hash it
+    sends back with a stage button both come from here, so the hash always
+    names the bytes the owner saw.
+    """
+    scope.resolve_stored(relative)  # another entity's path is refused here
+    state = _capture_source_state(scope.root, relative)
+    if state.contents is None:
+        raise NoteUnreadable("note is missing")
+    try:
+        text = state.contents.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise NoteUnreadable("note could not be read") from exc
+    return NoteSnapshot(text, hashlib.sha256(state.contents).hexdigest())
+
+
+@structured_reader(category="front-matter")
+def snapshot_body(snapshot: NoteSnapshot) -> str:
+    """The body of a snapshot as the read-only popup shows it (the reader the
+    Board uses), for a note whose header the editor cannot place."""
+    return split_front_matter(snapshot.text)[1]
+
+
 def _inbox_cards(scope: Scope, vault: Vault, items: list[InboxItem]) -> list[BoardCard]:
     entity = scope.current_entity()
     cards: list[BoardCard] = []
@@ -335,6 +377,7 @@ def _inbox_cards(scope: Scope, vault: Vault, items: list[InboxItem]) -> list[Boa
                 filename=item.path.name,
                 proposal_id=None,
                 formula_result=None,
+                sha256=item.sha256,
             )
         )
     return cards

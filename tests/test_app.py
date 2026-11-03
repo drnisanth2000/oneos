@@ -227,7 +227,9 @@ def test_client_assets_are_vendored_not_cdn(client):
     html = client.get("/").text
     srcs = re.findall(r'<script[^>]+src="([^"]+)"', html)
     assert srcs, "no script tags found"
-    assert all(s.startswith("/static/vendor/") for s in srcs), srcs
+    # Third-party code is vendored; the page's own first-party scripts live in /static.
+    own = {"/static/master_drag.js"}
+    assert all(s.startswith("/static/vendor/") or s in own for s in srcs), srcs
     assert "unpkg" not in html and "cdn." not in html
     assert 'src="http' not in html
 

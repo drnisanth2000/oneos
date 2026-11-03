@@ -1,7 +1,13 @@
 {# One master-view card. A button, so it is reachable by keyboard; it loads the
-   read-only popup into the dialog outside #master (see home.html). Reads only. #}
+   popup into the dialog outside #master (see home.html). Reads only.
+   The data-* attributes are what static/master_drag.js reads for a drag: the
+   entity, the note path, the hash of the bytes this card was built from
+   (empty for a card that no read made), and the lane. The script turns
+   draggable off on phones and touch screens. #}
 {% from "_icon.html" import file_icon, icon %}
-<button type="button" class="board-card master-card"
+<button type="button" class="board-card master-card" draggable="true"
+        data-entity="{{ item.entity }}" data-path="{{ item.card.relative_path }}"
+        data-source-sha256="{{ item.card.sha256 }}" data-lane="{{ item.card.lane }}"
         hx-get="/master/card/{{ item.entity | urlencode }}?path={{ item.card.relative_path | urlencode }}"
         hx-target="#master-popup" hx-swap="innerHTML">
   <span class="master-card-title">
@@ -14,10 +20,11 @@
     {% if item.card.updated %}<time class="master-date" datetime="{{ item.card.updated }}">{{ item.card.updated }}</time>{% endif %}
   </span>
   {# The stored wall time, as typed; never converted here. #}
-  {% set card_stage = stage_of(item.card) if item.reminder else "" %}
-  {% if card_stage in ("waiting", "review") %}
+  {# The effective stage: a flagged filed note is in To review. #}
+  {% set shown_stage = card_stage(item.card, item.flag) if item.reminder else "" %}
+  {% if shown_stage in ("waiting", "review") %}
   <span class="master-reminder">
-    {{ icon("bell") }}<span>{{ "Review by" if card_stage == "review" else "Due" }} <time datetime="{{ item.reminder.due_at.isoformat() }}">{{ due_label(item.reminder.due_at) }}</time></span>
+    {{ icon("bell") }}<span>{{ "Review by" if shown_stage == "review" else "Due" }} <time datetime="{{ item.reminder.due_at.isoformat() }}">{{ due_label(item.reminder.due_at) }}</time></span>
   </span>
   {% endif %}
 </button>

@@ -167,7 +167,63 @@ class LifecycleProposal:
                 for key, value in record.items() if key not in {"id", "version", "created"}}
 
 
-OutboxProposal = Proposal | LifecycleProposal
+@dataclass(frozen=True)
+class StageProposal:
+    """A stage move or draft edit of one note (master view 3).
+
+    Written by `app.stage.propose_stage` and approved through `approve()`'s
+    S7 sequence like any other record. `src == dst` edits a filed note in
+    place; an inbox `src` moves to `dst` exactly as a classification would.
+    Every input to the new bytes lives in the record, so the review digest
+    binds all of them. Validated from the record bytes by
+    `app.stage.stage_from_record`.
+    """
+    id: str
+    path: Path
+    entity: str
+    created: str
+    src: str
+    dst: str
+    source_sha256: str
+    set_status: str | None
+    updated: str
+    body: str | None
+    comment: str | None
+    module: str
+    sub: str | None
+    block: str
+    supersedes: str | None
+    supersedes_review_sha256: str | None
+    action: str = "stage"
+
+
+@dataclass(frozen=True)
+class MalformedStageProposal:
+    """An `action: stage` record that `stage_from_record` refuses.
+
+    A stage record is written whole by one OneOS action, so a malformed one
+    was tampered with or written by a different version. It must not block
+    the entity's Outbox the way an unreadable classification does, and it
+    must never be approved: it is a row-local error that can only be
+    rejected, through the same S7 sequence (capture once, compare its digest,
+    parse those bytes). Its id is the scan-validated filename, never a value
+    read from the record, and nothing from the record is displayed.
+    """
+    id: str
+    path: Path
+    entity: str
+    error: UnreadableProposalRecord
+    action: str = "stage"
+    # Inert display values for the shared review card.
+    src: str = ""
+    dst: str = ""
+    module: str = ""
+    sub: str | None = None
+    block: str = ""
+    source_sha256: str = ""
+
+
+OutboxProposal = Proposal | LifecycleProposal | StageProposal | MalformedStageProposal
 ClassificationActionResult = OutboxProposal | SpentAction
 
 
@@ -176,7 +232,7 @@ class OutboxRow:
     """One outbox entry as the Console can safely present it. Rows carry
     **capabilities**, not kinds (design §3): a row that cannot be diffed or
     approved is still a row, and it never withholds another row's controls."""
-    proposal: Proposal | LifecycleProposal | None
+    proposal: OutboxProposal | None
     diff: str | None
     error: BaseException | None
     can_approve: bool
@@ -505,7 +561,11 @@ def _parse_record_bytes(contents: bytes) -> object:
         ) from exc
     try:
         return yaml.safe_load(text) or {}
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, ValueError, TypeError, AttributeError, KeyError) as exc:
+        # Scalar construction (an unquoted impossible date such as
+        # `2026-02-30`, an explicit `!!timestamp` tag) raises outside
+        # YAMLError. Either way the record is unreadable — never a crash of
+        # the whole listing.
         raise UnreadableProposalRecord(
             "proposal record is invalid YAML"
         ) from exc
@@ -536,8 +596,42 @@ def _validate_record(path: Path, record: object) -> Proposal | None:
         ) from exc
 
 
-def _proposal_from_contents(path: Path, contents: bytes) -> Proposal | LifecycleProposal | None:
-    record = _parse_record_bytes(contents)
+#: A top-level `action: stage` line in raw record text. Used only when the
+#: record cannot be parsed at all, to keep a damaged stage record row-local.
+_RAW_STAGE_ACTION = re.compile(
+    rb"""^action:[ \t]*(?:stage|'stage'|"stage")[ \t]*(?:#[^\r\n]*)?\r?$""",
+    re.MULTILINE,
+)
+
+
+def _malformed_stage(path: Path, exc: UnreadableProposalRecord) -> MalformedStageProposal:
+    """The reject-only row for a stage record that cannot be validated.
+
+    Only a record whose *filename* is a canonical id qualifies; anything
+    else keeps the original, entity-blocking refusal.
+    """
+    try:
+        proposal_id = require_proposal_id(path.stem)
+    except ProposalIdentityError as identity_error:
+        raise exc from identity_error
+    return MalformedStageProposal(proposal_id, path, path.parent.parent.name, exc)
+
+
+def _proposal_from_contents(path: Path, contents: bytes) -> OutboxProposal | None:
+    try:
+        record = _parse_record_bytes(contents)
+    except UnreadableProposalRecord as exc:
+        if _RAW_STAGE_ACTION.search(contents):
+            return _malformed_stage(path, exc)
+        raise
+    if isinstance(record, dict) and record.get("action") == "stage":
+        # Recognised before the unknown-action refusal, in the same change
+        # that can write the kind, so a stage record never blocks the Outbox.
+        from .stage import stage_from_record
+        try:
+            return stage_from_record(path, record)
+        except UnreadableProposalRecord as exc:
+            return _malformed_stage(path, exc)
     if isinstance(record, dict) and record.get("action") in ("lifecycle_repair", "lifecycle_rollback"):
         from .lifecycle_receipts import parse_proposal
         try:
@@ -647,6 +741,15 @@ def _render_review(scope: Scope, proposal: OutboxProposal) -> tuple[str, str]:
     uses, and translates failures into the same domain types `approve` raises
     for the identical physical cause — so a projected row and its approve
     button never describe different conditions for one cause."""
+    if isinstance(proposal, MalformedStageProposal):
+        # Unchained on purpose: the operator outcome is a rejectable invalid
+        # row (E-INVALID), not E-UNREADABLE's "remove it outside the Console".
+        raise OutboxDestinationError(
+            "stage proposal record is malformed; it can only be rejected"
+        ) from None
+    if isinstance(proposal, StageProposal):
+        from .stage import render_stage_review
+        return render_stage_review(scope, proposal)
     if isinstance(proposal, LifecycleProposal):
         from .lifecycle_receipts import render_lifecycle_receipt
         removing = proposal.action == "lifecycle_rollback"
@@ -715,16 +818,20 @@ def preview_diff(scope: Scope, proposal: OutboxProposal) -> str:
 
     `test_approval_route_visibly_refuses_unfresh_source` now observes
     `approve`'s own refusal rendered through the projection's listing. Its
-    missing-source case additionally produces a row-level `E-MISSING`; there
-    is no row-level `E-STALE`, because staleness is a revalidation concern
-    rather than a read-boundary one, so a stale row keeps `can_approve` and
-    renders a normal diff."""
+    missing-source case additionally produces a row-level `E-MISSING`. A
+    stale *classification* has no row-level `E-STALE`: its staleness is a
+    revalidation concern, so the row keeps `can_approve` and renders a normal
+    diff. A stale *stage* record is different. Its diff must equal the bytes
+    approval would write, and approval would refuse, so its row carries
+    `E-STALE` and can only be rejected (`tests/test_stage.py`).
+
+    Stage records, including malformed ones, render through `_render_review`."""
     _require_outbox_path(scope, proposal.path, require_leaf=True)
     reloaded = get_proposal(scope, proposal.id)
     if reloaded.id != proposal.id or reloaded.path != proposal.path:
         raise OutboxDestinationError("proposal changed since it was loaded")
     proposal = reloaded
-    if isinstance(proposal, LifecycleProposal):
+    if isinstance(proposal, (LifecycleProposal, StageProposal, MalformedStageProposal)):
         return _render_review(scope, proposal)[0]
     src_path = scope.resolve_stored(proposal.src)
     old = src_path.read_text(encoding="utf-8") if src_path.exists() else ""
@@ -853,6 +960,7 @@ def project_outbox(scope: Scope) -> OutboxListing:
             diff, title = _render_review(scope, review.value)
         except (
             MissingProposalSource,
+            StaleProposalSource,
             RedirectedPathError,
             OutboxDestinationError,
             ProposalSourceUnavailable,
@@ -914,6 +1022,13 @@ def _require_destination(scope: Scope, proposal: OutboxProposal) -> OutboxPropos
     proposal = _require_scope(scope, proposal)
     _require_outbox_path(scope, proposal.path, require_leaf=True)
     if isinstance(proposal, LifecycleProposal):
+        return proposal
+    if isinstance(proposal, (StageProposal, MalformedStageProposal)):
+        # A stage record's paths depend on the registries and the disk, and
+        # are checked where they are used — row-locally in the projection,
+        # and before the transaction in approval — never here. Here a
+        # failure would refuse every proposal in the entity *and* make the
+        # stage record itself unrejectable, stranding it.
         return proposal
     try:
         source = scope.root / proposal.src
@@ -1105,6 +1220,10 @@ def approve(
     )
     _require_destination(scope, prop)
     _require_outbox_path(scope, prop.path, require_leaf=True)
+    if isinstance(prop, MalformedStageProposal):
+        raise UnreadableProposalRecord(
+            "stage proposal record is malformed; it can only be rejected"
+        ) from prop.error
     if isinstance(prop, LifecycleProposal):
         from .lifecycle_repair import approve_lifecycle
         try:
@@ -1112,6 +1231,12 @@ def approve(
         except (GitTransactionError, OSError, ValueError) as exc:
             raise OutboxTransactionError("lifecycle approval could not complete") from exc
         return result if isinstance(result, SpentAction) else prop
+    if isinstance(prop, StageProposal):
+        # The same S7 ownership as below: `proposal_state` is the state
+        # whose bytes matched `review_sha256` and from which `prop` was
+        # parsed, and it is handed to the transaction unchanged.
+        from .stage import approve_stage
+        return approve_stage(scope, proposal_rel, proposal_state, prop, review_digest)
 
     # One capture of the source, as late as possible, and every check below
     # is about *these* bytes. Approve used to read the source twice — a

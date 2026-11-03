@@ -4351,3 +4351,181 @@ def test_unexpected_later_axis_error_fails_check_closed(
     captured = capsys.readouterr()
     assert "GATE 3 ERROR:" in captured.err
     assert "GATE 3: PASS" not in captured.out
+
+
+# --- stage approvals (master view): `outbox: stage <id> (...)` ----------------
+
+STAGE_FILED = "synthetic/11-library/active/plan.md"
+STAGE_INBOX = "synthetic/00-inbox/active/receipt.md"
+STAGE_INBOX_DST = "synthetic/11-library/active/receipt.md"
+STAGE_TODAY = "2026-11-02"
+OTHER_PROPOSAL_ID = "20260824T120001-" + "cd" * 16
+
+FILED_NOTE = textwrap.dedent(
+    """\
+    ---
+    type: note
+    title: Synthetic plan
+    entity: synthetic
+    product: null
+    status: draft
+    created: 2026-01-01
+    updated: 2026-01-01
+    sub: notes
+    ---
+    Synthetic plan body.
+    """
+)
+
+
+def _stage_vault(tmp_path: Path) -> Path:
+    vault = _audit_vault(tmp_path, initialize_git=True)
+    (vault / STAGE_FILED).write_text(FILED_NOTE, encoding="utf-8")
+    _git(vault, "add", "--", STAGE_FILED)
+    _git(vault, "commit", "-q", "-m", "fixture: filed note")
+    return vault
+
+
+def _stage_approval(vault: Path, *, inbox: bool):
+    """One real stage approval through app.stage; its commit records."""
+    from app.stage import propose_and_approve_stage
+
+    scope = Scope(vault, "synthetic")
+    src = STAGE_INBOX if inbox else STAGE_FILED
+    before_head = _git(vault, "rev-parse", "HEAD").strip()
+    before = gate3.collect_dirty_fingerprints(vault)
+    extra = {"module": "11-library", "sub": "notes"} if inbox else {}
+    result = propose_and_approve_stage(
+        scope,
+        src=src,
+        source_sha256=hashlib.sha256((vault / src).read_bytes()).hexdigest(),
+        set_status="waiting",
+        updated=STAGE_TODAY,
+        **extra,
+    )
+    records = gate3.collect_commit_records(vault, before_head)
+    assert len(records) == 1
+    assert records[0].message.startswith(f"outbox: stage {result.id} (")
+    return result.id, records, before
+
+
+@pytest.mark.parametrize("inbox", [False, True], ids=["in-place", "inbox-move"])
+def test_real_stage_approval_commit_is_sanctioned(tmp_path: Path, inbox: bool):
+    vault = _stage_vault(tmp_path)
+    proposal_id, records, before = _stage_approval(vault, inbox=inbox)
+    rules = gate3.AuditRules.load(vault)
+
+    commits = gate3.audit_commits(records, rules, vault)
+    assert commits.ok is True, commits
+    assert commits.sanctioned_commits == [records[0].message]
+
+    dirty = gate3.audit_dirty(
+        before, gate3.collect_dirty_fingerprints(vault), rules, vault, records=records
+    )
+    assert dirty.ok is True, dirty
+    assert dirty.sanctioned_writes == [f"synthetic/outbox/.consumed/{proposal_id}.yaml"]
+
+
+def _tampered(record, *, message=None, changes=None):
+    return dataclasses.replace(
+        record,
+        message=record.message if message is None else message,
+        changes=record.changes if changes is None else changes,
+    )
+
+
+@pytest.mark.parametrize("inbox", [False, True], ids=["in-place", "inbox-move"])
+def test_tampered_stage_commit_envelopes_stay_violating(tmp_path: Path, inbox: bool):
+    vault = _stage_vault(tmp_path)
+    proposal_id, records, _ = _stage_approval(vault, inbox=inbox)
+    rules = gate3.AuditRules.load(vault)
+    real = records[0]
+    receipt = f"synthetic/outbox/.receipts/{proposal_id}.yaml"
+    route = f"{STAGE_INBOX} → {STAGE_INBOX_DST}" if inbox else STAGE_FILED
+    note_changes = tuple(change for change in real.changes if change.path != receipt)
+    extra = gate3.PathChangeRecord("M", "synthetic/00-inbox/active/.gitkeep")
+    variants = {
+        "extra path": _tampered(real, changes=real.changes + (extra,)),
+        "missing receipt": _tampered(real, changes=note_changes),
+        "other route": _tampered(
+            real,
+            message=f"outbox: stage {proposal_id} ("
+            + (STAGE_INBOX if inbox else f"{STAGE_FILED} → {STAGE_FILED}")
+            + ")",
+        ),
+        "trailing text": _tampered(
+            real, message=f"outbox: stage {proposal_id} ({route}) extra"
+        ),
+        "receipt for another id": _tampered(
+            real, message=f"outbox: stage {OTHER_PROPOSAL_ID} ({route})"
+        ),
+        "merge": dataclasses.replace(real, parents=real.parents + ("e" * 40,)),
+    }
+    if not inbox:
+        # An inbox move under `outbox: approve` is the classification
+        # envelope; its consumed stage record is refused by the dirty audit
+        # (test_stage_consumed_record_needs_its_own_stage_commit).
+        variants["approve message"] = _tampered(
+            real, message=f"outbox: approve {proposal_id} (synthetic)"
+        )
+        variants["inbox edited in place"] = _tampered(
+            real,
+            message=f"outbox: stage {proposal_id} ({STAGE_INBOX})",
+            changes=(gate3.PathChangeRecord("M", STAGE_INBOX),)
+            + tuple(change for change in real.changes if change.path == receipt),
+        )
+        variants["added, not edited"] = _tampered(
+            real,
+            changes=tuple(
+                dataclasses.replace(change, status="A") for change in real.changes
+            ),
+        )
+    assert _tampered(real).message == f"outbox: stage {proposal_id} ({route})"
+    assert gate3.audit_commits((real,), rules, vault).ok is True
+    for name, record in variants.items():
+        assert gate3.audit_commits((record,), rules, vault).ok is False, name
+
+
+@pytest.mark.parametrize(
+    ("receipt_id", "action_kind"),
+    [("other", "approval"), ("own", "registry deletion")],
+    ids=["receipt-for-another-id", "wrong-action-kind"],
+)
+def test_stage_commit_with_a_wrong_receipt_stays_violating(
+    tmp_path: Path, receipt_id: str, action_kind: str
+):
+    vault = _stage_vault(tmp_path)
+    proposal_id, records, before = _stage_approval(vault, inbox=False)
+    receipt_relative = f"synthetic/outbox/.receipts/{proposal_id}.yaml"
+    stored = yaml.safe_load((vault / receipt_relative).read_text(encoding="utf-8"))
+    replacement = make_action_receipt(
+        OTHER_PROPOSAL_ID if receipt_id == "other" else proposal_id,
+        stored["review_sha256"],
+        action_kind,
+    )
+    (vault / receipt_relative).write_bytes(render_action_receipt(replacement))
+    _git(vault, "add", receipt_relative)
+    _git(vault, "commit", "-q", "--amend", "--no-edit")
+    records = gate3.collect_commit_records(
+        vault, _git(vault, "rev-parse", "HEAD~1").strip()
+    )
+    rules = gate3.AuditRules.load(vault)
+
+    assert gate3.audit_commits(records, rules, vault).ok is False
+    dirty = gate3.audit_dirty(
+        before, gate3.collect_dirty_fingerprints(vault), rules, vault, records=records
+    )
+    assert dirty.violating_writes == [f"synthetic/outbox/.consumed/{proposal_id}.yaml"]
+
+
+def test_stage_consumed_record_needs_its_own_stage_commit(tmp_path: Path):
+    """A classify-shaped approval never authorizes a consumed stage record."""
+    vault = _stage_vault(tmp_path)
+    proposal_id, records, before = _stage_approval(vault, inbox=True)
+    rules = gate3.AuditRules.load(vault)
+    disguised = (_tampered(records[0], message=f"outbox: approve {proposal_id} (synthetic)"),)
+
+    dirty = gate3.audit_dirty(
+        before, gate3.collect_dirty_fingerprints(vault), rules, vault, records=disguised
+    )
+    assert dirty.violating_writes == [f"synthetic/outbox/.consumed/{proposal_id}.yaml"]

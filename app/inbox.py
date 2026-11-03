@@ -5,6 +5,7 @@ screen proposes classifications and the outbox performs any move (steps 7–8).
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +22,8 @@ class InboxItem:
     summary: str
     source: str | None
     fm: dict = field(default_factory=dict)
+    # SHA-256 of the exact bytes this read parsed (the note's source hash).
+    sha256: str = ""
 
 
 @structured_reader(category="front-matter")
@@ -91,7 +94,10 @@ def read_inbox(scope: Scope) -> list[InboxItem]:
     items: list[InboxItem] = []
     for discovered in sorted(directory.glob("*.md")):
         p = _require_real_receipt(directory, discovered)
-        fm, body = split_front_matter(p.read_text(encoding="utf-8"))
+        raw = p.read_bytes()
+        text = raw.decode("utf-8")
+        # Parsed as `read_text` always did (universal newlines); hashed as read.
+        fm, body = split_front_matter(text.replace("\r\n", "\n").replace("\r", "\n"))
         if fm.get("sub") != "triage":
             continue
         items.append(
@@ -101,6 +107,7 @@ def read_inbox(scope: Scope) -> list[InboxItem]:
                 summary=body.strip(),
                 source=fm.get("source"),
                 fm=fm,
+                sha256=hashlib.sha256(raw).hexdigest(),
             )
         )
     return items

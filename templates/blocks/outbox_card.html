@@ -13,7 +13,26 @@
 <div class="proposal classification-review"
      id="review-card-{{ row.proposal.id }}-{{ row.review_sha256 }}-{{ issue }}">
   {% if label %}<p class="muted review-label">{{ label }}</p>{% endif %}
-  <h2 class="review-title">{{ row.title or row.proposal.src.split('/')[-1] }}</h2>
+  {# A malformed stage row has neither a title nor a source to name it by. #}
+  <h2 class="review-title">{{ row.title or row.proposal.src.split('/')[-1] or "Unreadable change" }}</h2>
+  {% if row.proposal.action == "stage" %}
+  {# A stage record (a master view press whose record was left pending): say
+     what approval does to the note in plain words, not as a module move.
+     A malformed record shows nothing read from it; it can only be rejected. #}
+  {% if row.proposal.error is defined %}
+  <p class="review-consequence">This change could not be read, so it cannot be approved.
+    Reject removes it and leaves the note as it is.</p>
+  {% elif row.proposal.src != row.proposal.dst %}
+  <p class="review-consequence">Approval files this note into {{ row.proposal.module }} and records the change in history.
+    Reject leaves the note where it is.</p>
+  {% elif row.proposal.set_status %}
+  <p class="review-consequence">Approval changes this note's status to {{ stage_label(row.proposal.set_status) }} and records the change in history.
+    Reject leaves the note as it is.</p>
+  {% else %}
+  <p class="review-consequence">Approval updates this note and records the change in history.
+    Reject leaves the note as it is.</p>
+  {% endif %}
+  {% else %}
   <dl class="review-route">
     <div><dt>From</dt><dd>{{ row.proposal.src.split('/')[1] }}</dd></div>
     <div><dt>To</dt><dd class="prop-route">{{ row.proposal.module }}</dd></div>
@@ -21,6 +40,7 @@
   </dl>
   <p class="review-consequence">Approval moves this document and records the change in history.
     Reject leaves the document where it is.</p>
+  {% endif %}
   {% if error %}
   {% include "blocks/alert.html" %}
   {% endif %}

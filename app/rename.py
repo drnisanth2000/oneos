@@ -504,7 +504,8 @@ DEFAULT_VALIDATORS = [_validate_check_v2]
 
 
 def _reminders_follow_rename(plan: RenamePlan) -> None:
-    """After an entity rename committed, re-key that entity's reminders.
+    """After an entity rename committed, re-key that entity's reminders and
+    review flags.
 
     Only the `entity` axis changes paths. This runs strictly after the vault
     commit and never fails the rename: with no store, or an unsafe one, it
@@ -516,16 +517,23 @@ def _reminders_follow_rename(plan: RenamePlan) -> None:
     # One line: what happened, what the owner will see, and what to do about it.
     remedy = (
         f"reminders for {plan.old} will show as 'Card moved or removed' "
-        "- remove them on the home page and set them again."
+        "- remove them on the home page and set them again; its notes "
+        "flagged To review go back to their stage columns - flag them again."
     )
     try:
         store = reminder_store()
         if store is None:
-            print(f"Reminders were not updated (ONEOS_AUTH_STATE_DIR is not set): {remedy}")
+            print(
+                "Reminders and review flags were not updated "
+                f"(ONEOS_AUTH_STATE_DIR is not set): {remedy}"
+            )
             return
         store.rename_entity(plan.old, plan.new)
     except ReminderStoreUnavailable:
-        print(f"Reminders were not updated (the reminder store is unavailable): {remedy}")
+        print(
+            "Reminders and review flags were not updated "
+            f"(the reminder store is unavailable): {remedy}"
+        )
 
 
 def apply_rename(vault: Path | str, plan: RenamePlan, validators=None) -> str:

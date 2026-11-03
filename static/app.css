@@ -838,6 +838,12 @@ a.board-chip:hover { background: var(--fill-strong); }
 .review-surface .master-card:focus-visible {
   background: var(--panel); box-shadow: var(--shadow-md), 0 0 0 1px var(--line);
 }
+.master-card.is-dragging { opacity: .5; }
+/* Drag is for a mouse or trackpad on a wide screen; the script turns it off elsewhere. */
+@media (min-width: 768px) and (hover: hover) and (pointer: fine) {
+  .review-surface .master-card[draggable="true"] { cursor: grab; }
+  .review-surface .master-card[draggable="true"]:active { cursor: grabbing; }
+}
 .master-card-title {
   display: flex; gap: var(--space-2); align-items: flex-start; margin-bottom: var(--space-2);
   font-weight: 600; line-height: 1.35; overflow-wrap: anywhere;
@@ -950,6 +956,35 @@ a.board-chip:hover { background: var(--fill-strong); }
 .reminder-fields:disabled .reminder-actions button { opacity: .5; cursor: not-allowed; }
 .review-surface .reminder-remove:hover { border-color: var(--err-ink); color: var(--err-ink); }
 /* --- end reminder box --- */
+
+/* --- stage form --- */
+.master-notice {
+  margin: var(--space-3) 0 0; padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm); background: var(--fill); font-size: var(--text-md);
+}
+.master-notice.is-error { background: var(--err-bg); color: var(--err-ink); }
+.master-notice.is-done { background: var(--accent-soft); }
+.master-flag-note { margin: var(--space-2) 0 0; font-size: var(--text-md); overflow-wrap: anywhere; }
+.stage-form { display: grid; gap: var(--space-3); margin-top: var(--space-3); min-width: 0; }
+.stage-field { display: grid; gap: var(--space-1); min-width: 0; color: var(--ink-dim); font-size: var(--text-sm); font-weight: 600; }
+.master-body-edit {
+  width: 100%; min-height: 12em; margin: 0; border: 1px solid var(--line);
+  color: var(--ink); resize: vertical;
+}
+.stage-field :is(input, select) {
+  font: inherit; font-size: var(--text-base); font-weight: 400; min-height: 36px; min-width: 0; width: 100%;
+  padding: 0 var(--space-3); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel); color: var(--ink);
+}
+.stage-file-to { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: var(--space-3); }
+.stage-buttons { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--space-2); }
+.review-surface .stage-button { min-height: 40px; padding: 0 var(--space-2); font-size: var(--text-md); }
+.review-surface .stage-button.is-current { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+@media (max-width: 760px) {
+  .stage-buttons { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .review-surface .stage-button { min-height: 44px; }
+}
+/* --- end stage form --- */
 
 /* Tablet: two columns per row. */
 @media (max-width: 1100px) {
