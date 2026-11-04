@@ -426,7 +426,17 @@ CALENDAR_ACTIONS = {
     'read_only': 'The OneOS calendar is read-only. Use a calendar you can edit, then run install-calendar again.',
     'permission': "Open System Settings \u2192 Privacy & Security \u2192 Automation and allow OneOS's Python to control Calendar, then run install-calendar again in Terminal.",
 }
-CALENDAR_FAILED = 'The last calendar sync failed. It tries again on its own; if it keeps failing, run remove-calendar, then install-calendar, in Terminal.'
+# Shown by `status`/`doctor` when the job is installed: it retries on its own, so never "run install-calendar".
+PICKS_UP = ' OneOS picks this up on its own within a few minutes of the next reminder change.'
+CALENDAR_STATUS = {
+    'no_calendar': 'In Calendar, create a calendar named OneOS (choose iCloud so its alerts reach your iPhone).' + PICKS_UP,
+    'duplicate_calendar': 'More than one calendar is named OneOS. Keep one (the iCloud one), and rename or delete the others.' + PICKS_UP,
+    'read_only': 'The OneOS calendar is read-only. Use a calendar you can edit.' + PICKS_UP,
+    'permission': "Open System Settings \u2192 Privacy & Security \u2192 Automation and allow OneOS's Python to control Calendar." + PICKS_UP,
+}
+CALENDAR_FAILED = 'The last calendar sync failed. OneOS tries again on its own within a few minutes of the next reminder change; if it keeps failing, run remove-calendar, then install-calendar, in Terminal.'
+# Shown by a foreground install-calendar refusal (nothing installed yet).
+CALENDAR_INSTALL_FAILED = 'Calendar did not answer. Check Calendar opens normally, then run install-calendar again.'
 CALENDAR_UNAVAILABLE = 'Calendar sync could not use its private state. Check that the state directory is owner-only, then run install-calendar again in Terminal.'
 
 
@@ -448,22 +458,34 @@ def calendar_sync_once(config):
         pass
 
 
+def _install_refusal(code):
+    if code in CALENDAR_ACTIONS:
+        return CalendarRefusal(code, CALENDAR_ACTIONS[code])
+    return CalendarRefusal('calendar_failed', CALENDAR_INSTALL_FAILED)
+
+
 def install_calendar(config, *, sync=None, calendar_factory=None):
     """Run one forced sync in the foreground (so macOS asks for permission here), and
     install the background job only when Calendar is ready."""
     from tools import calendar_mac, calendar_sync
+    from tools.calendar_mac import CalendarUnavailable
     sync = sync or calendar_sync.run_sync
     calendar_factory = calendar_factory or calendar_mac.MacCalendar
     state = config['state_dir']
     _preflight_agent('calendar', 'calendar')  # refuse before waking Calendar
+    calendar = calendar_factory()
     try:
-        report = sync(Path(state), calendar_factory(), force=True)
+        report = sync(Path(state), calendar, force=True)
+        if report.state == 'skipped':
+            # The sync did not reach Calendar (no store, busy, locked): ask it once here, so the
+            # macOS permission prompt appears in Terminal and a bad calendar is caught now.
+            calendar.events()
+    except CalendarUnavailable as exc:
+        raise _install_refusal(exc.code) from None
     except Exception:  # never a traceback or the error's text
         raise CalendarRefusal('calendar_unavailable', CALENDAR_UNAVAILABLE) from None
-    if report.state == 'needs_setup' and report.code in CALENDAR_ACTIONS:
-        raise CalendarRefusal(report.code, CALENDAR_ACTIONS[report.code])
     if report.state in ('needs_setup', 'failed'):
-        raise CalendarRefusal('calendar_failed', CALENDAR_FAILED)
+        raise _install_refusal(report.code)
     _launch_agent(config, 'calendar', 'calendar-sync', 'calendar', {
         'WatchPaths': [state + '/auth', state + '/auth/reminders.sqlite3'],
         'ThrottleInterval': 30, 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
@@ -501,8 +523,8 @@ def calendar_diagnostic(config):
         state, code = status.get('state'), status.get('code')
         if state in ('ok', 'skipped'):
             return finding('on', 'Reminders sync to the OneOS calendar.')
-        if state == 'needs_setup' and code in CALENDAR_ACTIONS:
-            return finding('needs_setup', CALENDAR_ACTIONS[code])
+        if state == 'needs_setup' and code in CALENDAR_STATUS:
+            return finding('needs_setup', CALENDAR_STATUS[code])
         if state == 'failed':
             return finding('failed', CALENDAR_FAILED)
     except (OSError, ValueError, TypeError):

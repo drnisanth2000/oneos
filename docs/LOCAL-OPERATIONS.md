@@ -113,6 +113,9 @@ never a note's path. It is off until you set it up:
    notes opens OneOS only on this Mac, because OneOS answers only at
    `localhost`.
 
+Calendar may open by itself for a moment (at login, about once a day, and when
+a reminder changes). That is OneOS updating the OneOS calendar.
+
 An event for a reminder is updated when the reminder changes and removed when
 the reminder is done. `status` and `doctor` show a `calendar` line: `off` (job
 not installed), `on`, `needs_setup` (with the step to take), or `failed`. The

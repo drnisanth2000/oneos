@@ -909,6 +909,15 @@ CALENDAR_ACTIONS = {
     'permission': "Open System Settings → Privacy & Security → Automation and allow OneOS's Python to control Calendar, then run install-calendar again in Terminal.",
 }
 
+PICKS_UP = ' OneOS picks this up on its own within a few minutes of the next reminder change.'
+STATUS_ACTIONS = {
+    'no_calendar': 'In Calendar, create a calendar named OneOS (choose iCloud so its alerts reach your iPhone).' + PICKS_UP,
+    'duplicate_calendar': 'More than one calendar is named OneOS. Keep one (the iCloud one), and rename or delete the others.' + PICKS_UP,
+    'read_only': 'The OneOS calendar is read-only. Use a calendar you can edit.' + PICKS_UP,
+    'permission': "Open System Settings \u2192 Privacy & Security \u2192 Automation and allow OneOS's Python to control Calendar." + PICKS_UP,
+}
+INSTALL_FAILED = 'Calendar did not answer. Check Calendar opens normally, then run install-calendar again.'
+
 
 @pytest.fixture(autouse=True)
 def no_real_launch_agents(tmp_path_factory, monkeypatch):
@@ -1011,7 +1020,7 @@ def test_install_calendar_refuses_a_failed_sync(tmp_path, monkeypatch):
     with pytest.raises(service.CalendarRefusal) as refusal:
         service.install_calendar(config, sync=FakeSync(SyncReport('failed', code='script')), calendar_factory=object)
     assert refusal.value.code == 'calendar_failed'
-    assert 'install-calendar' in refusal.value.message
+    assert refusal.value.message == INSTALL_FAILED
     assert not list(launch_agents.iterdir())
     assert [command[1] for command in calls] == ['print']
 
@@ -1026,12 +1035,60 @@ def test_install_calendar_reports_state_errors_from_the_sync_as_a_refusal(tmp_pa
     assert not list(launch_agents.iterdir())
 
 
-def test_install_calendar_installs_after_a_skipped_sync(tmp_path, monkeypatch):
+class FakeCalendar:
+    def __init__(self, error=None):
+        self.error, self.reads = error, 0
+
+    def events(self):
+        self.reads += 1
+        if self.error:
+            raise self.error
+        return []
+
+
+@pytest.mark.parametrize('code', ['no_store', 'busy', 'locked'])
+def test_install_calendar_reads_calendar_once_after_a_skipped_sync_then_installs(tmp_path, monkeypatch, code):
     from tools import local_service as service
     from tools.calendar_sync import SyncReport
     config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
-    service.install_calendar(config, sync=FakeSync(SyncReport('skipped', code='no_store')), calendar_factory=object)
+    calendar = FakeCalendar()
+    service.install_calendar(config, sync=FakeSync(SyncReport('skipped', code=code)), calendar_factory=lambda: calendar)
+    assert calendar.reads == 1
     assert (launch_agents / 'local.oneos.calendar.plist').is_file()
+
+
+def test_install_calendar_does_not_read_calendar_again_after_an_ok_sync(tmp_path, monkeypatch):
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    calendar = FakeCalendar()
+    service.install_calendar(config, sync=FakeSync(), calendar_factory=lambda: calendar)
+    assert calendar.reads == 0
+
+
+@pytest.mark.parametrize('code', sorted(CALENDAR_ACTIONS))
+def test_install_calendar_refuses_after_a_skipped_sync_when_calendar_is_unusable(tmp_path, monkeypatch, code):
+    from tools import local_service as service
+    from tools.calendar_mac import CalendarUnavailable
+    from tools.calendar_sync import SyncReport
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    calendar = FakeCalendar(CalendarUnavailable(code))
+    with pytest.raises(service.CalendarRefusal) as refusal:
+        service.install_calendar(config, sync=FakeSync(SyncReport('skipped', code='no_store')), calendar_factory=lambda: calendar)
+    assert refusal.value.code == code and refusal.value.message == CALENDAR_ACTIONS[code]
+    assert not list(launch_agents.iterdir())
+    assert [command[1] for command in calls] == ['print']
+
+
+@pytest.mark.parametrize('error', [__import__('tools.calendar_mac', fromlist=['x']).CalendarUnavailable('script'), RuntimeError('private-path')])
+def test_install_calendar_refuses_a_skipped_sync_whose_calendar_read_fails(tmp_path, monkeypatch, error):
+    from tools import local_service as service
+    from tools.calendar_sync import SyncReport
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    with pytest.raises(service.CalendarRefusal) as refusal:
+        service.install_calendar(config, sync=FakeSync(SyncReport('skipped', code='no_store')),
+                                 calendar_factory=lambda: FakeCalendar(error))
+    assert 'private-path' not in refusal.value.message
+    assert not list(launch_agents.iterdir())
 
 
 def test_install_calendar_refuses_existing_plist_before_syncing(tmp_path, monkeypatch):
@@ -1215,7 +1272,9 @@ def test_calendar_diagnostic_reports_needs_setup_with_the_codes_action(tmp_path,
     monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
     install_job(tmp_path)
     write_calendar_status(service, state, {'state': 'needs_setup', 'code': code, 'at': 'x'})
-    assert service.calendar_diagnostic(config) == {'state': 'needs_setup', 'action': CALENDAR_ACTIONS[code]}
+    result = service.calendar_diagnostic(config)
+    assert result == {'state': 'needs_setup', 'action': STATUS_ACTIONS[code]}
+    assert 'install-calendar' not in result['action']
 
 
 @pytest.mark.parametrize('value', [{'state': 'failed', 'code': 'script'}, {'state': 'bogus'}, ['x'], {'state': 'needs_setup', 'code': 'private'}])
@@ -1335,3 +1394,13 @@ def test_install_calendar_command_prints_job_exists_for_existing_and_loaded_jobs
     error = json.loads(capsys.readouterr().err)
     assert error['code'] == 'job_exists' and 'already loaded' in error['message'] and 'remove-calendar' in error['message']
     assert sync.calls == []
+
+
+def test_calendar_status_failed_text_fits_an_installed_job(tmp_path, monkeypatch):
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    install_job(tmp_path)
+    write_calendar_status(service, state, {'state': 'failed', 'code': 'script'})
+    action = service.calendar_diagnostic(config)['action']
+    assert 'tries again on its own' in action and 'within a few minutes' in action
