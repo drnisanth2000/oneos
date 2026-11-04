@@ -1094,3 +1094,102 @@ def test_logout_everywhere_requires_csrf(owner):
         response = anonymous.post("/logout/everywhere", headers=dict(OWN_ORIGIN, **{"X-CSRF-Token": csrf}))
         assert response.status_code == 401
     assert store.session(other)
+
+
+# --- the Home deep link kept through sign-in ------------------------------------
+
+DEEP = "/?reminder=oneos-" + "0123456789abcdef" * 2
+BAD_NEXT = [
+    "//evil.example", "https://evil.example/", "/outbox", "/?reminder=x&a=b", "/%2F%2Fevil",
+    DEEP + "&a=b", DEEP + "#top", DEEP + "\n", DEEP.upper(), "\\\\evil.example", "/\\evil.example",
+    "https://localhost:8443" + DEEP, "//localhost:8443" + DEEP, DEEP.replace("/?", "/%3F"),
+    DEEP.replace("?", "/?"), DEEP.replace("reminder", "Reminder"), DEEP + DEEP[1:], DEEP[:-1],
+    DEEP + "0", "/?reminder=" + DEEP, " " + DEEP, "", "/",
+]
+
+
+def test_safe_next_keeps_only_the_deep_link_shape():
+    from app.auth_web import _safe_next
+    assert _safe_next(DEEP) == DEEP
+    for value in BAD_NEXT:
+        assert _safe_next(value) == "/", value
+    for value in (None, 7, [DEEP], b"/?reminder=oneos-" + b"0" * 32):
+        assert _safe_next(value) == "/"
+
+
+def _sign_in_page(client, next_value=None):
+    response = client.get("/login", params={} if next_value is None else {"next": next_value})
+    assert response.status_code == 200
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', response.text).group(1)
+    shown = re.search(r'<input type="hidden" name="next" value="([^"]*)">', response.text).group(1)
+    return csrf, shown
+
+
+def test_signed_out_deep_link_goes_to_sign_in_carrying_it(owner):
+    from urllib.parse import parse_qs, urlsplit
+    from app.main import app
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        response = client.get(DEEP)
+        assert response.status_code == 303
+        location = urlsplit(response.headers["location"])
+        assert location.path == "/login" and parse_qs(location.query) == {"next": [DEEP]}
+        assert response.headers["HX-Redirect"] == response.headers["location"]
+        _csrf, shown = _sign_in_page(client, parse_qs(location.query)["next"][0])
+        assert shown == DEEP
+        for path in ("/", "/outbox", "/?reminder=x&a=b", DEEP + "&a=b", "/outbox" + DEEP[1:], "/%2F" + DEEP[1:]):
+            response = client.get(path)
+            assert response.status_code == 303 and response.headers["location"] == "/login", path
+
+
+def test_password_sign_in_lands_on_the_deep_link(owner):
+    import pyotp
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        csrf, shown = _sign_in_page(client, DEEP)
+        data = {"password": "synthetic owner password", "code": pyotp.TOTP(secret).now(), "csrf_token": csrf, "next": shown}
+        response = client.post("/login", data=data, headers={"Origin": "https://localhost:8443"})
+        assert response.status_code == 303 and response.headers["location"] == DEEP
+
+
+@pytest.mark.parametrize("value", BAD_NEXT)
+def test_password_sign_in_never_follows_another_next(owner, value):
+    import pyotp
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        csrf, shown = _sign_in_page(client, value)
+        assert shown == "/"
+        # A forged form field is checked again on the way in.
+        data = {"password": "synthetic owner password", "code": pyotp.TOTP(secret).now(), "csrf_token": csrf, "next": value}
+        response = client.post("/login", data=data, headers={"Origin": "https://localhost:8443"})
+        assert response.status_code == 303 and response.headers["location"] == "/"
+
+
+def test_password_sign_in_without_next_lands_home(owner):
+    import pyotp
+    from app.main import app
+    store, secret = owner
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        csrf, shown = _sign_in_page(client)
+        assert shown == "/"
+        data = {"password": "synthetic owner password", "code": pyotp.TOTP(secret).now(), "csrf_token": csrf}
+        response = client.post("/login", data=data, headers={"Origin": "https://localhost:8443"})
+        assert response.status_code == 303 and response.headers["location"] == "/"
+
+
+def test_failed_sign_in_offers_to_try_again_keeping_the_deep_link(owner):
+    from urllib.parse import parse_qs, urlsplit
+    import html as _html
+    from app.main import app
+    with TestClient(app, base_url="https://localhost:8443", follow_redirects=False) as client:
+        csrf, shown = _sign_in_page(client, DEEP)
+        data = {"password": "wrong", "code": "000000", "csrf_token": csrf, "next": shown}
+        response = client.post("/login", data=data, headers={"Origin": "https://localhost:8443"})
+        assert response.status_code == 401
+        again = urlsplit(_html.unescape(re.search(r'<a href="([^"]+)">Try again</a>', response.text).group(1)))
+        assert again.path == "/login" and parse_qs(again.query) == {"next": [DEEP]}
+        csrf, _shown = _sign_in_page(client)
+        data = {"password": "wrong", "code": "000000", "csrf_token": csrf, "next": "//evil.example"}
+        response = client.post("/login", data=data, headers={"Origin": "https://localhost:8443"})
+        assert '<a href="/login">Try again</a>' in response.text

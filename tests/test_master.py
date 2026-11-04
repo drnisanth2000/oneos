@@ -3186,3 +3186,190 @@ def test_a_changed_proposal_shows_the_newer_card_and_writes_nothing(
     assert record.read_bytes() == newer
     assert sorted(p.name for p in record.parent.iterdir()) == [record.name]
     assert list(directory.iterdir()) == []
+
+
+# --- the Home deep link a Calendar event's notes point to ----------------------
+
+_GONE_NOTICE = "That reminder is no longer in OneOS."
+_UNAVAILABLE_NOTICE = "Reminders are unavailable right now."
+
+
+def _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch):
+    """A committed vault with one Waiting card that carries a reminder."""
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    _git_commit_all(tmp_path)
+    reminder = _reminder("alpha", "Chase", datetime.now(timezone.utc) + timedelta(days=2))
+    _seed(directory, reminder)
+    return main, client, directory, reminder
+
+
+def _loaders(html):
+    """Every load-triggered element: (its whole start tag, its offset)."""
+    return [(m.group(0), m.start()) for m in re.finditer(r"<[a-z]+\b[^>]*hx-trigger=\"load\"[^>]*>", html)]
+
+
+def _outside_master(html, offset):
+    return offset < html.index('<div id="master"') or offset > html.index("<!-- /master -->")
+
+
+def _reads_nothing_written(tmp_path, directory):
+    def state():
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout
+        files = {
+            p: (p.read_bytes(), p.stat().st_mtime_ns)
+            for root in (tmp_path, directory)
+            for p in root.rglob("*")
+            if p.is_file() and ".git" not in p.relative_to(root).parts
+        }
+        return head, files, sorted(p.name for p in directory.iterdir())
+    return state
+
+
+def test_deep_link_opens_the_reminders_card_popup(tmp_path, tmp_path_factory, monkeypatch):
+    from urllib.parse import quote
+    from app.reminders import calendar_event_id
+
+    main, client, directory, reminder = _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch)
+    state = _reads_nothing_written(tmp_path, directory)
+    before = state()
+    response = client.get("/", params={"reminder": calendar_event_id(reminder.key)})
+    assert response.status_code == 200
+    html = response.text
+    (tag, offset), = _loaders(html)
+    # Built as the card's own button builds it (Jinja's urlencode keeps "/").
+    expected = f"/master/card/alpha?path={quote(reminder.key, safe='/')}"
+    assert f'hx-get="{expected}"' in tag
+    assert 'hx-target="#master-popup"' in tag and 'hx-swap="innerHTML"' in tag
+    assert _outside_master(html, offset)
+    assert _GONE_NOTICE not in html and _UNAVAILABLE_NOTICE not in html
+    # The URL it loads is the card's own popup.
+    assert "stage-form" in client.get(expected).text
+    assert state() == before
+
+
+def test_deep_link_to_a_resolved_reminder_still_opens_its_card(tmp_path, tmp_path_factory, monkeypatch):
+    from app.reminders import calendar_event_id
+
+    main, client, directory, reminder = _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch)
+    ReminderStore(directory).resolve(reminder.key)
+    html = client.get("/", params={"reminder": calendar_event_id(reminder.key)}).text
+    (tag, _offset), = _loaders(html)
+    assert "/master/card/alpha?path=" in tag
+
+
+def test_deep_link_html_escapes_and_encodes_the_card_url(tmp_path, tmp_path_factory, monkeypatch):
+    from urllib.parse import quote
+    from app.reminders import calendar_event_id
+
+    main, client = _client(tmp_path, monkeypatch)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    name = 'Odd & "name"'
+    _note(tmp_path, "alpha", "02-work", name, status="waiting")
+    reminder = _reminder("alpha", name, datetime.now(timezone.utc) + timedelta(days=2))
+    _seed(directory, reminder)
+    html = client.get("/", params={"reminder": calendar_event_id(reminder.key)}).text
+    (tag, _offset), = _loaders(html)
+    assert f'hx-get="/master/card/alpha?path={quote(reminder.key, safe="/")}"' in tag
+    assert "%26" in tag and "%22" in tag
+
+
+@pytest.mark.parametrize("case", ["unknown id", "entity gone", "no store file", "store not configured"])
+def test_deep_link_to_a_reminder_that_is_gone_says_so(tmp_path, tmp_path_factory, monkeypatch, case):
+    from app.reminders import calendar_event_id
+
+    main, client, directory, reminder = _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch)
+    wanted = calendar_event_id(reminder.key)
+    if case == "unknown id":
+        wanted = calendar_event_id("alpha/02-work/active/Other.md")
+    elif case == "entity gone":
+        orphan = _reminder("gamma", "Lost", datetime.now(timezone.utc) + timedelta(days=1))
+        ReminderStore(directory).save(orphan)
+        wanted = calendar_event_id(orphan.key)
+    elif case == "no store file":
+        for path in directory.iterdir():
+            path.unlink()
+    else:
+        monkeypatch.delenv("ONEOS_AUTH_STATE_DIR")
+    state = _reads_nothing_written(tmp_path, directory)
+    before = state()
+    response = client.get("/", params={"reminder": wanted})
+    assert response.status_code == 200
+    assert response.text.count(_GONE_NOTICE) == 1
+    assert _loaders(response.text) == []
+    assert state() == before
+
+
+def test_deep_link_with_the_store_unavailable_says_so(tmp_path, tmp_path_factory, monkeypatch):
+    from app.reminders import calendar_event_id
+
+    main, client, directory, reminder = _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch)
+    directory.chmod(0o755)
+    state = _reads_nothing_written(tmp_path, directory)
+    before = state()
+    response = client.get("/", params={"reminder": calendar_event_id(reminder.key)})
+    assert response.status_code == 200
+    assert response.text.count(_UNAVAILABLE_NOTICE) == 1
+    assert _GONE_NOTICE not in response.text and _loaders(response.text) == []
+    assert state() == before
+
+
+@pytest.mark.parametrize("value", [
+    "../x", "oneos-ZZ", pytest.param("a" * 1000, id="1000-characters"), "", "oneos-" + "A" * 32, "oneos-" + "0" * 31, "oneos-" + "0" * 33,
+    "oneos-" + "0" * 32 + "\n", " oneos-" + "0" * 32,
+])
+def test_deep_link_with_a_malformed_id_is_plain_home_with_no_lookup(
+    tmp_path, tmp_path_factory, monkeypatch, value
+):
+    main, client, directory, reminder = _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch)
+
+    def no_lookup(key):
+        raise AssertionError("a malformed id was looked up")
+
+    monkeypatch.setattr(main, "calendar_event_id", no_lookup)
+    state = _reads_nothing_written(tmp_path, directory)
+    before = state()
+    response = client.get("/", params={"reminder": value})
+    assert response.status_code == 200
+    html = response.text
+    assert _loaders(html) == []
+    assert _GONE_NOTICE not in html and _UNAVAILABLE_NOTICE not in html
+    assert 'id="master"' in html
+    assert state() == before
+
+
+def test_plain_home_has_no_deep_link(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory, reminder = _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch)
+    html = client.get("/").text
+    assert _loaders(html) == []
+    assert _GONE_NOTICE not in html and _UNAVAILABLE_NOTICE not in html
+
+
+@pytest.mark.parametrize("error", ["EntityManifestError", "SystemRegistryPathError", "VaultRootUnavailable"])
+def test_deep_link_with_an_unreadable_registry_says_reminders_are_unavailable(
+    tmp_path, tmp_path_factory, monkeypatch, error
+):
+    import sys
+    import app.config
+    import app.entities
+    from app.reminders import calendar_event_id
+
+    main, client, directory, reminder = _deep_link_setup(tmp_path, tmp_path_factory, monkeypatch)
+    cls = getattr(app.config, error, None) or getattr(app.entities, error)
+
+    real = main.build_scope
+
+    def unreadable(entity):
+        # Only the deep link's own lookup fails; the master view reads as usual.
+        if sys._getframe(1).f_code.co_name == "_deep_link":
+            raise cls("synthetic")
+        return real(entity)
+
+    monkeypatch.setattr(main, "build_scope", unreadable)
+    state = _reads_nothing_written(tmp_path, directory)
+    before = state()
+    response = client.get("/", params={"reminder": calendar_event_id(reminder.key)})
+    assert response.status_code == 200
+    assert response.text.count(_UNAVAILABLE_NOTICE) == 1 and _loaders(response.text) == []
+    assert state() == before

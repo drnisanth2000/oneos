@@ -67,6 +67,7 @@ from .reminders import (
     ReminderStore,
     ReminderStoreUnavailable,
     ReviewFlag,
+    calendar_event_id,
     clean_flag_comment,
     clean_subject,
     default_subject,
@@ -119,7 +120,7 @@ from .registry import (
 )
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
-from .auth_web import AuthenticatedFormRoute, OwnerAuthMiddleware
+from .auth_web import REMINDER_ID, AuthenticatedFormRoute, OwnerAuthMiddleware
 from .deployment_health import install_health
 
 BASE = Path(__file__).resolve().parent.parent
@@ -477,6 +478,43 @@ def _page_flags() -> dict | None:
         return None
 
 
+_DEEP_LINK_GONE = "That reminder is no longer in OneOS."
+_DEEP_LINK_UNAVAILABLE = "Reminders are unavailable right now."
+
+
+def _deep_link(reminder_id: str) -> dict:
+    """Home's `/?reminder=<id>`, the link in a reminder's Calendar event: the
+    card popup to open, or the notice to show instead. `reminder_id` is
+    already a well-formed event id. Every row is read, resolved ones too, so
+    the leftover event of a card moved to Done still opens it. Reads only.
+
+    Every `build_scope` failure is answered here, so the page keeps its own
+    declared family: an entity that left the registry is "no longer in
+    OneOS"; a registry or vault root that cannot be read right now is
+    "unavailable right now"."""
+    try:
+        store = reminder_store()
+        if store is None:
+            return {"notice": _DEEP_LINK_GONE}
+        rows = ReminderStore.all(store)
+    except ReminderStoreUnavailable:
+        return {"notice": _DEEP_LINK_UNAVAILABLE}
+    found = next(
+        (row for key, row in rows.items() if calendar_event_id(key) == reminder_id), None
+    )
+    if found is None:
+        return {"notice": _DEEP_LINK_GONE}
+    try:
+        entity = build_scope(found.entity).current_entity()
+    except EntitySelectionError:
+        return {"notice": _DEEP_LINK_GONE}
+    except (EntityManifestError, VaultRootUnavailable):
+        return {"notice": _DEEP_LINK_UNAVAILABLE}
+    # The URL the card's own button loads (blocks/master_card.html); the popup
+    # route checks the path against the entity's cards before reading it.
+    return {"entity": entity, "path": found.key}
+
+
 @app.get("/", response_class=HTMLResponse)
 @console_route(
     catches=_SIDEBAR_CATCHES,
@@ -507,6 +545,9 @@ def shell(request: Request) -> HTMLResponse:
             reminders=_page_reminders(),
             flags=_page_flags(),
         )
+        # Anything but a well-formed event id is ignored, with no lookup.
+        wanted = params.get("reminder")
+        deep_link = _deep_link(wanted) if wanted and REMINDER_ID.fullmatch(wanted) else None
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
@@ -516,6 +557,7 @@ def shell(request: Request) -> HTMLResponse:
             "bundles": bundles,
             "page": page,
             "failures": [(f.entity_label, describe(f.error)) for f in page.failures],
+            "deep_link": deep_link,
         },
     )
 

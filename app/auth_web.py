@@ -1,5 +1,6 @@
 """Authentication precedes route matching, including framework error handlers."""
 import base64
+import html
 import hashlib
 import json
 import os
@@ -7,7 +8,7 @@ import re
 import secrets
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from fastapi.routing import APIRoute
 from starlette.concurrency import run_in_threadpool
@@ -39,6 +40,27 @@ JSON_TYPE = "application/json"
 CHECK_MESSAGE = "Password or code not accepted. If you just used this code to sign in, wait for the next one."
 BLOCKED_MESSAGE = "Too many failed sign-ins. Wait a few minutes and try again."
 DEFAULT_CSP = "frame-ancestors 'none'"
+# A reminder's Calendar event id (`calendar_event_id`): the only thing a
+# sign-in may carry back to, as Home's deep link `/?reminder=<id>`.
+REMINDER_ID = re.compile(r"oneos-[0-9a-f]{32}")
+_DEEP_LINK = re.compile(r"/\?reminder=" + REMINDER_ID.pattern)
+
+
+def _safe_next(value):
+    """Where a sign-in may return: `value` only when it is exactly Home's deep
+    link, path `/` with the single query `reminder=oneos-<32 lowercase hex>`,
+    and nothing else (no scheme or host, no fragment, no other or repeated
+    parameter, no percent-encoding, no backslash). Anything else is `/`, so no
+    sign-in ever sends the browser somewhere it chose itself."""
+    if isinstance(value, str) and _DEEP_LINK.fullmatch(value):
+        return value
+    return "/"
+
+
+def _sign_in_url(next_value):
+    """The sign-in page, carrying `next` only when it is a deep link."""
+    safe = _safe_next(next_value)
+    return "/login" if safe == "/" else "/login?" + urlencode({"next": safe})
 
 
 def _set_session_cookie(response, token, *, kept):
@@ -191,8 +213,8 @@ _LOGIN_SCRIPT = r"""
       };
       if (answer.userHandle) body.response.userHandle = toText(answer.userHandle);
       if (credential.authenticatorAttachment) body.authenticatorAttachment = credential.authenticatorAttachment;
-      var result = await post('/login/passkey', {credential: body, keep: form.elements.keep.checked});
-      if (result.ok) { location.assign('/'); return; }
+      var result = await post('/login/passkey', {credential: body, keep: form.elements.keep.checked, next: form.elements.next.value});
+      if (result.ok) { location.assign((await result.json()).redirect); return; }
       if (result.status === 403) { location.reload(); return; }
       say('Touch ID sign-in failed.' + retry);
     } catch (error) {
@@ -214,12 +236,14 @@ _LOGIN_SCRIPT_HASH = base64.b64encode(hashlib.sha256(_LOGIN_SCRIPT.encode()).dig
 _LOGIN_CSP = "default-src 'none'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 
 
-def _login_page(nonce, touch_id):
-    """The sign-in page and its Content-Security-Policy. No external resources; usable without JavaScript."""
+def _login_page(nonce, touch_id, next_value="/"):
+    """The sign-in page and its Content-Security-Policy. No external resources; usable without JavaScript.
+    `next_value` is where both sign-ins return; it is checked again on the way in."""
     parts = [
         '<!doctype html><html lang="en"><meta charset="utf-8"><title>Sign in · OneOS</title>'
         '<main><h1>Sign in to OneOS</h1><form id="sign-in" method="post" action="/login">'
         f'<input type="hidden" name="csrf_token" value="{nonce}">'
+        f'<input type="hidden" name="next" value="{html.escape(_safe_next(next_value))}">'
     ]
     if touch_id:
         parts.append('<div id="touch-id" hidden><button type="button" id="touch-id-button">Sign in with Touch ID</button>'
@@ -323,15 +347,19 @@ class OwnerAuthMiddleware:
             )
             login = path in PRE_SIGN_IN
             if not csrf and not login:
-                response = RedirectResponse("/login", 303) if request.method in ("GET", "HEAD") else PlainTextResponse("Sign in required", 401)
-                response.headers["HX-Redirect"] = "/login"
+                # Home's deep link survives sign-in; nothing else is carried.
+                query = request.url.query
+                target = _sign_in_url(path + ("?" + query if query else ""))
+                response = RedirectResponse(target, 303) if request.method in ("GET", "HEAD") else PlainTextResponse("Sign in required", 401)
+                response.headers["HX-Redirect"] = target
                 return await finish(response)
             if login and path != "/login" and request.method != "POST":
                 return await finish(PlainTextResponse("Method not allowed", 405, headers={"Allow": "POST"}))
             if path == "/login" and request.method == "GET":
                 nonce = secrets.token_urlsafe(32)
                 touch_id = bool(await run_in_threadpool(store.passkeys))
-                page, csp = _login_page(nonce, touch_id)
+                wanted = request.query_params.getlist("next")
+                page, csp = _login_page(nonce, touch_id, wanted[0] if len(wanted) == 1 else "/")
                 response = HTMLResponse(page)
                 response.set_cookie(LOGIN_COOKIE, nonce, max_age=600, secure=True, httponly=True, samesite="strict", path="/")
                 return await finish(response, csp)
@@ -372,16 +400,17 @@ class OwnerAuthMiddleware:
                     return await finish(Response(options, 200, media_type=JSON_TYPE))
                 if path == "/login/passkey":
                     payload = _json_object(request, body)
-                    if (payload is None or not set(payload) <= {"credential", "keep"}
+                    if (payload is None or not set(payload) <= {"credential", "keep", "next"}
                             or not isinstance(payload.get("credential"), dict)
-                            or type(payload.get("keep", False)) is not bool):
+                            or type(payload.get("keep", False)) is not bool
+                            or type(payload.get("next", "/")) is not str):
                         return await finish(_invalid())
                     keep = payload.get("keep", False)
                     answer = json.dumps(payload["credential"])
                     session = await run_in_threadpool(lambda: store.finish_login(answer, origin=origin, keep=keep))
                     if session is None:
                         return await finish(JSONResponse({"error": "failed"}, 401))
-                    response = JSONResponse({"redirect": "/"})
+                    response = JSONResponse({"redirect": _safe_next(payload.get("next", "/"))})
                     _set_session_cookie(response, session, kept=keep)
                     response.delete_cookie(LOGIN_COOKIE, secure=True, httponly=True, samesite="strict")
                     return await finish(response)
@@ -389,10 +418,12 @@ class OwnerAuthMiddleware:
                     if request.method != "POST" or any(len(v) != 1 for v in fields.values()):
                         return await finish(PlainTextResponse("Invalid form", 400))
                     keep = fields.get("keep") == ["1"]
+                    after = _safe_next((fields.get("next") or ["/"])[0])
                     session = await run_in_threadpool(lambda: store.login((fields.get("password") or [""])[0], (fields.get("code") or [""])[0], keep=keep))
                     if session is None:
-                        return await finish(HTMLResponse('<p>Sign in failed. Check your credentials or wait before retrying.</p><a href="/login">Try again</a>', 401))
-                    response = RedirectResponse("/", 303)
+                        again = html.escape(_sign_in_url(after))
+                        return await finish(HTMLResponse(f'<p>Sign in failed. Check your credentials or wait before retrying.</p><a href="{again}">Try again</a>', 401))
+                    response = RedirectResponse(after, 303)
                     _set_session_cookie(response, session, kept=keep)
                     response.delete_cookie(LOGIN_COOKIE, secure=True, httponly=True, samesite="strict")
                     return await finish(response)
