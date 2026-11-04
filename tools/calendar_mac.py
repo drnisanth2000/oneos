@@ -119,12 +119,14 @@ class MacCalendar:
             raise CalendarUnavailable('script')
 
 
-def matching(found: list[CalendarEvent], want: CalendarEvent) -> CalendarEvent | None:
-    for item in found:
-        if (item.id, item.title, item.start, item.end, item.alarm) == \
-                (want.id, want.title, want.start, want.end, want.alarm) and (not want.uid or item.uid == want.uid):
-            return item
-    return None
+def only_match(found: list[CalendarEvent], want: CalendarEvent) -> CalendarEvent | None:
+    """The one listed event with want's marker, when it also has want's title, times and alert."""
+    mine = [item for item in found if item.id == want.id]
+    if len(mine) != 1:
+        return None
+    item = mine[0]
+    same = (item.title, item.start, item.end, item.alarm) == (want.title, want.start, want.end, want.alarm)
+    return item if same else None
 
 
 def clean_up(calendar: MacCalendar, marker: str) -> str:
@@ -138,7 +140,8 @@ def clean_up(calendar: MacCalendar, marker: str) -> str:
 
 
 def selftest(calendar: MacCalendar) -> str:
-    """Create "OneOS test" one hour ahead, list it, move it a day later, list it, delete it.
+    """Create "OneOS test" one hour ahead, list it, move it a day later under a new title (which
+    replaces the event), list it, delete it.
 
     Returns 'ok' or the failure code. The test event (and any an interrupted run left) is
     deleted by its marker whatever happens in between.
@@ -150,18 +153,19 @@ def selftest(calendar: MacCalendar) -> str:
     outcome = 'ok'
     try:
         calendar.apply([test], [], [])
-        made = matching(calendar.events(), test)
+        made = only_match(calendar.events(), test)
         if made is None:
             outcome = 'script'
         else:
             moved = replace(test, uid=made.uid, title='OneOS test (moved)', start=test.start + timedelta(days=1),
-                            end=test.end + timedelta(days=1), alarm=False)
+                            end=test.end + timedelta(days=1))
             calendar.apply([], [moved], [])
-            if matching(calendar.events(), moved) is None:
+            if only_match(calendar.events(), moved) is None:
                 outcome = 'script'
     except CalendarUnavailable as exc:
         outcome = exc.code
-    cleaned = clean_up(calendar, marker)
+    finally:
+        cleaned = clean_up(calendar, marker)
     return outcome if outcome != 'ok' else cleaned
 
 

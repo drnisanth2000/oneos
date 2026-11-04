@@ -193,8 +193,13 @@ def test_calendar_name_is_passed_through():
 class FakeCalendar:
     """A stand-in for the script that keeps events in memory, for the selftest."""
 
-    def __init__(self, fail_lists=0):
+    def __init__(self, fail_lists=0, keep_replaced=False):
         self.events, self.calls, self.fail_lists, self.next = {}, [], fail_lists, 0
+        self.keep_replaced = keep_replaced
+
+    def add(self, item):
+        self.next += 1
+        self.events[f"UID-{self.next}"] = dict(item, uid=f"UID-{self.next}", created=None)
 
     def __call__(self, args, **kwargs):
         command, payload = args[4], json.loads(args[5])
@@ -205,10 +210,16 @@ class FakeCalendar:
                 return subprocess.CompletedProcess(args, 1, "", "")
             return subprocess.CompletedProcess(args, 0, json.dumps(list(self.events.values())), "")
         for item in payload["create"]:
-            self.next += 1
-            self.events[f"UID-{self.next}"] = dict(item, uid=f"UID-{self.next}", created=None)
+            self.add(item)
         for item in payload["update"]:
-            if item["uid"] in self.events:
+            old = self.events.get(item["uid"])
+            if old is None:
+                continue
+            if any(old[key] != item[key] for key in ("start", "end", "alarm")):  # Like the script: replace.
+                self.add(item)
+                if not self.keep_replaced:
+                    del self.events[item["uid"]]
+            else:
                 self.events[item["uid"]] = dict(item, created=None)
         for uid in payload["delete"]:
             self.events.pop(uid, None)
@@ -228,10 +239,35 @@ def test_selftest_creates_lists_moves_and_deletes(capsys, monkeypatch):
     start = datetime.fromisoformat(created["start"])
     assert timedelta(minutes=58) < start - datetime.now(timezone.utc) <= timedelta(hours=1)
     moved = fake.calls[2][1]["update"][0]
-    assert moved["uid"] == "UID-1" and moved["title"] != "OneOS test" and moved["alarm"] is False
+    assert moved["uid"] == "UID-1" and moved["title"] != "OneOS test" and moved["alarm"] is True
     assert datetime.fromisoformat(moved["start"]) == start + timedelta(days=1)
     assert datetime.fromisoformat(moved["end"]) == start + timedelta(days=1, minutes=15)
-    assert fake.calls[-1][1]["delete"] == ["UID-1"]
+    assert fake.calls[-1][1]["delete"] == ["UID-2"]  # The replacement, under its new uid.
+    assert fake.events == {}
+
+
+def test_selftest_reports_script_when_the_move_leaves_two_events(capsys, monkeypatch):
+    fake = FakeCalendar(keep_replaced=True)
+    monkeypatch.setattr(calendar_mac.subprocess, "run", fake)
+    assert calendar_mac.main(["selftest"]) == 1
+    assert capsys.readouterr().out.strip() == "script"
+    assert fake.events == {}  # Both are cleaned up by the marker.
+
+
+def test_selftest_cleans_up_even_on_an_unexpected_error(monkeypatch):
+    fake = FakeCalendar()
+    calls = {"n": 0}
+    real_events = MacCalendar.events
+
+    def events(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("unexpected")
+        return real_events(self)
+
+    monkeypatch.setattr(MacCalendar, "events", events)
+    with pytest.raises(RuntimeError):
+        calendar_mac.selftest(MacCalendar(run=fake))
     assert fake.events == {}
 
 
@@ -288,7 +324,10 @@ def test_script_has_one_error_code_table_and_exact_match():
     assert "whose(" not in source
     assert "-1743" in source
     assert "writable()" in source
-    assert "calendars.byId(" in source and "events.byId(" in source
+    assert "calendars.byName(wanted)" in source and "events.byId(" in source
+    # The live check: calendar identifiers and calendar byId fail, and deleting an alarm fails.
+    assert "calendarIdentifier" not in source and "calendars.byId(" not in source
+    assert not re.search(r"[A-Za-z]*Alarms\[", source) and "removeAlarms" not in source
     assert not re.search(r"(calendars|events)\[", source)  # Never addressed by position.
 
 
@@ -320,8 +359,11 @@ function run(argv) {
         ascii: /^[\\x00-\\x7e]*$/.test(output({text: cases.text})),
         codes: [code(function () { fail('read_only'); }), code(function () { fail('nonsense'); }),
                 codeFor({errorNumber: -1743}), codeFor({errorNumber: -1728}), codeFor(new Error('x'))],
-        moves: [moveOrder(new Date(at(1)), new Date(at(24))), moveOrder(new Date(at(1)), new Date(at(-24))),
-                moveOrder(new Date(at(1)), new Date(at(1)))]
+        calendars: cases.calendars.map(function (names) { return code(function () { pickCalendar(names, 'OneOS'); }); }),
+        kinds: cases.kinds.map(function (k) {
+            var current = {start: new Date(at(k[0])), end: new Date(at(k[1])), alarm: k[2]};
+            var item = {start: new Date(at(k[3])), end: new Date(at(k[4])), alarm: k[5]};
+            return updateKind(current, item, now); })
     });
 }
 """
@@ -345,7 +387,17 @@ def test_script_pure_functions_under_osascript(tmp_path):
              "markers": [f"Open\n{marker}", f"Open\r\n{marker}\n", marker, f"{marker}\nmore", f"{marker} ",
                          f"OneOS id: oneos-{hex32.upper()}", f"OneOS id: oneos-{hex32[:-1]}", "", None],
              "instants": ["2026-11-05T09:30:00.000Z", "2026-11-05T09:30:00Z", "2026-11-05T09:30:00",
-                          "2026-11-05T09:30:00+05:30", "2026-11-05", "nonsense"]}
+                          "2026-11-05T09:30:00+05:30", "2026-11-05", "nonsense"],
+             "calendars": [["OneOS"], ["Work", "OneOS", "Home"], [], ["Oneos"], ["OneOS", "OneOS"],
+                           ["OneOS", "oneos"], ["ONEOS", "OneOS"], ["ONEOS", "Oneos"]],
+             # [current start, end (hours from now), has alarm, new start, end, wants alarm]
+             "kinds": [[1, 2, True, 1, 2, True],      # same times and alarm: title/notes in place
+                       [1, 2, True, 24, 25, True],    # moved later
+                       [1, 2, True, 1, 3, True],      # new end only
+                       [1, 2, False, 1, 2, True],     # alarm wanted, none there
+                       [1, 2, True, 1, 2, False],     # alarm no longer wanted, start still ahead
+                       [-2, -1, True, -2, -1, False], # start passed: the fired alarm is no reason to replace
+                       [1, 2, False, 1, 2, False]]}
     result = osascript(str(harness), json.dumps(cases))
     assert result.returncode == 0, "harness failed"
     out = json.loads(result.stdout)
@@ -357,7 +409,9 @@ def test_script_pure_functions_under_osascript(tmp_path):
     assert out["unmarked"] == "script" and out["backwards"] == "script"
     assert out["echo"] == text and out["ascii"] is True
     assert out["codes"] == ["read_only", "script", "permission", "script", "script"]
-    assert out["moves"] == [["endDate", "startDate"], ["startDate", "endDate"], ["startDate", "endDate"]]
+    assert out["calendars"] == ["none", "none", "no_calendar", "no_calendar", "duplicate_calendar",
+                                "duplicate_calendar", "duplicate_calendar", "no_calendar"]
+    assert out["kinds"] == ["inPlace", "replace", "replace", "replace", "replace", "inPlace", "inPlace"]
 
 
 @pytest.mark.skipif(not MAC, reason="needs macOS osascript")

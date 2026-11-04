@@ -3,9 +3,11 @@
 // Values arrive only as the one JSON argument and are read with JSON.parse.
 // Output is JSON on stdout. Failures exit with a code from EXIT and print nothing.
 //
-// Every write addresses its target by a stable id: the calendar by its calendarIdentifier and
-// each event by its uid (both are Calendar's `id` key), never by a position, which Calendar
-// re-resolves on every Apple event and which a sync from iCloud can shift.
+// Nothing is addressed by a position, which Calendar re-resolves on every Apple event and which a
+// sync from iCloud can shift: the calendar is addressed by its name (made unambiguous first) and
+// each event by its uid (Calendar's `id` key).
+// Calendar cannot delete an alarm (-10000), so an event whose times or alert change is replaced:
+// a new marked event is made, then the old one is deleted.
 ObjC.import('stdlib');
 
 // ---- Pure part: no Apple events. tests/test_calendar_mac.py runs these functions directly. ----
@@ -15,8 +17,6 @@ var EXIT = {script: 1, no_calendar: 3, permission: 4, duplicate_calendar: 5, rea
 var PERMISSION_ERROR = -1743;
 var MARKER = /^OneOS id: oneos-[0-9a-f]{32}$/;
 var ISO_UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,3})?Z$/;
-// Open file alarms are left alone: Calendar refuses to modify them (a save error).
-var ALARM_KINDS = ['displayAlarms', 'soundAlarms', 'mailAlarms'];
 
 function Failure(code) { this.code = code; }
 function fail(code) { throw new Failure(code); }
@@ -62,10 +62,28 @@ function checked(item, now) {
             alarm: item.alarm && start.getTime() > now};  // No alert for a start already past.
 }
 
-// The order to set the times in so Calendar never sees a start after the end:
-// moving later past the current end sets the end first; otherwise the start goes first.
-function moveOrder(currentEnd, newStart) {
-    return newStart.getTime() > currentEnd.getTime() ? ['endDate', 'startDate'] : ['startDate', 'endDate'];
+// The one calendar named exactly `wanted`. More than one name equal to it ignoring case counts
+// as a duplicate, so addressing it by name (which may ignore case) cannot pick the wrong one.
+function pickCalendar(names, wanted) {
+    var exact = 0, folded = 0;
+    for (var i = 0; i < names.length; i++) {
+        if (names[i] === wanted) exact++;  // Case-sensitive; AppleScript `whose` is not.
+        if (typeof names[i] === 'string' && names[i].toLowerCase() === wanted.toLowerCase()) folded++;
+    }
+    if (exact === 0) fail('no_calendar');
+    if (exact > 1 || folded > 1) fail('duplicate_calendar');
+}
+
+// How an update is written. 'inPlace' sets the title and notes and keeps the event and its alert;
+// 'replace' makes a new event and deletes the old one, for a change of times or of the alert.
+// An alert that has already fired (start past) is no reason to replace an event.
+function updateKind(current, item, now) {
+    if (current.start.getTime() !== item.start.getTime() || current.end.getTime() !== item.end.getTime()) {
+        return 'replace';
+    }
+    if (item.alarm && !current.alarm) return 'replace';
+    if (!item.alarm && current.alarm && item.start.getTime() > now) return 'replace';
+    return 'inPlace';
 }
 
 function sameList(a, b) {
@@ -77,16 +95,8 @@ function sameList(a, b) {
 // ---- Calendar part. ----
 
 function oneCalendar(app, wanted) {
-    var calendars = app.calendars;
-    var names = calendars.name(), ids = calendars.calendarIdentifier();
-    if (!sameList(names, calendars.name()) || ids.length !== names.length) fail('script');
-    var matches = [];
-    for (var i = 0; i < names.length; i++) {
-        if (names[i] === wanted) matches.push(ids[i]);  // Case-sensitive; AppleScript `whose` is not.
-    }
-    if (matches.length === 0) fail('no_calendar');
-    if (matches.length > 1) fail('duplicate_calendar');
-    var calendar = app.calendars.byId(matches[0]);
+    pickCalendar(app.calendars.name(), wanted);
+    var calendar = app.calendars.byName(wanted);
     if (calendar.name() !== wanted) fail('script');
     if (calendar.writable() !== true) fail('read_only');
     return calendar;
@@ -135,10 +145,14 @@ function addAlarm(app, event) {
     event.displayAlarms.push(app.DisplayAlarm({triggerInterval: 0}));  // An alert at the start time.
 }
 
-function removeAlarms(app, event) {
-    ALARM_KINDS.forEach(function (kind) {
-        for (var n = event[kind].length - 1; n >= 0; n--) app.delete(event[kind][n]);
-    });
+// The only way an event is made. The notes, and so the marker, are part of the creation record.
+function make(app, calendar, item) {
+    var made = app.Event({summary: item.title, startDate: item.start, endDate: item.end,
+                          description: item.notes});
+    calendar.events.push(made);
+    var event = calendar.events.byId(made.uid());
+    if (event.description() !== item.notes) fail('script');
+    if (item.alarm) addAlarm(app, event);
 }
 
 function apply(app, calendar, change) {
@@ -158,13 +172,14 @@ function apply(app, calendar, change) {
     updates.forEach(function (item) {
         var event = ours(calendar, item.uid);
         if (!event) return;  // Gone, or no longer OneOS's: nothing to do.
-        event.summary = item.title;
-        moveOrder(event.endDate(), item.start).forEach(function (field) {
-            event[field] = field === 'startDate' ? item.start : item.end;
-        });
-        event.description = item.notes;
-        removeAlarms(app, event);
-        if (item.alarm) addAlarm(app, event);
+        var current = {start: event.startDate(), end: event.endDate(), alarm: event.displayAlarms.length > 0};
+        if (updateKind(current, item, now) === 'replace') {
+            make(app, calendar, item);  // A failed delete next leaves a duplicate marker; the engine collapses it.
+            app.delete(event);
+        } else {
+            event.summary = item.title;
+            event.description = item.notes;
+        }
         summary.updated++;
     });
     change.delete.forEach(function (uid) {
@@ -174,13 +189,7 @@ function apply(app, calendar, change) {
         summary.deleted++;
     });
     creates.forEach(function (item) {
-        // The notes, and so the marker, are part of the creation record.
-        var made = app.Event({summary: item.title, startDate: item.start, endDate: item.end,
-                              description: item.notes});
-        calendar.events.push(made);
-        var event = calendar.events.byId(made.uid());
-        if (event.description() !== item.notes) fail('script');
-        if (item.alarm) addAlarm(app, event);
+        make(app, calendar, item);
         summary.created++;
     });
     return summary;
