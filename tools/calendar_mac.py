@@ -1,7 +1,7 @@
 """Host-side adapter for the Mac's Calendar app, through tools/calendar_mac.js (JXA)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -76,16 +76,18 @@ class MacCalendar:
         self.run = run
         self.name = name
 
-    def call(self, command: str, payload: dict):
+    def call(self, command: str, payload: dict, *, retry: bool = False):
+        """Run one script command. Only reads are retried: a timed-out apply may have written."""
         argv = [OSASCRIPT, '-l', 'JavaScript', str(SCRIPT), command,
                 json.dumps({'calendar': self.name, **payload})]
-        for attempt in range(2):
+        attempts = 2 if retry else 1
+        for attempt in range(attempts):
             try:
                 result = self.run(argv, check=False, capture_output=True, encoding='utf-8',
                                   errors='replace', timeout=TIMEOUT)
                 break
             except subprocess.TimeoutExpired:
-                if attempt:
+                if attempt == attempts - 1:
                     raise CalendarUnavailable('script') from None
             except (OSError, subprocess.SubprocessError):
                 raise CalendarUnavailable('script') from None
@@ -97,7 +99,7 @@ class MacCalendar:
             raise CalendarUnavailable('script') from None
 
     def events(self) -> list[CalendarEvent]:
-        value = self.call('list', {})
+        value = self.call('list', {}, retry=True)
         try:
             if not isinstance(value, list):
                 raise ValueError('list output must be an array')
@@ -117,23 +119,50 @@ class MacCalendar:
             raise CalendarUnavailable('script')
 
 
+def matching(found: list[CalendarEvent], want: CalendarEvent) -> CalendarEvent | None:
+    for item in found:
+        if (item.id, item.title, item.start, item.end, item.alarm) == \
+                (want.id, want.title, want.start, want.end, want.alarm) and (not want.uid or item.uid == want.uid):
+            return item
+    return None
+
+
+def clean_up(calendar: MacCalendar, marker: str) -> str:
+    try:
+        uids = [item.uid for item in calendar.events() if item.id == marker]
+        if uids:
+            calendar.apply([], [], uids)
+    except CalendarUnavailable as exc:
+        return exc.code
+    return 'ok'
+
+
 def selftest(calendar: MacCalendar) -> str:
-    """Create "OneOS test" one hour ahead, list it, delete it; return 'ok' or the failure code."""
+    """Create "OneOS test" one hour ahead, list it, move it a day later, list it, delete it.
+
+    Returns 'ok' or the failure code. The test event (and any an interrupted run left) is
+    deleted by its marker whatever happens in between.
+    """
     marker = 'oneos-' + '0' * 32
     start = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(second=0, microsecond=0)
     test = CalendarEvent(id=marker, title='OneOS test', start=start, end=start + timedelta(minutes=15),
                          notes=f'OneOS selftest\nOneOS id: {marker}', alarm=True)
+    outcome = 'ok'
     try:
         calendar.apply([test], [], [])
-        found = [item for item in calendar.events() if item.id == marker]
-        if found:  # Also clears any test event an interrupted run left behind.
-            calendar.apply([], [], [item.uid for item in found])
-        if not any(item.title == test.title and item.start == test.start and item.end == test.end
-                   and item.alarm for item in found):
-            return 'script'
+        made = matching(calendar.events(), test)
+        if made is None:
+            outcome = 'script'
+        else:
+            moved = replace(test, uid=made.uid, title='OneOS test (moved)', start=test.start + timedelta(days=1),
+                            end=test.end + timedelta(days=1), alarm=False)
+            calendar.apply([], [moved], [])
+            if matching(calendar.events(), moved) is None:
+                outcome = 'script'
     except CalendarUnavailable as exc:
-        return exc.code
-    return 'ok'
+        outcome = exc.code
+    cleaned = clean_up(calendar, marker)
+    return outcome if outcome != 'ok' else cleaned
 
 
 def main(argv=None) -> int:

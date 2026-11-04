@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -65,6 +66,14 @@ def test_timeout_is_retried_once_then_script_error():
         MacCalendar(run=run).events()
     assert info.value.code == "script"
     assert len(run.calls) == 2
+
+
+def test_timed_out_apply_is_not_retried():
+    run = FakeRun(subprocess.TimeoutExpired("osascript", 60), (0, json.dumps({"created": 1, "updated": 0, "deleted": 0}), ""))
+    with pytest.raises(CalendarUnavailable) as info:
+        MacCalendar(run=run).apply([event()], [], [])
+    assert info.value.code == "script"
+    assert len(run.calls) == 1
 
 
 def test_awkward_subject_travels_only_in_the_json_argument():
@@ -181,29 +190,72 @@ def test_calendar_name_is_passed_through():
     assert json.loads(run.calls[0][0][5]) == {"calendar": "Other"}
 
 
-def test_selftest_creates_lists_and_deletes(capsys, monkeypatch):
-    seen = {}
+class FakeCalendar:
+    """A stand-in for the script that keeps events in memory, for the selftest."""
 
-    def fake(args, **kwargs):
-        payload = json.loads(args[5])
-        if args[4] == "apply" and payload["create"]:
-            seen["created"] = payload["create"][0]
-            return subprocess.CompletedProcess(args, 0, json.dumps({"created": 1, "updated": 0, "deleted": 0}), "")
-        if args[4] == "list":
-            item = dict(seen["created"], uid="UID-T", created=None)
-            return subprocess.CompletedProcess(args, 0, json.dumps([item]), "")
-        assert payload["delete"] == ["UID-T"]
-        seen["deleted"] = True
-        return subprocess.CompletedProcess(args, 0, json.dumps({"created": 0, "updated": 0, "deleted": 1}), "")
+    def __init__(self, fail_lists=0):
+        self.events, self.calls, self.fail_lists, self.next = {}, [], fail_lists, 0
 
+    def __call__(self, args, **kwargs):
+        command, payload = args[4], json.loads(args[5])
+        self.calls.append((command, payload))
+        if command == "list":
+            if self.fail_lists:
+                self.fail_lists -= 1
+                return subprocess.CompletedProcess(args, 1, "", "")
+            return subprocess.CompletedProcess(args, 0, json.dumps(list(self.events.values())), "")
+        for item in payload["create"]:
+            self.next += 1
+            self.events[f"UID-{self.next}"] = dict(item, uid=f"UID-{self.next}", created=None)
+        for item in payload["update"]:
+            if item["uid"] in self.events:
+                self.events[item["uid"]] = dict(item, created=None)
+        for uid in payload["delete"]:
+            self.events.pop(uid, None)
+        counts = {"created": len(payload["create"]), "updated": len(payload["update"]),
+                  "deleted": len(payload["delete"])}
+        return subprocess.CompletedProcess(args, 0, json.dumps(counts), "")
+
+
+def test_selftest_creates_lists_moves_and_deletes(capsys, monkeypatch):
+    fake = FakeCalendar()
     monkeypatch.setattr(calendar_mac.subprocess, "run", fake)
     assert calendar_mac.main(["selftest"]) == 0
     assert capsys.readouterr().out.strip() == "ok"
-    assert seen["created"]["title"] == "OneOS test"
-    assert seen["created"]["alarm"] is True
-    start = datetime.fromisoformat(seen["created"]["start"])
+    assert [command for command, _ in fake.calls] == ["apply", "list", "apply", "list", "list", "apply"]
+    created = fake.calls[0][1]["create"][0]
+    assert created["title"] == "OneOS test" and created["alarm"] is True
+    start = datetime.fromisoformat(created["start"])
     assert timedelta(minutes=58) < start - datetime.now(timezone.utc) <= timedelta(hours=1)
-    assert seen["deleted"]
+    moved = fake.calls[2][1]["update"][0]
+    assert moved["uid"] == "UID-1" and moved["title"] != "OneOS test" and moved["alarm"] is False
+    assert datetime.fromisoformat(moved["start"]) == start + timedelta(days=1)
+    assert datetime.fromisoformat(moved["end"]) == start + timedelta(days=1, minutes=15)
+    assert fake.calls[-1][1]["delete"] == ["UID-1"]
+    assert fake.events == {}
+
+
+def test_selftest_reports_script_when_the_move_does_not_show(capsys, monkeypatch):
+    fake = FakeCalendar()
+    original = fake.__call__
+
+    def ignore_updates(args, **kwargs):
+        if args[4] == "apply" and json.loads(args[5])["update"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"created": 0, "updated": 1, "deleted": 0}), "")
+        return original(args, **kwargs)
+
+    monkeypatch.setattr(calendar_mac.subprocess, "run", ignore_updates)
+    assert calendar_mac.main(["selftest"]) == 1
+    assert capsys.readouterr().out.strip() == "script"
+    assert fake.events == {}
+
+
+def test_selftest_cleans_up_when_the_first_list_fails(capsys, monkeypatch):
+    fake = FakeCalendar(fail_lists=1)
+    monkeypatch.setattr(calendar_mac.subprocess, "run", fake)
+    assert calendar_mac.main(["selftest"]) == 1
+    assert capsys.readouterr().out.strip() == "script"
+    assert fake.events == {}
 
 
 def test_selftest_reports_script_when_the_event_is_not_listed(capsys, monkeypatch):
@@ -236,6 +288,8 @@ def test_script_has_one_error_code_table_and_exact_match():
     assert "whose(" not in source
     assert "-1743" in source
     assert "writable()" in source
+    assert "calendars.byId(" in source and "events.byId(" in source
+    assert not re.search(r"(calendars|events)\[", source)  # Never addressed by position.
 
 
 def test_script_checks_input_before_touching_calendar():
@@ -243,3 +297,73 @@ def test_script_checks_input_before_touching_calendar():
     body = source[source.index("function run(argv)"):]
     assert body.index("COMMANDS.hasOwnProperty(argv[0])") < body.index("Application('Calendar')")
     assert body.index("JSON.parse(argv[1])") < body.index("Application('Calendar')")
+
+
+MAC = sys.platform == "darwin" and os.path.exists("/usr/bin/osascript")
+# Replaces the script's run handler (the later declaration wins), so nothing below makes an Apple event.
+HARNESS = """
+function run(argv) {
+    var cases = JSON.parse(argv[0]), now = Date.now();
+    function code(f) { try { f(); return 'none'; } catch (e) { return codeFor(e); } }
+    function at(hours) { return new Date(now + hours * 3600e3).toISOString(); }
+    return output({
+        exit: EXIT,
+        markers: cases.markers.map(markerOf),
+        instants: cases.instants.map(function (v) {
+            return code(function () { instant(v); }) === 'none' ? instant(v).toISOString() : 'refused'; }),
+        alarms: [1, -1].map(function (h) {
+            return checked({title: 'x', notes: cases.marker, alarm: true, start: at(h), end: at(h)}, now).alarm; }),
+        alarmOff: checked({title: 'x', notes: cases.marker, alarm: false, start: at(1), end: at(1)}, now).alarm,
+        unmarked: code(function () { checked({title: 'x', notes: 'x', alarm: false, start: at(1), end: at(1)}, now); }),
+        backwards: code(function () { checked({title: 'x', notes: cases.marker, alarm: false, start: at(2), end: at(1)}, now); }),
+        echo: JSON.parse(output({text: cases.text})).text,
+        ascii: /^[\\x00-\\x7e]*$/.test(output({text: cases.text})),
+        codes: [code(function () { fail('read_only'); }), code(function () { fail('nonsense'); }),
+                codeFor({errorNumber: -1743}), codeFor({errorNumber: -1728}), codeFor(new Error('x'))],
+        moves: [moveOrder(new Date(at(1)), new Date(at(24))), moveOrder(new Date(at(1)), new Date(at(-24))),
+                moveOrder(new Date(at(1)), new Date(at(1)))]
+    });
+}
+"""
+
+
+def osascript(*args):
+    return subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", *args], capture_output=True, text=True,
+                          timeout=60, check=False)
+
+
+@pytest.mark.skipif(not MAC, reason="needs macOS osascript")
+def test_script_pure_functions_under_osascript(tmp_path):
+    source = calendar_mac.SCRIPT.read_text()
+    assert "Application(" not in HARNESS
+    harness = tmp_path / "harness.js"
+    harness.write_text(source + HARNESS)
+    hex32 = "0123456789abcdef" * 2
+    marker = f"OneOS id: oneos-{hex32}"
+    text = 'Say "hi" it\'s a \\ back\nslash \U0001F382 é'
+    cases = {"marker": marker, "text": text,
+             "markers": [f"Open\n{marker}", f"Open\r\n{marker}\n", marker, f"{marker}\nmore", f"{marker} ",
+                         f"OneOS id: oneos-{hex32.upper()}", f"OneOS id: oneos-{hex32[:-1]}", "", None],
+             "instants": ["2026-11-05T09:30:00.000Z", "2026-11-05T09:30:00Z", "2026-11-05T09:30:00",
+                          "2026-11-05T09:30:00+05:30", "2026-11-05", "nonsense"]}
+    result = osascript(str(harness), json.dumps(cases))
+    assert result.returncode == 0, "harness failed"
+    out = json.loads(result.stdout)
+    assert {number: code for code, number in out["exit"].items() if code != "script"} == calendar_mac.EXIT_CODES
+    assert out["exit"]["script"] not in calendar_mac.EXIT_CODES
+    assert out["markers"] == [f"oneos-{hex32}"] * 3 + [None] * 6
+    assert out["instants"] == ["2026-11-05T09:30:00.000Z"] * 2 + ["refused"] * 4
+    assert out["alarms"] == [True, False] and out["alarmOff"] is False
+    assert out["unmarked"] == "script" and out["backwards"] == "script"
+    assert out["echo"] == text and out["ascii"] is True
+    assert out["codes"] == ["read_only", "script", "permission", "script", "script"]
+    assert out["moves"] == [["endDate", "startDate"], ["startDate", "endDate"], ["startDate", "endDate"]]
+
+
+@pytest.mark.skipif(not MAC, reason="needs macOS osascript")
+@pytest.mark.parametrize("args", [["bogus", "{}"], ["list"], ["list", "not json"], ["list", "[]"],
+                                  ["apply", '{"calendar": ""}']])
+def test_script_refuses_bad_input_before_calendar(args):
+    # Each of these fails before the script's Application('Calendar') line.
+    result = osascript(str(calendar_mac.SCRIPT), *args)
+    assert result.returncode == 1 and result.stdout == ""
