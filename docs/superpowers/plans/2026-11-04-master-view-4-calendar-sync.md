@@ -11,7 +11,7 @@
 - A pure sync engine decides what to create, update and remove. It is tested against a fake calendar.
 - The app gains three things:
   - a stable event id per reminder;
-  - "landing in Done removes the reminder" on every path;
+  - a private "resolved" mark for reminders kept on Done cards, so they get no event;
   - a Home deep link that opens the reminder's card, surviving sign-in.
 
 **Tech Stack:** Python 3.12 (host tools under `tools/`, the app's `app/reminders.py`, `app/main.py`, `app/auth_web.py`), macOS `launchd` (`WatchPaths`, `RunAtLoad`), `/usr/bin/osascript -l JavaScript` (no new dependency), `fcntl` locks, pytest with fakes only.
@@ -37,7 +37,15 @@ The same folder also holds `owner.sqlite3`, whose journal comes and goes on ever
 
 ### Which reminders become events
 
-- Every row in the store becomes an event. To make that match the design, Task 1 makes **every** path that lands a card in Done delete its reminder row. Today only a stage press to the literal `done` does. A classify approval that files a note as `active`, which counts as Done, keeps the row ("resolved, not deleted"); that changes to deletion.
+- Every **open** row in the store becomes an event: a row with no resolved mark. Today's behaviour is kept (owner decision on #64, 2026-11-04):
+  - a stage press to `done` deletes the row, as it does now;
+  - a classify approval that files a note as `active` (which counts as Done) keeps the row, and the Done card still shows its reminder.
+
+  Task 1 adds a private `resolved_reminders` table (`key TEXT PRIMARY KEY, resolved_at TEXT NOT NULL`) in the same file. It is created only inside the write transaction that first resolves a reminder, as `review_flags` is.
+  - Every path that lands a card in Done and keeps its row marks it resolved.
+  - A move out of Done clears the mark.
+  - `rekey`, `remove` and `rename_entity` carry the mark with the row.
+  - The sync skips resolved rows, so their events are removed.
 - If the store is unsafe at that moment, the commit still lands and the row is kept, as today. The event then stays until the owner removes the reminder. Status reports nothing about it (known limit).
 
 ### Event contents
@@ -79,7 +87,7 @@ OneOS → Calendar only.
 
 ### Reading the store
 
-- Use the new `ReminderStore.snapshot() -> dict[str, Reminder] | None`. It returns `None` (no basis to delete) when:
+- Use the new `ReminderStore.snapshot() -> dict[str, Reminder] | None`. It holds the open rows only: resolved rows are left out, and a file with no `resolved_reminders` table has none resolved. It returns `None` (no basis to delete) when:
   - the file is missing;
   - the file is 0 bytes;
   - it has no `reminders` table;
@@ -163,7 +171,7 @@ These are documented in `docs/LOCAL-OPERATIONS.md`:
 
 ---
 
-### Task 1: Every landing in Done removes its reminder; shared event id; store snapshot
+### Task 1: Resolved mark for reminders kept on Done cards; shared event id; store snapshot
 
 **Files:**
 - Modify: `app/reminders.py` (add `calendar_event_id`, `ReminderStore.snapshot`) and `app/main.py` (`_stage_follows_move`, `_reminder_follows_approval`)
@@ -173,17 +181,22 @@ These are documented in `docs/LOCAL-OPERATIONS.md`:
 - Produces:
   - `calendar_event_id(key: str) -> str`;
   - `ReminderStore.snapshot() -> dict[str, Reminder] | None`, per Global Constraints. It is read-only and creates nothing.
+  - `ReminderStore.resolve(key: str) -> None` and `ReminderStore.unresolve(key: str) -> None`. `resolve` creates the table only when it writes; `unresolve` on a file without the table writes nothing.
 
 - [ ] **Step 1: Failing tests.**
   - `snapshot()` returns `None` for a missing file, a 0-byte file and a file with no `reminders` table; `{}` for an empty table; the rows otherwise. Directory and file bytes are unchanged after each call.
   - `calendar_event_id` is stable and matches `oneos-[0-9a-f]{32}`.
-  - A classify approval that files a reminder card as `active` (Done) deletes its row. Change the old assertion at `tests/test_master.py` ~1621 from "resolved, not deleted" to "deleted".
-  - A stage press to `done` still deletes. Waiting and To review moves still keep the row.
+  - A classify approval that files a reminder card as `active` (Done) keeps its row (the assertion at `tests/test_master.py` ~1621 is unchanged), marks it resolved, and leaves it out of `snapshot()`.
+  - Moving that card back to Waiting clears the mark, and the row is in `snapshot()` again.
+  - A stage press to `done` still deletes. Waiting and To review moves keep the row unresolved.
+  - `rekey` and `rename_entity` keep the mark with the row, and `remove` drops it.
+  - `snapshot()`, `all()` and every no-op write never create `resolved_reminders`.
+  - The Done card still shows its reminder.
   - An unsafe store still lets the commit land.
 - [ ] **Step 2: Run** `env -u GIT_EDITOR uv run pytest -q tests/test_reminders.py tests/test_master.py`. Expect failures.
-- [ ] **Step 3: Implement.** Done = the resulting status is `done` or `active`, the same rule as `stage_of`.
+- [ ] **Step 3: Implement.** Done = the resulting status is `done` or `active`, the same rule as `stage_of`. The calls go in the same best-effort post-commit spots as today's `remove`/`rekey` (`_stage_follows_move`, `_reminder_follows_approval`). A store failure never turns a landed commit into an error.
 - [ ] **Step 4: Run** the tests. Expect them to pass, and `tests/test_console_invariants.py` too.
-- [ ] **Step 5: Commit** "Reminders: any landing in Done removes the reminder; event id; snapshot".
+- [ ] **Step 5: Commit** "Reminders: a resolved mark for Done cards; event id; snapshot".
 
 ### Task 2: Calendar adapter for the Mac (JXA), with a live check
 
@@ -332,4 +345,4 @@ These are documented in `docs/LOCAL-OPERATIONS.md`:
 4. The sync is one-way. Edits in Calendar are overwritten. A deleted OneOS event comes back on the next change, the next boot, or within a day.
 5. `remove-calendar` leaves events in place. Deleting the calendar removes them.
 6. JXA through the built-in `osascript`, rather than a compiled Swift helper: there is no build step and no new dependency.
-7. Every landing in Done, including a classify approval filed as `active`, now deletes the reminder. Plan 2 kept that row as "resolved, not deleted", so the Done card stops showing the reminder subject.
+7. **Owner decision (#64, 2026-11-04):** keep today's behaviour. A reminder kept on a Done card still shows there. It is marked resolved in the private store so its calendar event is removed, and the mark is cleared if the card leaves Done.
