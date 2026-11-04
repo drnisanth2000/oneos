@@ -1568,11 +1568,11 @@ _SRC = "alpha/00-inbox/active/marker.md"
 _DST = "alpha/02-work/active/marker.md"
 
 
-def _approval_setup(tmp_path, tmp_path_factory, monkeypatch, *, store=True):
+def _approval_setup(tmp_path, tmp_path_factory, monkeypatch, *, store=True, full=False):
     """A committed vault with one inbox note and its pending classify proposal,
     and (unless `store` is false) a reminder on the inbox card."""
     main, vault = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
-    _inbox_with_proposal(tmp_path, "alpha", "marker.md", status="active")
+    _inbox_with_proposal(tmp_path, "alpha", "marker.md", status="active", full=full)
     client = TestClient(main.app)
     if not store:
         monkeypatch.delenv("ONEOS_AUTH_STATE_DIR", raising=False)
@@ -1619,7 +1619,98 @@ def test_approved_review_reminder_is_resolved(tmp_path, tmp_path_factory, monkey
     assert [m.card.relative_path for m in after.columns[3].cards] == [_DST]
     assert after.columns[3].cards[0].card.status == "active"
     assert list(ReminderStore(directory).all()) == [_DST]  # resolved, not deleted
+    assert ReminderStore(directory).snapshot() == {}  # marked resolved, so not open
     assert "Needs attention" not in client.get("/").text
+
+
+def test_done_card_after_approval_still_shows_its_reminder(tmp_path, tmp_path_factory, monkeypatch):
+    main, vault, client, directory = _approval_setup(tmp_path, tmp_path_factory, monkeypatch)
+    _approve(client, tmp_path)
+    done = _page(main, vault, directory).columns[3].cards
+    assert [(m.card.relative_path, m.reminder.subject) for m in done] == [(_DST, "Review it")]
+    assert ReminderStore(directory).snapshot() == {}
+
+
+def _approved_done_card(tmp_path, tmp_path_factory, monkeypatch):
+    main, vault, client, directory = _approval_setup(tmp_path, tmp_path_factory, monkeypatch, full=True)
+    _approve(client, tmp_path)
+    assert ReminderStore(directory).snapshot() == {}
+    return main, client, directory
+
+
+@pytest.mark.parametrize("stage", ["waiting", "draft"])
+def test_moving_a_resolved_card_out_of_done_clears_the_mark(
+    tmp_path, tmp_path_factory, monkeypatch, stage
+):
+    main, client, directory = _approved_done_card(tmp_path, tmp_path_factory, monkeypatch)
+    response = _press(client, "alpha", _DST, stage)
+    assert response.status_code == 200, response.text
+    assert f"\nstatus: {stage}\n" in (tmp_path / _DST).read_text(encoding="utf-8")
+    store = ReminderStore(directory)
+    assert set(store.snapshot()) == {_DST} and set(store.all()) == {_DST}
+
+
+def test_flagging_a_resolved_card_to_review_clears_the_mark(tmp_path, tmp_path_factory, monkeypatch):
+    main, client, directory = _approved_done_card(tmp_path, tmp_path_factory, monkeypatch)
+    response = _press(client, "alpha", _DST, "review", comment="Look again")
+    assert response.status_code == 200, response.text
+    store = ReminderStore(directory)
+    assert set(store.flags()) == {_DST}
+    assert set(store.snapshot()) == {_DST}
+
+
+def test_a_stage_press_to_done_still_deletes_and_other_stages_keep_the_row_open(
+    tmp_path, tmp_path_factory, monkeypatch
+):
+    main, vault_ = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
+    (tmp_path / "alpha" / "02-work" / "active").mkdir(parents=True, exist_ok=True)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    client = TestClient(main.app)
+    for name in ("Chase", "Spec", "Shut"):
+        _note(tmp_path, "alpha", "02-work", name, status="draft")
+    _git_commit_all(tmp_path)
+    due = datetime.now(timezone.utc) + timedelta(days=1)
+    store = _seed(directory, *(_reminder("alpha", n, due) for n in ("Chase", "Spec", "Shut")))
+    assert _press(client, "alpha", _path("alpha", "Chase"), "waiting").status_code == 200
+    assert _press(client, "alpha", _path("alpha", "Spec"), "review", comment="Later").status_code == 200
+    assert _press(client, "alpha", _path("alpha", "Shut"), "done").status_code == 200
+    assert set(store.all()) == {_path("alpha", "Chase"), _path("alpha", "Spec")}
+    assert set(store.snapshot()) == set(store.all())
+    assert "resolved_reminders" not in _tables(directory)
+
+
+def _tables(directory):
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(f"{(directory / 'reminders.sqlite3').as_uri()}?mode=ro", uri=True)) as db:
+        return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def test_approval_that_files_a_waiting_card_leaves_the_row_open(tmp_path, tmp_path_factory, monkeypatch):
+    main, vault = _vault(tmp_path, monkeypatch, _ARCHETYPES_WITH_SUB)
+    _inbox_with_proposal(tmp_path, "alpha", "marker.md", status="waiting")
+    client = TestClient(main.app)
+    directory = _auth_dir(tmp_path_factory, monkeypatch)
+    store = _seed(directory, Reminder(_SRC, "alpha", "Review it", datetime.now(timezone.utc) + timedelta(days=2)))
+    assert _approve(client, tmp_path).status_code == 200
+    assert set(store.snapshot()) == {_DST}
+    assert "resolved_reminders" not in _tables(directory)
+
+
+def test_a_failed_mark_does_not_fail_the_approval(tmp_path, tmp_path_factory, monkeypatch):
+    main, vault, client, directory = _approval_setup(tmp_path, tmp_path_factory, monkeypatch)
+
+    def refuse(store, key):
+        raise main.ReminderStoreUnavailable()
+
+    monkeypatch.setattr(main.ReminderStore, "resolve", refuse)
+    response = _approve(client, tmp_path)
+    assert response.status_code == 200
+    assert (tmp_path / _DST).is_file() and not (tmp_path / _SRC).exists()
+    assert "outbox: approve" in subprocess.run(
+        ["git", "log", "-1", "--format=%s"], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    assert list(ReminderStore(directory).all()) == [_DST]
 
 
 def test_rekey_failure_does_not_fail_the_approval(tmp_path, tmp_path_factory, monkeypatch):

@@ -13,10 +13,19 @@ Review flags (a filed note put in "To review") live in the same file, in their
 own `review_flags` table. That table is created only inside a write
 transaction that stores a flag; a file without it simply has no flags, and no
 read or no-op write ever creates it.
+
+A reminder kept on a card that landed in Done (an approval that files a note
+as `active`) carries a private "resolved" mark, in its own `resolved_reminders`
+table. The row stays, so the Done card still shows its reminder, but it is no
+longer open: `snapshot()` leaves it out. The table follows the same rule as
+`review_flags`: created only inside the write transaction that first marks a
+reminder, never by a read or a no-op write. The mark moves with the row on
+`rekey` and `rename_entity` and goes with it on `remove`.
 """
 from __future__ import annotations
 
 import os
+import hashlib
 import re
 import sqlite3
 import stat
@@ -62,6 +71,13 @@ class ReviewFlag:
     entity: str
     comment: str | None
     flagged_at: datetime  # timezone-aware
+
+
+@failure_contract(raises=())
+def calendar_event_id(key: str) -> str:
+    """The id a reminder's Calendar event carries, derived from its card key.
+    It names no vault path, entity or title: `oneos-` and 32 lowercase hex."""
+    return "oneos-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
 @failure_contract(raises=(InvalidReminder,))
@@ -198,6 +214,10 @@ _FLAGS_SCHEMA = (
     "key TEXT PRIMARY KEY, entity TEXT NOT NULL, comment TEXT, "
     "flagged_at TEXT NOT NULL)"
 )
+_RESOLVED_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS resolved_reminders ("
+    "key TEXT PRIMARY KEY, resolved_at TEXT NOT NULL)"
+)
 
 
 def _has_table(db, name: str) -> bool:
@@ -208,6 +228,10 @@ def _has_table(db, name: str) -> bool:
 
 def _has_flags_table(db) -> bool:
     return _has_table(db, "review_flags")
+
+
+def _has_resolved_table(db) -> bool:
+    return _has_table(db, "resolved_reminders")
 
 
 class ReminderStore:
@@ -349,6 +373,26 @@ class ReminderStore:
             rows = db.execute("SELECT key, entity, subject, due_at FROM reminders").fetchall()
         return {row[0]: _row_to_reminder(row) for row in rows}
 
+    @failure_contract(raises=())
+    def snapshot(self) -> dict[str, Reminder] | None:
+        """The open reminders by key, for the Calendar sync: resolved rows are
+        left out, and a file with no `resolved_reminders` table has none
+        resolved. `None` means there is no basis to delete anything: the file
+        is missing or 0 bytes, has no `reminders` table, or cannot be read
+        safely. `{}` is a real, empty store. Read-only: it never creates the
+        file or a table."""
+        try:
+            with self.connect(readonly=True) as db:
+                if db is None or not _has_table(db, "reminders"):
+                    return None
+                query = "SELECT key, entity, subject, due_at FROM reminders"
+                if _has_resolved_table(db):
+                    query += " WHERE key NOT IN (SELECT key FROM resolved_reminders)"
+                rows = db.execute(query).fetchall()
+            return {row[0]: _row_to_reminder(row) for row in rows}
+        except ReminderStoreUnavailable:
+            return None
+
     @failure_contract(raises=(ReminderStoreUnavailable, InvalidReminder))
     def save(self, reminder: Reminder) -> None:
         reminder = _validated(reminder)
@@ -362,17 +406,48 @@ class ReminderStore:
                 "due_at=excluded.due_at, updated_at=excluded.updated_at",
                 (reminder.key, reminder.entity, subject, reminder.due_at.isoformat(), updated),
             )
+            # Saving a reminder is only offered on a card outside Done, so a
+            # mark left behind by a missed clean-up must not hide it.
+            if _has_resolved_table(db):
+                db.execute("DELETE FROM resolved_reminders WHERE key=?", (reminder.key,))
 
     @failure_contract(raises=(ReminderStoreUnavailable,))
     def remove(self, key: str) -> None:
         with self.connect(existing=True) as db:
             if db is not None:
                 db.execute("DELETE FROM reminders WHERE key=?", (key,))
+                if _has_resolved_table(db):
+                    db.execute("DELETE FROM resolved_reminders WHERE key=?", (key,))
+
+    @failure_contract(raises=(ReminderStoreUnavailable,))
+    def resolve(self, key: str) -> None:
+        """Mark the reminder under `key` resolved (kept, but no longer open).
+        Idempotent. A key with no reminder, and a file with no `reminders`
+        table, write nothing; the mark table is created only when a mark is
+        stored."""
+        with self.connect(existing=True) as db:
+            if db is None:
+                return
+            if db.execute("SELECT 1 FROM reminders WHERE key=?", (key,)).fetchone() is None:
+                return
+            db.execute(_RESOLVED_SCHEMA)
+            db.execute(
+                "INSERT OR IGNORE INTO resolved_reminders (key, resolved_at) VALUES (?, ?)",
+                (key, datetime.now(timezone.utc).isoformat()),
+            )
+
+    @failure_contract(raises=(ReminderStoreUnavailable,))
+    def unresolve(self, key: str) -> None:
+        """Clear the resolved mark; idempotent, and never creates anything."""
+        with self.connect(existing=True) as db:
+            if db is not None and _has_resolved_table(db):
+                db.execute("DELETE FROM resolved_reminders WHERE key=?", (key,))
 
     @failure_contract(raises=(ReminderStoreUnavailable,))
     def rekey(self, old: str, new: str) -> None:
-        """Move the reminder and the review flag stored under `old` to `new`
-        (a stale row already under `new` is replaced), in one transaction."""
+        """Move the reminder, its resolved mark and the review flag stored under
+        `old` to `new` (a stale row already under `new` is replaced), in one
+        transaction."""
         if old == new:
             return
         with self.connect(existing=True) as db:
@@ -385,6 +460,9 @@ class ReminderStore:
                     "UPDATE reminders SET key=?, updated_at=? WHERE key=?",
                     (new, now, old),
                 )
+                if _has_resolved_table(db):
+                    db.execute("DELETE FROM resolved_reminders WHERE key=?", (new,))
+                    db.execute("UPDATE resolved_reminders SET key=? WHERE key=?", (new, old))
             if _has_flags_table(db) and db.execute(
                 "SELECT 1 FROM review_flags WHERE key=?", (old,)
             ).fetchone() is not None:
@@ -429,7 +507,8 @@ class ReminderStore:
     def rename_entity(self, old: str, new: str) -> int:
         """Follow an entity rename: rewrite `entity` and the leading `old/`
         path segment of every key stored for `old`, in one transaction.
-        Returns the number of rows changed (reminders and flags). Only the exact first segment moves
+        Returns the number of rows changed (reminders and flags; resolved marks
+        ride along with their reminder and are not counted). Only the exact first segment moves
         (`older/x.md` is another entity's key and stays). A stale row already
         sitting under a rewritten key is replaced, as in `rekey`. Review flags
         follow the same rule in the same transaction; the count includes them."""
@@ -442,14 +521,19 @@ class ReminderStore:
                 return 0
             now = datetime.now(timezone.utc).isoformat()
             rows = db.execute("SELECT key FROM reminders WHERE entity=?", (old,)).fetchall()
+            marked = _has_resolved_table(db)
             for (key,) in rows:
                 new_key = new + "/" + key[len(prefix):] if key.startswith(prefix) else key
                 if new_key != key:
                     db.execute("DELETE FROM reminders WHERE key=?", (new_key,))
+                    if marked:
+                        db.execute("DELETE FROM resolved_reminders WHERE key=?", (new_key,))
                 db.execute(
                     "UPDATE reminders SET key=?, entity=?, updated_at=? WHERE key=?",
                     (new_key, new, now, key),
                 )
+                if marked and new_key != key:
+                    db.execute("UPDATE resolved_reminders SET key=? WHERE key=?", (new_key, key))
                 changed += 1
             if _has_flags_table(db):
                 flagged = db.execute(
