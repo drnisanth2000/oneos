@@ -508,3 +508,124 @@ def test_fingerprint_ignores_the_alarm_and_time_passing(state):
     assert before == after
     changed = calendar_sync.fingerprint(desired_events({item.key: replace(item, subject="Other")}, NOW))
     assert changed != before
+
+
+# ---- fix round 1 ----
+
+def test_changed_fingerprint_during_the_cool_down_runs(state):
+    store(state).save(reminder())
+    calendar = FakeCalendar(fail="no_calendar")
+    run(state, calendar)
+    calendar.fail = None
+    calendar.calls.clear()
+    store(state).save(reminder(key="b.md", subject="Second"))
+    report = run(state, calendar, now=NOW + timedelta(minutes=2))
+    assert (report.state, report.created) == ("ok", 2)
+    assert calendar.calls[0] == ("events",)
+
+
+class Exploding(FakeCalendar):
+    def apply(self, create, update, delete):
+        self.calls.append(("apply",))
+        raise RuntimeError("synthetic")
+
+
+def test_any_exception_records_failed_and_cools_down(state):
+    store(state).save(reminder())
+    calendar = Exploding()
+    report = run(state, calendar)
+    assert (report.state, report.code) == ("failed", "script")
+    folder = state / "calendar"
+    status = json.loads((folder / "status.json").read_text())
+    assert (status["state"], status["code"]) == ("failed", "script")
+    assert json.loads((folder / "last-sync.json").read_text())["outcome"] == "failed"
+    calendar.calls.clear()
+    report = run(state, calendar, now=NOW + timedelta(minutes=5))
+    assert (report.state, report.code) == ("skipped", "cool_down")
+    assert calendar.calls == []
+
+
+def test_an_overflow_date_reminder_does_not_poison_the_sync(state):
+    store(state).save(reminder())
+    store(state).save(reminder(key="far.md", subject="Far", due=datetime(9999, 12, 31, 23, 50, tzinfo=UTC)))
+    store(state).save(reminder(key="over.md", subject="Over",
+                               due=datetime(9999, 12, 31, 22, 0, tzinfo=timezone(timedelta(hours=-5)))))
+    calendar = FakeCalendar()
+    report = run(state, calendar)
+    assert (report.state, report.created) == ("ok", 1)
+    assert [item.id for item in calendar.ours()] == [calendar_event_id("inbox/pay-card.md")]
+
+
+def test_a_future_cool_down_stamp_counts_as_expired(state):
+    store(state).save(reminder())
+    calendar = FakeCalendar(fail="no_calendar")
+    run(state, calendar, now=NOW + timedelta(hours=1))  # the clock was ahead, then stepped back
+    calendar.fail = None
+    calendar.calls.clear()
+    report = run(state, calendar, force=False, now=NOW)
+    assert report.state == "ok" and calendar.calls[0] == ("events",)
+
+
+def test_a_future_force_stamp_forces(state):
+    store(state).save(reminder())
+    calendar = FakeCalendar()
+    run(state, calendar, now=NOW + timedelta(days=3))
+    calendar.calls.clear()
+    report = run(state, calendar, now=NOW)
+    assert report.state == "ok" and calendar.calls == [("events",)]
+
+
+def test_duplicate_collapse_never_deletes_the_kept_uid():
+    want = one_desired()
+    plan = plan_sync({want.id: want}, [listed(want, "u1"), listed(want, "u1"), listed(want, "u2"),
+                                       listed(want, "u2")])
+    assert plan == SyncPlan([], [], ["u2"])
+
+
+def test_sub_second_due_at_is_truncated_and_never_replaced(state):
+    due = datetime(2026, 11, 5, 9, 0, 0, 600000, tzinfo=UTC)
+    item = reminder(due=due)
+    event = desired_events({item.key: item}, NOW)[calendar_event_id(item.key)]
+    assert event.start == datetime(2026, 11, 5, 9, 0, tzinfo=UTC)
+    assert event.end == datetime(2026, 11, 5, 9, 15, tzinfo=UTC)
+    store(state).save(item)
+    calendar = FakeCalendar()
+    run(state, calendar)
+    calendar.calls.clear()
+    assert run(state, calendar, force=True, now=NOW + timedelta(minutes=1)).updated == 0
+    assert calendar.calls == [("events",)]
+
+
+def test_store_without_a_reminders_table_is_skipped(state):
+    import sqlite3
+    path = state / "auth" / "reminders.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.execute("CREATE TABLE other (x)")
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+    calendar = FakeCalendar()
+    assert (run(state, calendar).state, run(state, calendar).code) == ("skipped", "no_store")
+    assert calendar.calls == []
+
+
+def test_unsafe_store_is_skipped(state):
+    store(state).save(reminder())
+    (state / "auth" / "reminders.sqlite3").chmod(0o644)
+    calendar = FakeCalendar()
+    report = run(state, calendar)
+    assert (report.state, report.code) == ("skipped", "no_store")
+    assert calendar.calls == []
+
+
+def test_bad_row_is_skipped(state):
+    import sqlite3
+    store(state).save(reminder())
+    connection = sqlite3.connect(state / "auth" / "reminders.sqlite3")
+    connection.execute("UPDATE reminders SET due_at='not a time'")
+    connection.commit()
+    connection.close()
+    calendar = FakeCalendar()
+    report = run(state, calendar)
+    assert (report.state, report.code) == ("skipped", "no_store")
+    assert calendar.calls == []

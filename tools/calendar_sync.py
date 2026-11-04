@@ -59,14 +59,19 @@ def _second(value: datetime) -> datetime:
 
 
 def desired_events(reminders: dict[str, Reminder], now: datetime) -> dict[str, CalendarEvent]:
-    """The event each open reminder should have, by event id. The alert is set
-    only for a start still in the future at `now`."""
+    """The event each open reminder should have, by event id, at whole seconds.
+    The alert is set only for a start still in the future at `now`. A reminder
+    whose event would not fit in a datetime (due near year 9999) gets none."""
     events = {}
     for item in reminders.values():
         event_id = calendar_event_id(item.key)
-        start = item.due_at.astimezone(UTC)
+        try:
+            start = _second(item.due_at)
+            end = start + DURATION
+        except OverflowError:
+            continue
         events[event_id] = CalendarEvent(
-            id=event_id, title=item.subject, start=start, end=start + DURATION,
+            id=event_id, title=item.subject, start=start, end=end,
             notes=f'Open in OneOS on this Mac: {LINK}{event_id}\nOneOS id: {event_id}',
             alarm=start > now)
     return events
@@ -88,7 +93,10 @@ def plan_sync(desired: dict[str, CalendarEvent], existing: list[CalendarEvent]) 
         groups.setdefault(item.id, []).append(item)
     kept, duplicates = {}, []
     for event_id in sorted(groups):
-        first, *rest = sorted(groups[event_id], key=lambda item: item.uid)
+        by_uid = {}
+        for item in groups[event_id]:
+            by_uid.setdefault(item.uid, item)
+        first, *rest = (by_uid[uid] for uid in sorted(by_uid))
         kept[event_id] = first
         duplicates.extend(item.uid for item in rest)
     create, update = [], []
@@ -202,7 +210,7 @@ def _due_for_force(folder: Path, current_boot: str, now: datetime) -> bool:
         return True
     forced = _read(folder / 'forced.json')
     at = _time(forced.get('at')) if isinstance(forced, dict) else None
-    return at is None or now - at > FORCE_AGE
+    return at is None or at > now or now - at > FORCE_AGE  # a stamp ahead of the clock has expired
 
 
 def _skip(last, mark: str, now: datetime) -> str | None:
@@ -210,9 +218,11 @@ def _skip(last, mark: str, now: datetime) -> str | None:
     if not isinstance(last, dict):
         return None
     outcome, at = last.get('outcome'), _time(last.get('at'))
-    if outcome == 'ok' and last.get('fingerprint') == mark:
+    if last.get('fingerprint') != mark:
+        return None
+    if outcome == 'ok':
         return 'unchanged'
-    if outcome in ('needs_setup', 'failed') and at is not None and now - at < COOL_DOWN:
+    if outcome in ('needs_setup', 'failed') and at is not None and at <= now and now - at < COOL_DOWN:
         return 'cool_down'
     return None
 
@@ -239,22 +249,25 @@ def run_sync(state_dir: Path, calendar, *, force: bool | None = None, now: datet
             report = SyncReport('skipped', code=code)
             _status(folder, report, now)
             return report
-        desired = desired_events(reminders, now)
-        mark = fingerprint(desired)
-        current_boot = boot_id()
-        if force is None:
-            force = _due_for_force(folder, current_boot, now)
-        if not force:
-            skipped = _skip(_read(folder / 'last-sync.json'), mark, now)
-            if skipped:
-                return SyncReport('skipped', code=skipped)
+        mark, current_boot = '', ''
         try:
+            desired = desired_events(reminders, now)
+            mark = fingerprint(desired)
+            current_boot = boot_id()
+            if force is None:
+                force = _due_for_force(folder, current_boot, now)
+            if not force:
+                skipped = _skip(_read(folder / 'last-sync.json'), mark, now)
+                if skipped:
+                    return SyncReport('skipped', code=skipped)
             plan = plan_sync(desired, calendar.events())
             if plan.create or plan.update or plan.delete:
                 calendar.apply(plan.create, plan.update, plan.delete)
             report = SyncReport('ok', len(plan.create), len(plan.update), len(plan.delete))
         except CalendarUnavailable as exc:
             report = SyncReport('failed' if exc.code == 'script' else 'needs_setup', code=exc.code)
+        except Exception:  # never stall: record it so the cool-down applies, then report
+            report = SyncReport('failed', code='script')
         write_json(folder / 'last-sync.json', {'fingerprint': mark, 'outcome': report.state, 'at': now.isoformat()})
         if force:
             write_json(folder / 'boot-id', current_boot)
