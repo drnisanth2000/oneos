@@ -89,6 +89,37 @@ errors, paths, and credential data are never forwarded.
 python -m tools.local_service --state-dir "$ONEOS_STATE_DIR" install-login
 ```
 
+## Reminders in the Mac's Calendar
+
+OneOS can put each open reminder into the Mac's Calendar as a 15-minute event,
+so its alert reaches your iPhone. It is one-way: OneOS writes, and edits made
+in Calendar are overwritten. Only the reminder's subject goes to Calendar, and
+never a note's path. It is off until you set it up:
+
+1. In Calendar, create a calendar named `OneOS`. Choose iCloud so its alerts
+   reach your iPhone. OneOS never creates the calendar itself, and it refuses
+   to use one that is missing, duplicated, or read-only.
+2. In Terminal, run `OneOS.command install-calendar`. It runs one sync right
+   away, so macOS asks once for permission to control Calendar; allow it. If
+   anything is missing it stops and says what to fix (create the calendar,
+   remove a duplicate, use an editable calendar, or allow Calendar under
+   System Settings, Privacy & Security, Automation), and installs nothing.
+   When the sync works it installs the `local.oneos.calendar` LaunchAgent,
+   which syncs again whenever reminders change and at login.
+3. To turn it off, run `OneOS.command remove-calendar`. It unloads and removes
+   that one job and leaves the events in Calendar. To remove the events too,
+   delete the `OneOS` calendar in Calendar.
+4. Event alerts reach your iPhone through iCloud. The link in each event's
+   notes opens OneOS only on this Mac, because OneOS answers only at
+   `localhost`.
+
+An event for a reminder is updated when the reminder changes and removed when
+the reminder is done. `status` and `doctor` show a `calendar` line: `off` (job
+not installed), `on`, `needs_setup` (with the step to take), or `failed`. The
+calendar line never makes `doctor` fail. Like `install-login`, `install-calendar`
+refuses to replace an existing job file or loaded job; run `remove-calendar`
+first.
+
 ## External encrypted backup
 
 Use an external physical drive mounted in macOS. Only the encrypted restic

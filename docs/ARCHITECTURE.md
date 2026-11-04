@@ -92,7 +92,9 @@ the bug.
 **Tools** — `tools/gate3_audit.py` (Gate 3), `tools/public_repo_audit.py` and
 `tools/run_gitleaks.sh` (publication gates), `tools/local_service.py`,
 `tools/local_backup.py`, `tools/local_metadata.py` (local deployment and
-backups; see `docs/LOCAL-OPERATIONS.md`).
+backups; see `docs/LOCAL-OPERATIONS.md`), `tools/calendar_sync.py` and
+`tools/calendar_mac.py` (one-way sync of open reminders into the Mac's
+Calendar, run by the `local.oneos.calendar` LaunchAgent).
 
 ## HTTP routes
 

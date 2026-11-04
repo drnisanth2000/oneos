@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import json
 import math
@@ -214,6 +214,8 @@ def safe_failure(error):
         'insufficient private staging capacity': ('capacity_required', 'Free enough host storage for private snapshot staging, then retry.'),
         'insufficient isolated recovery capacity': ('capacity_required', 'Free enough host storage for isolated recovery, then retry.'),
         'snapshot manifest mismatch': ('verification_failed', 'Recovered data or metadata failed verification. Keep the isolated copy for inspection; do not activate it.'),
+        'calendar job already exists; inspect before replacing': ('job_exists', 'The calendar job is already installed. To reinstall it, run remove-calendar first.'),
+        'calendar job already loaded; inspect before replacing': ('job_exists', 'The calendar job is already loaded. To reinstall it, run remove-calendar first.'),
         'extended attribute copy verification failed': ('metadata_failed', 'Extended attribute preservation failed. Keep source metadata intact and inspect filesystem support.'),
     }
     if isinstance(error, ValueError) and str(error) in known:
@@ -276,7 +278,7 @@ def authentication_diagnostic(config):
             return finding('busy', 'Retry after the current authentication activity finishes.')
         # Immutable read avoids creating journals, SHM files or a write transaction.
         # This reports enrollment presence only; the app performs full validation.
-        with sqlite3.connect(path.as_uri() + '?immutable=1', uri=True) as db:
+        with closing(sqlite3.connect(path.as_uri() + '?immutable=1', uri=True)) as db:
             healthy = db.execute('pragma quick_check').fetchone() == ('ok',)
             enrolled = db.execute("SELECT EXISTS(SELECT 1 FROM owner WHERE id=1 AND password LIKE '$argon2id$%' AND length(secret)=32 AND typeof(counter)='integer')").fetchone()[0]
         if healthy and enrolled:
@@ -320,6 +322,7 @@ def diagnostics(config):
     except (OSError, ValueError):
         result['vault'] = finding('unavailable', 'Reconnect the configured vault and check private path permissions; do not create an empty replacement.')
     result['authentication'] = authentication_diagnostic(config)
+    result['calendar'] = calendar_diagnostic(config)
     if 'backup' not in config:
         result['backup'] = finding('not_configured', 'Optional: run setup-backup with an external drive and an offline key copy when you want backups.')
     else:
@@ -350,25 +353,31 @@ def diagnostics(config):
     return result
 
 
-def install_login(config):
-    """Install only on explicit invocation; launchd retries daily backup catch-up hourly."""
+def _preflight_agent(suffix, noun):
+    """Refuse an existing plist or loaded job; return (plist path, launchd domain, job target)."""
     library = safe_path(Path.home() / 'Library')
     (library / 'LaunchAgents').mkdir(mode=0o700, exist_ok=True)
     destination = safe_path(library / 'LaunchAgents')
-    python = sys.executable  # Preserve the venv entrypoint, not its base interpreter.
-    # Backups run only when the owner chooses (`backup`); no scheduled job.
-    jobs = [('login', 'login-start')]
-    paths = [destination / ('local.oneos.' + suffix + '.plist') for suffix, _ in jobs]
-    if any(path.exists() or path.is_symlink() for path in paths):
-        raise ValueError('login job already exists; inspect before replacing')
+    path = destination / ('local.oneos.' + suffix + '.plist')
+    if path.exists() or path.is_symlink():
+        raise ValueError(noun + ' job already exists; inspect before replacing')
     domain = 'gui/' + str(os.getuid())
-    targets = [domain + '/local.oneos.' + suffix for suffix, _ in jobs]
-    for target in targets:
-        result = subprocess.run(['launchctl', 'print', target], check=False, capture_output=True, timeout=30)
-        if result.returncode == 0:
-            raise ValueError('login job already loaded; inspect before replacing')
-        if result.returncode != 113:
-            raise OSError('unable to verify login job state')
+    target = domain + '/local.oneos.' + suffix
+    result = subprocess.run(['launchctl', 'print', target], check=False, capture_output=True, timeout=30)
+    if result.returncode == 0:
+        raise ValueError(noun + ' job already loaded; inspect before replacing')
+    if result.returncode != 113:
+        raise OSError('unable to verify ' + noun + ' job state')
+    return path, domain, target
+
+
+def _launch_agent(config, suffix, command, noun, extra):
+    """Install one user LaunchAgent only on explicit invocation, refusing to replace an
+    existing plist or loaded job and rolling back completely on any failure."""
+    python = sys.executable  # Preserve the venv entrypoint, not its base interpreter.
+    jobs = [(suffix, command)]
+    path, domain, target = _preflight_agent(suffix, noun)
+    paths, targets = [path], [target]
     created, attempted, bootstrapped = [], [], set()
     try:
         for (suffix, command), path, target in zip(jobs, paths, targets, strict=True):
@@ -376,7 +385,7 @@ def install_login(config):
             value = {'Label': label,
                      'ProgramArguments': [python, '-m', 'tools.local_service', '--state-dir', config['state_dir'], command],
                      'WorkingDirectory': config['repo_dir'], 'RunAtLoad': True,
-                     'EnvironmentVariables': {'PATH': os.environ.get('PATH', '')}}
+                     'EnvironmentVariables': {'PATH': os.environ.get('PATH', '')}, **extra}
             output = path.open('xb')
             created.append(path)
             with output:
@@ -392,24 +401,121 @@ def install_login(config):
                 result = subprocess.run(['launchctl', 'bootout', target], check=False,
                                         capture_output=True, timeout=30)
                 if result.returncode and (target in bootstrapped or result.returncode != 113):
-                    cleanup_error = OSError('login job rollback incomplete')
+                    cleanup_error = OSError(noun + ' job rollback incomplete')
             except (OSError, subprocess.SubprocessError):
-                cleanup_error = OSError('login job rollback incomplete')
+                cleanup_error = OSError(noun + ' job rollback incomplete')
         for path in reversed(created):
             try:
                 path.unlink(missing_ok=True)
             except OSError:
-                cleanup_error = OSError('login job rollback incomplete')
+                cleanup_error = OSError(noun + ' job rollback incomplete')
         if cleanup_error:
             raise cleanup_error from error
         raise
+
+
+def install_login(config):
+    """Install only on explicit invocation; launchd retries daily backup catch-up hourly."""
+    # Backups run only when the owner chooses (`backup`); no scheduled job.
+    _launch_agent(config, 'login', 'login-start', 'login', {})
+
+
+CALENDAR_ACTIONS = {
+    'no_calendar': 'In Calendar, create a calendar named OneOS (choose iCloud so its alerts reach your iPhone), then run install-calendar again in Terminal.',
+    'duplicate_calendar': 'More than one calendar is named OneOS. Keep one (the iCloud one), rename or delete the others, then run install-calendar again.',
+    'read_only': 'The OneOS calendar is read-only. Use a calendar you can edit, then run install-calendar again.',
+    'permission': "Open System Settings \u2192 Privacy & Security \u2192 Automation and allow OneOS's Python to control Calendar, then run install-calendar again in Terminal.",
+}
+CALENDAR_FAILED = 'The last calendar sync failed. It tries again on its own; if it keeps failing, run remove-calendar, then install-calendar, in Terminal.'
+CALENDAR_UNAVAILABLE = 'Calendar sync could not use its private state. Check that the state directory is owner-only, then run install-calendar again in Terminal.'
+
+
+class CalendarRefusal(ValueError):
+    """install-calendar declined; carries a code and the owner's next action only."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+def calendar_sync_once(config):
+    """The LaunchAgent's job: one sync, always returning normally. run_sync takes the
+    calendar lock itself and records the outcome in the status file."""
+    from tools import calendar_mac, calendar_sync
+    try:
+        calendar_sync.run_sync(Path(config['state_dir']), calendar_mac.MacCalendar())
+    except Exception:  # the job always exits 0; a state error just leaves the last status
+        pass
+
+
+def install_calendar(config, *, sync=None, calendar_factory=None):
+    """Run one forced sync in the foreground (so macOS asks for permission here), and
+    install the background job only when Calendar is ready."""
+    from tools import calendar_mac, calendar_sync
+    sync = sync or calendar_sync.run_sync
+    calendar_factory = calendar_factory or calendar_mac.MacCalendar
+    state = config['state_dir']
+    _preflight_agent('calendar', 'calendar')  # refuse before waking Calendar
+    try:
+        report = sync(Path(state), calendar_factory(), force=True)
+    except (ValueError, OSError):
+        raise CalendarRefusal('calendar_unavailable', CALENDAR_UNAVAILABLE) from None
+    if report.state == 'needs_setup' and report.code in CALENDAR_ACTIONS:
+        raise CalendarRefusal(report.code, CALENDAR_ACTIONS[report.code])
+    if report.state in ('needs_setup', 'failed'):
+        raise CalendarRefusal('calendar_failed', CALENDAR_FAILED)
+    _launch_agent(config, 'calendar', 'calendar-sync', 'calendar', {
+        'WatchPaths': [state + '/auth', state + '/auth/reminders.sqlite3'],
+        'ThrottleInterval': 30, 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
+
+
+def remove_calendar(config):
+    """Unload and delete only the calendar job; events stay in Calendar."""
+    path = Path.home() / 'Library/LaunchAgents/local.oneos.calendar.plist'
+    target = 'gui/' + str(os.getuid()) + '/local.oneos.calendar'
+    try:
+        result = subprocess.run(['launchctl', 'bootout', target], check=False, capture_output=True, timeout=30)
+    except subprocess.SubprocessError as error:
+        raise OSError('unable to unload the calendar job') from error
+    if result.returncode not in (0, 113):  # 113: it was not loaded
+        raise OSError('unable to unload the calendar job')
+    path.unlink(missing_ok=True)
+
+
+def calendar_diagnostic(config):
+    """off | on | needs_setup | failed from the job's plist and its status file; never a failure of doctor."""
+    try:
+        plist = Path.home() / 'Library/LaunchAgents/local.oneos.calendar.plist'
+        installed = plist.exists() or plist.is_symlink()
+    except (OSError, RuntimeError):
+        installed = False
+    if not installed:
+        return finding('off', "Optional: create a calendar named OneOS, then run install-calendar to put reminders in the Mac's Calendar.")
+    path = Path(config['state_dir']) / 'calendar/status.json'
+    try:
+        if not path.exists() and not path.is_symlink():
+            return finding('on', 'Reminders sync to the OneOS calendar; the first sync has not run yet.')
+        status = json.loads(private_file(path).read_text())
+        if not isinstance(status, dict):
+            raise ValueError('invalid calendar status')
+        state, code = status.get('state'), status.get('code')
+        if state in ('ok', 'skipped'):
+            return finding('on', 'Reminders sync to the OneOS calendar.')
+        if state == 'needs_setup' and code in CALENDAR_ACTIONS:
+            return finding('needs_setup', CALENDAR_ACTIONS[code])
+        if state == 'failed':
+            return finding('failed', CALENDAR_FAILED)
+    except (OSError, ValueError, TypeError):
+        pass
+    return finding('failed', CALENDAR_FAILED)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--state-dir', type=Path, required=True)
     parser.add_argument('command', choices=['setup', 'start', 'open', 'enroll', 'recover', 'stop', 'status', 'logs', 'doctor', 'backup',
-                                         'restore-check', 'install-login', 'login-start', 'backup-due', 'setup-backup'])
+                                         'restore-check', 'install-login', 'login-start', 'backup-due', 'setup-backup',
+                                         'calendar-sync', 'install-calendar', 'remove-calendar'])
     parser.add_argument('--vault', type=Path)
     parser.add_argument('--mount', type=Path)
     parser.add_argument('--offline-key-confirmed', action='store_true')
@@ -427,11 +533,15 @@ def main(argv=None):
         if args.command in ('doctor', 'status'):
             report = diagnostics(config)
             print(json.dumps(report))
-            # Backup is the owner's choice: its state is reported, never a failure.
+            # Backup and calendar are the owner's choice: reported, never a failure.
             return int(args.command == 'doctor' and any(item['state'] in {'missing', 'unavailable', 'unknown', 'partial', 'failed', 'missed', 'never', 'disconnected', 'not_enrolled', 'not_configured'}
-                                                        for name, item in report.items() if name != 'backup'))
+                                                        for name, item in report.items() if name not in {'backup', 'calendar'}))
         if args.command == 'login-start':
             run_login(config)
+            return 0
+        if args.command == 'calendar-sync':
+            # Takes the calendar lock (inside run_sync), not the operation lock; always exits 0.
+            calendar_sync_once(config)
             return 0
         stop_marker = None
         if args.command == 'stop':
@@ -457,6 +567,8 @@ def main(argv=None):
                 runtime.compose('stop')
             elif args.command == 'logs': print(runtime.compose('logs', '--tail', '200').stdout)
             elif args.command == 'install-login': install_login(config)
+            elif args.command == 'install-calendar': install_calendar(config)
+            elif args.command == 'remove-calendar': remove_calendar(config)
             else:
                 from tools.local_backup import backup, restore_check, setup_backup
                 if args.command == 'setup-backup':
@@ -467,6 +579,9 @@ def main(argv=None):
         return 0
     except KeyboardInterrupt:
         print(json.dumps({'code': 'operation_cancelled', 'message': 'Operation was interrupted by user input.'}), file=sys.stderr)
+        return 1
+    except CalendarRefusal as error:
+        print(json.dumps({'code': error.code, 'message': error.message}), file=sys.stderr)
         return 1
     except (ValueError, TypeError, OSError, KeyError, subprocess.SubprocessError,
             GitTransactionError) as error:

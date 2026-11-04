@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import pytest
 
@@ -774,9 +775,10 @@ def test_diagnostics_read_enrollment_without_mutating_database(tmp_path, monkeyp
     from tools import local_service as service
     config = diagnostic_config(tmp_path)
     path = tmp_path / 'state/auth/owner.sqlite3'
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db:
         db.execute('create table owner(id integer, password text, secret text, counter integer)')
         db.execute('insert into owner values(1,?,?,1)', ('$argon2id$synthetic', 'A' * 32))
+        db.commit()
     path.chmod(0o600)
     before = path.read_bytes()
     result = service.authentication_diagnostic(config)
@@ -847,9 +849,10 @@ def test_doctor_reports_but_does_not_fail_on_owner_choice_backup(tmp_path, monke
     service.write_json(state / 'config.json', config)
     service.write_status(config, 'never', None)
     owner = state / 'auth/owner.sqlite3'
-    with sqlite3.connect(owner) as db:
+    with closing(sqlite3.connect(owner)) as db:
         db.execute('create table owner(id integer, password text, secret text, counter integer)')
         db.execute('insert into owner values(1,?,?,1)', ('$argon2id$synthetic', 'A' * 32))
+        db.commit()
     owner.chmod(0o600)
     monkeypatch.setattr(service.shutil, 'which', lambda name: '/synthetic/tool')
     monkeypatch.setattr(service.subprocess, 'run', lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=''))
@@ -859,8 +862,9 @@ def test_doctor_reports_but_does_not_fail_on_owner_choice_backup(tmp_path, monke
     output = capsys.readouterr()
     report = json.loads(output.out)
     assert report['backup']['state'] == 'never'
+    assert report['calendar']['state'] == 'off'
     assert all(item['state'] in {'valid', 'available', 'running', 'accessible', 'enrolled'}
-               for name, item in report.items() if name != 'backup')
+               for name, item in report.items() if name not in {'backup', 'calendar'})
     assert output.err == ''
 
 
@@ -894,3 +898,351 @@ def test_diagnostics_non_mapping_backup_status_is_safe_unknown(tmp_path, monkeyp
     assert output.err == ''
     assert 'private-status-value' not in output.out
     assert str(state) not in output.out
+
+
+# --- calendar job: install-calendar, remove-calendar, calendar-sync, status -----------------
+
+CALENDAR_ACTIONS = {
+    'no_calendar': 'In Calendar, create a calendar named OneOS (choose iCloud so its alerts reach your iPhone), then run install-calendar again in Terminal.',
+    'duplicate_calendar': 'More than one calendar is named OneOS. Keep one (the iCloud one), rename or delete the others, then run install-calendar again.',
+    'read_only': 'The OneOS calendar is read-only. Use a calendar you can edit, then run install-calendar again.',
+    'permission': "Open System Settings → Privacy & Security → Automation and allow OneOS's Python to control Calendar, then run install-calendar again in Terminal.",
+}
+
+
+@pytest.fixture(autouse=True)
+def no_real_launch_agents(tmp_path_factory, monkeypatch):
+    """Nothing here may read or touch the real ~/Library/LaunchAgents."""
+    from tools import local_service as service
+    home = tmp_path_factory.mktemp('home')
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: home))
+
+
+def calendar_setup(tmp_path, monkeypatch):
+    """A config, a fake launchctl that records its calls, and an empty LaunchAgents folder."""
+    import subprocess
+    from tools import local_service as service
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    calls = []
+    loaded = set()
+
+    def launchctl(command, **kwargs):
+        assert command[0] == 'launchctl'
+        calls.append(command)
+        if command[1] == 'print':
+            return subprocess.CompletedProcess(command, 0 if command[-1] in loaded else 113)
+        if command[1] == 'bootstrap':
+            loaded.add('gui/' + str(service.os.getuid()) + '/local.oneos.' + command[-1].rsplit('local.oneos.', 1)[1][:-6])
+        if command[1] == 'bootout':
+            loaded.discard(command[-1])
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(service.subprocess, 'run', launchctl)
+    config = {'state_dir': '/synthetic/state', 'repo_dir': '/synthetic/repo'}
+    return config, launch_agents, calls, loaded
+
+
+class FakeSync:
+    def __init__(self, report=None, error=None):
+        from tools.calendar_sync import SyncReport
+        self.report = report or SyncReport('ok', 1, 0, 0)
+        self.error = error
+        self.calls = []
+
+    def __call__(self, state_dir, calendar, **kwargs):
+        self.calls.append((state_dir, calendar, kwargs))
+        if self.error:
+            raise self.error
+        return self.report
+
+
+def test_install_calendar_forces_one_sync_then_writes_and_bootstraps_the_job(tmp_path, monkeypatch):
+    import plistlib
+    from pathlib import Path
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    order = []
+    sync = FakeSync()
+    marker = object()
+
+    def recording(state_dir, calendar, **kwargs):
+        order.append([command[1] for command in calls])
+        return sync(state_dir, calendar, **kwargs)
+
+    service.install_calendar(config, sync=recording, calendar_factory=lambda: marker)
+    assert order == [['print']]  # only the preflight ran before the sync
+    assert sync.calls == [(Path('/synthetic/state'), marker, {'force': True})]
+    path = launch_agents / 'local.oneos.calendar.plist'
+    assert [item.name for item in launch_agents.iterdir()] == ['local.oneos.calendar.plist']
+    job = plistlib.loads(path.read_bytes())
+    assert job == {
+        'Label': 'local.oneos.calendar',
+        'ProgramArguments': [service.sys.executable, '-m', 'tools.local_service', '--state-dir',
+                             '/synthetic/state', 'calendar-sync'],
+        'WorkingDirectory': '/synthetic/repo',
+        'WatchPaths': ['/synthetic/state/auth', '/synthetic/state/auth/reminders.sqlite3'],
+        'RunAtLoad': True, 'ThrottleInterval': 30,
+        'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null',
+        'EnvironmentVariables': {'PATH': service.os.environ.get('PATH', '')}}
+    domain = 'gui/' + str(service.os.getuid())
+    assert calls[-1] == ['launchctl', 'bootstrap', domain, str(path)]
+
+
+@pytest.mark.parametrize('code', sorted(CALENDAR_ACTIONS))
+def test_install_calendar_refuses_a_needs_setup_with_that_codes_action(tmp_path, monkeypatch, code):
+    from tools import local_service as service
+    from tools.calendar_sync import SyncReport
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    sync = FakeSync(SyncReport('needs_setup', code=code))
+    with pytest.raises(service.CalendarRefusal) as refusal:
+        service.install_calendar(config, sync=sync, calendar_factory=object)
+    assert refusal.value.code == code
+    assert refusal.value.message == CALENDAR_ACTIONS[code]
+    assert not list(launch_agents.iterdir())
+    assert [command[1] for command in calls] == ['print']
+
+
+def test_install_calendar_refuses_a_failed_sync(tmp_path, monkeypatch):
+    from tools import local_service as service
+    from tools.calendar_sync import SyncReport
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    with pytest.raises(service.CalendarRefusal) as refusal:
+        service.install_calendar(config, sync=FakeSync(SyncReport('failed', code='script')), calendar_factory=object)
+    assert refusal.value.code == 'calendar_failed'
+    assert 'install-calendar' in refusal.value.message
+    assert not list(launch_agents.iterdir())
+    assert [command[1] for command in calls] == ['print']
+
+
+@pytest.mark.parametrize('error', [ValueError('private-path'), OSError('private-path')])
+def test_install_calendar_reports_state_errors_from_the_sync_as_a_refusal(tmp_path, monkeypatch, error):
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    with pytest.raises(service.CalendarRefusal) as refusal:
+        service.install_calendar(config, sync=FakeSync(error=error), calendar_factory=object)
+    assert 'private-path' not in refusal.value.message
+    assert not list(launch_agents.iterdir())
+
+
+def test_install_calendar_installs_after_a_skipped_sync(tmp_path, monkeypatch):
+    from tools import local_service as service
+    from tools.calendar_sync import SyncReport
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    service.install_calendar(config, sync=FakeSync(SyncReport('skipped', code='no_store')), calendar_factory=object)
+    assert (launch_agents / 'local.oneos.calendar.plist').is_file()
+
+
+def test_install_calendar_refuses_existing_plist_before_syncing(tmp_path, monkeypatch):
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    (launch_agents / 'local.oneos.calendar.plist').write_bytes(b'preserve')
+    sync = FakeSync()
+    with pytest.raises(ValueError, match='already exists'):
+        service.install_calendar(config, sync=sync, calendar_factory=object)
+    assert sync.calls == [] and calls == []
+    assert (launch_agents / 'local.oneos.calendar.plist').read_bytes() == b'preserve'
+
+
+def test_install_calendar_refuses_loaded_job_before_syncing(tmp_path, monkeypatch):
+    from tools import local_service as service
+    config, launch_agents, calls, loaded = calendar_setup(tmp_path, monkeypatch)
+    loaded.add('gui/' + str(service.os.getuid()) + '/local.oneos.calendar')
+    sync = FakeSync()
+    with pytest.raises(ValueError, match='already loaded'):
+        service.install_calendar(config, sync=sync, calendar_factory=object)
+    assert sync.calls == []
+    assert not list(launch_agents.iterdir())
+    assert [command[1] for command in calls] == ['print']
+
+
+def test_install_calendar_rolls_back_after_bootstrap_failure(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    real = service.subprocess.run
+
+    def failing(command, **kwargs):
+        if command[1] == 'bootstrap':
+            calls.append(command)
+            raise subprocess.CalledProcessError(5, command)
+        return real(command, **kwargs)
+
+    monkeypatch.setattr(service.subprocess, 'run', failing)
+    with pytest.raises(subprocess.CalledProcessError):
+        service.install_calendar(config, sync=FakeSync(), calendar_factory=object)
+    assert not list(launch_agents.iterdir())
+    assert [command[-1] for command in calls if command[1] == 'bootout'] == [
+        'gui/' + str(service.os.getuid()) + '/local.oneos.calendar']
+
+
+def test_remove_calendar_unloads_and_removes_only_the_calendar_plist(tmp_path, monkeypatch):
+    from tools import local_service as service
+    config, launch_agents, calls, loaded = calendar_setup(tmp_path, monkeypatch)
+    service.install_calendar(config, sync=FakeSync(), calendar_factory=object)
+    (launch_agents / 'local.oneos.login.plist').write_bytes(b'login')
+    calls.clear()
+    service.remove_calendar(config)
+    assert [item.name for item in launch_agents.iterdir()] == ['local.oneos.login.plist']
+    assert calls == [['launchctl', 'bootout', 'gui/' + str(service.os.getuid()) + '/local.oneos.calendar']]
+    assert loaded == set()
+
+
+def test_remove_calendar_when_nothing_is_installed_is_quiet(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(service.subprocess, 'run', lambda command, **kw: subprocess.CompletedProcess(command, 113))
+    service.remove_calendar(config)
+    assert not list(launch_agents.iterdir())
+
+
+def test_remove_calendar_keeps_the_plist_when_the_job_cannot_be_unloaded(tmp_path, monkeypatch):
+    import subprocess
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    (launch_agents / 'local.oneos.calendar.plist').write_bytes(b'job')
+    monkeypatch.setattr(service.subprocess, 'run', lambda command, **kw: subprocess.CompletedProcess(command, 5))
+    with pytest.raises(OSError):
+        service.remove_calendar(config)
+    assert (launch_agents / 'local.oneos.calendar.plist').read_bytes() == b'job'
+
+
+def main_config(tmp_path):
+    config = diagnostic_config(tmp_path)
+    from tools import local_service as service
+    service.write_json(tmp_path / 'state/config.json', config)
+    return config, tmp_path / 'state'
+
+
+@pytest.mark.parametrize('outcome', [
+    ('report', ('ok', 1, 0, 0, None)), ('report', ('skipped', 0, 0, 0, 'unchanged')),
+    ('report', ('needs_setup', 0, 0, 0, 'permission')), ('report', ('failed', 0, 0, 0, 'script')),
+    ('error', ValueError('private-path')), ('error', OSError('private-path'))])
+def test_calendar_sync_command_always_exits_zero_without_the_operation_lock(tmp_path, monkeypatch, capsys, outcome):
+    from tools import calendar_mac, calendar_sync
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    kind, value = outcome
+    sync = FakeSync(calendar_sync.SyncReport(*value) if kind == 'report' else None,
+                    error=value if kind == 'error' else None)
+    monkeypatch.setattr(calendar_sync, 'run_sync', sync)
+    monkeypatch.setattr(calendar_mac, 'MacCalendar', lambda *a, **k: 'fake-calendar')
+    with service.operation_lock(state):  # a held operation lock must not block the job
+        assert service.main(['--state-dir', str(state), 'calendar-sync']) == 0
+    assert [(call[0], call[1]) for call in sync.calls] == [(state, 'fake-calendar')]
+    assert 'force' not in sync.calls[0][2] or sync.calls[0][2]['force'] is None
+    assert 'private-path' not in capsys.readouterr().err
+
+
+def test_install_calendar_command_prints_the_action_and_exits_non_zero(tmp_path, monkeypatch, capsys):
+    from tools import calendar_mac, calendar_sync
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    calendar_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(calendar_sync, 'run_sync', FakeSync(calendar_sync.SyncReport('needs_setup', code='no_calendar')))
+    monkeypatch.setattr(calendar_mac, 'MacCalendar', lambda *a, **k: 'fake-calendar')
+    assert service.main(['--state-dir', str(state), 'install-calendar']) == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error == {'code': 'no_calendar', 'message': CALENDAR_ACTIONS['no_calendar']}
+
+
+def test_install_calendar_command_installs_under_the_operation_lock(tmp_path, monkeypatch, capsys):
+    from tools import calendar_mac, calendar_sync
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    _, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    sync = FakeSync()
+    monkeypatch.setattr(calendar_sync, 'run_sync', sync)
+    monkeypatch.setattr(calendar_mac, 'MacCalendar', lambda *a, **k: 'fake-calendar')
+    with service.operation_lock(state):
+        assert service.main(['--state-dir', str(state), 'install-calendar']) == 1
+    assert json.loads(capsys.readouterr().err)['code'] == 'operation_busy'
+    assert sync.calls == []
+    assert service.main(['--state-dir', str(state), 'install-calendar']) == 0
+    assert sync.calls[0][2] == {'force': True}
+    assert (launch_agents / 'local.oneos.calendar.plist').is_file()
+    assert service.main(['--state-dir', str(state), 'remove-calendar']) == 0
+    assert not list(launch_agents.iterdir())
+
+
+def status_report(tmp_path, monkeypatch, command='status'):
+    import subprocess
+    from tools import local_service as service
+    from tools import local_backup
+    config, state = main_config(tmp_path)
+    monkeypatch.setattr(service.shutil, 'which', lambda name: '/synthetic/tool')
+    monkeypatch.setattr(service.subprocess, 'run', lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout=''))
+    monkeypatch.setattr(service.Runtime, 'running_services', lambda self: ['app', 'caddy'])
+    monkeypatch.setattr(local_backup, 'validate_volume', lambda config: None)
+    return service, state
+
+
+def write_calendar_status(service, state, value):
+    (state / 'calendar').mkdir(mode=0o700, exist_ok=True)
+    service.write_json(state / 'calendar/status.json', value)
+
+
+def test_calendar_diagnostic_is_off_without_the_job(tmp_path):
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    assert service.calendar_diagnostic(config)['state'] == 'off'
+
+
+def install_job(tmp_path):
+    launch_agents = tmp_path / 'Library/LaunchAgents'
+    launch_agents.mkdir(parents=True, exist_ok=True)
+    (launch_agents / 'local.oneos.calendar.plist').write_bytes(b'job')
+
+
+@pytest.mark.parametrize('value', [None, {'state': 'ok', 'code': None}, {'state': 'skipped', 'code': 'unchanged'}])
+def test_calendar_diagnostic_is_on_when_the_last_run_was_ok_or_skipped(tmp_path, monkeypatch, value):
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    install_job(tmp_path)
+    if value:
+        write_calendar_status(service, state, value)
+    assert service.calendar_diagnostic(config)['state'] == 'on'
+
+
+@pytest.mark.parametrize('code', sorted(CALENDAR_ACTIONS))
+def test_calendar_diagnostic_reports_needs_setup_with_the_codes_action(tmp_path, monkeypatch, code):
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    install_job(tmp_path)
+    write_calendar_status(service, state, {'state': 'needs_setup', 'code': code, 'at': 'x'})
+    assert service.calendar_diagnostic(config) == {'state': 'needs_setup', 'action': CALENDAR_ACTIONS[code]}
+
+
+@pytest.mark.parametrize('value', [{'state': 'failed', 'code': 'script'}, {'state': 'bogus'}, ['x'], {'state': 'needs_setup', 'code': 'private'}])
+def test_calendar_diagnostic_reports_failed_for_failed_or_unreadable_status(tmp_path, monkeypatch, value):
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    install_job(tmp_path)
+    write_calendar_status(service, state, value)
+    result = service.calendar_diagnostic(config)
+    assert result['state'] == 'failed'
+    assert 'private' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('command', ['status', 'doctor'])
+@pytest.mark.parametrize('value', [{'state': 'needs_setup', 'code': 'permission'}, {'state': 'failed', 'code': 'script'}])
+def test_status_and_doctor_report_calendar_but_doctor_still_passes(tmp_path, monkeypatch, capsys, command, value):
+    service, state = status_report(tmp_path, monkeypatch)
+    monkeypatch.setattr(service.Path, 'home', classmethod(lambda cls: tmp_path))
+    install_job(tmp_path)
+    write_calendar_status(service, state, value)
+    # Make everything else healthy so only calendar could fail doctor.
+    monkeypatch.setattr(service, 'authentication_diagnostic', lambda config: service.finding('enrolled', 'ok'))
+    config = json.loads((state / 'config.json').read_text())
+    config['backup'] = {}
+    service.write_json(state / 'config.json', config)
+    service.write_status(config, 'ok', service.time.time())
+    assert service.main(['--state-dir', str(state), command]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['calendar']['state'] == value['state']
+    assert report['calendar']['action']
