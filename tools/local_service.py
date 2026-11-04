@@ -458,7 +458,7 @@ def install_calendar(config, *, sync=None, calendar_factory=None):
     _preflight_agent('calendar', 'calendar')  # refuse before waking Calendar
     try:
         report = sync(Path(state), calendar_factory(), force=True)
-    except (ValueError, OSError):
+    except Exception:  # never a traceback or the error's text
         raise CalendarRefusal('calendar_unavailable', CALENDAR_UNAVAILABLE) from None
     if report.state == 'needs_setup' and report.code in CALENDAR_ACTIONS:
         raise CalendarRefusal(report.code, CALENDAR_ACTIONS[report.code])
@@ -477,7 +477,7 @@ def remove_calendar(config):
         result = subprocess.run(['launchctl', 'bootout', target], check=False, capture_output=True, timeout=30)
     except subprocess.SubprocessError as error:
         raise OSError('unable to unload the calendar job') from error
-    if result.returncode not in (0, 113):  # 113: it was not loaded
+    if result.returncode not in (0, 3, 113):  # 3 or 113: it was not loaded
         raise OSError('unable to unload the calendar job')
     path.unlink(missing_ok=True)
 
@@ -529,6 +529,15 @@ def main(argv=None):
                 parser.error('--vault required for setup')
             setup(args.state_dir, args.vault, Path(__file__).resolve().parents[1], input('Git name: '), input('Git email: '))
             return 0
+        if args.command == 'calendar-sync':
+            # The job never uses the vault, so an unmounted vault or unreadable config must not
+            # matter: it takes the calendar lock (inside run_sync), not the operation lock, and
+            # always exits 0 with nothing printed.
+            try:
+                calendar_sync_once(load_config(args.state_dir, validate_runtime_paths=False))
+            except (Exception, KeyboardInterrupt):
+                pass
+            return 0
         config = load_config(args.state_dir, validate_runtime_paths=args.command not in ('doctor', 'status'))
         if args.command in ('doctor', 'status'):
             report = diagnostics(config)
@@ -538,10 +547,6 @@ def main(argv=None):
                                                         for name, item in report.items() if name not in {'backup', 'calendar'}))
         if args.command == 'login-start':
             run_login(config)
-            return 0
-        if args.command == 'calendar-sync':
-            # Takes the calendar lock (inside run_sync), not the operation lock; always exits 0.
-            calendar_sync_once(config)
             return 0
         stop_marker = None
         if args.command == 'stop':

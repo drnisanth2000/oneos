@@ -1133,7 +1133,8 @@ def test_calendar_sync_command_always_exits_zero_without_the_operation_lock(tmp_
         assert service.main(['--state-dir', str(state), 'calendar-sync']) == 0
     assert [(call[0], call[1]) for call in sync.calls] == [(state, 'fake-calendar')]
     assert 'force' not in sync.calls[0][2] or sync.calls[0][2]['force'] is None
-    assert 'private-path' not in capsys.readouterr().err
+    output = capsys.readouterr()
+    assert output.out == '' and 'private-path' not in output.err
 
 
 def test_install_calendar_command_prints_the_action_and_exits_non_zero(tmp_path, monkeypatch, capsys):
@@ -1246,3 +1247,91 @@ def test_status_and_doctor_report_calendar_but_doctor_still_passes(tmp_path, mon
     report = json.loads(capsys.readouterr().out)
     assert report['calendar']['state'] == value['state']
     assert report['calendar']['action']
+
+
+def test_calendar_sync_command_exits_zero_when_the_vault_is_missing_and_still_syncs(tmp_path, monkeypatch, capsys):
+    from tools import calendar_mac, calendar_sync
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    service.shutil.rmtree(config['vault'])  # an unmounted vault must not stop the job
+    sync = FakeSync()
+    monkeypatch.setattr(calendar_sync, 'run_sync', sync)
+    monkeypatch.setattr(calendar_mac, 'MacCalendar', lambda *a, **k: 'fake-calendar')
+    assert service.main(['--state-dir', str(state), 'calendar-sync']) == 0
+    assert len(sync.calls) == 1
+    output = capsys.readouterr()
+    assert output.out == '' and output.err == ''
+
+
+@pytest.mark.parametrize('damage', ['bad-json', 'missing-key', 'missing-file', 'missing-state'])
+def test_calendar_sync_command_exits_zero_when_the_config_cannot_be_read(tmp_path, monkeypatch, capsys, damage):
+    from tools import calendar_mac, calendar_sync
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    if damage == 'bad-json':
+        (state / 'config.json').write_text('{not json')
+    elif damage == 'missing-key':
+        service.write_json(state / 'config.json', {'state_dir': str(state)})
+    elif damage == 'missing-file':
+        (state / 'config.json').unlink()
+    else:
+        state = tmp_path / 'absent'
+    sync = FakeSync()
+    monkeypatch.setattr(calendar_sync, 'run_sync', sync)
+    monkeypatch.setattr(calendar_mac, 'MacCalendar', lambda *a, **k: 'fake-calendar')
+    assert service.main(['--state-dir', str(state), 'calendar-sync']) == 0
+    output = capsys.readouterr()
+    assert output.out == '' and output.err == ''
+
+
+@pytest.mark.parametrize('error', [KeyboardInterrupt(), InterruptedError('stopped'), RuntimeError('private-path')])
+def test_calendar_sync_command_exits_zero_on_interruption_or_any_error(tmp_path, monkeypatch, capsys, error):
+    from tools import calendar_mac, calendar_sync
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    monkeypatch.setattr(calendar_sync, 'run_sync', FakeSync(error=error))
+    monkeypatch.setattr(calendar_mac, 'MacCalendar', lambda *a, **k: 'fake-calendar')
+    assert service.main(['--state-dir', str(state), 'calendar-sync']) == 0
+    output = capsys.readouterr()
+    assert output.out == '' and 'private-path' not in output.err
+
+
+@pytest.mark.parametrize('code', [3, 113])
+def test_remove_calendar_treats_not_loaded_exit_codes_as_already_unloaded(tmp_path, monkeypatch, code):
+    import subprocess
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    (launch_agents / 'local.oneos.calendar.plist').write_bytes(b'job')
+    monkeypatch.setattr(service.subprocess, 'run', lambda command, **kw: subprocess.CompletedProcess(command, code))
+    service.remove_calendar(config)
+    assert not list(launch_agents.iterdir())
+
+
+def test_install_calendar_turns_any_sync_exception_into_the_generic_refusal(tmp_path, monkeypatch):
+    from tools import local_service as service
+    config, launch_agents, calls, _ = calendar_setup(tmp_path, monkeypatch)
+    with pytest.raises(service.CalendarRefusal) as refusal:
+        service.install_calendar(config, sync=FakeSync(error=RuntimeError('private-path')), calendar_factory=object)
+    assert refusal.value.code == 'calendar_unavailable'
+    assert 'private-path' not in refusal.value.message
+    assert not list(launch_agents.iterdir())
+
+
+def test_install_calendar_command_prints_job_exists_for_existing_and_loaded_jobs(tmp_path, monkeypatch, capsys):
+    from tools import calendar_mac, calendar_sync
+    from tools import local_service as service
+    config, state = main_config(tmp_path)
+    _, launch_agents, calls, loaded = calendar_setup(tmp_path, monkeypatch)
+    sync = FakeSync()
+    monkeypatch.setattr(calendar_sync, 'run_sync', sync)
+    monkeypatch.setattr(calendar_mac, 'MacCalendar', lambda *a, **k: 'fake-calendar')
+    (launch_agents / 'local.oneos.calendar.plist').write_bytes(b'job')
+    assert service.main(['--state-dir', str(state), 'install-calendar']) == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error['code'] == 'job_exists' and 'already installed' in error['message'] and 'remove-calendar' in error['message']
+    (launch_agents / 'local.oneos.calendar.plist').unlink()
+    loaded.add('gui/' + str(service.os.getuid()) + '/local.oneos.calendar')
+    assert service.main(['--state-dir', str(state), 'install-calendar']) == 1
+    error = json.loads(capsys.readouterr().err)
+    assert error['code'] == 'job_exists' and 'already loaded' in error['message'] and 'remove-calendar' in error['message']
+    assert sync.calls == []
