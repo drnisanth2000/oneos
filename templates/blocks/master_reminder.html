@@ -29,7 +29,7 @@
         </label>
         <label class="reminder-field" for="reminder-time">Time
           <input id="reminder-time" name="time" type="time" required x-ref="time"
-                 value="{{ typed_reminder.time if typed_reminder.time is defined else (reminder.due_at.strftime('%H:%M') if reminder else '09:00') }}">
+                 value="{{ typed_reminder.time if typed_reminder.time is defined else (reminder.due_at.strftime('%H:%M') if reminder else '') }}">
         </label>
         <label class="reminder-field reminder-subject" for="reminder-subject">Subject
           <input id="reminder-subject" name="subject" type="text" required maxlength="120"
