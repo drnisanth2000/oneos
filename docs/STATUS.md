@@ -45,14 +45,16 @@ With owner approval, the running install was updated to `origin/main`
 browser's current date and time (PR #67; owner chose the current minute over
 one minute ahead). The install checkout moved from `b4b4b73` by fast-forward.
 The app image running before the update is kept locally as the image tag
-`oneos-local:pre-668ae6f`. Templates only; `start` rebuilt and recreated only
-the app container. No backup (owner's choice).
+`oneos-local:pre-668ae6f`. The change is in two templates
+(`master_reminder.html` leaves a new reminder's time empty instead of `09:00`;
+`home.html` fills the browser's date and minute) plus its test; `start`
+rebuilt and recreated only the app container. No backup (owner's choice).
 
 Afterwards `status` reported every component available and services running,
 with `calendar` `on` (the owner ran `install-calendar` after the `b4b4b73`
-update; the job's last run exited 0). `/healthz` answered 200, `/` redirected
-to sign-in, the running container holds the new template, and the app log
-showed no errors. The vault's HEAD, status, worktree diff, and cached diff
+update). `/healthz` answered 200, `/` redirected to sign-in, the running
+container's `home.html` holds the new "A new reminder starts at the browser"
+block, and the app log showed no errors. The vault's HEAD, status, worktree diff, and cached diff
 were byte-identical before and after.
 
 ## Running install update to `b4b4b73` (2026-11-05)
@@ -78,8 +80,9 @@ iCloud calendar named OneOS, with a throwaway reminder store: create with an
 alert, an unchanged re-run, a subject-only edit in place, a time change
 replacing the event, resolve removing it, unresolve recreating it, and delete
 removing it, with nothing left over. The owner then ran `install-calendar`
-(job installed, Calendar answered); a real reminder's event and its link
-were followed to the sign-in page.
+(job installed, Calendar answered), and following an event's link while
+signed out reached the sign-in page carrying `next=/?reminder=…`. Still not
+recorded as checked: the card's popup opening after sign-in.
 
 ## Running install update to `65ab8da` (2026-11-03)
 
