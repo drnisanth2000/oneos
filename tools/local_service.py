@@ -464,6 +464,35 @@ def _install_refusal(code):
     return CalendarRefusal('calendar_failed', CALENDAR_INSTALL_FAILED)
 
 
+def resolve_older_done_reminders(config):
+    """Mark resolved every open reminder whose note is already Done (`done` or `active`),
+    as a Done card's reminder is marked when it lands there. Reads notes only, through the
+    app's scope rules and the configured vault; never writes the vault. A missing or
+    unreadable note and an unknown entity leave their row alone. No store: nothing to do."""
+    from app.board import note_snapshot
+    from app.master import note_text_is_done
+    from app.reminders import ReminderStore
+    from app.scope import Scope
+    store = ReminderStore(Path(config['state_dir']) / 'auth')
+    open_rows = store.snapshot()
+    if not open_rows:
+        return
+    scopes = {}
+    for key, reminder in open_rows.items():
+        try:
+            if reminder.entity not in scopes:
+                try:
+                    scopes[reminder.entity] = Scope(config['vault'], reminder.entity)
+                except Exception:
+                    scopes[reminder.entity] = None
+            scope = scopes[reminder.entity]
+            done = scope is not None and note_text_is_done(note_snapshot(scope, key).text)
+        except Exception:
+            continue
+        if done:
+            store.resolve(key)
+
+
 def install_calendar(config, *, sync=None, calendar_factory=None):
     """Run one forced sync in the foreground (so macOS asks for permission here), and
     install the background job only when Calendar is ready."""
@@ -473,6 +502,10 @@ def install_calendar(config, *, sync=None, calendar_factory=None):
     calendar_factory = calendar_factory or calendar_mac.MacCalendar
     state = config['state_dir']
     _preflight_agent('calendar', 'calendar')  # refuse before waking Calendar
+    try:
+        resolve_older_done_reminders(config)
+    except Exception:  # never a traceback or the error's text
+        raise CalendarRefusal('calendar_unavailable', CALENDAR_UNAVAILABLE) from None
     calendar = calendar_factory()
     try:
         report = sync(Path(state), calendar, force=True)
@@ -488,7 +521,7 @@ def install_calendar(config, *, sync=None, calendar_factory=None):
         raise _install_refusal(report.code)
     _launch_agent(config, 'calendar', 'calendar-sync', 'calendar', {
         'WatchPaths': [state + '/auth', state + '/auth/reminders.sqlite3'],
-        'ThrottleInterval': 30, 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
+        'ThrottleInterval': 30, 'StartInterval': 3600, 'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
 
 
 def remove_calendar(config):

@@ -105,7 +105,7 @@ never a note's path. It is off until you set it up:
    remove a duplicate, use an editable calendar, or allow Calendar under
    System Settings, Privacy & Security, Automation), and installs nothing.
    When the sync works it installs the `local.oneos.calendar` LaunchAgent,
-   which syncs again whenever reminders change and at login.
+   which syncs again whenever reminders change, at login, and on an hourly check.
 3. To turn it off, run `OneOS.command remove-calendar`. It unloads and removes
    that one job and leaves the events in Calendar. To remove the events too,
    delete the `OneOS` calendar in Calendar.
@@ -113,8 +113,12 @@ never a note's path. It is off until you set it up:
    notes opens OneOS only on this Mac, because OneOS answers only at
    `localhost`.
 
-Calendar may open by itself for a moment (at login, about once a day, and when
-a reminder changes). That is OneOS updating the OneOS calendar.
+Calendar may open by itself for a moment (at login, about once a day, after a
+failed try, and when a reminder changes). That is OneOS updating the OneOS
+calendar. OneOS also checks for changes once an hour, without opening Calendar
+unless something changed. `install-calendar` also marks as resolved any older
+reminder whose note is already Done, so finished work gets no event; it only
+reads your notes.
 
 An event for a reminder is updated when the reminder changes and removed when
 the reminder is done. `status` and `doctor` show a `calendar` line: `off` (job

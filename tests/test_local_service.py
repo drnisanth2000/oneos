@@ -1,5 +1,6 @@
 from contextlib import closing
 import json
+from pathlib import Path
 import pytest
 
 
@@ -992,7 +993,7 @@ def test_install_calendar_forces_one_sync_then_writes_and_bootstraps_the_job(tmp
                              '/synthetic/state', 'calendar-sync'],
         'WorkingDirectory': '/synthetic/repo',
         'WatchPaths': ['/synthetic/state/auth', '/synthetic/state/auth/reminders.sqlite3'],
-        'RunAtLoad': True, 'ThrottleInterval': 30,
+        'RunAtLoad': True, 'ThrottleInterval': 30, 'StartInterval': 3600,
         'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null',
         'EnvironmentVariables': {'PATH': service.os.environ.get('PATH', '')}}
     domain = 'gui/' + str(service.os.getuid())
@@ -1404,3 +1405,96 @@ def test_calendar_status_failed_text_fits_an_installed_job(tmp_path, monkeypatch
     write_calendar_status(service, state, {'state': 'failed', 'code': 'script'})
     action = service.calendar_diagnostic(config)['action']
     assert 'tries again on its own' in action and 'within a few minutes' in action
+
+
+class RecordingCalendar:
+    def __init__(self):
+        self.created = []
+
+    def events(self):
+        return []
+
+    def apply(self, create, update, delete):
+        self.created.extend(item.title for item in create)
+
+
+def older_reminders_setup(tmp_path, monkeypatch):
+    """A synthetic vault and private store with older reminders, plus fake launchctl."""
+    from datetime import datetime, timedelta, timezone
+    from app.reminders import Reminder, ReminderStore
+    from tools import calendar_sync
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    vault = Path(config['vault'])
+    (vault / '_system').mkdir()
+    (vault / '_system/entities.yaml').write_text('version: "1.0"\nentities:\n  acmeco:\n    label: Acme\n    flags: []\n', encoding='utf-8')
+    notes = {'acmeco/10-work/done.md': 'status: active', 'acmeco/10-work/wait.md': 'status: waiting',
+             'acmeco/10-work/draft.md': 'status: draft', 'acmeco/10-work/proper.md': 'status: done'}
+    for key, status in notes.items():
+        (vault / key).parent.mkdir(parents=True, exist_ok=True)
+        (vault / key).write_text('---\n' + status + '\n---\nbody text\n', encoding='utf-8')
+    (vault / 'acmeco/10-work/binary.md').write_bytes(b'\xff\xfe not utf8')
+    store = ReminderStore(Path(config['state_dir']) / 'auth')
+    due = datetime.now(timezone.utc) + timedelta(days=2)
+    keys = ['acmeco/10-work/done.md', 'acmeco/10-work/wait.md', 'acmeco/10-work/draft.md',
+            'acmeco/10-work/proper.md', 'acmeco/10-work/gone.md', 'acmeco/10-work/binary.md']
+    for key in keys:
+        store.save(Reminder(key=key, entity='acmeco', subject='S ' + key.rsplit('/', 1)[1], due_at=due))
+    store.save(Reminder(key='ghostco/x/y.md', entity='ghostco', subject='S ghost', due_at=due))
+    _, launch_agents, calls, loaded = calendar_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(calendar_sync, 'boot_id', lambda: 'boot')
+    return service, config, store, vault, launch_agents
+
+
+def tree_bytes(root):
+    return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob('*'))
+            if path.is_file() and '.git' not in path.parts}
+
+
+def test_install_calendar_resolves_older_done_reminders_before_the_forced_sync(tmp_path, monkeypatch):
+    service, config, store, vault, launch_agents = older_reminders_setup(tmp_path, monkeypatch)
+    before = tree_bytes(vault)
+    calendar = RecordingCalendar()
+    service.install_calendar(config, calendar_factory=lambda: calendar)
+    # `active` and `done` notes are Done; waiting, draft, a missing note, a note that cannot
+    # be read and an unknown entity are left alone.
+    assert set(store.snapshot()) == {'acmeco/10-work/wait.md', 'acmeco/10-work/draft.md',
+                                     'acmeco/10-work/gone.md', 'acmeco/10-work/binary.md', 'ghostco/x/y.md'}
+    assert sorted(calendar.created) == sorted(['S wait.md', 'S draft.md', 'S gone.md', 'S binary.md', 'S ghost'])
+    assert tree_bytes(vault) == before  # the vault is never written
+    assert (launch_agents / 'local.oneos.calendar.plist').is_file()
+
+
+def test_install_calendar_resolves_nothing_when_it_refuses_before_the_sync(tmp_path, monkeypatch):
+    service, config, store, vault, launch_agents = older_reminders_setup(tmp_path, monkeypatch)
+    (launch_agents / 'local.oneos.calendar.plist').write_bytes(b'job')
+    with pytest.raises(ValueError, match='already exists'):
+        service.install_calendar(config, calendar_factory=RecordingCalendar)
+    assert 'acmeco/10-work/done.md' in store.snapshot()
+
+
+def test_install_calendar_does_nothing_for_a_missing_store(tmp_path, monkeypatch):
+    from tools import calendar_sync
+    from tools import local_service as service
+    config = diagnostic_config(tmp_path)
+    _, launch_agents, calls, loaded = calendar_setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(calendar_sync, 'boot_id', lambda: 'boot')
+    service.install_calendar(config, calendar_factory=RecordingCalendar)
+    assert not (Path(config['state_dir']) / 'auth/reminders.sqlite3').exists()
+    assert (launch_agents / 'local.oneos.calendar.plist').is_file()
+
+
+def test_install_calendar_refuses_generically_when_resolving_fails(tmp_path, monkeypatch):
+    from app.reminders import ReminderStore, ReminderStoreUnavailable
+    service, config, store, vault, launch_agents = older_reminders_setup(tmp_path, monkeypatch)
+
+    def failing(self, key):
+        raise ReminderStoreUnavailable('private-path')
+
+    monkeypatch.setattr(ReminderStore, 'resolve', failing)
+    sync = FakeSync()
+    with pytest.raises(service.CalendarRefusal) as refusal:
+        service.install_calendar(config, sync=sync, calendar_factory=RecordingCalendar)
+    assert refusal.value.code == 'calendar_unavailable' and 'private-path' not in refusal.value.message
+    assert sync.calls == []
+    assert not list(launch_agents.iterdir())
