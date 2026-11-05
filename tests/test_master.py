@@ -1404,6 +1404,55 @@ def test_popup_sends_the_browsers_offset_for_the_chosen_date(tmp_path, monkeypat
     assert 'x-data="reminderBox"' in popup and 'x-ref="offset"' in popup
 
 
+_REMINDER_DEFAULT_HARNESS = r"""
+const assert = require('assert');
+const script = require('fs').readFileSync(process.argv[2], 'utf8');
+const RealDate = Date;
+const fixed = new RealDate(2026, 10, 5, 14, 7, 42);  // 5 Nov 2026, 14:07 local
+global.Date = class extends RealDate {
+  constructor(...args) { if (args.length) { super(...args); } else { super(fixed.getTime()); } }
+};
+let factory = null;
+global.Alpine = {data: (name, make) => { if (name === 'reminderBox') factory = make; }};
+new Function('Alpine', 'pad', 'hhmm', script)(global.Alpine,
+  (n) => String(n).padStart(2, '0'),
+  (d) => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'));
+function box(date, time) {
+  const b = factory();
+  b.$refs = {date: {value: date}, time: {value: time}, offset: {value: ''}};
+  b.init();
+  return b.$refs;
+}
+const fresh = box('', '');
+assert.strictEqual(fresh.date.value, '2026-11-05');
+assert.strictEqual(fresh.time.value, '14:07');
+assert.strictEqual(fresh.offset.value, String(-fixed.getTimezoneOffset()));
+const kept = box('2099-11-04', '09:15');
+assert.strictEqual(kept.date.value, '2099-11-04');
+assert.strictEqual(kept.time.value, '09:15');
+console.log('ok');
+"""
+
+
+def test_a_new_reminder_starts_at_the_current_date_and_time(tmp_path, monkeypatch):
+    main, client = _client(tmp_path, monkeypatch)
+    _note(tmp_path, "alpha", "02-work", "Chase", status="waiting")
+    popup = client.get("/master/card/alpha", params={"path": _card_path(main, "alpha", "Chase")}).text
+    # The server leaves both empty; the browser fills its own local date and time.
+    assert re.search(r'id="reminder-date"[^>]*value=""', popup)
+    assert re.search(r'id="reminder-time"[^>]*value=""', popup)
+    home = client.get("/").text
+    script = home.split("Alpine.data('reminderBox'")[1].split("// The popup's stage form")[0]
+    script = "Alpine.data('reminderBox'" + script
+    harness = tmp_path / "default.js"
+    harness.write_text(_REMINDER_DEFAULT_HARNESS, encoding="utf-8")
+    source = tmp_path / "box.js"
+    source.write_text(script, encoding="utf-8")
+    result = subprocess.run([_node_or_skip(), str(harness), str(source)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
 def test_orphan_strip_card_has_an_inline_remove(tmp_path, tmp_path_factory, monkeypatch):
     main, client = _client(tmp_path, monkeypatch)
     directory = _auth_dir(tmp_path_factory, monkeypatch)
