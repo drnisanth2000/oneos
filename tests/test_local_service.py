@@ -1498,3 +1498,26 @@ def test_install_calendar_refuses_generically_when_resolving_fails(tmp_path, mon
     assert refusal.value.code == 'calendar_unavailable' and 'private-path' not in refusal.value.message
     assert sync.calls == []
     assert not list(launch_agents.iterdir())
+
+
+@pytest.mark.parametrize('key', ['acmeco/.sensitive/x.md', 'acmeco/.git/x.md', 'acmeco/10-work/.consumed/x.md', 'acmeco/10-work/.hidden.md'])
+def test_install_calendar_never_reads_hidden_paths_when_resolving(tmp_path, monkeypatch, key):
+    from datetime import datetime, timedelta, timezone
+    from app import board
+    from app.reminders import Reminder
+    service, config, store, vault, launch_agents = older_reminders_setup(tmp_path, monkeypatch)
+    (vault / key).parent.mkdir(parents=True, exist_ok=True)
+    (vault / key).write_text('---\nstatus: active\n---\nprivate\n', encoding='utf-8')
+    store.save(Reminder(key=key, entity='acmeco', subject='S hidden', due_at=datetime.now(timezone.utc) + timedelta(days=2)))
+    real = board.note_snapshot
+    opened = []
+
+    def guarded(scope, relative):
+        opened.append(relative)
+        return real(scope, relative)
+
+    monkeypatch.setattr(board, 'note_snapshot', guarded)
+    service.install_calendar(config, calendar_factory=RecordingCalendar)
+    assert opened and key not in opened  # other rows were read, the hidden one never
+    assert key in store.snapshot()
+    assert 'acmeco/10-work/done.md' not in store.snapshot()

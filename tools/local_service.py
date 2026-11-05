@@ -479,6 +479,8 @@ def resolve_older_done_reminders(config):
         return
     scopes = {}
     for key, reminder in open_rows.items():
+        if any(part.startswith('.') for part in key.split('/')):
+            continue  # .sensitive, .git, .consumed and the like are never read
         try:
             if reminder.entity not in scopes:
                 try:
