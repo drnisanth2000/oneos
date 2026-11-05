@@ -10,12 +10,12 @@ Build order and rules: see `../BUILD.md` and the spec at
 
 Last reconciled: 2026-11-05, after the running install was updated to
 `668ae6f` (new reminders start at the current date and time). Earlier
-reconciliations: 2026-11-05 (install update to `b4b4b73`), 2026-11-03 (install updates to `65ab8da` and `604901f`), 2026-11-02 (install
-update to `345f7a7`),
+reconciliations: 2026-11-05 (install update to `b4b4b73`), 2026-11-03 (install
+updates to `65ab8da` and `604901f`), 2026-11-02 (install update to `345f7a7`),
 2026-10-30 (install updates to `75e6725` and `8df5979`), 2026-10-29 (install
-update to `d28ea6b`), 2026-10-28 (install updates to `d3dd761` and
-`85afa63`), 2026-10-26 (Board, rules line, and local deployment acceptance)
-and 2026-09-11 (trusted-local live Gate 1 session).
+update to `d28ea6b`), 2026-10-28 (install updates to `d3dd761` and `85afa63`),
+2026-10-26 (Board, rules line, and local deployment acceptance) and 2026-09-11
+(trusted-local live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
 
