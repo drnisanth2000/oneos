@@ -9,13 +9,13 @@ Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
 Last reconciled: 2026-11-05, after the running install was updated to
-`b4b4b73` (reminders in the Mac's Calendar). Earlier reconciliations:
-2026-11-03 (install updates to `65ab8da` and `604901f`), 2026-11-02 (install
-update to `345f7a7`),
+`668ae6f` (new reminders start at the current date and time). Earlier
+reconciliations: 2026-11-05 (install update to `b4b4b73`), 2026-11-03 (install
+updates to `65ab8da` and `604901f`), 2026-11-02 (install update to `345f7a7`),
 2026-10-30 (install updates to `75e6725` and `8df5979`), 2026-10-29 (install
-update to `d28ea6b`), 2026-10-28 (install updates to `d3dd761` and
-`85afa63`), 2026-10-26 (Board, rules line, and local deployment acceptance)
-and 2026-09-11 (trusted-local live Gate 1 session).
+update to `d28ea6b`), 2026-10-28 (install updates to `d3dd761` and `85afa63`),
+2026-10-26 (Board, rules line, and local deployment acceptance) and 2026-09-11
+(trusted-local live Gate 1 session).
 
 ## Local deployment acceptance (2026-10-26)
 
@@ -37,6 +37,25 @@ The owner decided that backups happen only when they run `backup`.
 `doctor` reports backup state without failing on it. The job on the running
 Mac was unloaded and its plist moved out of `LaunchAgents`. Install updates no
 longer require a backup first; the owner may take one when they choose.
+
+## Running install update to `668ae6f` (2026-11-05)
+
+With owner approval, the running install was updated to `origin/main`
+`668ae6f`: a new reminder on a Waiting or To review card starts at the
+browser's current date and time (PR #67; owner chose the current minute over
+one minute ahead). The install checkout moved from `b4b4b73` by fast-forward.
+The app image running before the update is kept locally as the image tag
+`oneos-local:pre-668ae6f`. The change is in two templates
+(`master_reminder.html` leaves a new reminder's time empty instead of `09:00`;
+`home.html` fills the browser's date and minute) plus its test; `start`
+rebuilt and recreated only the app container. No backup (owner's choice).
+
+Afterwards `status` reported every component available and services running,
+with `calendar` `on` (the owner ran `install-calendar` after the `b4b4b73`
+update). `/healthz` answered 200, `/` redirected to sign-in, the running
+container's `home.html` holds the new "A new reminder starts at the browser"
+block, and the app log showed no errors. The vault's HEAD, status, worktree diff, and cached diff
+were byte-identical before and after.
 
 ## Running install update to `b4b4b73` (2026-11-05)
 
@@ -60,8 +79,11 @@ from a LaunchAgent using the install's own interpreter, against the owner's
 iCloud calendar named OneOS, with a throwaway reminder store: create with an
 alert, an unchanged re-run, a subject-only edit in place, a time change
 replacing the event, resolve removing it, unresolve recreating it, and delete
-removing it, with nothing left over. Still pending with the owner:
-`install-calendar`, then a real reminder's event and its link.
+removing it, with nothing left over. The owner then ran `install-calendar`
+(job installed, Calendar answered), and following an event's link while
+signed out reached the sign-in page carrying `next=/?reminder=…`. On
+2026-11-05 the owner confirmed that a fresh reminder's event link opens that
+card's popup in OneOS.
 
 ## Running install update to `65ab8da` (2026-11-03)
 
