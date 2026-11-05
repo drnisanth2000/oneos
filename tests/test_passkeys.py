@@ -834,6 +834,46 @@ def test_passkey_sign_in_cookie_follows_keep(web, keep, age):
     assert client.get("/docs").status_code == 200
 
 
+DEEP = "/?reminder=oneos-" + "0123456789abcdef" * 2
+
+
+def test_passkey_sign_in_lands_on_the_deep_link(web):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    nonce = _nonce(client)
+    options = _options(client, nonce)
+    body = {"credential": json.loads(fake.assertion(options.text)), "keep": True, "next": DEEP}
+    response = _passkey_post(client, nonce, body)
+    assert response.status_code == 200 and response.json() == {"redirect": DEEP}
+    assert client.get("/docs").status_code == 200
+
+
+@pytest.mark.parametrize("value", [
+    "//evil.example", "https://evil.example/", "/outbox", "/?reminder=x&a=b", "/%2F%2Fevil",
+    DEEP + "&a=b", DEEP + "#top", "/\\evil.example", "",
+])
+def test_passkey_sign_in_never_follows_another_next(web, value):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    nonce = _nonce(client)
+    options = _options(client, nonce)
+    body = {"credential": json.loads(fake.assertion(options.text)), "keep": False, "next": value}
+    response = _passkey_post(client, nonce, body)
+    assert response.status_code == 200 and response.json() == {"redirect": "/"}
+
+
+@pytest.mark.parametrize("value", [None, 7, [DEEP], {"path": DEEP}, True])
+def test_passkey_sign_in_refuses_a_next_that_is_not_text(web, value):
+    client, store, secret = web
+    fake = _register(store, secret, 3030)
+    nonce = _nonce(client)
+    options = _options(client, nonce)
+    body = {"credential": json.loads(fake.assertion(options.text)), "keep": False, "next": value}
+    response = _passkey_post(client, nonce, body)
+    assert response.status_code == 400 and response.json() == {"error": "invalid"}
+    assert _cookie_headers(response, "__Host-oneos") == []
+
+
 def test_password_backup_still_signs_in_with_a_passkey_stored(web):
     client, store, secret = web
     _register(store, secret, 3030)
@@ -1513,13 +1553,15 @@ def test_sign_in_page_script_produces_an_answer_the_server_accepts(web, tmp_path
     node = _node()
     client, store, secret = web
     fake = _register(store, secret, 3030)
-    page = client.get("/login").text
+    page = client.get("/login", params={"next": DEEP}).text
     nonce = __import__("re").search(r'name="csrf_token" value="([^"]+)"', page).group(1)
+    shown = __import__("re").search(r'<input type="hidden" name="next" value="([^"]*)">', page).group(1)
+    assert shown == DEEP
     script = page.split("<script>")[1].split("</script>")[0]
     options = _options(client, nonce).text
     answer = json.loads(fake.assertion(options))
     (tmp_path / "page.js").write_text(script)
-    (tmp_path / "fixture.json").write_text(json.dumps({"options": json.loads(options), "answer": answer, "nonce": nonce}))
+    (tmp_path / "fixture.json").write_text(json.dumps({"options": json.loads(options), "answer": answer, "nonce": nonce, "next": shown}))
     harness = tmp_path / "harness.js"
     harness.write_text(r"""
 const assert = require('assert');
@@ -1532,7 +1574,7 @@ const link = element();
 const els = {
   'touch-id': element(), 'password-fields': element({ hidden: false }), 'password-submit': element({ hidden: false }),
   'use-password': element({ querySelector: () => link }), 'touch-id-button': element(), 'touch-id-status': element(),
-  'sign-in': { elements: { csrf_token: { value: fixture.nonce }, keep: { checked: true }, password: { focus() { els.focused = true; } } } },
+  'sign-in': { elements: { csrf_token: { value: fixture.nonce }, next: { value: fixture.next }, keep: { checked: true }, password: { focus() { els.focused = true; } } } },
 };
 global.window = global;
 global.document = { getElementById: (id) => els[id] || null };
@@ -1561,7 +1603,7 @@ global.fetch = async (url, init) => {
   assert.strictEqual(init.headers['X-CSRF-Token'], fixture.nonce);
   assert.strictEqual(init.headers['Content-Type'], 'application/json');
   if (url === '/login/passkey/options') return { ok: true, status: 200, json: async () => fixture.options };
-  if (url === '/login/passkey') return { ok: true, status: 200, json: async () => ({ redirect: '/' }) };
+  if (url === '/login/passkey') return { ok: true, status: 200, json: async () => ({ redirect: fixture.next }) };
   throw new Error('unexpected ' + url);
 };
 require(process.argv[2]);
@@ -1574,7 +1616,9 @@ require(process.argv[2]);
   // Every press asks for fresh options.
   assert.deepStrictEqual(posts.map((p) => p[0]), ['/login/passkey/options', '/login/passkey', '/login/passkey/options', '/login/passkey']);
   assert.strictEqual(gets, 2);
-  assert.deepStrictEqual(visits, ['/', '/']);
+  // It lands where the server said: the deep link it was sent.
+  assert.deepStrictEqual(visits, [fixture.next, fixture.next]);
+  assert.strictEqual(JSON.parse(posts[1][1].body).next, fixture.next);
   // "Use password and code instead" brings the form back.
   link.listeners.click({ preventDefault() {} });
   assert.strictEqual(els['password-fields'].hidden, false);
@@ -1589,7 +1633,7 @@ require(process.argv[2]);
     assert body["keep"] is True and body["credential"]["response"]["userHandle"] == answer["response"]["userHandle"]
     response = client.post("/login/passkey", content=result.stdout.encode(),
                            headers=dict(OWN, **{"X-CSRF-Token": nonce, "Content-Type": "application/json"}))
-    assert response.status_code == 200 and response.json() == {"redirect": "/"}
+    assert response.status_code == 200 and response.json() == {"redirect": DEEP}
     assert store.session_info(client.cookies.get("__Host-oneos")).kept is True
 
 

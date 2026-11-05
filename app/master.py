@@ -19,8 +19,9 @@ from .action_receipts import (
 )
 from .board import BoardCard, BoardLink, NoteUnreadable, _sort_cards, entity_cards
 from .config import VaultRootUnavailable
-from .console_routing import failure_contract
+from .console_routing import failure_contract, structured_reader
 from .entities import EntityManifestError, EntitySelectionError
+from .inbox import split_front_matter
 from .outbox import OutboxError
 from .reminders import Reminder, ReviewFlag
 from .scope import CrossScopeError, RedirectedPathError, Scope
@@ -59,6 +60,18 @@ _ENTITY_FAILURES = (
 #: as `NoteUnreadable` ("a file could not be read"), so the page does not say
 #: E-UNKNOWN. This is local to this page; no other route's message changes.
 _NOTE_READ_FAILURES = (UnicodeDecodeError, OSError)
+
+
+def status_is_done(status: object) -> bool:
+    """Whether a filed note's `status` puts it in Done (`done` or `active`):
+    the one rule `stage_of` and the reminder clean-up share."""
+    return isinstance(status, str) and _FILED_STAGE.get(status.strip().lower()) == "done"
+
+
+@structured_reader(category="front-matter")
+def note_text_is_done(text: str) -> bool:
+    """Whether a filed note's text carries a status that puts it in Done."""
+    return status_is_done(split_front_matter(text)[0].get("status"))
 
 
 def stage_of(card: BoardCard) -> str:

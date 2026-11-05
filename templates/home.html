@@ -72,6 +72,15 @@
   {% include "_sidebar.html" %}
 
   <main class="main">
+    {# The deep link a reminder's Calendar event opens (`/?reminder=<id>`). Outside
+       #master, so the minute refresh (which selects only #master) never loads
+       the popup again or brings back a notice the owner has read. #}
+    {% if deep_link and deep_link.entity %}
+    <div hidden hx-get="/master/card/{{ deep_link.entity | urlencode }}?path={{ deep_link.path | urlencode }}"
+         hx-trigger="load" hx-target="#master-popup" hx-swap="innerHTML"></div>
+    {% elif deep_link %}
+    <p class="master-notice" role="status">{{ deep_link.notice }}</p>
+    {% endif %}
     {# The master view. It refreshes itself every minute, and when a reminder is
        saved or removed (the response's HX-Trigger: master-refresh, which bubbles
        to the body), with a morph that keeps Alpine state (the phone stage

@@ -51,7 +51,15 @@ from .entities import (
     EntitySelectionError,
 )
 from .inbox import read_inbox
-from .master import card_stage, due_label, entity_tone, load_master, stage_label, stage_of
+from .master import (
+    card_stage,
+    due_label,
+    entity_tone,
+    load_master,
+    note_text_is_done,
+    stage_label,
+    stage_of,
+)
 from .note_text import NoteTextError, normalise_body, shown_body
 from .reminders import (
     InvalidReminder,
@@ -59,6 +67,7 @@ from .reminders import (
     ReminderStore,
     ReminderStoreUnavailable,
     ReviewFlag,
+    calendar_event_id,
     clean_flag_comment,
     clean_subject,
     default_subject,
@@ -111,7 +120,7 @@ from .registry import (
 )
 from .scope import CrossScopeError, RedirectedPathError, Scope
 from .vault import DestinationRegistryError, Vault
-from .auth_web import AuthenticatedFormRoute, OwnerAuthMiddleware
+from .auth_web import REMINDER_ID, AuthenticatedFormRoute, OwnerAuthMiddleware
 from .deployment_health import install_health
 
 BASE = Path(__file__).resolve().parent.parent
@@ -469,6 +478,43 @@ def _page_flags() -> dict | None:
         return None
 
 
+_DEEP_LINK_GONE = "That reminder is no longer in OneOS."
+_DEEP_LINK_UNAVAILABLE = "Reminders are unavailable right now."
+
+
+def _deep_link(reminder_id: str) -> dict:
+    """Home's `/?reminder=<id>`, the link in a reminder's Calendar event: the
+    card popup to open, or the notice to show instead. `reminder_id` is
+    already a well-formed event id. Every row is read, resolved ones too, so
+    the leftover event of a card moved to Done still opens it. Reads only.
+
+    Every `build_scope` failure is answered here, so the page keeps its own
+    declared family: an entity that left the registry is "no longer in
+    OneOS"; a registry or vault root that cannot be read right now is
+    "unavailable right now"."""
+    try:
+        store = reminder_store()
+        if store is None:
+            return {"notice": _DEEP_LINK_GONE}
+        rows = ReminderStore.all(store)
+    except ReminderStoreUnavailable:
+        return {"notice": _DEEP_LINK_UNAVAILABLE}
+    found = next(
+        (row for key, row in rows.items() if calendar_event_id(key) == reminder_id), None
+    )
+    if found is None:
+        return {"notice": _DEEP_LINK_GONE}
+    try:
+        entity = build_scope(found.entity).current_entity()
+    except EntitySelectionError:
+        return {"notice": _DEEP_LINK_GONE}
+    except (EntityManifestError, VaultRootUnavailable):
+        return {"notice": _DEEP_LINK_UNAVAILABLE}
+    # The URL the card's own button loads (blocks/master_card.html); the popup
+    # route checks the path against the entity's cards before reading it.
+    return {"entity": entity, "path": found.key}
+
+
 @app.get("/", response_class=HTMLResponse)
 @console_route(
     catches=_SIDEBAR_CATCHES,
@@ -499,6 +545,9 @@ def shell(request: Request) -> HTMLResponse:
             reminders=_page_reminders(),
             flags=_page_flags(),
         )
+        # Anything but a well-formed event id is ignored, with no lookup.
+        wanted = params.get("reminder")
+        deep_link = _deep_link(wanted) if wanted and REMINDER_ID.fullmatch(wanted) else None
     except _SIDEBAR_CATCHES as exc:
         return _render_console_error(request, describe(exc))
     return templates.TemplateResponse(
@@ -508,6 +557,7 @@ def shell(request: Request) -> HTMLResponse:
             "bundles": bundles,
             "page": page,
             "failures": [(f.entity_label, describe(f.error)) for f in page.failures],
+            "deep_link": deep_link,
         },
     )
 
@@ -1146,10 +1196,15 @@ def _stage_again(
     return _stage_popup(request, context, refresh=refresh)
 
 
-def _stage_follows_move(src: str, dst: str, *, resolve: bool) -> None:
+def _stage_follows_move(
+    src: str, dst: str, *, resolve: bool, kept_done: bool | None = False
+) -> None:
     """After a committed move: the card's reminder follows it to `dst`, any
     review flag on it is cleared (moving a card to a stage clears its flag),
-    and Done resolves (deletes) its reminder.
+    and Done resolves (deletes) its reminder. A card that landed in Done by
+    another path (`kept_done`: its status is `active`) keeps the row but marks
+    it resolved; a card that landed anywhere else has no mark; `None` (could
+    not tell) leaves the mark as it is.
 
     The vault change is already committed and its receipt written; this only
     updates the owner-private store and never changes what the move did. If
@@ -1166,6 +1221,21 @@ def _stage_follows_move(src: str, dst: str, *, resolve: bool) -> None:
         ReminderStore.unflag(store, dst)
         if resolve:
             ReminderStore.remove(store, dst)
+        elif kept_done:
+            ReminderStore.resolve(store, dst)
+        elif kept_done is not None:
+            ReminderStore.unresolve(store, dst)
+    except ReminderStoreUnavailable:
+        return
+
+
+def _clear_resolved_mark(path: str) -> None:
+    """A card flagged out of Done is open again: drop its resolved mark.
+    Best effort after the commit, like `_stage_follows_move`."""
+    try:
+        store = reminder_store()
+        if store is not None:
+            ReminderStore.unresolve(store, path)
     except ReminderStoreUnavailable:
         return
 
@@ -1313,6 +1383,7 @@ def master_stage(
                     return _stage_moved(
                         request, scope, catalog, card.relative_path, _notice(_FLAG_NOT_STORED, "error")
                     )
+                _clear_resolved_mark(card.relative_path)
                 return _stage_moved(request, scope, catalog, card.relative_path, moved_to)
 
             if card.lane == "filed":
@@ -2366,7 +2437,18 @@ def outbox_approve(
     )
 
 
-def _reminder_follows_approval(result) -> None:
+def _landed_in_done(scope: Scope, path: str) -> bool | None:
+    """Whether the note now at `path` is in Done (status `done` or `active`,
+    the rule `stage_of` uses); None when it cannot be read, so nothing about
+    its reminder is changed."""
+    try:
+        text = note_snapshot(scope, path).text
+    except (CrossScopeError, NoteUnreadable):
+        return None
+    return note_text_is_done(text)
+
+
+def _reminder_follows_approval(result, scope: Scope) -> None:
     """After `approve` filed an item, move its reminder to the filed path.
 
     The vault change is already committed and its receipt written; this only
@@ -2381,18 +2463,29 @@ def _reminder_follows_approval(result) -> None:
     and Done resolves the reminder. A record with no status change and no
     move (a body or comment edit only) does not say which stage was pressed,
     so its flag and reminder are left as they are.
+
+    A note filed with the status `active` is in Done, so its reminder is kept
+    but marked resolved; one filed anywhere else is open (no mark).
     """
     if isinstance(result, StageProposal):
         if result.set_status is None and result.src == result.dst:
             return
-        _stage_follows_move(result.src, result.dst, resolve=result.set_status == "done")
+        kept_done = _landed_in_done(scope, result.dst) if result.set_status is None else False
+        _stage_follows_move(
+            result.src, result.dst, resolve=result.set_status == "done", kept_done=kept_done
+        )
         return
     if not isinstance(result, Proposal):
         return
+    landed = _landed_in_done(scope, result.dst)
     try:
         store = reminder_store()
         if store is not None:
             ReminderStore.rekey(store, result.src, result.dst)
+            if landed is True:
+                ReminderStore.resolve(store, result.dst)
+            elif landed is False:
+                ReminderStore.unresolve(store, result.dst)
     except ReminderStoreUnavailable:
         return
 
@@ -2454,7 +2547,7 @@ def _outbox_approve_response(
                 return _outbox_list_error(
                     request, scope, exc, action_receipt=result.receipt
                 )
-        _reminder_follows_approval(result)
+        _reminder_follows_approval(result, scope)
     try:
         return _outbox_list(
             request,

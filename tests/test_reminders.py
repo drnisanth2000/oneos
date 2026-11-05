@@ -13,6 +13,7 @@ from app.reminders import (
     ReminderStore,
     ReviewFlag,
     ReminderStoreUnavailable,
+    calendar_event_id,
     clean_flag_comment,
     clean_subject,
     parse_due,
@@ -546,6 +547,8 @@ def _file_state(directory):
     lambda store: store.rekey("synthetic/00-inbox/active/a.md", "synthetic/02-work/active/a.md"),
     lambda store: store.rename_entity("synthetic", "renamed"),
     lambda store: store.remove("synthetic/02-work/active/a.md"),
+    lambda store: store.resolve("synthetic/02-work/active/a.md"),
+    lambda store: store.unresolve("synthetic/02-work/active/a.md"),
 ])
 def test_cleanup_writes_never_touch_a_zero_byte_store(state, call):
     """The master view calls `unflag` on every move: a store that was never
@@ -564,6 +567,8 @@ def test_cleanup_writes_never_touch_a_zero_byte_store(state, call):
     lambda store: store.rekey("synthetic/00-inbox/active/a.md", "synthetic/02-work/active/a.md"),
     lambda store: store.rename_entity("synthetic", "renamed"),
     lambda store: store.remove("synthetic/02-work/active/a.md"),
+    lambda store: store.resolve("synthetic/02-work/active/a.md"),
+    lambda store: store.unresolve("synthetic/02-work/active/a.md"),
 ])
 def test_cleanup_writes_never_add_a_reminders_table(state, call):
     import sqlite3
@@ -578,3 +583,184 @@ def test_cleanup_writes_never_add_a_reminders_table(state, call):
     call(ReminderStore(state))
     assert _file_state(state) == before
     assert _tables(path) == {"unrelated"}
+
+
+# --- resolved marks, event id, snapshot ------------------------------------
+
+
+def test_calendar_event_id_is_stable_and_shaped():
+    import hashlib
+    import re
+
+    key = "synthetic/02-work/active/a.md"
+    assert calendar_event_id(key) == calendar_event_id(key)
+    assert re.fullmatch(r"oneos-[0-9a-f]{32}", calendar_event_id(key))
+    assert calendar_event_id(key) == "oneos-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    assert calendar_event_id(key) != calendar_event_id(key + "x")
+
+
+def _bytes(directory):
+    return {p.name: p.read_bytes() for p in sorted(directory.iterdir())}
+
+
+def test_snapshot_is_none_for_a_missing_file_and_creates_nothing(state):
+    assert ReminderStore(state).snapshot() is None
+    assert list(state.iterdir()) == []
+
+
+def test_snapshot_is_none_for_a_zero_byte_file_and_leaves_it_alone(state):
+    path = state / "reminders.sqlite3"
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    before = _file_state(state)
+    assert ReminderStore(state).snapshot() is None
+    assert _file_state(state) == before
+
+
+def test_snapshot_is_none_for_a_file_without_a_reminders_table(state):
+    import sqlite3
+    from contextlib import closing
+
+    path = state / "reminders.sqlite3"
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("CREATE TABLE unrelated (x TEXT)")
+        db.commit()
+    path.chmod(0o600)
+    before = _file_state(state)
+    assert ReminderStore(state).snapshot() is None
+    assert _file_state(state) == before
+
+
+def test_snapshot_is_none_when_the_store_cannot_be_read(state):
+    ReminderStore(state).save(make())
+    state.chmod(0o755)
+    assert ReminderStore(state).snapshot() is None
+
+
+def test_snapshot_of_an_empty_table_is_an_empty_dict(state):
+    store = ReminderStore(state)
+    store.save(make())
+    store.remove("inbox/pay-card.md")
+    before = _file_state(state)
+    assert store.snapshot() == {}
+    assert _file_state(state) == before
+
+
+def test_snapshot_holds_the_open_rows_only(state):
+    store = ReminderStore(state)
+    store.save(make(key="a", subject="Open"))
+    store.save(make(key="b", subject="Done one"))
+    store.resolve("b")
+    before = _file_state(state)
+    found = store.snapshot()
+    assert set(found) == {"a"} and found["a"] == store.all()["a"]
+    assert set(store.all()) == {"a", "b"}  # the row is kept, only marked
+    assert _file_state(state) == before
+    store.unresolve("b")
+    assert set(store.snapshot()) == {"a", "b"}
+
+
+def test_resolve_creates_its_table_only_when_it_writes(state):
+    store = ReminderStore(state)
+    path = state / "reminders.sqlite3"
+    store.save(make(key="a"))
+    assert _tables(path) == {"reminders"}
+    store.resolve("no-such-row")  # nothing to mark: a no-op
+    store.unresolve("a")  # no table: a no-op
+    store.snapshot(), store.all(), store.flags()
+    assert _tables(path) == {"reminders"}
+    store.resolve("a")
+    assert _tables(path) == {"reminders", "resolved_reminders"}
+    store.resolve("a")  # idempotent
+    store.unresolve("a")
+    store.unresolve("a")
+    assert set(store.snapshot()) == {"a"}
+
+
+def test_resolve_leaves_a_flags_table_out_of_it(state):
+    store = ReminderStore(state)
+    store.save(make(key="a"))
+    store.resolve("a")
+    assert "review_flags" not in _tables(state / "reminders.sqlite3")
+
+
+def test_rekey_carries_the_resolved_mark_with_the_row(state):
+    store = ReminderStore(state)
+    store.save(make(key="a"))
+    store.resolve("a")
+    store.save(make(key="b", subject="Stale"))
+    store.rekey("a", "b")
+    assert set(store.all()) == {"b"} and store.snapshot() == {}
+    # An open row moved onto a stale mark is open again.
+    store.save(make(key="c"))
+    store.resolve("b")
+    store.rekey("c", "b")
+    assert set(store.snapshot()) == {"b"}
+
+
+def test_rename_entity_carries_the_resolved_mark(state):
+    store = ReminderStore(state)
+    store.save(make(key="old/02-work/a.md", entity="old", subject="A"))
+    store.save(make(key="old/02-work/b.md", entity="old", subject="B"))
+    store.save(make(key="older/02-work/c.md", entity="older", subject="C"))
+    store.resolve("old/02-work/a.md")
+    store.resolve("older/02-work/c.md")
+    assert store.rename_entity("old", "new") == 2
+    assert set(store.snapshot()) == {"new/02-work/b.md"}
+    assert set(store.all()) == {"new/02-work/a.md", "new/02-work/b.md", "older/02-work/c.md"}
+    store.unresolve("new/02-work/a.md")
+    assert set(store.snapshot()) == {"new/02-work/a.md", "new/02-work/b.md"}
+
+
+def test_remove_drops_the_mark_and_a_new_row_under_that_key_is_open(state):
+    store = ReminderStore(state)
+    store.save(make(key="a"))
+    store.resolve("a")
+    store.remove("a")
+    store.save(make(key="a", subject="Again"))
+    assert set(store.snapshot()) == {"a"}
+
+
+def test_saving_a_reminder_clears_a_stale_mark(state):
+    store = ReminderStore(state)
+    store.save(make(key="a"))
+    store.resolve("a")
+    store.save(make(key="a", subject="Edited", day=6))
+    assert set(store.snapshot()) == {"a"}
+
+
+def test_a_save_never_creates_the_resolved_table(state):
+    store = ReminderStore(state)
+    store.save(make(key="a"))
+    store.save(make(key="a", subject="Edited"))
+    assert _tables(state / "reminders.sqlite3") == {"reminders"}
+
+
+def test_resolved_marks_are_all_or_nothing_with_rekey(state, monkeypatch):
+    import app.reminders as module
+
+    store = ReminderStore(state)
+    store.save(make(key="a"))
+    store.resolve("a")
+    real = module._has_table
+
+    def boom(db, name):
+        if name == "resolved_reminders":
+            raise __import__("sqlite3").OperationalError("simulated")
+        return real(db, name)
+
+    monkeypatch.setattr(module, "_has_table", boom)
+    with pytest.raises(ReminderStoreUnavailable):
+        store.rekey("a", "b")
+    monkeypatch.setattr(module, "_has_table", real)
+    assert set(store.all()) == {"a"} and store.snapshot() == {}
+
+
+def test_resolved_methods_declare_failure_contracts():
+    for fn, expected in [
+        (ReminderStore.resolve, {ReminderStoreUnavailable}),
+        (ReminderStore.unresolve, {ReminderStoreUnavailable}),
+        (ReminderStore.snapshot, set()),
+        (calendar_event_id, set()),
+    ]:
+        assert set(fn.__failure_contract__.raises) == expected

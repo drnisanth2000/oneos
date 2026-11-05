@@ -6,6 +6,7 @@ landed and when. The published history starts at the 2026-08-07 baseline.
 
 ## Unreleased
 
+- Reminders reach the Mac's Calendar (plan 4 of 4): one event per open reminder in a calendar named OneOS, updated when the reminder changes and removed on Done; set up once with `install-calendar`.
 - Master view moves and editing (plan 3 of 4): stage buttons in the card popup,
   drag a card to Draft or Done on a computer, edit a draft's text, add a dated
   comment, and flag a filed note To review. Every change is one approved,

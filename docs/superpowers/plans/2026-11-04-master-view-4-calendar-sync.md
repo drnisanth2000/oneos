@@ -114,7 +114,7 @@ OneOS → Calendar only.
 - `ProgramArguments` `[sys.executable, -m, tools.local_service, --state-dir, <state>, calendar-sync]`;
 - `WorkingDirectory` = `config['repo_dir']` (needed for `-m tools…`, as `install_login` does);
 - `WatchPaths` `[<state>/auth, <state>/auth/reminders.sqlite3]`;
-- `RunAtLoad` true, `ThrottleInterval` 30;
+- `RunAtLoad` true, `ThrottleInterval` 30, `StartInterval` 3600 (an hourly idle check that, through the fingerprint skip, opens Calendar only when something changed or a retry or the daily re-check is due; added after the Codex review of #65);
 - `StandardOutPath` / `StandardErrorPath` `/dev/null`;
 - `EnvironmentVariables` `{PATH}`, as `install_login` sets it.
 - The job always exits 0 once it has written its status. A non-zero exit is reserved for the foreground `install-calendar` refusal.
