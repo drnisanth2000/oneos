@@ -81,8 +81,9 @@ alert, an unchanged re-run, a subject-only edit in place, a time change
 replacing the event, resolve removing it, unresolve recreating it, and delete
 removing it, with nothing left over. The owner then ran `install-calendar`
 (job installed, Calendar answered), and following an event's link while
-signed out reached the sign-in page carrying `next=/?reminder=…`. Still not
-recorded as checked: the card's popup opening after sign-in.
+signed out reached the sign-in page carrying `next=/?reminder=…`. On
+2026-11-05 the owner confirmed that a fresh reminder's event link opens that
+card's popup in OneOS.
 
 ## Running install update to `65ab8da` (2026-11-03)
 
