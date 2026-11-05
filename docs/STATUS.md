@@ -8,9 +8,10 @@ intended for eventual public release; the vault is never published.
 Build order and rules: see `../BUILD.md` and the spec at
 `$ONEOS_VAULT/_system/docs/oneos-spec.md`.
 
-Last reconciled: 2026-11-03, after the running install was updated to
-`65ab8da` (header-only `sub:` edits). Earlier reconciliations: 2026-11-03
-(install update to `604901f`), 2026-11-02 (install update to `345f7a7`),
+Last reconciled: 2026-11-05, after the running install was updated to
+`b4b4b73` (reminders in the Mac's Calendar). Earlier reconciliations:
+2026-11-03 (install updates to `65ab8da` and `604901f`), 2026-11-02 (install
+update to `345f7a7`),
 2026-10-30 (install updates to `75e6725` and `8df5979`), 2026-10-29 (install
 update to `d28ea6b`), 2026-10-28 (install updates to `d3dd761` and
 `85afa63`), 2026-10-26 (Board, rules line, and local deployment acceptance)
@@ -36,6 +37,31 @@ The owner decided that backups happen only when they run `backup`.
 `doctor` reports backup state without failing on it. The job on the running
 Mac was unloaded and its plist moved out of `LaunchAgents`. Install updates no
 longer require a backup first; the owner may take one when they choose.
+
+## Running install update to `b4b4b73` (2026-11-05)
+
+With owner approval, the running install was updated to `origin/main`
+`b4b4b73`: master view plan 4 of 4, reminders in the Mac's Calendar (plan in
+PR #64, build in PR #65). The install checkout moved from `65ab8da` by
+fast-forward. The app image running before the update is kept locally as the
+image tag `oneos-local:pre-b4b4b73`. No new dependency and no Dockerfile,
+Compose, or Caddy change; `start` alone rebuilt and recreated only the app
+container. No backup (owner's choice).
+
+Afterwards `status` reported every component available and services running,
+with the new `calendar` line at `off` (the Calendar job is installed only when
+the owner runs `install-calendar`). `/healthz` answered 200, `/` redirected to
+sign-in, the running container holds the new code, and the app log showed no
+errors. The vault's HEAD, status, worktree diff, and cached diff were
+byte-identical before and after.
+
+Before merging, the Calendar adapter and sync were checked live on this Mac
+from a LaunchAgent using the install's own interpreter, against the owner's
+iCloud calendar named OneOS, with a throwaway reminder store: create with an
+alert, an unchanged re-run, a subject-only edit in place, a time change
+replacing the event, resolve removing it, unresolve recreating it, and delete
+removing it, with nothing left over. Still pending with the owner:
+`install-calendar`, then a real reminder's event and its link.
 
 ## Running install update to `65ab8da` (2026-11-03)
 
